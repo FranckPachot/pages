@@ -1,0 +1,119 @@
+								<h1 class="entry-title">Filenames in AWR reports</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>If you have read my latest blog posts, you know I&#8217;ve measured IOPS with SLOB to estimate ACFS overhead on a fast storage. This blog is about something I learned after wasting one hour on the result.
+<span id="more-10352"></span>
+Here is how I did my tests:</p>
+<ol>
+<li>Create a SLOB database in ACFS</li>
+<li>Run SLOB PIO tests and tag the AWR report as &#8216;ACFS&#8217;</li>
+<li>Move datafile to +DATA</li>
+<li>Run SLOB PIO tests and tag the AWR report as &#8216;ASM&#8217;</li>
+</ol>
+<p>Of course, I&#8217;ve scripted to run several tests varying the number of sessions, work unit, etc. while I was doing something more productive.</p>
+<p>While done, I got a set of AWR report and the first task was to check that they were consistent. But they were not. The datafile in &#8216;File IO Stats&#8217; section did not match the tag I&#8217;ve put in the file name. First I suspected a bug in my script with bad tagging or failed datafile move. I had to read the alert.log to get that my tagging was good but filename in AWR reports was wrong. I finally looked at AWR views to understand why the filename was wrong and understood the problem:</p>
+<p><pre>SQL&gt; desc DBA_HIST_DATAFILE;
+ Name                                      Null?    Type
+ ----------------------------------------- -------- ----------------------------
+ DBID                                      NOT NULL NUMBER
+ FILE#                                     NOT NULL NUMBER
+ CREATION_CHANGE#                          NOT NULL NUMBER
+ FILENAME                                  NOT NULL VARCHAR2(513)
+ TS#                                       NOT NULL NUMBER
+ TSNAME                                             VARCHAR2(30)
+ BLOCK_SIZE                                         NUMBER
+ CON_DBID                                           NUMBER
+ CON_ID                                             NUMBER</pre></p>
+<p>There&#8217;s no SNAP_ID. AWR do not store the history of file names. We can suppose that it stores only the latest filename, but then my reports would be good as they were generated immediately after the snapshot. Or that the first name stays, but I had some reports with &#8216;+DATA&#8217;.</p>
+<p>Then, I grepped for &#8216;WRH$_HISTORY&#8217; in ORACLE_HOME/rdbms/admin and came upon this:</p>
+<p><pre>dbmsawr.sql:  --  This routine updates WRH$_DATAFILE rows for the datafile name and
+dbmsawr.sql:  --  WRH$_DATAFILE with the current information in database.</pre></p>
+<p>There is an update_datafile_info procedure here in the dbms_workload_repository and the comment says something like:
+<pre>This change will be captured at max after some
+  --  (generally 50) snapshots. So the AWR and AWR report may be wrong with
+  --  respect to data file name or tablespace name for that duration.</pre></p>
+<p>I love to work with Oracle. All information is there if you know where to look at.</p>
+<p>So if you want to rely on filename in an AWR report after a move, you should run this procedure before taking the report. And you should run this report before the next datafile move.</p>
+<p>Here is the example:</p>
+<p><pre>SQL&gt; exec dbms_workload_repository.create_snapshot;
+PL/SQL procedure successfully completed.
+
+SQL&gt; select file#,filename from DBA_HIST_DATAFILE where file#=6;
+
+     FILE# FILENAME
+---------- --------------------------------------
+         6 /u01/DEMO/oradata/DEMO14/users01.dbf
+
+SQL&gt; select snap_id,file#,filename from DBA_HIST_FILESTATXS where file#=6 order by snap_id fetch first 10 rows only;
+
+   SNAP_ID      FILE# FILENAME
+---------- ---------- --------------------------------------
+      1244          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1245          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1246          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1247          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1248          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1249          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+6 rows selected.</pre></p>
+<p>My file is user01 and this is what is stored in AWR.</p>
+<p>I rename it to users02 (thanks to 12<em>c</em> online move)</p>
+<p><pre>SQL&gt; alter database move datafile '/u01/DEMO/oradata/DEMO14/users01.dbf' to '/u01/DEMO/oradata/DEMO14/users02.dbf';
+Database altered.</pre></p>
+<p>but AWR is not aware of the change even after a snapshot:</p>
+<p><pre>SQL&gt; exec dbms_workload_repository.create_snapshot;
+PL/SQL procedure successfully completed.
+
+SQL&gt; select file#,filename from DBA_HIST_DATAFILE where file#=6;
+
+     FILE# FILENAME
+---------- --------------------------------------
+         6 /u01/DEMO/oradata/DEMO14/users01.dbf
+
+SQL&gt; select snap_id,file#,filename from DBA_HIST_FILESTATXS where file#=6 order by snap_id fetch first 10 rows only;
+
+   SNAP_ID      FILE# FILENAME
+---------- ---------- --------------------------------------
+      1244          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1245          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1246          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1247          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1248          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1249          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+      1250          6 /u01/DEMO/oradata/DEMO14/users01.dbf
+</pre></p>
+<p>You have to wait for those 50 snapshots or run the update:</p>
+<p><pre>SQL&gt; exec dbms_workload_repository.update_datafile_info;
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select file#,filename from DBA_HIST_DATAFILE where file#=6;
+
+     FILE# FILENAME
+---------- --------------------------------------
+         6 /u01/DEMO/oradata/DEMO14/users02.dbf
+
+SQL&gt; select snap_id,file#,filename from DBA_HIST_FILESTATXS where file#=6 order by snap_id fetch first 10 rows only;
+
+   SNAP_ID      FILE# FILENAME
+---------- ---------- --------------------------------------
+      1244          6 /u01/DEMO/oradata/DEMO14/users02.dbf
+      1245          6 /u01/DEMO/oradata/DEMO14/users02.dbf
+      1246          6 /u01/DEMO/oradata/DEMO14/users02.dbf
+      1247          6 /u01/DEMO/oradata/DEMO14/users02.dbf
+      1248          6 /u01/DEMO/oradata/DEMO14/users02.dbf
+      1249          6 /u01/DEMO/oradata/DEMO14/users02.dbf
+      1250          6 /u01/DEMO/oradata/DEMO14/users02.dbf
+</pre></p>
+<p>But as you see no history about previous names.</p>
+<p>Note that if you look at the table behind the view, there&#8217;s a SNAP_ID but it&#8217;s not part of the primary key. It is used by the purge procedures.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-103530"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,143 @@
+								<h1 class="entry-title">When Oracle resets session statistics</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>During our <a href="http://www.dbi-services.com/index.php/products/dbi-insite-workshops/oracle-12c-new-features-workshop">Oracle 12c New Features workshop</a> I had a very good question about whether the session statistics are reset or not when doing ALTER SESSION SET CONTAINER. My initial thought was that they were not reset because it&#8217;s the same session (same SID and SERIAL#). But when I&#8217;m not 100% sure about something, I test it. And once again, it proves that even the instructor can learn something new when giving a workshop, thanks to the great interaction with the participants.</p>
+<p>My test was very simple, querying the &#8216;logon&#8217; statistics after an ALTER SESSION SET CONTAINER and I came with the following tweet:</p>
+<blockquote lang="en"><p>Quizz: How can I be connected and get 0 logons from V$MYSTAT ? <a href="http://t.co/YZPQNU8FiH">pic.twitter.com/YZPQNU8FiH</a></p>
+<p>— Franck Pachot (@FranckPachot) <a href="https://twitter.com/FranckPachot/status/537598847946854400">November 26, 2014</a></p></blockquote>
+<p>Of course that needs more investigation. This is about session statistics. What about session events? and session time model?</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect / as sysdba
+Connected.
+
+SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where name like 'logon%';
+
+NAME                                     VALUE
+----------------------------------- ----------
+logons cumulative                            1
+logons current                               1
+</pre>
+<p>I&#8217;m connected to the root container. I generate a bit of activity (using dbms_system.wait_for_event for fake i/o activity):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec for i in 1..1e5 loop dbms_system.wait_for_event('db file sequential read', 0 , 0 ); end loop;
+PL/SQL procedure successfully completed.
+
+SQL&gt; exec for i in 1..100 loop dbms_system.wait_for_event('db file sequential read', 0 , 1 ); end loop;
+PL/SQL procedure successfully completed.
+
+SQL&gt; declare s date:=sysdate; begin loop exit when sysdate&gt;s+60/24/60/60; end loop; end;
+  2  /
+PL/SQL procedure successfully completed.
+</pre>
+<p>and here are my session statistics:</p>
+<p><strong>Time Model</strong> show 60 seconds of CPU and the 100 seconds of I/O is in the DB time (time model values are in microseconds):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select stat_name,value from v$sess_time_model where sid=sys_context('userenv','sid') and stat_name in ('DB time','DB CPU');
+
+STAT_NAME                                VALUE
+----------------------------------- ----------
+DB time                              165084940
+DB CPU                                61119000
+</pre>
+<p><strong>Session Events</strong> shows those 100 seconds of I/O and the longest call took 1 second (values are in centisecond when not with &#8216;MICRO&#8217;):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select event,total_waits,time_waited_micro,max_wait from v$session_event where sid=sys_context('userenv','sid');
+
+EVENT                          TOTAL_WAITS TIME_WAITED_MICRO   MAX_WAIT
+------------------------------ ----------- ----------------- ----------
+Disk file operations I/O                19              1407          0
+db file sequential read             100100         104060605        101
+SQL*Net message to client               33               123          0
+SQL*Net message from client             32             13842          0
+</pre>
+<p><strong>Session Statistics</strong> where time is in centiseconds show 60 seconds of CPU and 100 + 60 of DB time:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where name = 'DB time' or name like 'CPU%' or name like 'SQL*Net%client';
+
+NAME                                     VALUE
+----------------------------------- ----------
+CPU used when call started                6118
+CPU used by this session                  6118
+DB time                                  16513
+user I/O wait time                       10406
+SQL*Net roundtrips to/from client           33
+</pre>
+<p>Ok, so that is consistent. And this has to be consistent as we often compare information for those 3 sources.</p>
+<p>Let&#8217;s now change to another container with ALTER SESSION SET CONTAINER:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; show con_id
+
+CON_ID
+------------------------------
+1
+
+SQL&gt; alter session set container=PDB1;
+
+Session altered.
+</pre>
+<p>and look at the same statistics now:</p>
+<pre>SQL&gt; select stat_name,value from v$sess_time_model where sid=sys_context('userenv','sid') and stat_name in ('DB time','DB CPU');
+
+STAT_NAME                                VALUE
+----------------------------------- ----------
+DB time                              103907514
+DB CPU                                    2000
+</pre>
+<pre>SQL&gt; select event,total_waits,time_waited_micro,max_wait from v$session_event where sid=sys_context('userenv','sid');
+
+EVENT                          TOTAL_WAITS TIME_WAITED_MICRO   MAX_WAIT
+------------------------------ ----------- ----------------- ----------
+Disk file operations I/O                25              2084          0
+db file sequential read             100100         104060605        101
+SQL*Net message to client               42               180          0
+SQL*Net message from client             41             17774          0
+</pre>
+<pre>SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where name = 'DB time' or name like 'CPU%' or name like 'SQL*Net%client';
+
+NAME                                     VALUE
+----------------------------------- ----------
+CPU used when call started                  11
+CPU used by this session                    11
+DB time                                      8
+user I/O wait time                           0
+SQL*Net roundtrips to/from client            5</pre>
+<p>All the session statistics have been reset and now have low values. And only them: events and time model still show cumulative values from the begining of the session.</p>
+<p>So this unfortunately brings inconsistency. Here:</p>
+<ul>
+<li>session statistic DB time cannot be compared with time model</li>
+<li>SQL*Net roundtrips cannot be compared to the count of &#8216;SQL*net message to client&#8217; event</li>
+<li>CPU info from session statistics cannot be compared with the time model</li>
+<li>session statistic wait time cannot be compared with session event time</li>
+</ul>
+<p>and this how I can be connected and see 0 logons for my session:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where name like 'logon%';
+
+NAME                                     VALUE
+----------------------------------- ----------
+logons cumulative                            0
+logons current                               0
+</pre>
+<p>Now, as we are talking about resetting statistics, there is something else we can do. As you see above the session keeps track of the longest time for each wait event. Here above, the maximum I/O time was 1 second. We can reset that if we want:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_system.kcfrms;
+PL/SQL procedure successfully completed.
+</pre>
+<p>we still have all cumulative values for the session, but the high water mark of wait event duration has been reset:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select event,total_waits,time_waited_micro,max_wait from v$session_event where sid=sys_context('userenv','sid');
+
+EVENT                          TOTAL_WAITS TIME_WAITED_MICRO   MAX_WAIT
+------------------------------ ----------- ----------------- ----------
+Disk file operations I/O                29              2263          0
+db file sequential read             100100         104060605          0
+SQL*Net message to client               49               209          0
+</pre>
+<p>Finally, I made other tests that I do not reproduce here:
+If you ALTER SESSION SET CONTAINER with your current container then statistics are not reset.
+If you ALTER SESSION SET CURRENT_SCHEMA the statistics are not reset.
+So I&#8217;ll stay with a reconnect when I want to reset all session statistics with wait events and time model as well.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5340"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

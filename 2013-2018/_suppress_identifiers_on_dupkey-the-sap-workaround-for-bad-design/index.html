@@ -1,0 +1,252 @@
+								<h1 class="entry-title">&#8220;_suppress_identifiers_on_dupkey&#8221; &#8211; the SAP workaround for bad design</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In SQL, &#8216;upsert&#8217; is a conditional insert or update: if the row is there, you update it, but if it is not there, you insert it. In Oracle, you should use a MERGE statement for that. You are clearly doing it wrong if you code something like:
+<pre>
+begin
+ insert...
+exception
+ when dup_val_on_index then update...
+end;
+</pre>
+<span id="more-18780"></span>
+But it seems that there are many applications with this bad design, and Oracle has introduced an underscore parameter for them: &#8220;_suppress_identifiers_on_dupkey&#8221;. You won&#8217;t be surprised that this one is part of the long list of parameters required for SAP.</p>
+<p>Let&#8217;s investigate this.</p>
+<h3>Insert &#8211; Exception &#8211; Update</h3>
+<p>So the idea is to try first an insert, rely on the unique constraint (primary key) to get an exception if the row exists, and in this case update the existing row. There are several flows with that.</p>
+<p>The first problem, is that it is not as easy as it looks like. If a concurrent session deletes the row between you insert and update, then the update will fail. You have to manage this. The failed insert cannot leave a lock on the rows that was not inserted.</p>
+<p>The second problem is that the SQL engine is optimized for transactions which commit. When the &#8216;dup_val_on_index&#8217; on index occurs, you have already inserted the table row, updated some indexes, etc. And all that has to be rolled back when the exception occurs. This generates unnecessary contention on the index leaf block, and unnecessary redo.</p>
+<p>Then the third problem, and probably the worst one, is that an exception is an error. And error management has lot of work to do, such as looking into the dictionary for the violated constraint name in order to give you a nice error message.</p>
+<p>I&#8217;ve created the following table:
+<pre>
+create table demo as select * from dual;
+create unique index demo on demo(dummy);
+</pre></p>
+<p>And I&#8217;ve run 10 million inserts on it, all with duplicates:
+<pre>
+exec for i in 1..1e7 loop begin insert into demo values('x'); exception when others then null; end; end loop;
+</pre></p>
+<p>Here is some extracts from the AWR on manual snapshots taked before and after.
+<pre>
+   Elapsed:               20.69 (mins)
+   DB Time:               20.69 (mins)
+</pre>
+This has run for 20 minutes.</p>
+<p><pre>
+Instance Efficiency Percentages (Target 100%)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            Buffer Nowait %:  100.00       Redo NoWait %:  100.00
+            Buffer  Hit   %:  100.00    In-memory Sort %:  100.00
+            Library Hit   %:  100.00        Soft Parse %:  100.00
+         Execute to Parse %:   33.34         Latch Hit %:  100.00
+Parse CPU to Parse Elapsd %:   92.31     % Non-Parse CPU:   94.90
+          Flash Cache Hit %:    0.00
+</pre>
+The &#8216;Execute to Parse %&#8217; show that 2/3 of statements are parsed each time.</p>
+<p><pre>
+SQL ordered by Gets                           DB/Inst: CDB1/CDB1  Snaps: 19-20
+-&gt; Resources reported for PL/SQL code includes the resources used by all SQL
+   statements called by the code.
+-&gt; %Total - Buffer Gets   as a percentage of Total Buffer Gets
+-&gt; %CPU   - CPU Time      as a percentage of Elapsed Time
+-&gt; %IO    - User I/O Time as a percentage of Elapsed Time
+-&gt; Total Buffer Gets:     180,125,740
+-&gt; Captured SQL account for  127.7% of Total
+
+     Buffer                 Gets              Elapsed
+      Gets   Executions   per Exec   %Total   Time (s)  %CPU   %IO    SQL Id
+----------- ----------- ------------ ------ ---------- ----- ----- -------------
+1.80094E+08           1 1.800942E+08  100.0    1,239.8  99.5    .3 frvpzg5yubp29
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+BEGIN for i in 1..1e7 loop begin insert into demo values('x'); exception when ot
+hers then null; end; end loop; END;
+
+1.60094E+08  10,000,000         16.0   88.9      983.1 100.3    .4 319ypa1z41aba
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+INSERT INTO DEMO VALUES('x')
+
+ 49,999,995   9,999,999          5.0   27.8      201.1 103.2     0 2skwhauh2cwky
+   PDB: PDB1
+select o.name, u.name from obj$ o, user$ u where o.obj# = :1 and o.owner# = u.u
+ser#
+
+ 19,999,998   9,999,999          2.0   11.1      148.5  98.9     0 2jfqzrxhrm93b
+   PDB: PDB1
+select /*+ rule */ c.name, u.name from con$ c, cdef$ cd, user$ u where c.con# =
+ cd.con# and cd.enabled = :1 and c.owner# = u.user#
+</pre></p>
+<p>My failed inserts have read on average 16 blocks for each attempt. that&#8217;s too much for doing nothing. And in addition to that, I see two expensive statements parsed and executed each time: one to get the object name and one to get the constraint name.
+This is how we can retreive the error message which is:
+<pre>
+
+ORA-00001: unique constraint (SCOTT.DEMO) violated
+
+</pre></p>
+<p>This is a big waste of resource. I did this test in PL/SQL but if you cumulate all worst practices and run those inserts row by row, then you will see those colors:
+<a href="../wp-insides/uploads/sites/2/2017/09/CaptureBreakReset.png" rel="lightbox[18780]"><img src="../wp-insides/uploads/sites/2/2017/09/CaptureBreakReset.png" alt="CaptureBreakReset" width="808" height="463" class="aligncenter size-full wp-image-18783" /></a></p>
+<p>The Orange is &#8216;Log File Sync&#8217; because you generate more redo than necessary.
+The Green is &#8216;CPU&#8217; because you read more blocks than necessary.
+The read is &#8216;SQL*Net break/reset to client&#8217; when the server process sends the error.</p>
+<h3>_suppress_identifiers_on_dupkey</h3>
+<p>When you set &#8220;_suppress_identifiers_on_dupkey&#8221; to true, Oracle will not return the name of the constraint which is violated, but only the information which is already there in the session context.</p>
+<p>Here is the message that you get:
+<pre>
+
+ORA-00001: unique constraint (UNKNOWN.obj#=73375) violated
+
+</pre>
+Where 73375 is the OBJECT_ID of the index where the unique constraint exception has been violated.</p>
+<p>You have less information, but it is faster:
+<pre>
+   Elapsed:               15.45 (mins)
+   DB Time:               15.48 (mins)
+</pre></p>
+<p>There is no Soft Parse overhead:
+<pre>
+Instance Efficiency Percentages (Target 100%)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            Buffer Nowait %:  100.00       Redo NoWait %:  100.00
+            Buffer  Hit   %:  100.00    In-memory Sort %:  100.00
+            Library Hit   %:  100.00        Soft Parse %:   96.43
+         Execute to Parse %:   99.98         Latch Hit %:  100.00
+Parse CPU to Parse Elapsd %:   90.38     % Non-Parse CPU:   99.95
+          Flash Cache Hit %:    0.00
+</pre></p>
+<p>Our statement is the only one using the CPU and reads less blocks:
+<pre>
+SQL ordered by Gets                           DB/Inst: CDB1/CDB1  Snaps: 21-22
+-&gt; Resources reported for PL/SQL code includes the resources used by all SQL
+   statements called by the code.
+-&gt; %Total - Buffer Gets   as a percentage of Total Buffer Gets
+-&gt; %CPU   - CPU Time      as a percentage of Elapsed Time
+-&gt; %IO    - User I/O Time as a percentage of Elapsed Time
+-&gt; Total Buffer Gets:     110,132,467
+-&gt; Captured SQL account for   81.8% of Total
+
+     Buffer                 Gets              Elapsed
+      Gets   Executions   per Exec   %Total   Time (s)  %CPU   %IO    SQL Id
+----------- ----------- ------------ ------ ---------- ----- ----- -------------
+1.10091E+08           1 1.100906E+08  100.0      926.2  98.8     1 frvpzg5yubp29
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+BEGIN for i in 1..1e7 loop begin insert into demo values('x'); exception when ot
+hers then null; end; end loop; END;
+
+ 90,090,580  10,000,000          9.0   81.8      515.7  99.1   1.9 319ypa1z41aba
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+INSERT INTO DEMO VALUES('x')
+</pre></p>
+<p>This parameter is a workaround for bad design, but not a solution.</p>
+<h3>Update &#8211; no rows &#8211; Insert</h3>
+<p>In order to avoid all this rollback and exception management overhead, there is another idea. Start with the update and, when no row was found, insert it. This is easy with the ROWCOUNT.
+<pre>
+begin
+ update ...
+ if SQL%ROWCOUNT = 0 then insert ...
+</pre></p>
+<p>This is more efficient but still subject to a concurrent session inserting the row between your update and you insert. But at least, you manage the different scenario with a condition on ROWCOUNT rather than with an exception, which is more scalable.</p>
+<h3>So what?</h3>
+<p>Always use the database in the expected way. Exceptions and Errors are not for the normal scenario of the use-case. Exceptions should be unusual. The solution is to use the MERGE statement which has been implemented exactly for this reason: do an upsert without the error management overhead and with the statement isolation level which prevents errors in a multi-user environment.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-187810" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/09/CaptureBreakReset.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-8694">
+				<div id="div-comment-8694" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a2a19e1fb1fdd173d1a39b0e73390c09?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Foued</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-8694">
+			September 29, 2017 at 17 h 56 min</a>		</div>
+
+		<p>Thanks for this post.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-86951"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-8694' onclick='return addComment.moveForm( "div-comment-8694", "8694", "respond", "18780" )' aria-label='Reply to Foued to Foued'>Reply to Foued</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-8728">
+				<div id="div-comment-8728" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a2a19e1fb1fdd173d1a39b0e73390c09?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Foued</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-8728">
+			October 2, 2017 at 18 h 43 min</a>		</div>
+
+		<p>Nice read, thank you
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-87291"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-8728' onclick='return addComment.moveForm( "div-comment-8728", "8728", "respond", "18780" )' aria-label='Reply to Foued to Foued'>Reply to Foued</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-8731">
+				<div id="div-comment-8731" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/cab94fa7266bb46702d171929c859395?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Christo Kutovsky</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-8731">
+			October 2, 2017 at 20 h 52 min</a>		</div>
+
+		<p>In my opinion, this is an inherent deficiency with the implementation. It&#8217;s something that &#8220;SQL&#8221; failed to deliver on &#8211; as you were expected to express intent &#8211; and SQL takes care of the implementation details.</p>
+<p>Merge and single row merge didn&#8217;t exist in SQL for years. In my opinion it&#8217;s a big draw back. I know it&#8217;s a super-set of the basic commands &#8211; but then implementation can be handled however is more efficient.</p>
+<p>My number issue with SQL however is that all commands but 1 commands use name-based column mapping. The other one uses positional.</p>
+<p>SELECT, DELETE, UPDATE &#8211; all use name based resolution
+INSERT &#8211; uses positional. </p>
+<p>Which is a big pain when you have a lot of columns &#8211; especially when you need to add something.</p>
+<p>In my opinion, there should be a clause of update &#8211; something in the realm of:
+UPDATE TAB SET X=Y
+where key=A
+WHEN NOT MATCHED INSERT</p>
+<p>Which will solve a lot of bad code out there. Including the race condition you mentioned.
+Other language updates I would like to see also INSERT AS SELECT FROM &#8211; to have a variant that has name-based column matching.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-87321"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-8731' onclick='return addComment.moveForm( "div-comment-8731", "8731", "respond", "18780" )' aria-label='Reply to Christo to Christo Kutovsky'>Reply to Christo</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

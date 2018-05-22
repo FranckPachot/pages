@@ -1,0 +1,238 @@
+								<h1 class="entry-title">Oracle SQL Profile: why multiple OPT_ESTIMATE?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a <a href="http://www.dbi-services.com/index.php/blog/entry/oracle-sql-profiles-check-what-they-do-before-accepting-them-blindly">previous blog</a> I&#8217;v shared my script to retrieve the OPT_ESTIMATE hints from a SQL Profile. In the example I made, I had two lines for each table:</p>
+<pre>--- PROFILE HINTS from dbiInSite (1) statement 4fz1vtn0w8aak:
+/*+
+OPT_ESTIMATE(@"SEL$2CBA5DDD", TABLE, "EMPLOYEES"@"SEL$1", SCALE_ROWS=2)
+OPT_ESTIMATE(@"SEL$58A6D7F6", TABLE, "EMPLOYEES"@"SEL$1", SCALE_ROWS=2)
+OPT_ESTIMATE(@"SEL$6AE97DF7", TABLE, "DEPARTMENTS"@"SEL$1", SCALE_ROWS=5.185185185)
+OPT_ESTIMATE(@"SEL$58A6D7F6", TABLE, "DEPARTMENTS"@"SEL$1", SCALE_ROWS=5.185185185)
+*/
+</pre>
+<p>The reason is that when the optimizer do some transformations to the query, then the query block identifiers can change. And when you adjust a cardinality estimation, you must do it for all transformations or you will completely mess up the optimizer choice.</p>
+<p>When I do an explain plan which show the query blocks, I have only the SEL$58A6D7F6 one:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; explain plan for
+  2  select distinct DEPARTMENT_NAME  from DEPARTMENTS join EMPLOYEES
+  3  using(DEPARTMENT_ID)  where DEPARTMENT_NAME like '%ing' and SALARY&gt;20000 ;
+
+Explained.
+
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'basic +alias'));
+
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------
+Plan hash value: 3041748347
+-------------------------------------------------------------------
+| Id  | Operation                             | Name              |
+-------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |                   |
+|   1 |  HASH UNIQUE                          |                   |
+|   2 |   NESTED LOOPS SEMI                   |                   |
+|   3 |    TABLE ACCESS FULL                  | DEPARTMENTS       |
+|   4 |    TABLE ACCESS BY INDEX ROWID BATCHED| EMPLOYEES         |
+|   5 |     INDEX RANGE SCAN                  | EMP_DEPARTMENT_IX |
+-------------------------------------------------------------------
+
+Query Block Name / Object Alias (identified by operation id):
+-------------------------------------------------------------
+
+   1 - SEL$58A6D7F6
+   3 - SEL$58A6D7F6 / DEPARTMENTS@SEL$1
+   4 - SEL$58A6D7F6 / EMPLOYEES@SEL$1
+   5 - SEL$58A6D7F6 / EMPLOYEES@SEL$1
+
+</pre>
+<p>In order to confirm that the duplicate OPT_ESTIMATE are coming from different transformations, I&#8217;ve generated a 10053 trace and searched for SEL$6AE97DF7:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">Registered qb: SEL$6AE97DF7 0x851d8eb8 (DISTINCT PLACEMENT SEL$58A6D7F6; SEL$58A6D7F6; "EMPLOYEES"@"SEL$1")
+---------------------
+QUERY BLOCK SIGNATURE
+---------------------
+  signature (): qb_name=SEL$6AE97DF7 nbfros=2 flg=0
+    fro(0): flg=0 objn=92595 hint_alias="DEPARTMENTS"@"SEL$1"
+    fro(1): flg=1 objn=0 hint_alias="VW_DTP_43B5398E"@"SEL$43B5398E"
+
+</pre>
+<p>that&#8217;s the Distinct Placement.
+let&#8217;s try the PLACE_DISTINCT hint:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; explain plan for
+  2  select /*+ PLACE_DISTINCT(EMPLOYEES) */ distinct DEPARTMENT_NAME  from DEPARTMENTS join EMPLOYEES
+  3  using(DEPARTMENT_ID)  where DEPARTMENT_NAME like '%ing' and SALARY&gt;20000 ;
+
+Explained.
+
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'basic +alias'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------
+Plan hash value: 2901355344
+
+--------------------------------------------------------------------
+| Id  | Operation                              | Name              |
+--------------------------------------------------------------------
+|   0 | SELECT STATEMENT                       |                   |
+|   1 |  HASH UNIQUE                           |                   |
+|   2 |   NESTED LOOPS SEMI                    |                   |
+|   3 |    TABLE ACCESS FULL                   | DEPARTMENTS       |
+|   4 |    VIEW PUSHED PREDICATE               | VW_DTP_43B5398E   |
+|   5 |     TABLE ACCESS BY INDEX ROWID BATCHED| EMPLOYEES         |
+|   6 |      INDEX RANGE SCAN                  | EMP_DEPARTMENT_IX |
+--------------------------------------------------------------------
+
+Query Block Name / Object Alias (identified by operation id):
+-------------------------------------------------------------
+
+   1 - SEL$6AE97DF7
+   3 - SEL$6AE97DF7 / DEPARTMENTS@SEL$1
+   4 - SEL$9B757045 / VW_DTP_43B5398E@SEL$43B5398E
+   5 - SEL$9B757045 / EMPLOYEES@SEL$1
+   6 - SEL$9B757045 / EMPLOYEES@SEL$1
+
+</pre>
+<p>Here is where the</p>
+<pre>OPT_ESTIMATE(@"SEL$6AE97DF7", TABLE, "DEPARTMENTS"@"SEL$1", SCALE_ROWS=5.185185185)</pre>
+<p>makes sense. The same cardinality adjustment must be done for each transformation that the optimizer is evaluating.</p>
+<p>That observation brings me to the following: what happens to your profiles when you upgrade to a version that brings new optimizer transformations? The optimizer will compare some plans with adjusted cardinalities, compared with some plans with non-adjusted cardinalites. And that is probably not a good idea.</p>
+<p>In my opinion, SQL Profiles are just like hints: a short term workaround that must be documented and re-evaluated at each upgrade.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5200"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 5 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1267">
+				<div id="div-comment-1267" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/aad8e5c3b03a723bc53ddb807436f320?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Martin Preiss</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1267">
+			November 10, 2014 at 18 h 28 min</a>		</div>
+
+		<p>Hi Franck,
+the basic idea of an offline optimization is something I like &#8211; but I agree that sql profiles are just a workaround and not a long term solution. For data warehouses I could imagine an additional optimizer mode (or something similar) that would give the CBO more time to create decent plans for long running queries &#8211; the standard OLTP strategy to create plans as fast as possible seems to me not to be very fitting in the DWH context. Of course that&#8217;s still not a guarantee for better plans&#8230;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12681"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1267' onclick='return addComment.moveForm( "div-comment-1267", "1267", "respond", "519" )' aria-label='Reply to Martin to Martin Preiss'>Reply to Martin</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1268">
+				<div id="div-comment-1268" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1f3f471596f97000d86f7851a596751a?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Sayan Malakshinov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1268">
+			November 10, 2014 at 20 h 17 min</a>		</div>
+
+		<p>Strictly speaking, I don&#8217;t know really &#8220;long term solutions&#8221;&#8230; Optimizer is constantly changing.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12691"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1268' onclick='return addComment.moveForm( "div-comment-1268", "1268", "respond", "519" )' aria-label='Reply to Sayan to Sayan Malakshinov'>Reply to Sayan</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1269">
+				<div id="div-comment-1269" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1269">
+			November 11, 2014 at 7 h 46 min</a>		</div>
+
+		<p>Hi Sayan, by &#8216;long term solution&#8217; I can think of adding extended statistics, setting table preferences to gather histograms or not, changing the query to use bind variable or not&#8230;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12701"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1269' onclick='return addComment.moveForm( "div-comment-1269", "1269", "respond", "519" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1270">
+				<div id="div-comment-1270" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ed6ed998566a3e8eb6bf1a0c79f9b017?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Dominic Brooks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1270">
+			November 11, 2014 at 11 h 22 min</a>		</div>
+
+		<p>Interesting&#8230; </p>
+<p>I never use the default SQL Profile mechanism &#8211; by &#8220;default&#8221;, I mean via SQL Tuning Advisor and using OPT_ESTIMATE.</p>
+<p>In practice, I only ever use SQL Profiles as alternative to a SQL Plan Baseline to apply the outline hints from a specific execution as used by the Oracle-supplied coe_xfr_sql_profile.sql script, part of SQLT.</p>
+<p>One of the first things I checked when looking at 12c was whether the query block alias generation seemed to generate the same alias in 12 as 11 and it did seem to.</p>
+<p>But new and subtle variations on join methods come along each release which mean that even the outline hints are not immune to being incomplete on upgrade.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12711"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1270' onclick='return addComment.moveForm( "div-comment-1270", "1270", "respond", "519" )' aria-label='Reply to Dominic to Dominic Brooks'>Reply to Dominic</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1271">
+				<div id="div-comment-1271" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1271">
+			November 11, 2014 at 12 h 32 min</a>		</div>
+
+		<p>Hi Dominic, thanks for you comment.
+It&#8217;s a good idea to make reference to Carlos Sierra coe_xfr_sql_profile.sql
+I usually prefer to use SQL Patch for that, which is available without option and also in Standard Edition.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12721"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1271' onclick='return addComment.moveForm( "div-comment-1271", "1271", "respond", "519" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

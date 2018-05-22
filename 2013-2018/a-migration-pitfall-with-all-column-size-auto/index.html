@@ -1,0 +1,245 @@
+								<h1 class="entry-title">A migration pitfall with ALL COLUMN SIZE AUTO</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you migrate, you should be prepared to face some execution plan changing. That&#8217;s not new. But here I&#8217;ll show you a case where you have several bad execution plans because lot of histograms are missing. The version is the same. The system is the same. You&#8217;ve migrated with DataPump importing all statistics. You have the same automatic job to gather statistics with all default options. You have repeated the migration several times on a system where you constantly reproduce the load. Have done a lot of regression tests. Everything was ok.</p>
+<p>Then you are ready for the go-live. You migrate production on Sunday. You check everything and you are ready to welcome new connections on Monday.</p>
+<p>But on Monday some queries are going bad. Unexpected nested loops &#8211; abnormal CPU usage. Unexpected full table scan &#8211; abnormal I/O usage. What went wrong? I&#8217;ll reproduce here the case I encountered this morning during a post-migration performance tuning analysis.</p>
+<h3>The test case</h3>
+<p>In order to show you a reproducible case, I&#8217;ll create the table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create table DEMO_SKEW as
+  2  select rownum id , case when mod(rownum,21)!=0 then 0 else 1+mod(rownum,10) end status
+  3  from (select * from dual connect by 1000&gt;=level),(select * from dual connect by 1000&gt;level);
+
+Table created.
+</pre>
+<p>With an index on that STATUS column which is quite skewed (most of status are 0 and a few other status):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create index DEMO_SKEW_STATUS on DEMO_SKEW(STATUS);
+
+Index created.
+</pre>
+<p>I calculate statistics in order to have histograms. I could have used a size for the histograms but the method I use here is a clue to help you figure out the issue&#8230;</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMO_SKEW',method_opt=&gt;'for all columns size skewonly');
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>Ok, so I have frequency histogram with 11 buckets:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select num_buckets,histogram,last_analyzed from dba_tab_col_statistics where owner='DEMO' and table_name='DEMO_SKEW' and column_name='STATUS';
+
+NUM_BUCKETS HISTOGRAM       LAST_ANA
+----------- --------------- --------
+         11 FREQUENCY       19:34:22
+</pre>
+<h3>Statistic gathering</h3>
+<p>Ok, I&#8217;m at the same state as on Sunday where everything is imported with success. Because you know that the physical organization of the tables have changed you run a dbms_stats.gather_database_statistics. You run it with the default options &#8211; exactly as the automatic job did it before, in previous production or in pre-production migration tests.</p>
+<p>So let&#8217;s do the same on our test table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMO_SKEW',method_opt=&gt;'for all columns size auto');
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>Then you go home as you want to be at the office when the users will start to connect. Just in case&#8230;</p>
+<h3>Then production starts&#8230;</h3>
+<p>So here is the kind of queries that I&#8217;ve seen the morning just after a migration.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set statistics_level=all;
+
+Session altered.
+
+SQL&gt; select count(*) from DEMO_SKEW where status in (1,2,3,4,5);
+
+  COUNT(*)
+----------
+     23809
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+-----------------------------------------------------------------------------
+SQL_ID  cbr6yy2vwr6s0, child number 0
+-------------------------------------
+select count(*) from DEMO_SKEW where status in (1,2,3,4,5)
+
+Plan hash value: 3093139370
+
+-----------------------------------------------------------------------------
+| Id  | Operation          | Name      | Starts | E-Rows | A-Rows | Buffers |
+-----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |           |      1 |        |      1 |    1671 |
+|   1 |  SORT AGGREGATE    |           |      1 |      1 |      1 |    1671 |
+|*  2 |   TABLE ACCESS FULL| DEMO_SKEW |      1 |    454K|  23809 |    1671 |
+-----------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(("STATUS"=1 OR "STATUS"=2 OR "STATUS"=3 OR "STATUS"=4 OR
+              "STATUS"=5))
+</pre>
+<p>I&#8217;m looking for those very few status and I don&#8217;t expect a full table scan. Each execution here is reading thousand of blocks. Look at the right plan when forcing an index access:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select /*+ index(DEMO_SKEW) */ count(*) from DEMO_SKEW where status in (1,2,3,4,5);
+
+  COUNT(*)
+----------
+     23809
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  9nwws35r3vj57, child number 0
+-------------------------------------
+select /*+ index(DEMO_SKEW) */ count(*) from DEMO_SKEW where status in
+(1,2,3,4,5)
+
+Plan hash value: 3152074358
+
+------------------------------------------------------------------------------------
+| Id  | Operation          | Name             | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                  |      1 |        |      1 |      58 |
+|   1 |  SORT AGGREGATE    |                  |      1 |      1 |      1 |      58 |
+|   2 |   INLIST ITERATOR  |                  |      1 |        |  23809 |      58 |
+|*  3 |    INDEX RANGE SCAN| DEMO_SKEW_STATUS |      5 |    454K|  23809 |      58 |
+------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access(("STATUS"=1 OR "STATUS"=2 OR "STATUS"=3 OR "STATUS"=4 OR "STATUS"=5))
+</pre>
+<p>This is the right plan for those low cardinality status, reading much less blocks. Why did the CBO have chosen a full table scan? Because of cardinality estimation. It estimates to read 454000 rows but actual number of rows is 23000 here.</p>
+<h3>Bad estimation comes from missing stats</h3>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select num_buckets,histogram,last_analyzed from dba_tab_col_statistics where owner='DEMO' and table_name='DEMO_SKEW' and column_name='STATUS';
+
+NUM_BUCKETS HISTOGRAM       LAST_ANA
+----------- --------------- --------
+          1 NONE            19:34:23
+</pre>
+<p>My histograms have disappeared. The CBO estimates as if all status were well distributed among the 10 status:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select endpoint_number,endpoint_value from dba_tab_histograms where owner='DEMO' and table_name='DEMO_SKEW' and column_name='STATUS';
+
+ENDPOINT_NUMBER ENDPOINT_VALUE
+--------------- --------------
+              0              0
+              1             10
+</pre>
+<p>So what was my solution? Gather the statistics:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMO_SKEW',method_opt=&gt;'for all columns size auto');
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>And now I have my histograms:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select num_buckets,histogram,last_analyzed from dba_tab_col_statistics where owner='DEMO' and table_name='DEMO_SKEW' and column_name='STATUS';
+
+NUM_BUCKETS HISTOGRAM       LAST_ANA
+----------- --------------- --------
+         11 FREQUENCY       19:34:24
+
+SQL&gt; select endpoint_number,endpoint_value from dba_tab_histograms where owner='DEMO' and table_name='DEMO_SKEW' and column_name='STATUS';
+
+ENDPOINT_NUMBER ENDPOINT_VALUE
+--------------- --------------
+         957142              1
+         961904              2
+         966666              3
+         971428              4
+         976190              5
+         980952              6
+         985714              7
+         990476              8
+         995238              9
+        1000000             10
+         952381              0
+</pre>
+<p>Did you realize that I&#8217;ve gathered statistics with exactly the same options as before? When I&#8217;ve run it just after the migration, my histograms have disappeared. Now running exactly the same they are back. Explanation later&#8230;</p>
+<h3>Invalidate cursors</h3>
+<p>The statistics gathering was run with the default option &#8211; rolling invalidation. Which means that my bad execution plans &#8211; with full table scan &#8211; are still used. Because I don&#8217;t want too many hard parses at the same time, I invalidate only the plans that I&#8217;ve identified as causing a problem to users:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec for c in (select address,hash_value,users_executing,sql_text from v$sqlarea where sql_id='cbr6yy2vwr6s0') loop sys.dbms_shared_pool.purge(c.address||','||c.hash_value,'...'); end loop;
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>More about that <a href="http://www.dbi-services.com/index.php/blog/entry/flush-one-sql-statement-to-hard-parse-it-again">here</a>. Then let&#8217;s check the plan &#8211; without hint:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select count(*) from DEMO_SKEW where status in (1,2,3,4,5);
+
+  COUNT(*)
+----------
+     23809
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  cbr6yy2vwr6s0, child number 0
+-------------------------------------
+select count(*) from DEMO_SKEW where status in (1,2,3,4,5)
+
+Plan hash value: 3152074358
+
+------------------------------------------------------------------------------------
+| Id  | Operation          | Name             | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                  |      1 |        |      1 |      58 |
+|   1 |  SORT AGGREGATE    |                  |      1 |      1 |      1 |      58 |
+|   2 |   INLIST ITERATOR  |                  |      1 |        |  23809 |      58 |
+|*  3 |    INDEX RANGE SCAN| DEMO_SKEW_STATUS |      5 |  23809 |  23809 |      58 |
+------------------------------------------------------------------------------------
+
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access(("STATUS"=1 OR "STATUS"=2 OR "STATUS"=3 OR "STATUS"=4 OR "STATUS"=5))
+</pre>
+<p>Good plan because of good estimations. Now that I have the frequency histogram, the cardinality of each status is known.</p>
+<h3>SIZE AUTO</h3>
+<p>So what happened with that &#8216;for all columns size auto&#8217; that do not consistently calculate histograms ?
+There are 3 ways to define the histogram size:</p>
+<ul>
+<li><strong>SIZE</strong> n where you define the number of buckets. 1 means no histograms. &gt;1 means histograms.</li>
+<li><strong>SIZE SKEWONLY</strong> where Oracle will choose to gather histograms when it sees that values are not evenly distributed &#8211; know as skewed.</li>
+<li><strong>SIZE AUTO</strong> where histograms are gathered when values are skewed and there were some predicates on that column where histogram may change the plan.</li>
+</ul>
+<p>So think about it. Just after the import we had brand new objects with skewed values, but no queries yet. No were clause predicates have been recorded. Then the SIZE AUTO did not gather any histograms.</p>
+<p>After having run my query once, the usage of columns have been recorded. We can query them:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select dbms_stats.report_col_usage(user,'DEMO_SKEW') from dual;
+
+DBMS_STATS.REPORT_COL_USAGE(USER,'DEMO_SKEW')
+-------------------------------------------------------------
+LEGEND:
+.......
+
+EQ         : Used in single table EQuality predicate
+RANGE      : Used in single table RANGE predicate
+LIKE       : Used in single table LIKE predicate
+NULL       : Used in single table is (not) NULL predicate
+EQ_JOIN    : Used in EQuality JOIN predicate
+NONEQ_JOIN : Used in NON EQuality JOIN predicate
+FILTER     : Used in single table FILTER predicate
+JOIN       : Used in JOIN predicate
+GROUP_BY   : Used in GROUP BY expression
+............................................................
+
+############################################################
+
+COLUMN USAGE REPORT FOR DEMO.DEMO_SKEW
+......................................
+
+1. STATUS                              : EQ
+############################################################
+</pre>
+<p>Which simply means that a query having an equality predicate on the STATUS column have been seen. Thus, if values are skewed, dbms_stats will gather histogram for it.</p>
+<p>But just after the migration that was empty and no histograms have been gathered.</p>
+<h3>Solution (updated May 2017)</h3>
+<p>One solution could have been to gather statistics with SKEWONLY, but the risk is to have too many histograms. Another solution could have been to lock statistics for a few days just after the import but they don&#8217;t reflect the new physical organization. Probably the best solution to avoid new plans would have been to use REPEAT instead of AUTO until enough column usage has been gathered (a few days). Note that when migrating from 11g the column usage comes with impdp, and can be manually imported with DBMS_STATS.MERGE_COL_USAGE.
+You should also read <a href="https://sqlmaria.com/2017/05/09/optimizer-histograms/" target="_blank">Maria Colgan blog about histograms</a>.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-19230"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

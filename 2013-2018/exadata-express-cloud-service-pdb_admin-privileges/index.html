@@ -1,0 +1,128 @@
+								<h1 class="entry-title">Exadata Express Cloud Service: PDB_ADMIN privileges</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I usually explain that the main point about Multitenant Architecture is the separation of roles between a system DBA who manages the container, and is responsible for its availability, and application DBA who owns all the application objects, and is responsible for data integrity and performance. The Exadata Express Cloud Service is the implementation of that: a CDB managed by Oracle and a PDB that you administrate. But the fact that the system is shared, over the internet, brings the necessity for new limitations. Let&#8217;s see what you can do or not as a PDB administrator.
+<span id="more-14420"></span>
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/01/CaptureEXCS024.png" rel="lightbox[14420]"><img style="float:left;margin-right:20px" src="../wp-insides/uploads/sites/2/2017/01/CaptureEXCS024-300x204.png" alt="CaptureEXCS024" width="300" height="204" class="alignnone size-medium wp-image-14425" /></a> When you create a pluggable database you need to provide a local user and its password. When you create an Exadata Express Cloud Service, the PDM_ADMIN user is created but the account is locked. You need to provide your password in order to unlock it. Then, this PDB_ADMIN is the only user for which you know the password.</p>
+<p>But what really means &#8216;PDB administrator&#8217;? Which privileges do you have?</p>
+<h3>System privileges</h3>
+<p>PDB_ADMIN looks like a DBA. He is not granted &#8216;DBA&#8217; but &#8216;PDB_DBA&#8217; and many other roles.
+Let&#8217;s see which system privileges are not granted, either directly or though a path of roles:</p>
+<p><pre>with my_user_roles(grantee,granted_role) as (
+select grantee,granted_role from dba_role_privs where grantee='PDB_ADMIN' union all select r.grantee,r.granted_role from dba_role_privs r join my_user_roles u on r.grantee =u.granted_role
+) select listagg(privilege,',')within group(order by privilege) from (
+select distinct privilege from dba_sys_privs minus select distinct privilege from dba_sys_privs where grantee in (select granted_role from my_user_roles));
+
+LISTAGG(PRIVILEGE,',')WITHINGROUP(ORDERBYPRIVILEGE)
+---------------------------------------------------
+ADMINISTER KEY MANAGEMENT,BACKUP ANY TABLE,BECOME USER,CREATE ANY CREDENTIAL,CREATE ANY DIRECTORY,CREATE ANY JOB,CREATE ANY LIBRARY,CREATE CREDENTIAL,CREATE DATABASE LINK,CREATE EXTERNAL JOB,CREATE LIBRARY,CREATE PUBLIC DATABASE LINK,DROP ANY DIRECTORY,DROP PUBLIC DATABASE LINK,EM EXPRESS CONNECT,EXECUTE ANY CLASS,EXECUTE ANY PROGRAM,EXEMPT ACCESS POLICY,EXEMPT DDL REDACTION POLICY,EXEMPT DML REDACTION POLICY,EXEMPT REDACTION POLICY,EXPORT FULL DATABASE,FLASHBACK ANY TABLE,FLASHBACK ARCHIVE ADMINISTER,FORCE TRANSACTION,GRANT ANY PRIVILEGE,GRANT ANY ROLE,IMPORT FULL DATABASE,INHERIT ANY PRIVILEGES,LOGMINING,MANAGE ANY FILE GROUP,MANAGE FILE GROUP,MANAGE SCHEDULER,SELECT ANY TRANSACTION,UNLIMITED TABLESPACE,USE ANY JOB RESOURCE,USE ANY SQL TRANSLATION PROFILE
+</pre></p>
+<p>So your PDB_ADMIN has some system privileges. For example you can gather system statistics:
+<pre>
+SQL&gt; exec dbms_stats.gather_system_stats;
+PL/SQL procedure successfully completed.
+
+SNAME          PNAME       PVAL1  PVAL2
+-----          -----       -----  -----
+SYSSTATS_INFO  STATUS             COMPLETED
+SYSSTATS_INFO  DSTART             01-24-2017 19:48
+SYSSTATS_INFO  DSTOP              01-24-2017 19:48
+SYSSTATS_INFO  FLAGS       1
+SYSSTATS_MAIN  CPUSPEEDNW  3097
+SYSSTATS_MAIN  IOSEEKTIM   7
+SYSSTATS_MAIN  IOTFRSPEED  4096
+</pre></p>
+<p>but you cannot create database links or directories, which may be considered as application objects:
+<pre>
+create directory mydir as '/tmp'
+ORA-01031: insufficient privileges
+
+SQL&gt; create database link mydblink connect to pdb_admin identified by "Ach1z0#d" using '//localhost';
+ORA-01031: insufficient privileges
+</pre></p>
+<p>What you should understand is that you have a PDB, in a shared CDB, it is yours and you can do whatever you want as long as it has no side effects on your neighbours. You will see that communication with the external world (network, filesystem, host server) are very limited.</p>
+<h3>Lockdown profiles</h3>
+<p>Now we will see that the privileges we have are going beyond those that you can see in DBA_SYS_PRIVS and DBA_ROLE_PRIVS.</p>
+<p>From my query above, I have the ALTER SYSTEM privilege, so I can change some parameters:
+<pre>
+SQL&gt; alter system set temp_undo_enabled=true;
+System SET altered.
+SQL&gt; alter system set cursor_sharing=exact;
+System SET altered.
+</pre></p>
+<p>However, some parameters cannot be set:
+<pre>
+SQL&gt; alter session set max_idle_time=60;
+ORA-01031: insufficient privileges
+SQL&gt; alter system set sga_target=3G;
+ORA-01031: insufficient privileges
+SQL&gt; alter system set sql_trace=true;
+ORA-01031: insufficient privileges
+</pre>
+and most of the other ALTER SYSTEM statements are forbidden:
+<pre>
+SQL&gt; alter system flush shared_pool;
+ORA-01031: insufficient privileges
+</pre></p>
+<p>This is forbidden by a multitenant lockdown profile, which gives a finer grain than privileges: it disables some statements, or statements clauses or options. The bad thing about it is that you don&#8217;t know what you are allowed or not. Always the same &#8216;insufficient privileges&#8217; and the detail is stored only on CDB$ROOT. From the PDB:
+<pre>
+SQL&gt; select * from dba_lockdown_profiles;
+no rows selected
+</pre></p>
+<p>the only thing that can be known from the PDB is the name of the lockdown profile:
+<pre>
+SQL&gt; show parameter lockdown
+NAME         TYPE   VALUE
+------------ ------ -----
+pdb_lockdown string S20
+</pre>
+That&#8217;s not a coincidence. I&#8217;m on a &#8216;S20&#8242; service (30 GB storage, 3GB SGA) and the lockdown profile is associated with the service level.
+Of course, you cannot change it:
+<pre>
+SQL&gt; alter system set pdb_lockdown='S50';
+ORA-32017: failure in updating SPFILE
+ORA-01031: insufficient privileges
+
+SQL&gt; alter system set pdb_lockdown='S50' scope=memory;
+ORA-01031: insufficient privileges
+</pre>
+Always the same message&#8230; Before 12<em>c</em>R2 you just query the system privileges to understand why you get this message. Now, you need to ask to your CDB administrator. Of course, for Exadata Express Cloud Service, this is documented in <a href="https://docs.oracle.com/en/cloud/paas/exadata-express-cloud/csdbk/feature-restrictions-and-limitations.html">limitations</a>.</p>
+<p>Lockdown profiles are not only for ALTER SYSTEM.
+You have a few things that you cannot do with ALTER SESSION, such as setting SQL Trace, any Event, and any underscore parameter is also forbidden. ALTER DATABASE and ALTER PLUGGABLE DATABASE allow only OPEN/CLOSE, or change default edition, default tablespace and temporary tablespace. On datafiles, you can only resize  and set autoextend on/off. You can also set the time zone.</p>
+<p>Well, I&#8217;m not completely sure about CLOSE:
+<pre>
+SQL&gt; alter pluggable database close immediate;
+ORA-01031: insufficient privileges
+alter pluggable database open
+ORA-65019: pluggable database EPTDOJVM1KG already open
+</pre></p>
+<p>Lockdown profiles goes beyond enabling or disable statements. It can disable a few features that you see mentioned in &#8216;limitations': you can&#8217;t create a manual AWR snapshot, can&#8217;t access the OS files by any way (UTL_FILE is disabled), can&#8217;t use any network protocol (UTL_TCP, UTL_MAIL,&#8230;)</p>
+<h3>So what?</h3>
+<p>I&#8217;m a DBA and connecting to a database where I&#8217;m not SYSDBA is a bit frustrating. PDB_ADMIN is granted SYSOPER but is locked in the password file. I&#8217;ve unlocked PDB_ADMIN but it is still EXPIRED &amp; LOCKED in password file;
+<pre>
+SQL&gt; select * from dba_users where username='PDB_ADMIN';
+
+USERNAME   USER_ID  PASSWORD  ACCOUNT_STATUS  LOCK_DATE  EXPIRY_DATE           DEFAULT_TABLESPACE  TEMPORARY_TABLESPACE  LOCAL_TEMP_TABLESPACE  CREATED               PROFILE  INITIAL_RSRC_CONSUMER_GROUP  EXTERNAL_NAME  PASSWORD_VERSIONS  EDITIONS_ENABLED  AUTHENTICATION_TYPE  PROXY_ONLY_CONNECT  COMMON  LAST_LOGIN                                     ORACLE_MAINTAINED  INHERITED  DEFAULT_COLLATION  IMPLICIT
+--------   -------  --------  --------------  ---------  -----------           ------------------  --------------------  ---------------------  -------               -------  ---------------------------  -------------  -----------------  ----------------  -------------------  ------------------  ------  ----------                                     -----------------  ---------  -----------------  --------
+PDB_ADMIN  94                 OPEN                       22-JUL-2017 19:17:41  SYSEXT              TEMP                  TEMP                   27-JUL-2016 17:05:02  DEFAULT  DEFAULT_CONSUMER_GROUP                      11G 12C            N                 PASSWORD             N                   NO      24-JAN-17 08.46.02.000000000 PM EUROPE/BERLIN  N                  NO         USING_NLS_COMP     NO
+
+SQL&gt; select * from v$pwfile_users where username='PDB_ADMIN';
+
+USERNAME   SYSDBA  SYSOPER  SYSASM  SYSBACKUP  SYSDG  SYSKM  ACCOUNT_STATUS    PASSWORD_PROFILE  LAST_LOGIN  LOCK_DATE             EXPIRY_DATE           EXTERNAL_NAME  AUTHENTICATION_TYPE  COMMON  CON_ID
+--------   ------  -------  ------  ---------  -----  -----  --------------    ----------------  ----------  ---------             -----------           -------------  -------------------  ------  ------
+PDB_ADMIN  FALSE   TRUE     FALSE   FALSE      FALSE  FALSE  EXPIRED &amp; LOCKED  DEFAULT                       07-JAN-2017 04:47:03  07-JAN-2017 04:47:03                 PASSWORD             NO      47
+</pre></p>
+<p>Keep in mind that this service is not for system DBA. You have the DBaaS for this. This is Oracle managed PDBaaS for developers and developers will get lot of freedom here: ability to test any feature, any optimizer setting, etc. This is a lot more than what Amazon RDS allows. You don&#8217;t have file or network access, but this is for small databases and it is totally integrated with SQL Developer to move data. No sql trace, no tkprof, but you have SQL Monitor. This is a very interesting platform for development small projects, 12<em>c</em>R2 features testing or prototypes. Very easy and fast to start. You can connect and code with APEX, .Net, Java, OCI&#8230;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-144210" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/01/CaptureEXCS024-300x204.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

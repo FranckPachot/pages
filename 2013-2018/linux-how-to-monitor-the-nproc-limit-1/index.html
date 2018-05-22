@@ -1,0 +1,486 @@
+								<h1 class="entry-title">Linux: how to monitor the nproc limit</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>You probably know about &#8216;nproc&#8217; limits in Linux which are set in /etc/limits.conf and checked with &#8216;ulimit -u&#8217;. But do you know how to handle the monitoring and be alerted when you&#8217;re close the fixed limit?</p>
+<h3>Nproc and ps</h3>
+<p>Nproc is defined at OS level to limit the number of processes per user. Oracle 11.2.0.4 documentation recommends the following:
+<pre>oracle soft nproc 2047
+oracle hard nproc 16384
+</pre>
+But that is often too low, especially when you have the Enterprise Manager agent or other java programs running.</p>
+<p>Do you want to check that you are far from the limit? then you can use &#8216;ps&#8217;. But beware, &#8216;ps&#8217; by default does not show all processes.
+In Linux, when doing multithreading, each thread is implemented as a light-weight process (LWP). And you must use the &#8216;-L&#8217; to see all of them.</p>
+<p>Let&#8217;s take an example. I have a system where &#8216;ps -u oracle&#8217; returns 243 lines. But including LWPs shows a lot more processes which is near the limit:
+<pre>$ ps h -Led -o user | sort | uniq -c | sort -n
+      1 dbus
+      1 ntp
+      1 rpc
+      1 rpcuser
+      2 avahi
+      2 haldaemon
+      2 postfix
+    166 grid
+    400 root
+   1370 oracle
+</pre>
+So the &#8216;oracle&#8217; user has 1370 processes. That&#8217;s high. And this is the actual number where the nproc limit applies.</p>
+<p>&#8216;ps -Lf&#8217; can show the detail. And even without &#8216;-L&#8217; we can display the NLWP which is the number of threads per process:
+<pre>ps -o nlwp,pid,lwp,args -u oracle | sort -n
+NLWP   PID   LWP COMMAND
+   1  8444  8444 oracleOPRODP3 (LOCAL=NO)
+   1  9397  9397 oracleOPRODP3 (LOCAL=NO)
+   1  9542  9542 oracleOPRODP3 (LOCAL=NO)
+   1  9803  9803 /u00/app/oracle/product/agent12c/core/12.1.0.3.0/perl/bin/perl /u00/app/oracle/product/agent12c/core/12.1.0.3.0/bin/emwd.pl agent /u00/app/oracle/product/agent12c/agent_inst/sysman/log/emagent.nohup
+  19 11966 11966 /u00/app/11.2.0/grid/bin/oraagent.bin
+1114  9963  9963 /u00/app/oracle/product/agent12c/core/12.1.0.3.0/jdk/bin/java ... emagentSDK.jar oracle.sysman.gcagent.tmmain.TMMain
+</pre>
+The Oracle 12c EM agent has started 1114 threads and the grid infrastructure &#8216;oraagent.bin&#8217; has 19 threads. In addition to that I&#8217;ve a lot of other monothreaded processes. This is how we reach 1370 which is the exact value to compare to the nproc limit.</p>
+<p>So what are the good values to set? About the high number of threads for EM agent 12c, there are a few bugs. And I suspect that 1000 threads is too much, especially when checking them with &#8216;jstack&#8217; I see that they are &#8220;CRSeOns&#8221; threads that should not be used in 11.2.0.2 and higher. But that&#8217;s another problem which I&#8217;m currently investigating. When you reach the nproc limit, the user will not be able to create new processes. clone() calls will return EAGAIN and that is reported by Oracle as:
+<pre>ORA-27300: OS system dependent operation:fork failed with status: 11
+ORA-27301: OS failure message: Resource temporarily unavailable
+</pre>
+And that is clearly bad when it concerns an +ASM instance or archiver processes.</p>
+<p>The goal of the nproc limit is only to prevent &#8216;fork bombs&#8217; where a process forks forever and exhausts all resources. So there is no problem to increase this limit. However if you set it high for some users (&#8216;oracle&#8217; and &#8216;grid&#8217; usually), it can be a good idea to monitor the number of processes with the ps h -L above. Because having too many processes is suspect and increasing the limit just hides a process leak and defer the failure.</p>
+<p>In &#8216;ps h -L -o&#8217; The argument &#8216;h&#8217; is there to remove the header line, and &#8216;-L&#8217; to show all processes including LWP. Then you can count with &#8216;wc -l&#8217;.</p>
+<h3>The proof</h3>
+<p>In order to be sure that &#8216;ps h -L&#8217; gives the exact number, I have tested it. In case you want to check this on your system, here is how to do it. And please report any difference.</p>
+<p>First, set your limit to 1024 processes. This is a limit for my user, and the limit is set for my shell and all its child processes:
+<pre>[oracle@VM211 ocm]$ ulimit -u 1024
+</pre>
+Now you can check it:
+<pre>[oracle@VM211 ocm]$ ulimit -a
+core file size          (blocks, -c) 0
+data seg size           (kbytes, -d) unlimited
+scheduling priority             (-e) 0
+file size               (blocks, -f) unlimited
+pending signals                 (-i) 15919
+max locked memory       (kbytes, -l) 64
+max memory size         (kbytes, -m) unlimited
+open files                      (-n) 1024
+pipe size            (512 bytes, -p) 8
+POSIX message queues     (bytes, -q) 819200
+real-time priority              (-r) 0
+stack size              (kbytes, -s) 10240
+cpu time               (seconds, -t) unlimited
+max user processes (-u) 1024
+virtual memory          (kbytes, -v) unlimited
+file locks                      (-x) unlimited
+</pre>
+Then you can run a small C program (<a title="title" href="http://blog.dbi-services.com/images/easyblog_images/139/testnproc.zip" target="_self">testnproc.zip</a>) that calls fork() in a loop until it fails with EAGAIN:
+<pre>[oracle@VM211 ocm]$ ./testnproc
+...
+parent says fork number 871 sucessful
+ child says fork number 872 pid 1518
+parent says fork number 872 sucessful
+ child says fork number 873 pid 1519
+parent says fork number 873 sucessful
+ child says fork number 874 pid 1520
+parent says fork number 874 sucessful
+parent says fork number 875 failed (nproc: soft=1024 hard=1024) with errno=11
+</pre>
+And finally, because the processes sleep for a while, you can check how many processes you have. I do that from another user account for the simple reason that I need to create 2 more processes (&#8216;ps&#8217; and &#8216;wc&#8217;) for that:
+<pre>[root@VM211 ocm]# ps h -Lu oracle | wc -l
+1023
+</pre></p>
+<h3>Recommended values for Oracle</h3>
+<p>Currently this is what is set on Oracle linux 6 for 11gR2 by the preinstall package (in /etc/security/limits.conf):
+<pre>oracle   soft   nproc    16384
+oracle   hard   nproc    16384
+</pre>
+For 12c, these are set in /etc/security/limits.d/oracle-rdbms-server-12cR1-preinstall.conf which overrides /etc/security/limits.conf:
+<pre>oracle soft nproc 16384
+oracle hard nproc 16384
+</pre>
+And just for your information, here is what is set in the ODA X4-2:
+<pre>oracle soft nproc 131072
+</pre>
+So what do you want to set? You probably don&#8217;t want it too low and experience &#8216;resource temporarily unavailable&#8217;. But what you don&#8217;t want either is 100000 processes on your server. So my recommendation is to set it high but monitor it when the number of processes reaches something that is not sensible. Then you prevent having the system down in case of process leak, but you can detect it and ask for a patch.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4500"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 14 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1252">
+				<div id="div-comment-1252" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a0970312b16f718a0cc1e61e8925e4d4?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Prasad</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1252">
+			October 26, 2014 at 8 h 57 min</a>		</div>
+
+		<p>Thanks Franck , you are a savior! Great article indeed.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12531"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1252' onclick='return addComment.moveForm( "div-comment-1252", "1252", "respond", "449" )' aria-label='Reply to Prasad to Prasad'>Reply to Prasad</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1309">
+				<div id="div-comment-1309" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/813db8e5a57e6d754509ce64723f31d3?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Krishna</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1309">
+			November 27, 2014 at 14 h 44 min</a>		</div>
+
+		<p>Very useful article. Thanks Franck !
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13101"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1309' onclick='return addComment.moveForm( "div-comment-1309", "1309", "respond", "449" )' aria-label='Reply to Krishna to Krishna'>Reply to Krishna</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1311">
+				<div id="div-comment-1311" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/438aa79c6a9fa4ab2d46e9413096146a?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Tunde</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1311">
+			November 29, 2014 at 19 h 18 min</a>		</div>
+
+		<p>Great stuff. Saved us from production headache
+Thanks
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13121"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1311' onclick='return addComment.moveForm( "div-comment-1311", "1311", "respond", "449" )' aria-label='Reply to Tunde to Tunde'>Reply to Tunde</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1325">
+				<div id="div-comment-1325" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/165a74f96b6d71771306590db27c3e65?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">TimL</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1325">
+			December 16, 2014 at 14 h 55 min</a>		</div>
+
+		<p>Franck, thank you for the thorough explanation on diagnosing these types issues.   It showed me exactly where my problem was.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13261"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1325' onclick='return addComment.moveForm( "div-comment-1325", "1325", "respond", "449" )' aria-label='Reply to TimL to TimL'>Reply to TimL</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1326">
+				<div id="div-comment-1326" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/545763d46916c9cb3b08c9eb7120b11f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">SEK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1326">
+			December 16, 2014 at 20 h 51 min</a>		</div>
+
+		<p>Great !!
+Thank you very much.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13271"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1326' onclick='return addComment.moveForm( "div-comment-1326", "1326", "respond", "449" )' aria-label='Reply to SEK to SEK'>Reply to SEK</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1327">
+				<div id="div-comment-1327" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/545763d46916c9cb3b08c9eb7120b11f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">SEK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1327">
+			December 16, 2014 at 20 h 51 min</a>		</div>
+
+		<p>Great !!
+Thank you very much.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13281"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1327' onclick='return addComment.moveForm( "div-comment-1327", "1327", "respond", "449" )' aria-label='Reply to SEK to SEK'>Reply to SEK</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-1394">
+				<div id="div-comment-1394" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/44f7e55727bc13cea6f79dc3f536d250?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Newbie</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1394">
+			February 26, 2015 at 6 h 19 min</a>		</div>
+
+		<p>Hi Franck Pachot, my DBA-Village friend <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":-)" class="wp-smiley" /></p>
+<p>When I try to login to grid I am getting the error su: cannot set user id: Resource temporarily unavailable</p>
+<p>limits.conf show soft nproc 2047 for the grid user. ps h -Led -o user | sort | uniq -c | sort -n shows grid only at 503. Is there any others that could have cause Linux to think that the user account had exceeded the nproc limit?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13951"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1394' onclick='return addComment.moveForm( "div-comment-1394", "1394", "respond", "449" )' aria-label='Reply to Newbie to Newbie'>Reply to Newbie</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment odd alt depth-2" id="comment-7334">
+				<div id="div-comment-7334" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/859ec19adbed5e5f6f659259447e2666?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Adarsh V K</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7334">
+			April 18, 2017 at 8 h 32 min</a>		</div>
+
+		<p>Hi Newbie,</p>
+<p>Its 2017 now, but I hit the same issue. </p>
+<p>While checking further got to know that npoc actually limit the threads created by _real_user_id (ps -U ) rather than effective user (ps -u ).</p>
+<p>You may confirm this from man page of getrlimit:</p>
+<p># man getrlimit  | grep -A2 RLIMIT_NPROC
+       RLIMIT_NPROC
+              The maximum number of processes (or, more precisely on Linux, threads) that can be created for the real user ID of the calling process.  Upon encountering this limit, fork(2) fails with the error EAGAIN.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73351"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7334' onclick='return addComment.moveForm( "div-comment-7334", "7334", "respond", "449" )' aria-label='Reply to Adarsh to Adarsh V K'>Reply to Adarsh</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-odd thread-alt depth-1" id="comment-1397">
+				<div id="div-comment-1397" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1397">
+			March 1, 2015 at 16 h 20 min</a>		</div>
+
+		<p>Hi &#8216;Newbie&#8217;,
+I&#8217;m glad to see you there.
+The limits.conf my be overwritten by /etc/security/limits.d files
+You can check ulimit -Hu and ulimit -Su
+Maybe you can strace/truss the su command and see which system call returns EAGAIN (which is 11)
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13981"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1397' onclick='return addComment.moveForm( "div-comment-1397", "1397", "respond", "449" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-1505">
+				<div id="div-comment-1505" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6f032aad944873c67453265b61f782dd?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">KK</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1505">
+			June 23, 2015 at 21 h 33 min</a>		</div>
+
+		<p>It helped me so quickly. awesome and Thanks a lot!!!
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-15061"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1505' onclick='return addComment.moveForm( "div-comment-1505", "1505", "respond", "449" )' aria-label='Reply to KK to KK'>Reply to KK</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-1551">
+				<div id="div-comment-1551" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/8cc6c8e503965d3f21090b544984cb78?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Jared</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1551">
+			July 15, 2015 at 23 h 41 min</a>		</div>
+
+		<p>Hi Franck,
+Doing some research on nproc and came across this excellent article.</p>
+<p>Thought you might find these results interesting:</p>
+<p>Oracle VirtualBox 4.something</p>
+<p>[oracle@ora12102a test-nproc]$ cat /etc/issue
+Oracle Linux Server release 6.5</p>
+<p>[oracle@ora12102a test-nproc]$ ulimit -u 1024
+[oracle@ora12102a test-nproc]$ grep &#8216;Max processes&#8217; /proc/$$/limits
+Max processes             1024                 1024                 processes</p>
+<p>[root@ora12102a ~]# ps h -Lu oracle  | wc -l
+47</p>
+<p>[oracle@ora12102a test-nproc]$ ./testnproc
+&#8230;
+ child says fork number 1018 pid 31680
+parent says fork number 1018 sucessful
+parent says fork number 1019 failed (nproc: soft=1024 hard=1024) with errno=11</p>
+<p>[root@ora12102a ~]# ps h -Lu oracle  | wc -l
+1066
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-15521"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1551' onclick='return addComment.moveForm( "div-comment-1551", "1551", "respond", "449" )' aria-label='Reply to Jared to Jared'>Reply to Jared</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-260">
+				<div id="div-comment-260" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/5f3a145f136099fc076577afafb10796?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Laura Sallwasser</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-260">
+			August 31, 2015 at 22 h 02 min</a>		</div>
+
+		<p>Hi, Franck
+First, thank you for the great explanation of this requirement.  It&#8217;s the first one I&#8217;ve seen that immediately explains the light-weight process (LWP) component in a straight-forward way.  In my environment, Enterprise Manager agents are usually the reason why oracle&#8217;s overall thread count exceeds the soft limit (2047) value.  Once it&#8217;s over 2047, any attempt to su &#8211; to oracle returns the message &#8220;resource temporarily unavailable&#8221; .  My question is why does this happens at the soft limit, instead of the hard limit?  The hard limit is 16384.  If only the soft limit matters, then what is the purpose of setting a hard limit?
+Thank you,
+Laura Sallwasser
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-2611"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-260' onclick='return addComment.moveForm( "div-comment-260", "260", "respond", "449" )' aria-label='Reply to Laura to Laura Sallwasser'>Reply to Laura</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-261">
+				<div id="div-comment-261" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-261">
+			August 31, 2015 at 22 h 27 min</a>		</div>
+
+		<p>Hi Laura,
+Thanks for your  feedback.
+The soft limit can be raised (up to the high limit) with the ulimit command.
+Of course, in your case, when you have the error at login then you can&#8217;t run the ulimit command.
+You can think of them as hard limit is your admin that limits you, soft limit is yourself limiting.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-2621"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-261' onclick='return addComment.moveForm( "div-comment-261", "261", "respond", "449" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-7132">
+				<div id="div-comment-7132" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ef2437dfd2d067c582ce3dc0e2be4abf?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.awsadvices.com' rel='external nofollow' class='url'>karnam</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7132">
+			March 16, 2017 at 13 h 17 min</a>		</div>
+
+		<p>Perfect thanks for your wonderful information.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-71331"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7132' onclick='return addComment.moveForm( "div-comment-7132", "7132", "respond", "449" )' aria-label='Reply to karnam to karnam'>Reply to karnam</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

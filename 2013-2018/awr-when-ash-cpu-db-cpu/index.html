@@ -1,0 +1,107 @@
+								<h1 class="entry-title">AWR when ASH CPU &gt;&gt; DB CPU</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I&#8217;ll present How to read an AWR report next month at UKOUG TECH15 and the first recommendation after checking Average Active Sessions is to verify that we are not in a CPU starvation situation. Here is a little demo to show how it looks like in an AWR report.
+<span id="more-5162"></span>
+In other words, I&#8217;ll demo the second line of:</p>
+<blockquote class="twitter-tweet" width="550"><p lang="en" dir="ltr">Slide 21 provides an excellent summary!&#10;<a href="https://t.co/jn64Sp8Plv">https://t.co/jn64Sp8Plv</a> <a href="https://t.co/AQgq3cCMkh">pic.twitter.com/AQgq3cCMkh</a></p>
+<p>&mdash; Christian Antognini (@ChrisAntognini) <a href="https://twitter.com/ChrisAntognini/status/661470038717808640">November 3, 2015</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<h3>One session 100% in CPU</h3>
+<p>I&#8217;m doing the demo on a VM with 4 cores and I&#8217;m running a query that reads 15 million blocks from buffer cache, which means it run fully in CPU for nearly 5 minutes:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l1-01.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l1-01.jpg" alt="Capture-l1-01" width="614" height="290" class="alignnone size-full wp-image-5182" /></a></p>
+<p>From the load profile above we are actually using 1 second of CPU per second, which confirms that my session was able to run in CPU 100% of the time.</p>
+<p>It&#8217;s the only activity in that database, so I see nearly 100% of the DB time spent in CPU:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l1-02.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l1-02.jpg" alt="Capture-l1-02" width="620" height="107" class="alignnone size-full wp-image-5181" /></a></p>
+<p>From the host, it&#8217;s the only instance running there, using 1 of the 4 vCPU &#8211; which means 25% utilization:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l1-03.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l1-03.jpg" alt="Capture-l1-03" width="615" height="149" class="alignnone size-full wp-image-5180" /></a></p>
+<p>I&#8217;ve set timed_os_statistics to gather OS statistics every 10 seconds. We can see that most context switches are voluntary ones (when doing a system call):</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l1-04.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l1-04.jpg" alt="Capture-l1-04" width="519" height="147" class="alignnone size-full wp-image-5179" /></a></p>
+<p>Finally I check ASH:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l1-05.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l1-05.jpg" alt="Capture-l1-05" width="626" height="154" class="alignnone size-full wp-image-5178" /></a></p>
+<p>29 samples (taken every 10 seconds) are in CPU or Wait for CPU which covers nearly 100% of the 292.1 seconds of DB CPU.</p>
+<p>This is the &#8216;normal&#8217; case.</p>
+<h3>One session 100% + four processes in CPU</h3>
+<p>Now, in addition to my Oracle session I run 4 processes that also want to run on CPU all the time:
+<pre>
+dd if=/dev/random of=/dev/null&amp;
+dd if=/dev/random of=/dev/null&amp;
+dd if=/dev/random of=/dev/null&amp;
+dd if=/dev/random of=/dev/null&amp;
+</pre></p>
+<p>I introduced contention on the server, thus the time to run the same workload in the database has increased:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l5-01.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l5-01.jpg" alt="Capture-l5-01" width="610" height="422" class="alignnone size-full wp-image-5177" /></a></p>
+<p>You see here that DB time has increased because it includes the time to wait for CPU in runqueue, but the DB CPU(s) per second is now only 0.8 because my session was about 20% of its time waiting for CPU (5 processes sharing only 4 vCPUs).</p>
+<p>The main symptom of that is on the Top events where the total is far less than 100% because of the unaccounted time waiting in runqueue:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l5-02.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l5-02.jpg" alt="Capture-l5-02" width="615" height="131" class="alignnone size-full wp-image-5176" /></a></p>
+<p>Look at the load average that is higher than the number of vCPUs:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l5-03.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l5-03.jpg" alt="Capture-l5-03" width="608" height="154" class="alignnone size-full wp-image-5175" /></a></p>
+<p>Lot of time in context switching (system CPU) and my instance is using only 1/5 of the total CPU used.</p>
+<p>The OS has to share the cpu among the processes. this is why we see more &#8216;involuntary context switches&#8217; than voluntary ones:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l5-04.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l5-04.jpg" alt="Capture-l5-04" width="510" height="150" class="alignnone size-full wp-image-5174" /></a></p>
+<p>Now comparing with ASH:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l5-05.jpg" rel="lightbox[5162]"><img src="../wp-insides/uploads/sites/2/2015/11/Capture-l5-05.jpg" alt="Capture-l5-05" width="626" height="168" class="alignnone size-full wp-image-5173" /></a></p>
+<p>460 seconds (46 samples taken every 10 seconds) in CPU is far more than the DB CPU (362.8) because 20% of the time was spent waiting for CPU, because of involuntary context switches, because of CPU starvation.</p>
+<p>Note that the time waiting in runqueue after a wait event (system call &#8211; voluntary context switch) is not accounted as &#8216;Wait for CPU&#8217; but is accounted in the wait event waiting time, for the simple reason that the accounting (which is done by a few CPU instructions) can&#8217;t be done before the process is back in CPU. A consequence of that is inflated wait time. I don&#8217;t have lot of waits here, but you can see that &#8216;db file sequential read&#8217; is on average less than one millisecond in the first case, but has been inflated to 6 milliseconds when CPU had to be shared by lot of processes.</p>
+<p>I usually don&#8217;t look at ADDM report, but there is a little clue about that in it &#8211; unfortunately not the Top-1 finding:
+<pre>
+Finding 2: CPU Usage
+Impact is .06 active sessions, 5.7% of total activity.
+------------------------------------------------------
+Host CPU was a bottleneck and the instance was consuming 26% of the host CPU.
+All wait times will be inflated by wait for CPU.
+Host CPU consumption was 100%.
+
+   Recommendation 1: Application Analysis
+   Estimated benefit is 1 active sessions, 100% of total activity.
+...
+   Recommendation 2: Host Configuration
+   Estimated benefit is .06 active sessions, 5.7% of total activity.
+...
+</pre></p>
+<p>The recommendations are not good either. My problem is on the host, outside of this database instance. It&#8217;s the rare case where we have to check at system level before looking at application&#8230;</p>
+<p>Conclusion: if you are CPU-bound, the most important numbers in the AWR report (wait events) are meaningless. I wanted to show that kind of report here. At TECH15 presentation I just warn about it and then show how I read a report that is relevant. Hope to see you <a href="http://www.tech15.ukoug.org/default.asp?p=12861&amp;dlgact=shwprs&amp;prs_prsid=10652&amp;day_dayid=94" target="_blank">there</a>.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-51630" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/Capture-l1-01.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1887">
+				<div id="div-comment-1887" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/f72c41a3ff54423293bdb68ae747aa44?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Kais</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1887">
+			November 17, 2015 at 19 h 23 min</a>		</div>
+
+		<p>Franck , Thx again for sharing !
+Kais
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-18881"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1887' onclick='return addComment.moveForm( "div-comment-1887", "1887", "respond", "5162" )' aria-label='Reply to Kais to Kais'>Reply to Kais</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

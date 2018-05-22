@@ -1,0 +1,85 @@
+								<h1 class="entry-title">CPU_COUNT</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you have less CPU threads than the number of processes that has something to run in CPU, the OS will schedule them to share the CPU resource. Increasing the workload at that point will not increase the throughput because you have reached the capacity of your system, and response time will increase because of queuing. Actually, performance will even decrease because of the overhead of context switching when trying to share the processors.
+When you don&#8217;t want the OS scheduler to do the resource sharing job, you can, and should, use Instance Caging. For sure, the database instance can do resource sharing more intelligently than the OS as it knows the kind of workload and the performance requirement of each process.
+<span id="more-9307"></span>
+I did some tests on a 8 CPU machine running SLOB from 32 concurrent sessions, then 31, then 30,&#8230; down to the last run with 1 sessions, each for 5 minutes. This is what you see on the right-most dark green triangle here:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/06/CaptureSLOBCPUCOUNT01.png" rel="lightbox[9307]"><img src="../wp-insides/uploads/sites/2/2016/06/CaptureSLOBCPUCOUNT01.png" alt="CaptureSLOBCPUCOUNT01" width="1704" height="372" class="alignnone size-full wp-image-9313" /></a>
+After a very short library cache contention when all 32 sessions are parsing their statements. The each run go decreasing. The dark green here is labelled as &#8216;CPU + CPU wait&#8217; and is coming from ASH where all sessions are on state &#8216;ON CPU&#8217; even when they are actually in the OS runqueue. Of course, I&#8217;ve only 8 CPU threads, so I cannot have 32 sessions running on CPU.</p>
+<p>The runs on the left where you can see the same but with some light green is from same runs but with Instance Caging active. I&#8217;ve a resource manager plan set and I&#8217;ve set CPU_COUT to 8 (the first run on the left), then 7, &#8230; down to 1. The dark green is still the &#8216;ON CPU&#8217; state and with Instance Caging Oracle allows at maximum CPU_COUNT processes in that state. The remaining processes are switched to a waiting state, instrumented as &#8216;resmgr: cpu quantum&#8217; and displayed in light green.</p>
+<p>My goal is to show that you can increase the throughput with Instance Caging. I measured the logical reads per second and made an Excel chart from them. The blue lines are from different CPU_COUNT settings from 8 to 1. The orange line is from no setting CPU_COUNT which means that instance caging is not enabled. On the X axes you have the number of conccurent SLOB sessions I&#8217;ve run. What you see from the bluse lines is that the throughput increases linearly with the number of concurrent session until it reaches the limit: either the CPU_COUNT limit or the physical limit when CPU_COUNT is not set. Note that the CPU threads are not cores here. Tests were done on Oracle Public Cloud 4 OCPUs (aka OC5 compute shape) which are actually 8 threads from E5-2690 v2 Intel processors. This is why running on two threads here do not double the throughput. Actually, when running 8 sessions on 8 threads the throughput is only x6 from running one session on one thread.</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/06/CaptureSLOBCPUCOUNT.png" rel="lightbox[9307]"><img src="../wp-insides/uploads/sites/2/2016/06/CaptureSLOBCPUCOUNT.png" alt="CaptureSLOBCPUCOUNT" width="1225" height="891" class="alignnone size-full wp-image-9308" /></a></p>
+<p>The second goal is to compare Oracle instance caging with OS scheduler when instance is using full capacity of the server. On the top you can see the darker blue line which is when CPU_COUT is set to the actual number of CPU threads (CPU_COUNT=8). The orange line is when no CPU_COUNT is set: instance caging is disabled. The maximum throughput then, 3.6 MLR/s, is reached when we run same number of sessions as the number of CPU threads. What you see here is that when the server is overloaded scheduling at instance level is more efficient than scheduling at OS level. Without instance caging, the orange line, the LR/s degrades because of context switching overhead. So the recommandation here is to always do instance caging even if you have only one instance on your server.</p>
+<p>Why is the instance caging algorithm better than the OS scheduler? Because it is focused at database processes workload. Here is the graphs of the &#8216;resmgr: cpu quantum&#8217; wait times. </p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/06/CaptureSLOBCPUCOUNT02.png" rel="lightbox[9307]"><img src="../wp-insides/uploads/sites/2/2016/06/CaptureSLOBCPUCOUNT02.png" alt="CaptureSLOBCPUCOUNT02" width="1680" height="469" class="alignnone size-full wp-image-9319" /></a></p>
+<p>On the left, I&#8217;ve run with CPU_COUNT=8. When I have 32 concurrent sessions each of them spend 3/4 of their time waiting for CPU. Those waits are about 300 milliseconds. When I&#8217;ve only 9 sessions, each one have to spend only small part of their response time on waiting. They wait about 25 milliseconds on &#8216;resmgr: cpu quantum&#8217;. The wait time is not fixed and depends on the load. This makes sens: when you know you will have to spend a long time waiting, it&#8217;s better to have longer waits in order to avoid too many context switches. On the right, it&#8217;s the same but with CPU_COUNT=1 which gives x8 less CPU time to the processes. They will have to spend more time on waiting. And we see that the wait time is adjusted: can go up to 4 seconds time slices. The OS scheduler will never do that, putting a process on runqueue wait for several seconds, because the scheduler tries focus on the response time. It&#8217;s different with instance caging. When you know that you will have to spend a long time waiting, then it&#8217;s better to optimize throughput by lowering the context switching.</p>
+<p>The recommandation is to enable instance caging: set a resource manager plan and set cpu_count. It&#8217;s not an option. There&#8217;s no additional costs for it. And it will always be better than letting the OS manager CPU starvation.</p>
+<p>On Standard Edition 2, it&#8217;s even easier: Oracle Corp. enabled instance caging for you <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-93080" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/06/CaptureSLOBCPUCOUNT01.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3784">
+				<div id="div-comment-3784" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/261923f0f22c0ea513b1d93e542e9b62?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://kevinclosson.wordpress.com' rel='external nofollow' class='url'>Kevin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3784">
+			June 17, 2016 at 19 h 32 min</a>		</div>
+
+		<p>So this is cached SLOB (LIOPS) on an Oracle VM right? </p>
+<p>Another interesting thing to test would be to implement a large number of sessions all performing think time (slob.conf-&gt;THINK_*).   I assure you that there are more bad choices made by the Linux scheduler when there are large numbers of processes coming runable from more diverse blocking such as IPC sem wakeup, sleep wake up (think time), latch sleep wakeup (poll() expiration).  The method in this case would be to find the min and max sleep settings that run the CPU tuilization right to saturation and then test with that recipe.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37851"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3784' onclick='return addComment.moveForm( "div-comment-3784", "3784", "respond", "9307" )' aria-label='Reply to Kevin to Kevin'>Reply to Kevin</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-3785">
+				<div id="div-comment-3785" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3785">
+			June 17, 2016 at 19 h 38 min</a>		</div>
+
+		<p>Hi Kevin, yes it is cached SLOB on OVM (public cloud). Good idea, thanks.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37861"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3785' onclick='return addComment.moveForm( "div-comment-3785", "3785", "respond", "9307" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

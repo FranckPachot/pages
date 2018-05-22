@@ -1,0 +1,392 @@
+								<h1 class="entry-title">Drilling down V$RECOVERY_AREA_USAGE</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a previous post I used X$KCCAGF to get more information about <a href="http://www.dbi-services.com/index.php/blog/entry/archivelog-deletion-policy-for-standby-database-in-oracle-data-guard">reclaimable archived logs in FRA</a>, because there is a bug in standby (not opened) databases where archivelog deletion policy is ignored. I explained that the view V$RECOVERY_AREA_USAGE has only aggregated information about space reclaimable without the details about which files are reclaimable or not. Here I&#8217;ll explain how I came to X$KCCAGF and I&#8217;ll give the query to get all the detailed information that is hidden behind V$RECOVERY_AREA_USAGE.</p>
+<p>Here is what is exposed by V$RECOVERY_AREA_USAGE:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; set linesize 200 pagesize 1000
+SQL&gt; select * from v$recovery_area_usage;
+
+FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES
+----------------------- ------------------ ------------------------- ---------------
+CONTROL FILE                           .21                         0               1
+REDO LOG                                 0                         0               0
+ARCHIVED LOG                           .44                       .37              15
+BACKUP PIECE                           .37                         0               1
+IMAGE COPY                               0                         0               0
+FLASHBACK LOG                            0                         0               0
+FOREIGN ARCHIVED LOG                     0                         0               0
+AUXILIARY DATAFILE COPY                  0                         0               0
+
+8 rows selected.
+</pre>
+<p>and this is a good overview about space usage. But now I want to see which are those archived logs that are reclaimable and which are not. Because I want to compare with backups, standby shipping, retention, etc.</p>
+<p>Here is the information that I want:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">FILE_TYPE    FILE_NAME                                                     BYTES REC COMPLETIO
+------------ ------------------------------------------------------------------- --- ---------
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_9_9v5cn1kv_.arc       81408 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_7_9v59wnsb_.arc      599552 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_4_9v57fdtn_.arc    10725376 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_8_9v5cd035_.arc      112640 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_11_9v5ffd57_.arc    2515968 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_12_9v5fqd0k_.arc     112640 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_13_9v5fz8z1_.arc     529408 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_14_9v5hgkqr_.arc      94208 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_5_9v598zsz_.arc     2663424 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_10_9v5cxtr4_.arc     312832 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_6_9v59lvv7_.arc      127488 YES 01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_17_9v5jcds8_.arc     126464 NO  01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_16_9v5j2968_.arc     634368 NO  01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_15_9v5hrgtv_.arc    2430976 NO  01-JUL-14
+ARCHIVED LOG /fra/demo/archivelog/2014_07_01/o1_mf_1_18_9v5kny3b_.arc     190976 NO  01-JUL-14
+BACKUP PIECE /fra/demo/backupset/2014_07_18/o1_mf_annnn_TAG20140718T... 17882624 NO  18-JUL-14
+CONTROL FILE /fra/demo/controlfile/o1_mf_9v506z2f_.ctl                  10027008 NO
+
+17 rows selected.
+</pre>
+<p>I&#8217;ll show the query to get that, at the end of this post. But I&#8217;m also going to show you how I came to the right query, using undocumented information. The first idea was to get the V$RECOVERY_AREA_USAGE definition and see if there is any &#8216;group by&#8217; that we can get rid of. V$ views definition is exposed in V$FIXED_VIEW_DEFINITION:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from v$fixed_view_definition where view_name='V$RECOVERY_AREA_USAGE';
+
+VIEW_NAME
+------------------------------
+VIEW_DEFINITION
+--------------------------------------------------------------------------------
+    CON_ID
+----------
+V$RECOVERY_AREA_USAGE
+select fusg.file_type,
+ decode(nvl2(ra.name, ra.space_limit, 0), 0, 0,
+  round(nvl(fusg.space_used, 0)/ra.space_limit, 4)                          * 10
+0),                                                            decode(nvl2(ra.na
+...
+                                    from v$archived_log,
+                                   (select /*+ no_merge */ ceilasm from x$krasga
+)                      where is_recovery_dest_file = 'YES'
+                   and name is not null) al,
+         0
+</pre>
+<p>but this is not enough because the view definition is limited to 4000 characters and the query is much larger than that. Note that I&#8217;ve not reproduced all the 4000 characters here.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; desc v$fixed_view_definition
+ Name               Null?    Type
+ ------------------ -------- ----------------
+ VIEW_NAME                   VARCHAR2(30)
+ VIEW_DEFINITION             VARCHAR2(4000)
+</pre>
+<p>So how to get the whole query? The fixed view definition is hardcoded in the oracle code. So let&#8217;s try to get it from the oracle binary. I have the beginning and I will try to find the full line from that pattern:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ strings $ORACLE_HOME/bin/oracle | grep "select fusg.file_type,"
+</pre>
+<p>And bingo, I have the full query. Once again, I reproduce only the first and last lines:</p>
+<pre>select fusg.file_type,                                                           decode(nvl2(ra.name, ra.space_limit, 0), 0, 0,                                   
+...
+union all                                                                select 'AUXILIARY DATAFILE COPY'        file_type,                               sum(adc.file_size)               space_used,                              sum(case when adc.purgable = 1 then adc.file_size                                  else 0 end)             space_reclaimable,                       count(*)                         number_of_files                     from (select case when ceilasm = 1 and adfcnam like '+%'                               then                                                                         ceil(((adfcnblks*adfcbsz)+1)/1048576)*1048576                          else                                                                         adfcnblks*adfcbsz                                                      end file_size,                                                            adfcrecl purgable                                                    from x$kccadfc,                                                                (select /*+ no_merge */ ceilasm from x$krasga)                      where bitand(adfcflg, 1) = 1                                                and adfcnam is not null)adc)fusg
+</pre>
+<p>Here we get the whole query in one line. Then I&#8217;ve just to put it in the SQLDeveloper formatter, replace the aggregate functions for PERCENT_SPACE_USED, PERCENT_SPACE_RECLAIMABLE and NUMBER_OF_FILES by the file name and size, and the &#8216;reclaimable&#8217; flag. Here is the whole query I used to get the result above:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">set linesize 200 pagesize 1000
+column file_name format a100
+SELECT file_type,
+  name file_name,
+  space_used bytes,
+  CASE
+    WHEN space_reclaimable&gt;=space_used
+    THEN 'YES'
+    ELSE 'NO'
+  END reclaimable,
+  completion_time
+FROM
+  (SELECT 'CONTROL FILE' file_type,
+    name,
+    CAST(NULL AS DATE) completion_time,
+    (
+    CASE
+      WHEN ceilasm = 1
+      AND name LIKE '+%'
+      THEN ceil(((block_size*file_size_blks)+1)/1048576)*1048576
+      ELSE block_size       *file_size_blks
+    END) space_used,
+    0 space_reclaimable,
+    1 number_of_files
+  FROM v$controlfile,
+    (SELECT /*+ no_merge */
+      ceilasm FROM x$krasga
+    )
+  WHERE is_recovery_dest_file = 'YES'
+  UNION ALL
+  SELECT 'REDO LOG' file_type,
+    member,
+    CAST(NULL AS DATE),
+    (
+    CASE
+      WHEN ceilasm = 1
+      AND member LIKE '+%'
+      THEN ceil((l.bytes+1)/1048576)*1048576
+      ELSE l.bytes
+    END) space_used,
+    0 space_reclaimable,
+    1 number_of_files
+  FROM
+    (SELECT group#, bytes FROM v$log
+    UNION
+    SELECT group#, bytes FROM v$standby_log
+    ) l,
+    v$logfile lf,
+    (SELECT /*+ no_merge */
+      ceilasm FROM x$krasga
+    )
+  WHERE l.group#               = lf.group#
+  AND lf.is_recovery_dest_file = 'YES'
+  UNION ALL
+  SELECT 'ARCHIVED LOG' file_type,
+    name,
+    completion_time,
+    (al.file_size) space_used,
+    (
+    CASE
+      WHEN dl.rectype = 11
+      THEN al.file_size
+      ELSE 0
+    END) space_reclaimable,
+    1 number_of_files
+  FROM
+    (SELECT recid,
+      name,
+      completion_time,
+      CASE
+        WHEN ceilasm = 1
+        AND name LIKE '+%'
+        THEN ceil(((blocks*block_size)+1)/1048576)*1048576
+        ELSE blocks       * block_size
+      END file_size
+    FROM v$archived_log,
+      (SELECT /*+ no_merge */
+        ceilasm FROM x$krasga
+      )
+    WHERE is_recovery_dest_file = 'YES'
+    AND name                   IS NOT NULL
+    ) al,
+    x$kccagf dl
+  WHERE al.recid    = dl.recid(+)
+  AND dl.rectype(+) = 11
+  UNION ALL
+  SELECT 'BACKUP PIECE' file_type,
+    handle,
+    completion_time,
+    (bp.file_size) space_used,
+    (
+    CASE
+      WHEN dl.rectype = 13
+      THEN bp.file_size
+      ELSE 0
+    END) space_reclaimable,
+    1 number_of_files
+  FROM
+    (SELECT recid,
+      handle,
+      completion_time,
+      CASE
+        WHEN ceilasm = 1
+        AND handle LIKE '+%'
+        THEN ceil((bytes+1)/1048576)*1048576
+        ELSE bytes
+      END file_size
+    FROM v$backup_piece,
+      (SELECT /*+ no_merge */
+        ceilasm FROM x$krasga
+      )
+    WHERE is_recovery_dest_file = 'YES'
+    AND handle                 IS NOT NULL
+    ) bp,
+    x$kccagf dl
+  WHERE bp.recid    = dl.recid(+)
+  AND dl.rectype(+) = 13
+  UNION ALL
+  SELECT 'IMAGE COPY' file_type,
+    name,
+    completion_time,
+    (dc.file_size) space_used,
+    (
+    CASE
+      WHEN dl.rectype = 16
+      THEN dc.file_size
+      ELSE 0
+    END) space_reclaimable,
+    1 number_of_files
+  FROM
+    (SELECT recid,
+      name,
+      completion_time,
+      CASE
+        WHEN ceilasm = 1
+        AND name LIKE '+%'
+        THEN ceil(((blocks*block_size)+1)/1048576)*1048576
+        ELSE blocks       * block_size
+      END file_size
+    FROM v$datafile_copy,
+      (SELECT /*+ no_merge */
+        ceilasm FROM x$krasga
+      )
+    WHERE is_recovery_dest_file = 'YES'
+    AND name                   IS NOT NULL
+    ) dc,
+    x$kccagf dl
+  WHERE dc.recid    = dl.recid(+)
+  AND dl.rectype(+) = 16
+  UNION ALL
+  SELECT 'FLASHBACK LOG' file_type,
+    name,
+    first_time,
+    NVL(fl.space_used, 0) space_used,
+    NVL(fb.reclsiz, 0) space_reclaimable,
+    NVL(fl.number_of_files, 0) number_of_files
+  FROM
+    (SELECT name,
+      first_time,
+      (
+      CASE
+        WHEN ceilasm = 1
+        AND name LIKE '+%'
+        THEN ceil((fl.bytes+1)/1048576)*1048576
+        ELSE bytes
+      END)space_used,
+      1 number_of_files
+    FROM v$flashback_database_logfile fl,
+      (SELECT /*+ no_merge */
+        ceilasm FROM x$krasga
+      )
+    ) fl,
+    (SELECT SUM(to_number(fblogreclsiz)) reclsiz FROM x$krfblog
+    )fb
+  UNION ALL
+  SELECT 'FOREIGN ARCHIVED LOG' file_type,
+    rlnam,
+    CAST(NULL AS DATE),
+    (rlr.file_size) space_used,
+    (
+    CASE
+      WHEN rlr.purgable = 1
+      THEN rlr.file_size
+      ELSE 0
+    END) space_reclaimable,
+    1 number_of_files
+  FROM
+    (SELECT rlnam,
+      CASE
+        WHEN ceilasm = 1
+        AND rlnam LIKE '+%'
+        THEN ceil(((rlbct*rlbsz)+1)/1048576)*1048576
+        ELSE rlbct       *rlbsz
+      END file_size,
+      CASE
+        WHEN bitand(rlfl2, 4096) = 4096
+        THEN 1
+        WHEN bitand(rlfl2, 8192) = 8192
+        THEN 1
+        ELSE 0
+      END purgable
+    FROM x$kccrl,
+      (SELECT /*+ no_merge */
+        ceilasm FROM x$krasga
+      )
+    WHERE bitand(rlfl2, 64) = 64
+    AND rlnam              IS NOT NULL
+    )rlr
+  UNION ALL
+  SELECT 'AUXILIARY DATAFILE COPY' file_type,
+    adfcnam,
+    CAST(NULL AS DATE),
+    (adc.file_size) space_used,
+    (
+    CASE
+      WHEN adc.purgable = 1
+      THEN adc.file_size
+      ELSE 0
+    END) space_reclaimable,
+    1 number_of_files
+  FROM
+    (SELECT adfcnam,
+      CASE
+        WHEN ceilasm = 1
+        AND adfcnam LIKE '+%'
+        THEN ceil(((adfcnblks*adfcbsz)+1)/1048576)*1048576
+        ELSE adfcnblks       *adfcbsz
+      END file_size,
+      adfcrecl purgable
+    FROM x$kccadfc,
+      (SELECT /*+ no_merge */
+        ceilasm FROM x$krasga
+      )
+    WHERE bitand(adfcflg, 1) = 1
+    AND adfcnam             IS NOT NULL
+    )adc
+  )fusg
+ORDER BY completion_time nulls last;
+</pre>
+<p>Don&#8217;t hesitate to add more information as I did when investigating the archivelog deletion policy.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-1230"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment byuser comment-author-nicolas-jardot even thread-even depth-1" id="comment-1241">
+				<div id="div-comment-1241" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/44aaa4979e6e6d88085c5337b3c385c5?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/blog' rel='external nofollow' class='url'>Nicolas Jardot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1241">
+			October 6, 2014 at 9 h 05 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>you extracted the view definition from a 12 database right?
+In 11g, the last block in UNION doesn&#8217;t exist because it concerns auxiliary datafile copy and the base x$ view doesn&#8217;t exist.</p>
+<p>Regards,</p>
+<p>Nicolas
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12421"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1241' onclick='return addComment.moveForm( "div-comment-1241", "1241", "respond", "122" )' aria-label='Reply to Nicolas to Nicolas Jardot'>Reply to Nicolas</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1242">
+				<div id="div-comment-1242" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1242">
+			October 6, 2014 at 16 h 52 min</a>		</div>
+
+		<p>Hi Nicolas, Yes that&#8217;s right it&#8217;s from 12c.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12431"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1242' onclick='return addComment.moveForm( "div-comment-1242", "1242", "respond", "122" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

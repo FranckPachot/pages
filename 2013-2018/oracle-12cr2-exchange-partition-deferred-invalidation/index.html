@@ -1,0 +1,189 @@
+								<h1 class="entry-title">Oracle 12cR2: exchange partition deferred invalidation</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a <a href="../oracle-12cr2-ddl-deferred-invalidation/index.html" target="_blank">previous post</a> I introduced the new 12<em>c</em>R2 feature where some DDL operations can use the same rolling invalidation than what is done with dbms_stats. On tables, DDL deferred invalidation is available only for operations on partitions. Here is how it works for partition exchange.
+<span id="more-16880"></span>
+Here is my session environment:
+<pre>
+SQL&gt; whenever sqlerror exit failure
+SQL&gt; alter session set nls_date_format='hh24:mi:ss';
+Session altered.
+SQL&gt; alter session set session_cached_cursors=0;
+Session altered.
+SQL&gt; alter session set optimizer_dynamic_sampling=0;
+Session altered.
+SQL&gt; alter system set "_optimizer_invalidation_period"=5;
+System SET altered.
+SQL&gt; show user
+USER is "DEMO"
+</pre></p>
+<p>I create a partitioned table with one local index
+<pre>
+SQL&gt; create table DEMO (n number, p number) partition by list(p) (partition P1 values(1), partition P2 values(2));
+Table DEMO created.
+SQL&gt; create index DEMO on DEMO(n) local;
+Index DEMO created.
+</pre></p>
+<p>I create the table with same structure for exchange
+<pre>
+SQL&gt; create table DEMOX for exchange with table DEMO;
+Table DEMOX created.
+SQL&gt; create index DEMOX on DEMOX(n);
+Index DEMOX created.
+</pre></p>
+<p>The CREATE TABLE FOR EXCHANGE do not create the indexes, but for rolling invalidation we need them. Without the same indexes, immediate invalidation occurs.</p>
+<p>In order observe invalidation, I run queries on the partitioned tables, involving or not the partition I&#8217;ll exchange. I also run a query on the table used for exchange.
+<pre>
+SQL&gt; SELECT * FROM DEMO partition (P1);
+no rows selected
+SQL&gt; SELECT * FROM DEMO partition (P2);
+no rows selected
+SQL&gt; SELECT * FROM DEMO;
+no rows selected
+SQL&gt; SELECT * FROM DEMOX;
+no rows selected
+</pre></p>
+<p>Here are the cursors and some execution plans:
+<pre>
+SQL&gt; select sql_id,sql_text,child_number,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%' order by sql_text;
+
+SQL_ID         SQL_TEXT                           CHILD_NUMBER  INVALIDATIONS  LOADS  PARSE_CALLS  EXECUTIONS  FIRST_LOAD_TIME      LAST_LOAD_TIME       LAST_ACTIVE_TIME  IS_ROLLING_INVALID
+------         --------                           ------------  -------------  -----  -----------  ----------  ---------------      --------------       ----------------  ------------------
+dd3ajp6k49u1d  SELECT * FROM DEMO                 0             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+1ft329rx910sa  SELECT * FROM DEMO partition (P1)  0             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+9pp3h276waqvm  SELECT * FROM DEMO partition (P2)  0             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+by2m6mh16tpsz  SELECT * FROM DEMOX                0             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+
+SQL&gt; select * from table(dbms_xplan.display_cursor('1ft329rx910sa',0,'basic +partition'));
+
+PLAN_TABLE_OUTPUT
+-----------------
+EXPLAINED SQL STATEMENT:
+------------------------
+SELECT * FROM DEMO partition (P1)
+
+Plan hash value: 3520634703
+
+------------------------------------------------------
+| Id  | Operation             | Name | Pstart| Pstop |
+------------------------------------------------------
+|   0 | SELECT STATEMENT      |      |       |       |
+|   1 |  PARTITION LIST SINGLE|      |     1 |     1 |
+|   2 |   TABLE ACCESS FULL   | DEMO |     1 |     1 |
+------------------------------------------------------
+
+SQL&gt; select * from table(dbms_xplan.display_cursor('dd3ajp6k49u1d',0,'basic +partition'));
+
+PLAN_TABLE_OUTPUT
+-----------------
+EXPLAINED SQL STATEMENT:
+------------------------
+SELECT * FROM DEMO
+
+Plan hash value: 1180220521
+
+---------------------------------------------------
+| Id  | Operation          | Name | Pstart| Pstop |
+---------------------------------------------------
+|   0 | SELECT STATEMENT   |      |       |       |
+|   1 |  PARTITION LIST ALL|      |     1 |     2 |
+|   2 |   TABLE ACCESS FULL| DEMO |     1 |     2 |
+---------------------------------------------------
+</pre></p>
+<p>I exchange the partition P1 with the table DEMOX. I include indexes and add the DEFERRED INVALIDATION clause</p>
+<p><pre>
+SQL&gt; alter table DEMO exchange partition P1 with table DEMOX including indexes without validation deferred invalidation;
+Table DEMO altered.
+</pre></p>
+<p>If I do the same without the DEFERRED INVALIDATION clause, or without including indexes, or having different indexes, then I would see all cursors invalidated. Here only the select on the DEMOX table is invalidated:</p>
+<p><pre>
+SQL&gt; select sql_text,child_number,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%' order by sql_text;
+
+SQL_TEXT                           CHILD_NUMBER  INVALIDATIONS  LOADS  PARSE_CALLS  EXECUTIONS  FIRST_LOAD_TIME      LAST_LOAD_TIME       LAST_ACTIVE_TIME  IS_ROLLING_INVALID
+--------                           ------------  -------------  -----  -----------  ----------  ---------------      --------------       ----------------  ------------------
+SELECT * FROM DEMO                 0             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+SELECT * FROM DEMO partition (P1)  0             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+SELECT * FROM DEMO partition (P2)  0             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+SELECT * FROM DEMOX                0             1              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:12          N
+</pre></p>
+<p>I expected to see the IS_ROLLING_INVALID flag changed to &#8216;Y&#8217; as we can observe with other operations. I have opened an SR for that. </p>
+<p>Rolling invalidation sets a timestamp at next execution:</p>
+<p><pre>
+SQL&gt; SELECT * FROM DEMO partition (P1);
+no rows selected
+SQL&gt; SELECT * FROM DEMO partition (P2);
+no rows selected
+SQL&gt; SELECT * FROM DEMO;
+no rows selected
+SQL&gt; SELECT * FROM DEMOX;
+no rows selected
+
+
+SQL&gt; select sql_text,child_number,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%' order by sql_text;
+
+SQL_TEXT                           CHILD_NUMBER  INVALIDATIONS  LOADS  PARSE_CALLS  EXECUTIONS  FIRST_LOAD_TIME      LAST_LOAD_TIME       LAST_ACTIVE_TIME  IS_ROLLING_INVALID
+--------                           ------------  -------------  -----  -----------  ----------  ---------------      --------------       ----------------  ------------------
+SELECT * FROM DEMO                 0             0              1      2            2           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:14          N
+SELECT * FROM DEMO partition (P1)  0             0              1      2            2           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:14          N
+SELECT * FROM DEMO partition (P2)  0             0              1      2            2           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:14          N
+SELECT * FROM DEMOX                0             1              2      1            1           2017-05-26/10:06:12  2017-05-26/10:06:14  10:06:14          N
+</pre></p>
+<p>I expected to see IS_ROLLING_INVALID going from &#8216;Y&#8217; to &#8216;X&#8217; here when the random time is set for invalidation.</p>
+<p>By default, the random time is set within a 5 hours window, but I changed &#8220;_optimizer_invalidation_period&#8221; to 5 seconds instead and I wait for this time window to be sure that invalidation occurs. And then run my queries again.</p>
+<p><pre>
+SQL&gt; host sleep 5
+
+SQL&gt; SELECT * FROM DEMO partition (P1);
+no rows selected
+SQL&gt; SELECT * FROM DEMO partition (P2);
+no rows selected
+SQL&gt; SELECT * FROM DEMO;
+no rows selected
+SQL&gt; SELECT * FROM DEMOX;
+no rows selected
+
+</pre></p>
+<p>Here are the new child cursors created for the ones that were marked for rolling invalidation. The IS_ROLLING_INVALID did not display anything, but it seems that it works as expected:</p>
+<p><pre>
+SQL&gt; select sql_text,child_number,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%' order by sql_text;
+
+SQL_TEXT                           CHILD_NUMBER  INVALIDATIONS  LOADS  PARSE_CALLS  EXECUTIONS  FIRST_LOAD_TIME      LAST_LOAD_TIME       LAST_ACTIVE_TIME  IS_ROLLING_INVALID
+--------                           ------------  -------------  -----  -----------  ----------  ---------------      --------------       ----------------  ------------------
+SELECT * FROM DEMO                 0             0              1      2            2           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:14          N
+SELECT * FROM DEMO                 1             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:19  10:06:19          N
+SELECT * FROM DEMO partition (P1)  1             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:19  10:06:19          N
+SELECT * FROM DEMO partition (P1)  0             0              1      2            2           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:14          N
+SELECT * FROM DEMO partition (P2)  1             0              1      1            1           2017-05-26/10:06:12  2017-05-26/10:06:19  10:06:19          N
+SELECT * FROM DEMO partition (P2)  0             0              1      2            2           2017-05-26/10:06:12  2017-05-26/10:06:12  10:06:14          N
+SELECT * FROM DEMOX                0             1              2      2            2           2017-05-26/10:06:12  2017-05-26/10:06:14  10:06:19          N
+</pre></p>
+<p>Here is the confirmation that those 3 cursors were not shared because they have passed the rolling invalidation window:</p>
+<p><pre>
+SQL&gt; select sql_id,child_number,reason from v$sql_shared_cursor join v$sql using(sql_id, child_number) where sql_text like 'S%DEMO%';
+
+SQL_ID         CHILD_NUMBER  REASON
+------         ------------  ------
+1ft329rx910sa  0             033Rolling Invalidate Window Exceeded(3)2x414957859751495785979
+1ft329rx910sa  1
+by2m6mh16tpsz  0
+dd3ajp6k49u1d  0             033Rolling Invalidate Window Exceeded(3)2x414957859771495785979
+dd3ajp6k49u1d  1
+9pp3h276waqvm  0             033Rolling Invalidate Window Exceeded(3)2x414957859781495785979
+9pp3h276waqvm  1
+</pre></p>
+<h3>So what?</h3>
+<p>The first observation is that deferred invalidation works with partition exchange, despite the fact that the V$SQL.IS_ROLLING_INVALID flag is not updated. I was surprised to see that rolling invalidation occurs even for the cursors accessing to the partition which was exchanged. However, the rolling invalidation occurs only if the indexes are the same. If we do not exchange the indexes, then all cursors are invalidated immediately. This means that probably the cursor parsed is compatible to run after the exchange as the indexes are guaranteed to have same structure, type, compression,&#8230;
+This is a very nice feature when exchange partition is used to keep the fact table when loading new data: you load into a table and then exchange it with the latest partition. The new values are now exposed immediately and this new feature avoids a hard parse peak.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-168810"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

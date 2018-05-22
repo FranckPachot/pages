@@ -1,0 +1,225 @@
+								<h1 class="entry-title">Phantom session environment in multitenant?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In multitenant a session can switch from one container to another. There are a few restrictions such as a transaction cannot span multiple containers. But how do sessions parameters behave? It seems that there is a small inconsistency.
+<span id="more-6241"></span>
+I was looking at some adaptive plan and SPM behavior (see this tweeter <a href="https://twitter.com/MarisElsins/status/677990324308992000" target="_blank">conversation</a>) and played with the optimizer environment to reproduce the plan I wanted, and then came to a strange behavior. I can understand that a session keep its parameter settings when switching to another container. But not when closing and re-opening the pluggable database. The default values should come then.</p>
+<p>Here is an example.</p>
+<h3>Change in memory value of optimizer parameter</h3>
+<p>This is in 12.1.0.2 latest PSU. I connect to PDB
+<pre>
+19:13:10 SQL&gt; alter session set container=PDB;
+Session altered.
+</pre>
+and check parameter optimizer_index_cost_adj from memory:
+<pre>
+19:13:10 SQL&gt; show parameter optimizer_index_cost_adj;
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_index_cost_adj             integer     100
+</pre>
+It&#8217;s the default.</p>
+<p>then I set it to one in memory only:
+<pre>
+19:37:17 SQL&gt; alter system set optimizer_index_cost_adj=1 scope=memory;
+System altered.
+</pre>
+And I run a query and check that the optimizer used that value
+<pre>
+19:37:18 SQL&gt; select * from dual;
+
+D
+-
+X
+
+19:37:19 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'+outline'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------
+SQL_ID  a5ks9fhw2v9s1, child number 0
+-------------------------------------
+select * from dual
+
+Plan hash value: 272002086
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+Outline Data
+-------------
+
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      OPT_PARAM('optimizer_index_cost_adj' 1)
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$1")
+      FULL(@"SEL$1" "DUAL"@"SEL$1")
+      END_OUTLINE_DATA
+  */
+
+</pre>
+Si this is expected, my custom value has been used to optimize the cursor.</p>
+<h3>close and re-open the PDB</h3>
+<p>I close and restart my PDB:
+<pre>
+19:37:19 SQL&gt; shutdown immediate
+Pluggable Database closed.
+19:37:21 SQL&gt; startup
+Pluggable Database opened.
+</pre>
+As the value was set in memory, it&#8217;s now back to default:
+<pre>
+19:36:48 SQL&gt; show parameter optimizer_index_cost_adj;
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_index_cost_adj             integer     100
+
+</pre>
+and of course, my cursor is not there anymore:
+<pre>
+19:36:48 SQL&gt; select sql_id,child_number,first_load_time,con_id from v$sql where sql_id='a5ks9fhw2v9s1';
+
+no rows selected
+</pre></p>
+<p>So now I run again my query and expect the default optimizer environement:
+<pre>
+19:36:48 SQL&gt; select dummy from dual;
+
+D
+-
+X
+
+19:36:48 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'+outline'));
+
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------
+SQL_ID  4au7rzs3y6kzn, child number 0
+-------------------------------------
+select dummy from dual
+
+Plan hash value: 272002086
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+Outline Data
+-------------
+
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      OPT_PARAM('optimizer_index_cost_adj' 1)
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$1")
+      FULL(@"SEL$1" "DUAL"@"SEL$1")
+      END_OUTLINE_DATA
+  */
+</pre>
+And my new cursor has used the optimizer_index_cost_adj=1 which is not what I expected at all.
+Does that mean that session parameters remain across PDB close/start?
+No according to &#8216;show parameter':
+<pre>
+19:37:07 SQL&gt; show parameter optimizer_index_cost_adj;
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_index_cost_adj             integer     100
+
+</pre>
+but yes according to V$SES_OPTIMIZER_ENV:
+<pre>
+19:37:07 SQL&gt; select sid,name,value from v$ses_optimizer_env where name='optimizer_index_cost_adj' and sid=sys_context('userenv','sid');
+
+       SID NAME                                     VALUE
+---------- ---------------------------------------- -------------------------
+        35 optimizer_index_cost_adj                 1
+
+</pre></p>
+<h3>Conclusion</h3>
+<p>I&#8217;ve reproduced the same when re-connecting (instead of changing session container) and even when connecting to another PDB.
+In my opinion, this is a bug. The session parameters should be reinitialized when re-connecting. So be careful.</p>
+<h3>Update 12-JUL-2016</h3>
+<p>See Maciej Tokar <a href="http://dba24.pl/2016/07/07/alter-system-cdb-params-hack-from-pdb-a-bug-or-a-feature/">post</a> about this issue (my case being only one effect)</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-62420"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-3979">
+				<div id="div-comment-3979" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75234dd34f80230790f957f674492496?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://dba24.pl' rel='external nofollow' class='url'>Maciej Tokar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3979">
+			July 12, 2016 at 16 h 59 min</a>		</div>
+
+		<p>It seems to be a problem of a similiar kind to the issue I have discovered. Did you observe the parameters to have been propagated to other PDB, I mean other than you were in when issuing ALTER SYSTEM?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39801"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3979' onclick='return addComment.moveForm( "div-comment-3979", "3979", "respond", "6241" )' aria-label='Reply to Maciej to Maciej Tokar'>Reply to Maciej</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-3980">
+				<div id="div-comment-3980" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3980">
+			July 12, 2016 at 17 h 30 min</a>		</div>
+
+		<p>Hi Maciej, Yes, I didn&#8217;t check the CDB$ROOT, but I&#8217;ve noted that it was the same in all PDBs.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39811"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3980' onclick='return addComment.moveForm( "div-comment-3980", "3980", "respond", "6241" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

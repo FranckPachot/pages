@@ -1,0 +1,58 @@
+								<h1 class="entry-title">Large Pages and MEMORY_TARGET on Windows</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a previous <a href="http://blog.dbi-services.com/large-pages-on-windows/" target="_blank">post</a> about enabling large page on Windows Server, I explained that it&#8217;s possible to use large pages with Automatic Memory Management (AMM, where sizing if SGA and PGA is automatic with MEMORY_TARGET setting) but possible does not mean that it is recommended. We feel that it&#8217;s not a good idea, but are there reasons for it or it&#8217;s just our linux backgroud that brings this opinion?
+<span id="more-9963"></span></p>
+<h3>SGA_MAX_SIZE=4G, MEMORY_MAX_SIZE=6G</h3>
+<p>What is the size of allocated large pages? If it is set, SGA_MAX_SIZE is the size allocated as large pages when ORA_LPENABLE=1, even if you&#8217;ve set some MEMORY_MAX_SIZE:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_17_12_02.png" rel="lightbox[9963]"><img src="../wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_17_12_02.png" alt="VirtualBox_Windows 2012 Server_27_07_2016_17_12_02" width="1152" height="864" class="alignnone size-full wp-image-9964" /></a></p>
+<p>I take screenshots with all information: the init.ora settings and the regedit entry on top-left. Latest sqlplus commands on top right (here screenshot is just after the startup). And memory given by <a href="https://technet.microsoft.com/en-us/sysinternals/rammap.aspx" target="_blank">Sysinternals RamMap</a>. </p>
+<p>So, when SGA_MAX_SIZE is set, it&#8217;s the maximum size of SGA that can be allocated, and this is what is allocated at startup from physical memory until the end of the instance. You can reduce the SGA_TARGET dynamically, but I don&#8217;t see any reason for that as the memory allocated in large page will not be released, nor swapped, nor usable for PGA.</p>
+<h3>SGA_MAX_SIZE unset, MEMORY_MAX_SIZE=6G</h3>
+<p>If we don&#8217;t set SGA_MAX_SIZE, then the SGA can grow up to MEMORY_MAX_SIZE and this is what is allocated at startup when ORA_LPENABLE=1:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_17_16_44.png" rel="lightbox[9963]"><img src="../wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_17_16_44.png" alt="VirtualBox_Windows 2012 Server_27_07_2016_17_16_44" width="1152" height="864" class="alignnone size-full wp-image-9968" /></a></p>
+<h3>Physical memory must be free</h3>
+<p>When ORA_LPENABLE=1 and not enough memory is available if physical memory, you get an error (ORA-27102 OS 1450) at startup:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_17_23_171.png" rel="lightbox[9963]"><img src="../wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_17_23_171.png" alt="VirtualBox_Windows 2012 Server_27_07_2016_17_23_17" width="1152" height="864" class="alignnone size-full wp-image-9986" /></a></p>
+<p>What I did here was running 10 instances of SQLDeveloper to use 2GB on my 8GB VM.</p>
+<h3>Fragmentation</h3>
+<p>Not only we need the SGA to be allocated from physical memory, but it needs to be contiguous. Here is a screenshot I took some times later with those sqldev closed but after I had lot of activity on the VM:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_21_32_16.png" rel="lightbox[9963]"><img src="../wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_21_32_16.png" alt="VirtualBox_Windows 2012 Server_27_07_2016_21_32_16" width="1152" height="864" class="alignnone size-full wp-image-9974" /></a>
+As you see here, there is enough RAM (7GB) but not contiguous.</p>
+<p>The recommandation when using large pages on Windows is to start all instances immediately after server restart, and if you have to restart an instance you may have to reboot the server. Note that the major advantage of large pages is on virtualized environments, and then you should not have more that one instance in a server. If you are convinced that with Windows it&#8217;s always good to restart the server, here you have a reason: fragmentation breaks large pages.</p>
+<h3>Mixed-mode</h3>
+<p>Let&#8217;s go back to the state where I had 10 SQLDeveloper opened. I change ORA_LPENABLE to 2 instead of 1 to be able to start the instance even is there is not enough contiguous RAM for the SGA (here for the MEMORY_TARGET as no SGA_MAX_SIZE is defined).</p>
+<p>Now, I&#8217;m able to start the instance (but it took several minutes here as physical memory is exhausted):
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_20_56_25.png" rel="lightbox[9963]"><img src="../wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_20_56_25.png" alt="VirtualBox_Windows 2012 Server_27_07_2016_20_56_25" width="1152" height="864" class="alignnone size-full wp-image-9976" /></a>
+Instance is started, but not all 6GB have been allocated as large pages. In this case where SGA_TARGET is 3GB, I presume that all SGA uses large pages unless we increase SGA_TARGET higher than the 5GB allocated, but this is only my guess.</p>
+<h3>MEMORY_MAX_SIZE and ORA_LPENABLE=0</h3>
+<p>So, now that we know how it works, let&#8217;s see the danger to run AMM with large pages.</p>
+<p>Here is a database in AMM where MEMORY_TARGET=5GB after running some query that needs several GB of buffer cache (thanks to CACHE hint and &#8220;_serial_direct_read&#8221;=never) and several GB of PGA (thanks to manual workarea size policy). First, without large pages:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_21_56_24.png" rel="lightbox[9963]"><img src="../wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_21_56_24.png" alt="VirtualBox_Windows 2012 Server_27_07_2016_21_56_24" width="1152" height="864" class="alignnone size-full wp-image-9981" /></a></p>
+<p>The RAM allocation is all private process memory (on Windows, Oracle processes are actually threads from one process only). And AMM achieves its goal: target is MEMORY_TARGET=5GB and this is what we have allocated for the instance.</p>
+<h3>MEMORY_MAX_SIZE and ORA_LPENABLE=2</h3>
+<p>Now doing the same with large page:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_22_09_10.png" rel="lightbox[9963]"><img src="../wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_22_09_10.png" alt="VirtualBox_Windows 2012 Server_27_07_2016_22_09_10" width="1152" height="864" class="alignnone size-full wp-image-9980" /></a></p>
+<p>MEMORY_MAX_SIZE is supposed to be used for PGA+SGA and a large use of PGA should reduce SGA. But it cannot be done here because SGA is large page and PGA cannot be allocated from large pages. This means that AMM with large page do not achieve its goal. MEMORY_MAX_SIZE acts like having set SGA_MAX_SIZE to that value and very small PGA_AGGREGATE_TARGET. In this example (artificial example as I used manual workarea size policy, but same happens with auto and several sessions) physical memory is exhausted.</p>
+<p>From that, I think we have a reason to recommend ASSM (Automatic Shared Memory Management) with large pages, as with Linux. In Oracle, because of the threaded architecture, it&#8217;s not a requirement but in my opinion it&#8217;s still a good idea to differentiate those memory areas that are so different: </p>
+<ul>
+<li>SGA: one area allocated at startup, preferentially from large pages</li>
+<li>PGA: variable size areas allocated and de-allocated by sessions</li>
+</ul>
+<p>If you have more than few GB on your server, you should size SGA and PGA independently and benefit from large pages for SGA. Do not set MEMORY_MAX_SIZE then. Don&#8217;t set MEMORY_TARGET either as it acts as MEMORY_MAX_SIZE if this one is not set.</p>
+<h3>Added 18th December 2016</h3>
+<p>In the above, I explained that using AMM is not a good idea with large pages because the allocated MEMORY_TARGET was not used for PGA. It can be worse. AMM may try to release some large pages to allocate small pages for PGA. And re-get large page later. This can bring huge fragmentation and contention. This has been confirmed by Oracle developers.</p>
+<p>So the conclusion is clear: don&#8217;t use AMM with large pages even on Windows where it is allowed. Recommandation is to use large pages and set SGA_TARGET and PGA_AGGREGATE_TARGET without setting MEMORY_TARGET. </p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-99640" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/07/VirtualBox_Windows-2012-Server_27_07_2016_17_12_02.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

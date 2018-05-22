@@ -1,0 +1,175 @@
+								<h1 class="entry-title">Variations on 1M rows insert (5): using &#8216;perf&#8217;</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In previous post I explained that I&#8217;ve observed a 2x CPU usage when running my insert test case in 11.2.0.4 vs. 11.2.0.2 I discussed that with @martinberx @OracleSK @TanelPoder @xtner @Ycolin @fritshoogland @lleturgez @LucaCanaliDB on twitter and it became clear that:</p>
+<ul>
+<li>&#8216;perf&#8217; is the tool to use when investigating CPU usage.</li>
+<li>we must be use hardware event &#8216;cpu-cycles&#8217; and not &#8216;cpu-clock&#8217; and they are not available in my VirtualBox VM</li>
+</ul>
+<p>So I installed a VMware VM with OEL7 and the following two versions of Oracle: 11.2.0.3 and 11.2.0.4</p>
+<h3>Elapsed Time</h3>
+<p>On my VirtualBox VMs my <a href="http://blog.dbi-services.com/alter-table-inmemory/">test case</a> elapsed time was 77 seconds on 12.1.0.2 instead of 35 seconds on 11.2.0.2. I&#8217;ve tested it in different situations: 32-bit and 64-bit linux, 11.2.0.1, 11.2.0.2, 11.2.0.4 and it was clear that the CPU time used to execute the test case is consistently about 35 seconds in version 11.2.0.2 and before. And the double on versions 11.2.0.4 and 12c.</p>
+<p>I tried perf but it wasn&#8217;t possible to get cpu-cycles samples even when setting <a href="http://www.virtualbox.org/manual/ch09.html#sse412passthrough">SSE4 passthrough</a>. So I installed a VMware environment (and I&#8217;ve enabled &#8216;Virtualize CPU performance counters in VM sessions&#8217;) and tried the buk insert version.</p>
+<p>Here are a few runs on 11.2.0.4</p>
+<pre>Elapsed: 00:00:18.01
+Elapsed: 00:00:16.40
+Elapsed: 00:00:15.61
+Elapsed: 00:00:15.54
+</pre>
+<p>Here is the elapsed time on 11.2.0.3</p>
+<pre>Elapsed: 00:00:08.34
+Elapsed: 00:00:08.35
+Elapsed: 00:00:09.87
+Elapsed: 00:00:09.25
+</pre>
+<p>So I&#8217;ve two conclusions for the moment:</p>
+<ul>
+<li>It&#8217;s not the same time in VMWare and VirtualBox</li>
+<li>I&#8217;ve reproduced my issue where elapsed time is x2 11.2.0.4</li>
+</ul>
+<h3>cpuinfo</h3>
+<p>The performance difference probably comes from the CPU features that are enabled in the VMware VM:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[oracle@vmware home]$ grep ^flags /proc/cpuinfo
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush dts mmx fxsr sse sse2 ss syscall nx rdtscp lm constant_tsc arch_perfmon pebs bts nopl xtopology tsc_reliable nonstop_tsc aperfmperf eagerfpu pni pclmulqdq ssse3 cx16 pcid sse4_1 sse4_2 x2apic popcnt aes xsave avx f16c rdrand hypervisor lahf_lm ida arat epb xsaveopt pln pts dtherm fsgsbase smep
+</pre>
+<p>and that are not in the VBox VM:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[oracle@vbox home]$ grep ^flags /proc/cpuinfo
+flags           : fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 syscall nx rdtscp lm constant_tsc rep_good nopl pni monitor ssse3 lahf_lm
+</pre>
+<h3>perf</h3>
+<p>In order to use perf, I&#8217;ve read Stefan Koehler <a href="http://scn.sap.com/community/oracle/blog/2014/01/14/oracle-profiling-and-troubleshooting-oracle-related-cpu-performance-issues-on-linux-with-perf-perfevents">blog</a> about it.</p>
+<p>First, I get the process id for my session:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select spid from v$process 
+where addr=(select paddr from v$session where sid=sys_context('userenv','sid'));
+SPID
+------------------------
+55597
+</pre>
+<p>Then I record the sampling of cpu-cycles:</p>
+<pre>perf record -e cpu-cycles -o /tmp/perf.out -g -p 55597
+</pre>
+<p>Then I run my PL/SQL block inserting 1M rows, bulk insert, commit only at the end. And I stop the sampling with ^c.</p>
+<p>I show the report with:</p>
+<pre>perf report -i /tmp/perf.out -g none -n --stdio
+</pre>
+<h3>Perf report for run on 11.2.0.3</h3>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"># ========
+# captured on: Sat May 16 21:59:53 2015
+# hostname : localhost.localdomain
+# os release : 3.8.13-35.3.1.el7uek.x86_64
+# perf version : 3.8.13-35.3.1.el7uek.x86_64
+# arch : x86_64
+# nrcpus online : 1
+# nrcpus avail : 1
+# cpudesc : Intel(R) Core(TM) i7-3630QM CPU @ 2.40GHz
+# cpuid : GenuineIntel,6,58,9
+# total memory : 1780608 kB
+# cmdline : /usr/libexec/perf.3.8.13-35.3.1.el7uek.x86_64 record -e cpu-cycles -o /tmp/perf.out -g -p 55256
+# event : name = cpu-cycles, type = 0, config = 0x0, config1 = 0x0, config2 = 0x0, excl_usr = 0, excl_kern = 0, excl_host = 0, excl_guest = 1, precise_ip = 0, id = { 10 }
+# HEADER_CPU_TOPOLOGY info available, use -I to display
+# HEADER_NUMA_TOPOLOGY info available, use -I to display
+# pmu mappings: cpu = 4, software = 1, tracepoint = 2, breakpoint = 5
+# ========
+#
+# Samples: 28K of event 'cpu-cycles'
+# Event count (approx.): 18991352213
+#
+# Overhead      Samples  Command       Shared Object                                       Symbol
+# ........  ...........  .......  ..................  ...........................................
+#
+    13.11%         3763   oracle  oracle              [.] kdiins0
+     3.43%          958   oracle  oracle              [.] lnxadd
+     2.73%          761   oracle  oracle              [.] pfrfd1_init_locals
+     2.47%          688   oracle  oracle              [.] lnxmul
+     2.23%          635   oracle  oracle              [.] __intel_new_memcpy
+     2.18%          608   oracle  oracle              [.] pevm_ENTER
+     1.90%          529   oracle  oracle              [.] lnxsub
+     1.84%          519   oracle  oracle              [.] pmusgel_Get_Element
+     1.75%          500   oracle  oracle              [.] kdkcmp1
+     1.68%          467   oracle  oracle              [.] pfrrun_no_tool
+     1.58%          440   oracle  oracle              [.] pfrust
+     1.54%          429   oracle  oracle              [.] lnxmin
+     1.22%          349   oracle  oracle              [.] kauxsin
+     1.07%          297   oracle  oracle              [.] pfrinstr_INMDH
+     0.94%          269   oracle  [kernel.kallsyms]   [k] native_apic_mem_write
+     0.88%          244   oracle  oracle              [.] pevm_RET
+     0.87%          248   oracle  oracle              [.] pfsabrc
+     0.85%          237   oracle  oracle              [.] pfrinstr_ADDN
+     0.83%          231   oracle  oracle              [.] pfrxca
+     0.78%          217   oracle  oracle              [.] pfrinstr_INHFA1
+     0.75%          209   oracle  oracle              [.] pfrinstr_SUBN
+     0.73%          204   oracle  oracle              [.] kgiPinObject
+     0.70%          200   oracle  oracle              [.] pfrb2_convert_var2aad
+     0.69%          191   oracle  oracle              [.] pmusise_Insert_Element
+     0.67%          187   oracle  oracle              [.] pfrinstr_INFR
+     0.64%          179   oracle  libc-2.17.so        [.] __memmove_ssse3_back
+</pre>
+<h3>Perf report for run on 11.2.0.4</h3>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"># ========
+# captured on: Sat May 16 19:46:51 2015
+# hostname : localhost.localdomain
+# os release : 3.8.13-35.3.1.el7uek.x86_64
+# perf version : 3.8.13-35.3.1.el7uek.x86_64
+# arch : x86_64
+# nrcpus online : 1
+# nrcpus avail : 1
+# cpudesc : Intel(R) Core(TM) i7-3630QM CPU @ 2.40GHz
+# cpuid : GenuineIntel,6,58,9
+# total memory : 1780608 kB
+# cmdline : /usr/libexec/perf.3.8.13-35.3.1.el7uek.x86_64 record -e cpu-cycles -o /tmp/perf.out -g -p 35344
+# event : name = cpu-cycles, type = 0, config = 0x0, config1 = 0x0, config2 = 0x0, excl_usr = 0, excl_kern = 0, excl_host = 0, excl_guest = 1, precise_ip = 0, id = { 5 }
+# HEADER_CPU_TOPOLOGY info available, use -I to display
+# HEADER_NUMA_TOPOLOGY info available, use -I to display
+# pmu mappings: cpu = 4, software = 1, tracepoint = 2, breakpoint = 5
+# ========
+#
+# Samples: 25K of event 'cpu-cycles'
+# Event count (approx.): 17296175886
+#
+# Overhead      Samples  Command      Shared Object                                       Symbol
+# ........  ...........  .......  .................  ...........................................
+#
+    14.20%         3646   oracle  oracle             [.] kdiins0
+     3.61%          918   oracle  oracle             [.] lnxadd
+     3.20%          814   oracle  oracle             [.] pfrfd1_init_locals
+     2.49%          637   oracle  oracle             [.] __intel_new_memcpy
+     2.43%          618   oracle  oracle             [.] lnxmul
+     2.34%          596   oracle  oracle             [.] pevm_ENTER
+     2.05%          527   oracle  oracle             [.] kdkcmp1
+     2.01%          513   oracle  oracle             [.] pmusgel_Get_Element
+     2.00%          507   oracle  oracle             [.] lnxsub
+     1.99%          505   oracle  oracle             [.] pfrrun_no_tool
+     1.74%          443   oracle  oracle             [.] lnxmin
+     1.74%          441   oracle  oracle             [.] pfrust
+     1.72%          434   oracle  libc-2.17.so       [.] __memmove_ssse3_back
+     1.25%          321   oracle  oracle             [.] kauxsin
+     1.22%          311   oracle  oracle             [.] pfrfd_init_frame
+     1.17%          299   oracle  oracle             [.] pfrinstr_INMDH
+     1.09%          276   oracle  oracle             [.] kglpnp
+     0.96%          243   oracle  oracle             [.] pfrinstr_ADDN
+     0.94%          239   oracle  oracle             [.] pfrxca
+     0.93%          239   oracle  oracle             [.] pfsabrc
+     0.91%          230   oracle  oracle             [.] pmusise_Insert_Element
+     0.90%          228   oracle  oracle             [.] __PGOSF347_pfrinstr_INHFA1
+     0.81%          206   oracle  oracle             [.] kss_get_owner
+     0.80%          204   oracle  oracle             [.] pfrinstr_XCAL
+     0.72%          182   oracle  oracle             [.] pevm_RET
+     0.70%          177   oracle  oracle             [.] pevm_ARGEIBBI
+     0.70%          178   oracle  oracle             [.] pfrb2_convert_var2aad
+</pre>
+<p>I don&#8217;t see many differences here, so it does not seem that there is an additional code path that is run.</p>
+<p>So the question is still opened&#8230; But &#8216;perf&#8217; is really a great tool to get the detail about the database time with is not accounted in wait events. There are a lot of references about it at the end of Stefan Koehler&#8217;s <a href="http://scn.sap.com/community/oracle/blog/2014/01/14/oracle-profiling-and-troubleshooting-oracle-related-cpu-performance-issues-on-linux-with-perf-perfevents">blog</a>.</p>
+<p>Update May 17th: It was not clear when I posted that yesterday, but all tests on that VMware environment are done using the bulk version with forall but no append_values hint.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-20830"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

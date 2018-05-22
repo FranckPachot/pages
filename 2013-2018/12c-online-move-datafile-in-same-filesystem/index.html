@@ -1,0 +1,221 @@
+								<h1 class="entry-title">12c online move datafile in same filesystem.</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>On Linux, when you move a datafile, with &#8220;mv&#8221; within the filesystem it&#8217;s just a rename. There is no copy. In 12c you can move a datafile online where oracle takes care of the move at OS level. But be careful. Even if you are in the same filesystem, moving a datafile online does a copy of the file.
+<span id="more-12459"></span></p>
+<h3>Linux mv</h3>
+<p>I have a file, /u01/oradata/test1.txt and I move it to /u01/oradata/test2.txt within the same filesystem:
+<pre>
+mv /u01/oradata/test1.txt /u01/oradata/test2.txt
+</pre>
+Actually, I&#8217;m running it with strace, tracing file operations for these files:
+<pre>
+strace -e trace=file mv /u01/oradata/test1.txt /u01/oradata/test2.txt
+</pre>
+Then I can see clearly that there is no open() call but just a rename():
+<pre>
+execve("/usr/bin/mv", ["mv", "/u01/oradata/test1.txt", "/u01/oradata/test2.txt"], [/* 29 vars */]) = 0
+stat("/u01/oradata/test2.txt", 0x7ffcfa624270) = -1 ENOENT (No such file or directory)
+lstat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0644, st_size=0, ...}) = 0
+lstat("/u01/oradata/test2.txt", 0x7ffcfa623f20) = -1 ENOENT (No such file or directory)
+rename("/u01/oradata/test1.txt", "/u01/oradata/test2.txt") = 0
+</pre>
+If I do the same to another filesystem:
+<pre>
+strace -e trace=file mv /u01/oradata/test2.txt /u02/oradata/test2.txt
+</pre>
+a rename() is attempted:
+<pre>
+execve("/usr/bin/mv", ["mv", "/u01/oradata/test2.txt", "/u02/oradata/test2.txt"], [/* 29 vars */]) = 0
+stat("/u02/oradata/test2.txt", 0x7fff1e2b3340) = -1 ENOENT (No such file or directory)
+lstat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0644, st_size=0, ...}) = 0
+lstat("/u02/oradata/test2.txt", 0x7fff1e2b2ff0) = -1 ENOENT (No such file or directory)
+rename("/u01/oradata/test2.txt", "/u02/oradata/test2.txt") = -1 EXDEV (Invalid cross-device link)
+</pre>
+but because it&#8217;s another filesystem, the &#8220;mv&#8221; command will do like a &#8220;cp&#8221;, open the source in read and the target in write, creating it if not exist:
+<pre>
+unlink("/u02/oradata/test2.txt")        = -1 ENOENT (No such file or directory)
+lgetxattr("/u01/oradata/test2.txt", "security.selinux", "unconfined_u:object_r:unlabeled_t:s0", 255) = 37
+open("/u01/oradata/test2.txt", O_RDONLY|O_NOFOLLOW) = 3
+open("/u02/oradata/test2.txt", O_WRONLY|O_CREAT|O_EXCL, 0600) = 4
+newfstatat(AT_FDCWD, "/u01/oradata/test2.txt", {st_mode=S_IFREG|0644, st_size=0, ...}, AT_SYMLINK_NOFOLLOW) = 0
+unlinkat(AT_FDCWD, "/u01/oradata/test2.txt", 0) = 0
+</pre></p>
+<h3>Move datafile</h3>
+<p>Let&#8217;s do the same from the database where I&#8217;ve created the same datafile:
+<pre>
+SQL&gt; create tablespace DEMO datafile '/u01/oradata/test1.txt' size 5M;
+Tablespace created.
+</pre>
+I get my shadow process PID:
+<pre>
+SQL&gt; set define %
+SQL&gt; column spid new_value spid
+SQL&gt; select spid from v$process join v$session on paddr=addr where sid=sys_context('userenv','sid');
+
+SPID
+------------------------
+7257
+
+SQL&gt; host ps -fp %spid
+UID        PID  PPID  C STIME TTY          TIME CMD
+oracle    7257  7256 93 21:35 ?        00:00:03 oracleCDB1 (DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=beq)))
+</pre>
+and run strace on it:
+<pre>SQL&gt; host strace -o /tmp/tmp.log -e trace=file -p %spid &amp;</pre>
+I move the file online to the same filesystem:
+<pre>
+SQL&gt; alter database move datafile '/u01/oradata/test1.txt' to '/u01/oradata/test2.txt';
+Database altered.
+</pre>
+and read the trace:
+<pre>grep /test /tmp/tmp.log</pre></p>
+<p><pre>
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+statfs("/u01/oradata/test1.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014477, f_bavail=853095, f_files=786432, f_ffree=672545, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+open("/u01/oradata/test1.txt", O_RDWR|O_DSYNC) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+statfs("/u01/oradata/test1.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014477, f_bavail=853095, f_files=786432, f_ffree=672545, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+statfs("/u01/oradata/test1.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014477, f_bavail=853095, f_files=786432, f_ffree=672545, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+</pre>
+At this point the source datafile is opened in read. It continues with:
+<pre>
+open("/u01/oradata/test2.txt", O_RDONLY) = -1 ENOENT (No such file or directory)
+stat("/u01/oradata/test2.txt", 0x7ffd0201e5d8) = -1 ENOENT (No such file or directory)
+open("/u01/oradata/test2.txt", O_RDWR|O_CREAT|O_EXCL|O_SYNC, 0660) = 11
+</pre>
+and now the destination datafile in write, created if not exist (existence had been tested before). Then it starts the copy:
+<pre>
+stat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test2.txt", O_RDONLY) = 11
+stat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test2.txt", O_RDONLY) = 11
+statfs("/u01/oradata/test2.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014475, f_bavail=853093, f_files=786432, f_ffree=672544, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test2.txt", O_RDONLY) = 11
+open("/u01/oradata/test2.txt", O_RDWR)  = 11
+open("/u01/oradata/test2.txt", O_RDWR|O_DSYNC) = 11
+</pre>
+at the end, because I didn&#8217;t use the &#8216;KEEP&#8217; option, so the source file is deleted:
+<pre>
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+unlink("/u01/oradata/test1.txt")        = 0
+stat("/u01/app/oracle/diag/rdbms/cdb1/CDB1/log/test", {st_mode=S_IFDIR|0750, st_size=4096, ...}) = 0
+</pre></p>
+<h3>So what?</h3>
+<p>As any online move operation, you need two times the space during the copy. Here, the source file is still used for read and write until the move finishes, so this cannot be a rename. A rename would have to put the datafile offline even for a short time. If you can afford a small downtime, then you may prefer to use the offline rename (&#8220;mv&#8221; at OS level, ALTER DATABASE RENAME FILE at database level).</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-124600"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-5141">
+				<div id="div-comment-5141" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/cab94fa7266bb46702d171929c859395?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.pythian.com/blog/author/kutrovsky/' rel='external nofollow' class='url'>Christo Kutrovsky</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5141">
+			November 3, 2016 at 16 h 12 min</a>		</div>
+
+		<p>Nice discovery on how Oracle does things behind the scenes. I wonder why they didn&#8217;t implement it via hard links. </p>
+<p>Using hard links you can kind-a do the move online by yourself, as it allows you to have the file at both locations.</p>
+<p>One cool trick with hard links is the ability to &#8220;undelete&#8221; a file that you accidentally removed, with zero downtime:</p>
+<p><a href="https://www.pythian.com/blog/how-to-recover-deleted-oracle-datafiles-with-no-downtime/" rel="nofollow">https://www.pythian.com/blog/how-to-recover-deleted-oracle-datafiles-with-no-downtime/</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-51421"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5141' onclick='return addComment.moveForm( "div-comment-5141", "5141", "respond", "12459" )' aria-label='Reply to Christo to Christo Kutrovsky'>Reply to Christo</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2 parent" id="comment-5142">
+				<div id="div-comment-5142" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5142">
+			November 3, 2016 at 16 h 33 min</a>		</div>
+
+		<p>Hi Christo,</p>
+<p>Yes they can implement a rename online with your solution. However the goal of online datafile move is not rename but move to another filesystem. Actually, they didn&#8217;t implement it to make our life easy but just because they need it with ILM feature. ADO can automatically move cold data to lower cost storage so to do it automatically they need to do it online.
+If one day they need to rename online for the implementation of an an expensive option, then we may get it <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /></p>
+<p>Thanks for the link to you blog. Very well explained. Just take care than when &gt;= 11.2.0.2 the checkpoint will crash the instance when unable to write to a datafile, so you must have to be quick! Or set &#8220;_datafile_write_errors_
+crash_instance&#8221; to false. Details here: <a href="http://www.dbi-services.com/wp-insides/uploads/2016/01/1.-UKOUG_FranckPachot.pdf" rel="nofollow">http://www.dbi-services.com/wp-insides/uploads/2016/01/1.-UKOUG_FranckPachot.pdf</a></p>
+<p>Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-51431"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5142' onclick='return addComment.moveForm( "div-comment-5142", "5142", "respond", "12459" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment even depth-3" id="comment-5143">
+				<div id="div-comment-5143" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/cab94fa7266bb46702d171929c859395?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.pythian.com/blog/author/kutrovsky/' rel='external nofollow' class='url'>Christo Kutrovsky</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5143">
+			November 3, 2016 at 16 h 50 min</a>		</div>
+
+		<p>Ha, I haven&#8217;t tested with anything beyond 10 I think. Thanks for sharing &#8211; didn&#8217;t know this little detail. I agree with your points in your article, I am just wondering if shutdown abort is the best option here&#8230;</p>
+<p>It could try to dirty buffers elsewhere .. it could &#8220;switch&#8221; the instance into read only mode&#8230; so many better choices. Lots of room for improvement.</p>
+<p>I wonder what the error is however&#8230; because removing a file does not cause an error for a process that already has the file open. So they must be doing a &#8220;stat&#8221; or close/reopen somewhere to notice the file is removed.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-51441"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5143' onclick='return addComment.moveForm( "div-comment-5143", "5143", "respond", "12459" )' aria-label='Reply to Christo to Christo Kutrovsky'>Reply to Christo</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

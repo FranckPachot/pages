@@ -1,0 +1,212 @@
+								<h1 class="entry-title">Generic query for multicriteria search &#8211; part I: USE_CONCAT (OR Expansion)</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>You have a multicriteria search screen on the EMPLOYEE table where you can enter an employee id, a department id, a manager id or a job id. Either you put the value you want to filter on, or you leave it null when you don&#8217;t want to filter on it. How will you code that? You can build the query on the fly with dynamic SQL or use a generic query like this one:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">       SELECT *
+       FROM employees
+       WHERE (job_id = NVL(:job_id, job_id))
+       AND (department_id = NVL(:department_id, department_id))
+       AND (manager_id = NVL(:manager_id, manager_id))
+       AND (employee_id = NVL(:employee_id, employee_id))
+</pre>
+<p>This is good for the code maintainability, but having a one-fit-all query will not be optimial for each cases. Markus Winand (every database developer should read his book) describes the danger ot that in his website: <a href="http://use-the-index-luke.com/sql/where-clause/obfuscation/smart-logic">Use The Index, Luke</a>
+In this post I&#8217;ll show the problem on the Oracle example schema HR and in the next post I&#8217;ll see how 11g Adaptive Cursor Sharing can help.
+Here is the example to run on the HR schema. I declare the 4 variables in sqlplus:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt;  variable job_id varchar2(20)
+SQL&gt;  variable department_id number
+SQL&gt;  variable manager_id number
+SQL&gt;  variable employee_id number
+</pre>
+<h3>All binds null</h3>
+<p>I assign null for all of them &#8211; meaning that I don&#8217;t want to filter anything:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec :job_id:=null; :department_id:=null; :manager_id:=null; :employee_id:=null;
+PL/SQL procedure successfully completed.
+</pre>
+<p>and I run my generic query:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; 
+     SELECT
+     COUNT(*)
+     FROM
+       (SELECT 1
+       FROM employees
+       WHERE (job_id = NVL(:job_id, job_id))
+       AND (department_id = NVL(:department_id, department_id))
+       AND (manager_id = NVL(:manager_id, manager_id))
+       AND (employee_id = NVL(:employee_id, employee_id))
+       )
+SQL&gt; /
+
+  COUNT(*)
+----------
+       105
+</pre>
+<p>Let&#8217;s check the execution plan:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last +outline'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  5q737h3umyx3u, child number 0
+-------------------------------------
+SELECT  COUNT(*) FROM   (SELECT 1   FROM employees   WHERE (job_id =
+NVL(:job_id, job_id))   AND (department_id = NVL(:department_id,
+department_id))   AND (manager_id = NVL(:manager_id, manager_id))   AND
+(employee_id = NVL(:employee_id, employee_id))   )
+
+Plan hash value: 3424141370
+
+------------------------------------------------------------------------------------
+| Id  | Operation                       | Name          | Starts | E-Rows | A-Rows |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                |               |      1 |        |      1 |
+|   1 |  SORT AGGREGATE                 |               |      1 |      1 |      1 |
+|   2 |   CONCATENATION                 |               |      1 |        |    105 |
+|*  3 |    FILTER                       |               |      1 |        |    105 |
+|*  4 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      1 |    105 |    105 |
+|*  5 |      INDEX FULL SCAN            | EMP_EMP_ID_PK |      1 |    107 |    107 |
+|*  6 |    FILTER                       |               |      1 |        |      0 |
+|*  7 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      0 |      1 |      0 |
+|*  8 |      INDEX UNIQUE SCAN          | EMP_EMP_ID_PK |      0 |      1 |      0 |
+------------------------------------------------------------------------------------
+</pre>
+<p>The CBO has used OR Expansion on the 4th predicate on employee_id. The execution has used the branch for all rows (the INDEX FULL SCAN) and the branch optimized to get only one employee (INDEX UNIQUE SCAN) has not been executed (Starts=0).</p>
+<p>Do you wonder why the optimizer has chosen a full scan on the index instead of the table? Because the predicate implicitely select only rows where EMPLOYEE_ID is not null, and I&#8217;ve probably not enough statistics and/or constraint to let the optimizer know that all rows have an EMPLOYEE_ID. But that&#8217;s not the point here. I&#8217;m just using the HR schema as it is provided when creating the database with the example schemas.</p>
+<p>Here are the predicates where we see that the FILTER operations &#8211; line 3 and 6 &#8211; are on the predicate about :EMPLOYEE_ID being null or not:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(:EMPLOYEE_ID IS NULL)
+   4 - filter(("DEPARTMENT_ID"=NVL(:DEPARTMENT_ID,"DEPARTMENT_ID") AND
+              "MANAGER_ID"=NVL(:MANAGER_ID,"MANAGER_ID") AND "JOB_ID"=NVL(:JOB_ID,"JOB_ID")))
+   5 - filter("EMPLOYEE_ID" IS NOT NULL)
+   6 - filter(:EMPLOYEE_ID IS NOT NULL)
+   7 - filter(("DEPARTMENT_ID"=NVL(:DEPARTMENT_ID,"DEPARTMENT_ID") AND
+              "MANAGER_ID"=NVL(:MANAGER_ID,"MANAGER_ID") AND "JOB_ID"=NVL(:JOB_ID,"JOB_ID")))
+   8 - access("EMPLOYEE_ID"=:EMPLOYEE_ID)
+</pre>
+<p>There is another way to see that the plan has done OR expansion on the 4th predicate:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">Outline Data
+-------------
+
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$F5BB74E1")
+      MERGE(@"SEL$2")
+      OUTLINE_LEAF(@"SEL$F5BB74E1_1")
+      USE_CONCAT(@"SEL$F5BB74E1" 8 OR_PREDICATES(4))
+      OUTLINE_LEAF(@"SEL$F5BB74E1_2")
+      OUTLINE(@"SEL$1")
+      OUTLINE(@"SEL$2")
+      OUTLINE(@"SEL$F5BB74E1")
+      MERGE(@"SEL$2")
+      INDEX(@"SEL$F5BB74E1_1" "EMPLOYEES"@"SEL$2" ("EMPLOYEES"."EMPLOYEE_ID"))
+      BATCH_TABLE_ACCESS_BY_ROWID(@"SEL$F5BB74E1_1" "EMPLOYEES"@"SEL$2")
+      INDEX_RS_ASC(@"SEL$F5BB74E1_2" "EMPLOYEES"@"SEL$F5BB74E1_2" ("EMPLOYEES"."EMPLOYEE_ID"))
+      END_OUTLINE_DATA
+  */
+</pre>
+<p>This is the OR Expansion optimizer transformation. It rewrites the statement as if we did a UNION ALL where each branch is optimized for one case. The plan shows CONCATENATION instead of the UNION ALL but it&#8217;s the same. The filter predicate makes only one branche active and you see it in the execution statistics &#8216;Starts&#8217; column.</p>
+<h3>query for one EMPLOYEE_ID</h3>
+<p>Now I bind a value to EMPLOYEE_ID:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec :job_id:=null; :department_id:=null; :manager_id:=null; :employee_id:=0;
+PL/SQL procedure successfully completed.
+</pre>
+<p>and execute the same query as above:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; /
+
+  COUNT(*)
+----------
+         0
+</pre>
+<p>We have the same plan as we reuse the same cursor (child number 0):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  5q737h3umyx3u, child number 0
+-------------------------------------
+SELECT  COUNT(*) FROM   (SELECT 1   FROM employees   WHERE (job_id =
+NVL(:job_id, job_id))   AND (department_id = NVL(:department_id,
+department_id))   AND (manager_id = NVL(:manager_id, manager_id))   AND
+(employee_id = NVL(:employee_id, employee_id))   )
+
+Plan hash value: 3424141370
+
+------------------------------------------------------------------------------------
+| Id  | Operation                       | Name          | Starts | E-Rows | A-Rows |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                |               |      1 |        |      1 |
+|   1 |  SORT AGGREGATE                 |               |      1 |      1 |      1 |
+|   2 |   CONCATENATION                 |               |      1 |        |      0 |
+|*  3 |    FILTER                       |               |      1 |        |      0 |
+|*  4 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      0 |    105 |      0 |
+|*  5 |      INDEX FULL SCAN            | EMP_EMP_ID_PK |      0 |    107 |      0 |
+|*  6 |    FILTER                       |               |      1 |        |      0 |
+|*  7 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      1 |      1 |      0 |
+|*  8 |      INDEX UNIQUE SCAN          | EMP_EMP_ID_PK |      1 |      1 |      0 |
+------------------------------------------------------------------------------------
+</pre>
+<p>And now the branch optimized for one EMPLOYEE_ID is used (Starts=1), thanks to OR Expansion. This is good. The OR Expansion transformation makes it optimal when only one column is involved in the predicate.</p>
+<h3>Query for all employees but specific values on other columns</h3>
+<p>Here are my variable bindings:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec :job_id:='AC_MGR'; :department_id:=100; :manager_id:=0; :employee_id:=null;
+PL/SQL procedure successfully completed.
+</pre>
+<p>I have predicates on all other columns (where I have indexes).</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; /
+
+  COUNT(*)
+----------
+         0
+</pre>
+<p>But the same cursor is still shared:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  5q737h3umyx3u, child number 0
+-------------------------------------
+SELECT  COUNT(*) FROM   (SELECT 1   FROM employees   WHERE (job_id =
+NVL(:job_id, job_id))   AND (department_id = NVL(:department_id,
+department_id))   AND (manager_id = NVL(:manager_id, manager_id))   AND
+(employee_id = NVL(:employee_id, employee_id))   )
+
+Plan hash value: 3424141370
+
+------------------------------------------------------------------------------------
+| Id  | Operation                       | Name          | Starts | E-Rows | A-Rows |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                |               |      1 |        |      1 |
+|   1 |  SORT AGGREGATE                 |               |      1 |      1 |      1 |
+|   2 |   CONCATENATION                 |               |      1 |        |      0 |
+|*  3 |    FILTER                       |               |      1 |        |      0 |
+|*  4 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      1 |    105 |      0 |
+|*  5 |      INDEX FULL SCAN            | EMP_EMP_ID_PK |      1 |    107 |    107 |
+|*  6 |    FILTER                       |               |      1 |        |      0 |
+|*  7 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      0 |      1 |      0 |
+|*  8 |      INDEX UNIQUE SCAN          | EMP_EMP_ID_PK |      0 |      1 |      0 |
+------------------------------------------------------------------------------------
+</pre>
+<p>and this is not optimal because there is no branch for those predicates. The FULL SCAN branch has been used and rows have been filtered only after the table access.</p>
+<h3>Bind Sensitive</h3>
+<p>The statement is marked as bind sensitive (I have histograms on those columns) the the cursor never becomes bind aware. Here it s after hundreds of executions with different combination of values and nulls:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select child_number,executions,is_bind_sensitive,is_bind_aware from v$sql where sql_id='5q737h3umyx3u';
+
+CHILD_NUMBER EXECUTIONS IS_BIND_SENSITIVE IS_BIND_AWARE
+------------ ---------- ----------------- -------------
+           0        603 Y                 N       
+</pre>
+<h3>Bind Aware</h3>
+<p>So now, I want to try if I can solve the issue by adding the BIND_AWARE hint in the statement, in order to have different execution plans when providing different combination of values or nulls. But this is for the next blog post&#8230;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5910"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

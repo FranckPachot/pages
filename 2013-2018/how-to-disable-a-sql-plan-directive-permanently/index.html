@@ -1,0 +1,208 @@
+								<h1 class="entry-title">How to disable a SQL Plan Directive permanently</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In 12c you will see a lot of SQL Plan Directives. Some are useful to get better execution plans, but some will trigger too much Adaptive Dynamic Sampling and that can become a big overhead, especially in Standard Edition. Then you don&#8217;t want to drop them &#8211; or they will reappear. You can disable them, but what will happen after the retention weeks? Let&#8217;s test it.</p>
+<h3>Disabled directive</h3>
+<p>A directive has been created which triggers too expensive dynamic sampling. You don&#8217;t want that and you have disabled it one year ago with:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; dbms_spd.alter_sql_plan_directive(14130932452940503769,'ENABLED','NO');
+</pre>
+<p>and everything is good. You&#8217;re happy with that. Here is the directive:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select directive_id,state,last_used,auto_drop,enabled,extract(notes,'/spd_note/spd_text/text()') spd_text,extract(notes,'/spd_note/internal_state/text()') internal_state from dba_sql_plan_directives where directive_id in(select directive_id from dba_sql_plan_dir_objects where owner='DEMO' );
+
+        DIRECTIVE_ID STATE      LAST_USED AUTO_DROP ENABLED SPD_TEXT                         INTERNAL_S
+-------------------- ---------- --------- --------- ------- -------------------------------- ----------
+14130932452940503769 SUPERSEDED 28-APR-14 YES       NO      {E(DEMO.DEMO_TABLE)[A, B, C, D]} HAS_STATS
+</pre>
+<p>The directive has not been used since April 2014 thanks to the &#8216;enabled&#8217; set to NO.</p>
+<p>If I run a query with a filter on those columns:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select count(*) Q1 from DEMO_TABLE where a+b=c+d;
+
+                  Q1
+--------------------
+               10000
+
+23:10:32 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'basic +note'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+EXPLAINED SQL STATEMENT:
+------------------------
+select count(*) Q1 from DEMO_TABLE where a+b=c+d
+
+Plan hash value: 1839825454
+
+-----------------------------------------
+| Id  | Operation          | Name       |
+-----------------------------------------
+|   0 | SELECT STATEMENT   |            |
+|   1 |  SORT AGGREGATE    |            |
+|   2 |   TABLE ACCESS FULL| DEMO_TABLE |
+-----------------------------------------
+
+</pre>
+<p>there is no dynamic sampling that this is exactly what I want.</p>
+<h3>Retention weeks</h3>
+<p>My retention is the default: 53 weeks. Let&#8217;s see what happens after 53 weeks. I can call the &#8216;auto drop&#8217; job with dbms_spd.drop_sql_plan_directive passing a null instead of a directive_id:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_spd.drop_sql_plan_directive(null);
+
+PL/SQL procedure successfully completed.
+</pre>
+<h3>Run a few queries</h3>
+<p>Then let&#8217;s have a few queries on those table columns:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select count(*) Q2 from DEMO_TABLE where a+b=c+d;
+
+                  Q2
+--------------------
+               10000
+
+SQL&gt; select count(*) Q3 from DEMO_TABLE where a+b=c+d;
+
+                  Q3
+--------------------
+               10000
+
+</pre>
+<p>and check the execution plan:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'basic +note'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------
+EXPLAINED SQL STATEMENT:
+------------------------
+select count(*) Q3 from DEMO_TABLE where a+b=c+d
+
+Plan hash value: 1839825454
+
+-----------------------------------------
+| Id  | Operation          | Name       |
+-----------------------------------------
+|   0 | SELECT STATEMENT   |            |
+|   1 |  SORT AGGREGATE    |            |
+|   2 |   TABLE ACCESS FULL| DEMO_TABLE |
+-----------------------------------------
+
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=2)
+   - 1 Sql Plan Directive used for this statement
+
+</pre>
+<p>A directive has been used:</p>
+<pre class="brush: sql; gutter: true; first-line: 1"> SQL&gt; select directive_id,state,last_used,auto_drop,enabled,extract(notes,'/spd_note/spd_text/text()') spd_text,extract(notes,'/spd_note/internal_state/text()') internal_state from dba_sql_plan_directives where directive_id in(select directive_id from dba_sql_plan_dir_objects where owner='DEMO' );
+
+        DIRECTIVE_ID STATE      LAST_USED AUTO_DROP ENABLED SPD_TEXT                         INTERNAL_S
+-------------------- ---------- --------- --------- ------- -------------------------------- ----------
+14130932452940503769 SUPERSEDED 15-MAY-15 YES       YES     {E(DEMO.DEMO_TABLE)[A, B, C, D]} HAS_STATS
+</pre>
+<p>Oh! The directive is back and enabled !</p>
+<h3>Auto Drop</h3>
+<p>Here are the criteria for auto-drop. SPD are considered to be dropped when AUTO_DROP is YES and either:</p>
+<ul>
+<li>SPD is flagged as redundant</li>
+<li>One of the tables has been dropped (in recycle_bin means dropped)</li>
+<li>LAST_USAGE is from before the retention window</li>
+<li>State is NEW (LAST_USED is null) and CREATED is before retention window</li>
+</ul>
+<p>Do you see? Nothing about the ENABLE YES/NO there&#8230;</p>
+<h3>Conclusion</h3>
+<p>If you want to disable a SPD and be sure that it will never reappear then you have to do both of following:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_spd.alter_sql_plan_directive(14130932452940503769,'ENABLED','NO');
+SQL&gt; exec dbms_spd.alter_sql_plan_directive(14130932452940503769,'AUTO_DROP','NO');
+</pre>
+<p>then because the AUTO DROP is disabled, the directive will never be deleted automatically.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-23360"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1466">
+				<div id="div-comment-1466" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e634d55129526d1676fc4fcf1da0a653?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Advait Deo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1466">
+			June 3, 2015 at 11 h 53 min</a>		</div>
+
+		<p>Thanks for the article. But in your case SPD LAST_USAGE was before retention window. Then why didn&#8217;t it dropped that SPD ? Is it a bug ?</p>
+<p>Regards,</p>
+<p>Advait Deo
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14671"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1466' onclick='return addComment.moveForm( "div-comment-1466", "1466", "respond", "2335" )' aria-label='Reply to Advait to Advait Deo'>Reply to Advait</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1467">
+				<div id="div-comment-1467" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1467">
+			June 3, 2015 at 17 h 33 min</a>		</div>
+
+		<p>Hi Advait,
+The directive last usage was 28-APR-14 when I&#8217;ve disabled it. Then you wonder why I had to call the dbms_spd.drop_sql_plan_directive myself. Well I don&#8217;t know what is the frequency of that automatic purge job. We can probably trace SQL_Plan_Directive component and look for qosdCleanupSlave occurence. Because retention is in week, there is no need to run it frequently.
+However, this is only guesses. If you want all the story I didn&#8217;t wait 53 weeks to write my blog post, so I&#8217;ve updated sys.opt_directive$ after having disabled it in order to simulate the situation&#8230; But in my optinion, this is exactly what would have happened after 53 weeks.
+Thanks for your question. I like when people check details and this is why I publish things as blog posts ;
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14681"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1467' onclick='return addComment.moveForm( "div-comment-1467", "1467", "respond", "2335" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="pingback even thread-even depth-1" id="comment-2852">
+				<div id="div-comment-2852" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://orabase.org/index.php/2016/02/20/some-parameter-recommendations-for-oracle-12c-upgrade-your-database-now/' rel='external nofollow' class='url'>Some Parameter Recommendations for Oracle 12c (Upgrade your Database &#8212; NOW!) &#8212; orabase.org</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2852">
+			February 20, 2016 at 15 h 09 min</a>		</div>
+
+		<p>[&#8230;] Franck Pachot: http://blog.dbi-services.com/how-to-disable-a-sql-plan-directive-permanently/ [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-28531"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2852' onclick='return addComment.moveForm( "div-comment-2852", "2852", "respond", "2335" )' aria-label='Reply to Some to Some Parameter Recommendations for Oracle 12c (Upgrade your Database &#8212; NOW!) &#8212; orabase.org'>Reply to Some</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

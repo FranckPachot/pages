@@ -1,0 +1,192 @@
+								<h1 class="entry-title">Multitenant thin provisioning: PDB snapshots on ACFS</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Database on ACFS is a long story. At first, the main reason for ASM was to bypass a filesystem layer that is not required by the database. ACFS was for the non-database files that had to be accessed by all cluster nodes. But then, storage vendors and other providers came with snapshots, compression and thin provisioning and Oracle had to answer: they implemented those storage features in ACFS and allowed database files on it.
+<span id="more-10588"></span>
+When you create a database on an ODA X5, datafiles are created on an ACFS mount. There is only one ACFS mount for many databases. You probably want to snapshot at database level, but ACFS snapshots are only at filesystem level. To avoid that any write on the filesystem is copied when you need the snapshot for a single database, they implemented this way: At installation, the ACFS mount is created and a snapshot is taken when empty. Then each database created will create a snapshot. This means that in each snapshot you access only to one database. There is no overhead and no additional copies because the master is empty.
+Then came multitenant where you can snapshot at PDB level for thin cloning (create PDB from &#8230; snapshot copy). But multitenant cannot be created on a snapshot. CDB must be at root level on ACFS. In ODA X6, an ACFS filesystem is created for each database. But then, when you thin clone a PDB, a snapshot is taken for the whole database. But this one is not empty: any write will have additional copy and overhead.</p>
+<p>There&#8217;s more info about ACFS, copy-on-write which is not copy-on-write but redirect-on-write, and performance overhead in the excellent <a href="http://www.ludovicocaldara.net/dba/oracle-database-on-acfs-a-perfect-marriage/" target="_blank">presentation and demo</a> from Ludovico Caldara. Here I&#8217;ll show the snapshot overhead in multitenant when writing to the master, the clone, and the others.</p>
+<h3>PDB snapshots on ACFS</h3>
+<p>I start with a brand new CDB on ACFS with no snapshots:</p>
+<p><pre>[oracle@rac1 ~]$ df -h
+Filesystem         Size  Used Avail Use% Mounted on
+/dev/xvdb3          16G  5.0G  9.9G  34% /
+tmpfs              7.3G  631M  6.7G   9% /dev/shm
+/dev/xvdb1         477M  118M  330M  27% /boot
+/dev/xvdc1          69G   22G   44G  34% /u01
+/dev/asm/data-52    25G  6.6G   19G  27% /u02
+/dev/asm/fra-401    18G  3.4G   15G  19% /u03
+/dev/asm/redo-358   19G  8.2G   11G  44% /u04</pre></p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap info /u02
+    number of snapshots:  0
+    snapshot space usage: 0  ( 0.00 )</pre></p>
+<p>This is what is created by the Oracle Public Cloud for a RAC DBaaS.</p>
+<p>I have a PDB1 pluggable database.</p>
+<p>I create another one, PDBx, which will be totally independent.</p>
+<p><pre>SQL&gt; create pluggable database PDBx admin user admin identified by "Ach1z0#d";
+Pluggable database created.
+SQL&gt; alter pluggable database PDBx open;
+Pluggable Database opened</pre></p>
+<p>I create a thin clone pluggable database database PDB2,using PDB1 as the master:</p>
+<p><pre>SQL&gt; create pluggable database PDB2 from PDB1 snapshot copy;
+Pluggable database created.
+SQL&gt; alter pluggable database PDB2 open;
+Pluggable Database opened</pre></p>
+<p>Here are my pluggable databases:</p>
+<p><pre>SQL&gt; select pdb_name,GUID from dba_pdbs;
+
+PDB_NAME GUID
+-------- --------------------------------
+PDB$SEED 3360B2A306C60098E053276DD60A9928
+PDB1     3BDAA124651F103DE0531ADBC40A5DD3
+PDBX     3BDCCBE4C1B64A5AE0531ADBC40ADBB7
+PDB2     3BDCCBE4C1B74A5AE0531ADBC40ADBB7</pre></p>
+<p>The PDB2 being a snapshot clone, it has created a snapshot on the /u02 which is the ACFS filesystem where datafiles are:</p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap info /u02
+snapshot name:               3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+snapshot location:           /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+RO snapshot or RW snapshot:  RW
+parent name:                 /u02
+snapshot creation time:      Tue Sep  6 19:28:35 2016
+
+    number of snapshots:  1
+    snapshot space usage: 3588096  (   3.42 MB )</pre></p>
+<p>Space usage is minimal here as no write happened yet.</p>
+<h3>datafiles</h3>
+<p>Here are the datafiles of my CDB to see if PDB2 are on the snapshot:</p>
+<p><pre>RMAN&gt; report schema;
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------
+1    780      SYSTEM               YES     /u02/app/oracle/oradata/ORCL/datafile/o1_mf_system_cwxwcgz4_.dbf
+2    260      PDB$SEED:SYSTEM      NO      /u02/app/oracle/oradata/ORCL/3360B2A306C60098E053276DD60A9928/datafile/o1_mf_system_cwxwbzrd_.dbf
+3    1030     SYSAUX               NO      /u02/app/oracle/oradata/ORCL/datafile/o1_mf_sysaux_cwxw98jl_.dbf
+4    760      PDB$SEED:SYSAUX      NO      /u02/app/oracle/oradata/ORCL/3360B2A306C60098E053276DD60A9928/datafile/o1_mf_sysaux_cwxwdof3_.dbf
+7    545      UNDOTBS1             YES     /u02/app/oracle/oradata/ORCL/datafile/o1_mf_undotbs1_cwxwdl6s_.dbf
+8    200      UNDOTBS2             YES     /u02/app/oracle/oradata/ORCL/datafile/o1_mf_undotbs2_cwxwrw7y_.dbf
+9    370      PDB1:SYSTEM          NO      /u02/app/oracle/oradata/ORCL/3BDAA124651F103DE0531ADBC40A5DD3/datafile/o1_mf_system_cwxx3fb0_.dbf
+10   800      PDB1:SYSAUX          NO      /u02/app/oracle/oradata/ORCL/3BDAA124651F103DE0531ADBC40A5DD3/datafile/o1_mf_sysaux_cwxx3fbl_.dbf
+11   5        USERS                NO      /u02/app/oracle/oradata/ORCL/datafile/o1_mf_users_cwxxop2q_.dbf
+12   5        PDB1:USERS           NO      /u02/app/oracle/oradata/ORCL/3BDAA124651F103DE0531ADBC40A5DD3/datafile/o1_mf_users_cwxxopm9_.dbf
+49   370      PDBX:SYSTEM          NO      /u02/app/oracle/oradata/ORCL/3BDCCBE4C1B64A5AE0531ADBC40ADBB7/datafile/o1_mf_system_cwy6688l_.dbf
+50   800      PDBX:SYSAUX          NO      /u02/app/oracle/oradata/ORCL/3BDCCBE4C1B64A5AE0531ADBC40ADBB7/datafile/o1_mf_sysaux_cwy6688r_.dbf
+51   5        PDBX:USERS           NO      /u02/app/oracle/oradata/ORCL/3BDCCBE4C1B64A5AE0531ADBC40ADBB7/datafile/o1_mf_users_cwy6688z_.dbf
+52   370      PDB2:SYSTEM          NO      /u02/app/oracle/oradata/ORCL/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/datafile/o1_mf_system_cwy6725s_.dbf
+53   800      PDB2:SYSAUX          NO      /u02/app/oracle/oradata/ORCL/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/datafile/o1_mf_sysaux_cwy67261_.dbf
+54   5        PDB2:USERS           NO      /u02/app/oracle/oradata/ORCL/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/datafile/o1_mf_users_cwy67268_.dbf</pre></p>
+<p>The PDB2 datafiles are actually symbolic links to the snapshot:</p>
+<p><pre>
+[oracle@rac1 ~]$ ls -l /u02/app/oracle/oradata/ORCL/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/datafile
+/u02/app/oracle/oradata/ORCL/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/datafile:
+total 62484
+lrwxrwxrwx 1 oracle oinstall      142 Sep  6 19:28 o1_mf_sysaux_cwy67261_.dbf -&gt; /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/app/oracle/oradata/ORCL/3BDAA124651F103DE0531ADBC40A5DD3/datafile/o1_mf_sysaux_cwxx3fbl_.dbf
+lrwxrwxrwx 1 oracle oinstall      142 Sep  6 19:28 o1_mf_system_cwy6725s_.dbf -&gt; /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/app/oracle/oradata/ORCL/3BDAA124651F103DE0531ADBC40A5DD3/datafile/o1_mf_system_cwxx3fb0_.dbf
+-rw-r----- 1 oracle oinstall 63971328 Sep  6 19:28 o1_mf_temp_cwy67267_.dbf
+lrwxrwxrwx 1 oracle oinstall      141 Sep  6 19:28 o1_mf_users_cwy67268_.dbf -&gt; /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7/app/oracle/oradata/ORCL/3BDAA124651F103DE0531ADBC40A5DD3/datafile/o1_mf_users_cwxxopm9_.dbf</pre></p>
+<p>So, you have a snapshot on the/u02 which contains all the CDB datafiles but only the PDB2 datafiles will be read/written on the snapshot (though the symbolic links). The other CDB files are included in the snapshot, but without any reason. Nothing will read or write them. They are there only because ACFS cannot snapshot a folder or a set of file. It&#8217;s only a filesystem level. </p>
+<h3>write on master</h3>
+<p>For the moment, the snapshot is small: the blocks are shared.</p>
+<p>If I write 100MB on the master (PDB1), those blocks will be copied in order to persist the old image for the snapshot:</p>
+<p><pre>SQL&gt; alter session set container=PDB1
+Session altered.
+SQL&gt; truncate table DEMO;
+Table truncated.
+SQL&gt; insert /*+ append */into DEMO select lpad('b',900,'b') x from xmltable('1 to 100000');
+100000 rows created.
+</pre></p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap info /u02
+snapshot name:               3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+snapshot location:           /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+RO snapshot or RW snapshot:  RW
+parent name:                 /u02
+snapshot creation time:      Tue Sep  6 19:28:35 2016
+
+    number of snapshots:  1
+    snapshot space usage: 105025536  ( 100.16 MB )</pre></p>
+<p>Snapshot size increased by the volume that has been written, which is expected: old image is required by PDB2.</p>
+<h3>write on thin clone</h3>
+<p>If I write to the clone, copy has to happen as well:</p>
+<p><pre>SQL&gt; alter session set container=PDB2
+Session altered.
+SQL&gt; truncate table DEMO;
+Table truncated.
+SQL&gt; insert /*+ append */into DEMO select lpad('b',900,'b') x from xmltable('1 to 100000');
+100000 rows created.</pre></p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap info /u02
+snapshot name:               3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+snapshot location:           /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+RO snapshot or RW snapshot:  RW
+parent name:                 /u02
+snapshot creation time:      Tue Sep  6 19:28:35 2016
+
+    number of snapshots:  1
+    snapshot space usage: 211275776  ( 201.48 MB )</pre></p>
+<p>So, because I&#8217;ve written 200MB to blocks involved in the snapshots, the snapshot size is now 200MB.</p>
+<p>However, look at the way I did it with truncate and insert. I&#8217;m writing on the same blocks as I did when writing on PDB1. To be sure I checked it from DBA_EXTENTS and had the same result in both pdbs:
+<pre>SQL&gt; select file_id,listagg(block_id,',')within group(order by block_id),blocks from dba_extents where segment_name='DEMO' and segment_type='TABLE' group by file_id,blocks;
+
+   FILE_ID LISTAGG(BLOCK_ID,',')WITHINGROUP(ORDERBYBLOCK_ID)                                                                                                          BLOCKS
+---------- ------------------------------------------------------------------------------------------------------------------------------------------------------ ----------
+        64 33024,33032,33040,33048,33056,33064,33072,33080,33088,33096,33104,33112,33120,33128,33136,33144                                                                 8
+        64 33152,33280,33408,33536,33664,33792,33920,34048,34176,34304,34432,34560,34688,34816,34944,35072,35200,35328,35456,35584,35712,35840,35968,36096,36224,        128
+           36352,36480,36608,36736,36864,36992,37120,37248,37376,37504,37632,37760,37888,38016,38144,38272,38400,38528,38656,38784,38912,39040,39168,39296,39424,
+           39552,39680,39808,39936,40064,40192,40320,40448,40576,40704,40832,40960,41088                                                                                1024
+        64 41216,42240,43264,44288,45312 </pre></p>
+<p>So why do I have additional 100MB on my snapshots? Writing to the original blocks would be sufficient as they have been redirected to new ones by the write from PDB1? But because the ACFS snapshot, the previous image is kept. In addition to the current state of PDB1 and PDB2, the snapshot also keeps the blocks from PDB1 as they were at the time of the PDB2 clone. Who needs it?</p>
+<p>Ok. This is not a big issue if we consider that you usually don&#8217;t write on the master, because it&#8217;s the master.</p>
+<h3>write on other PDB</h3>
+<p>Remember that multitenant is for consolidation. You don&#8217;t use a CDB only for the master and its clones. You may want to host other PDBs. If we had a snapshot for PDB1 and PDB2, writes to other files should not be concerned: no write overhead and no additional storage. However, because the snapshot was made on the whole filesystem, any write to it will copy the blocks, even those that are not concerned by the thin cloned PDB. Here I&#8217;m writing 100MB to PDBx which has nothing in common with PDB1 nor PDB2:</p>
+<p><pre>SQL&gt; alter session set container=PDBx
+Session altered.
+SQL&gt; truncate table DEMO;
+Table truncated.
+SQL&gt; insert /*+ append */into DEMO select lpad('b',900,'b') x from xmltable('1 to 100000');
+100000 rows created.</pre></p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap info /u02
+snapshot name:               3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+snapshot location:           /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+RO snapshot or RW snapshot:  RW
+parent name:                 /u02
+snapshot creation time:      Tue Sep  6 19:28:35 2016
+
+    number of snapshots:  1
+    snapshot space usage: 311214080  ( 296.79 MB )</pre></p>
+<p>This is an additional 100MB. Before image of PDBx has been saved, for no reason because we will never read this previous image.</p>
+<h3>snapshot keeps growing</h3>
+<p>after a few minutes without any user activity, snapshot has grown further:</p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap info /u02
+snapshot name:               3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+snapshot location:           /u02/.ACFS/snaps/3BDCCBE4C1B74A5AE0531ADBC40ADBB7
+RO snapshot or RW snapshot:  RW
+parent name:                 /u02
+snapshot creation time:      Tue Sep  6 19:28:35 2016
+
+    number of snapshots:  1
+    snapshot space usage: 332947456  ( 317.52 MB )</pre></p>
+<p>On the /u02 filesystem, there is all the CDB files, SYSTEM, UNDO, controlfile, etc. They have activity and they are copied when written, once again for no reason.</p>
+<h3>drop thin clone</h3>
+<p>Only when I drop the PDB2 this space is released:</p>
+<p><pre>SQL&gt; alter pluggable database pdb2 close;
+Pluggable database altered.
+SQL&gt; drop pluggable database pdb2 including datafiles;
+Pluggable database dropped.</pre></p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap info /u02
+    number of snapshots:  0
+    snapshot space usage: 0  ( 0.00 )</pre></p>
+<h3>So what?</h3>
+<p>There&#8217;s no bug here. It works as designed because ACFS snapshot is at filesystem level. If you want to use multitenant thin provisioning, the recommendation is to dedicate a CDB for the master and its clones. Any other PDB will have their writes copied to the snapshot for no reason. Writes to common files: UNDO (in 12.1), SYSTEM, SYSAUX will also be concerned. The duration of the clones should be short life, refreshed frequently. And of course, thin cloning is not for production. Very few snapshot/compression/clone technologies can be used in production. Look at storage vendors solutions for that (<a href="http://www.emc.com/collateral/white-papers/h14485-xtremio-snapshot-refresh-oracle-databases.pdf" target="_blank">XtremIO</a> for example).</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-105890"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

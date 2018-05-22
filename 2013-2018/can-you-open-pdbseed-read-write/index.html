@@ -1,0 +1,214 @@
+								<h1 class="entry-title">Can you open PDB$SEED read write?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>If you are in multitenant, you probably already felt the desire to open the PDB$SEED in READ WRITE mode.</p>
+<ul>
+<li>Can you open PDB$SEED read write yourseld? Yes and No.</li>
+<li>Should you open PDB$SEED read write yourself? Yes and No.</li>
+<li>How to run upgrade scripts that need to write to PDB$SEED? catcon.pl</li>
+</ul>
+<p><span id="more-16310"></span>
+In 12.1 you have no reason to open the seed read write yourself. In 12.2 there is one reason when you are in LOCAL UNDO mode, because you may want to customize the UNDO tablespace. </p>
+<h3>12<em>c</em> in local undo</h3>
+<p>I am in 12.1 or in 12.2 in shared undo mode:
+<pre>SYS@CDB$ROOT SQL&gt; select * from database_properties where property_name like '%UNDO%';
+
+no rows selected
+</pre>
+When the CDB is opened, the PDB$SEED is opened in read only mode.
+<pre>SYS@CDB$ROOT SQL&gt; show pdbs
+&amp;nsbp;
+CON_ID  CON_NAME  OPEN MODE   RESTRICTED
+------  --------  ---- ----   ----------
+2       PDB$SEED  READ ONLY   NO
+3       PDB01     READ WRITE  NO</pre>
+I try to open the PDB$SEED in read write mode (FORCE is a shortcut to avoid to close it before)
+<pre>SYS@CDB$ROOT SQL&gt; alter pluggable database pdb$seed open force;
+&amp;nsbp;
+Error starting at line : 1 in command -
+alter pluggable database pdb$seed open force
+Error report -
+ORA-65017: seed pluggable database may not be dropped or altered
+65017. 00000 -  "seed pluggable database may not be dropped or altered"
+*Cause:    User attempted to drop or alter the Seed pluggable database which is not allowed.
+*Action:   Specify a legal pluggable database name.
+SYS@CDB$ROOT SQL&gt;
+</pre></p>
+<p>Obviously, this is impossible and clearly documented. PDB$SEED is not a legal pluggable database for this operation.</p>
+<h3>Oracle Script</h3>
+<p>There is an exception to that: internal Oracle scripts need to run statements in the PDB$SEED. They run with &#8220;_oracle_script&#8221;=true where this operation is possible:</p>
+<p><pre>SYS@CDB$ROOT SQL&gt; alter session set "_oracle_script"=true;
+Session altered.
+
+SYS@CDB$ROOT SQL&gt; alter pluggable database pdb$seed open read write force;
+Pluggable database PDB$SEED altered.
+</pre></p>
+<h3>catcon.pl</h3>
+<p>Of course, when upgrading, there are phases where you need the seed opened read-write. But you don&#8217;t to that yourself. The scripts to run in each container are called through catcon.pl which, by default, opens the seed read-write and ensures that the initial open mode is restored at the end even in case of error.
+<pre>
+   -m mode in which PDB$SEED should be opened; one of the following values
+        may be specified:
+        - UNCHANGED - leave PDB$SEED in whatever mode it is already open
+        - READ WRITE (default)
+        - READ ONLY
+        - UPGRADE
+        - DOWNGRADE
+</pre></p>
+<p>I have the following &#8220;/tmp/show_open_mode.sql&#8221; script
+<pre>
+column name format a10
+select name,open_mode,current_timestamp-open_time from v$containers;
+</pre>
+I call it with catcon to run in PDB$SEED:
+<pre>
+$ORACLE_HOME/perl/bin/perl $ORACLE_HOME/rdbms/admin/catcon.pl -c 'PDB$SEED' -n 1 -d /tmp -l /tmp -b tmp -show_open_mode.sql
+</pre>
+Here is the output in /tmp/tmp0.log
+<pre>
+CATCON_STATEMENT
+--------------------------------------
+catconExec(): @/tmp/show_open_mode.sql
+SQL&gt; SQL&gt; column name format a10
+SQL&gt; select name,open_mode,current_timestamp-open_time from v$containers;
+NAME       OPEN_MODE  CURRENT_TIMESTAMP-OPEN_TIME
+---------- ---------- ---------------------------------------------------------------------------
+PDB$SEED   READ WRITE +000000000 00:00:00.471398
+SQL&gt;
+END_RUNNING
+------------------------------------------------------------------------------------------------------------------------
+==== @/tmp/show_open_mode.sql Container:PDB$SEED Id:2 17-05-07 05:02:06 Proc:0 ====
+SQL&gt;
+END_RUNNING
+------------------------------------------------------------------------------------------------------------------------
+==== @/tmp/show_open_mode.sql Container:PDB$SEED Id:2 17-05-07 05:02:06 Proc:0 ====
+</pre>
+The PDB$SEED was opened READ WRITE to run the statements.</p>
+<p>We can see that in alert.log:
+<pre>
+alter pluggable database pdb$seed close immediate instances=all
+ALTER SYSTEM: Flushing buffer cache inst=0 container=2 local
+Pluggable database PDB$SEED closed
+Completed: alter pluggable database pdb$seed close immediate instances=all
+alter pluggable database pdb$seed OPEN READ WRITE
+Database Characterset for PDB$SEED is WE8MSWIN1252
+Opening pdb PDB$SEED (2) with no Resource Manager plan active
+Pluggable database PDB$SEED opened read write
+Completed: alter pluggable database pdb$seed OPEN READ WRITE
+alter pluggable database pdb$seed close immediate instances=all
+ALTER SYSTEM: Flushing buffer cache inst=0 container=2 local
+Pluggable database PDB$SEED closed
+Completed: alter pluggable database pdb$seed close immediate instances=all
+alter pluggable database pdb$seed OPEN READ ONLY instances=all
+Database Characterset for PDB$SEED is WE8MSWIN1252
+Opening pdb PDB$SEED (2) with no Resource Manager plan active
+Pluggable database PDB$SEED opened read only
+Completed: alter pluggable database pdb$seed OPEN READ ONLY instances=all
+</pre></p>
+<p>When the pre-upgrade and post-upgrade scripts are run from DBUA you can see the following in the logs:
+<pre>exec_DB_script: opened Reader and Writer
+exec_DB_script: executed connect / AS SYSDBA
+exec_DB_script: executed alter session set "_oracle_script"=TRUE
+/
+exec_DB_script: executed alter pluggable database pdb$seed close immediate instances=all
+/
+exec_DB_script: executed alter pluggable database pdb$seed OPEN READ WRITE
+/</pre></p>
+<p>This is displayed because DBUA runs catcon.pl in debug mode and you can do the same by adding &#8216;-g&#8217; to the catcon.pl arguments.</p>
+<h3>12<em>c</em>R2 in local undo</h3>
+<p>In 12.2 there is a case where you can make a change to the PDB$SEED to customize the UNDO tablespace template. Here I am changing to LOCAL UNDO:</p>
+<p><pre>
+SYS@CDB$ROOT SQL&gt; shutdown immediate;
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+&amp;nsbp;
+SYS@CDB$ROOT SQL&gt; startup upgrade;
+ORACLE instance started.
+&amp;nsbp;
+Total System Global Area   1107296256 bytes
+Fixed Size                    8791864 bytes
+Variable Size               939526344 bytes
+Database Buffers            150994944 bytes
+Redo Buffers                  7983104 bytes
+Database mounted.
+Database opened.
+&amp;nsbp;
+SYS@CDB$ROOT SQL&gt; alter database local undo on;
+Database altered.
+&amp;nsbp;
+SYS@CDB$ROOT SQL&gt; shutdown immediate;
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+
+SYS@CDB$ROOT SQL&gt; select * from database_properties where property_name like '%UNDO%';
+
+PROPERTY_NAME       PROPERTY_VALUE  DESCRIPTION
+-------------       --------------  -----------
+LOCAL_UNDO_ENABLED  TRUE            true if local undo is enabled
+</pre></p>
+<p>PDB$SEED is read only:
+<pre>
+SYS@CDB$ROOT SQL&gt; show pdbs
+CON_ID  CON_NAME  OPEN MODE   RESTRICTED
+------  --------  ---- ----   ----------
+2       PDB$SEED  READ ONLY   NO
+3       PDB01     READ WRITE  NO
+</pre>
+and _oracle_script is not set:
+<pre>
+SYS@CDB$ROOT SQL&gt; show parameter script
+
+NAME TYPE VALUE
+---- ---- -----
+
+</pre>
+I get no error now and can open the seed in read-write mode:
+<pre>
+SYS@CDB$ROOT SQL&gt; alter pluggable database PDB$SEED open force;
+Pluggable database PDB$SEED altered.
+
+SYS@CDB$ROOT SQL&gt; show pdbs
+
+CON_ID  CON_NAME  OPEN MODE   RESTRICTED
+------  --------  ---- ----   ----------
+2       PDB$SEED  READ WRITE  NO
+3       PDB01     READ WRITE  NO
+</pre></p>
+<h3>Customize UNDO seed</h3>
+<p>Once you open read write an undo tablespace is created. If you want to customize it, you can create another one and drop the previous one. This requires changing the undo_tablespace parameter:</p>
+<p><pre>
+SYS@CDB$ROOT SQL&gt; show parameter undo
+NAME              TYPE    VALUE
+----------------- ------- ------
+undo_tablespace   string  UNDO_1
+
+SYS@CDB$ROOT SQL&gt; create undo tablespace UNDO;
+Tablespace UNDO created.
+
+SYS@CDB$ROOT SQL&gt; alter system set undo_tablespace=UNDO;
+System SET altered.
+
+SYS@CDB$ROOT SQL&gt; drop tablespace UNDO_1 including contents and datafiles;
+Tablespace UNDO_1 dropped.
+
+SYS@CDB$ROOT SQL&gt; shutdown immediate
+Pluggable Database closed
+</pre></p>
+<p>You can leave it like this, just close and re-open read only. If you want to keep the same undo tablespace name as before, you need to play with create and drop, and change undo_tablespace again.</p>
+<h3>So what?</h3>
+<p>Don&#8217;t forget that you should not modify or drop PDB$SEED. If you want a customized template for your PDB creations, then you should create your PDB template to clone. You can clone remotely, so this is possible in single-tenant as well. Being able to open the PDB$SEED in read write is possible only for the exception of creating the UNDO tablespace in PDB$SEED when you move to local undo mode. This is not required, and then an UNDO tablespace will be created when you open a PDB with no undo_tablespace.
+When running pre-upgrade and post-upgrade scripts, then don&#8217;t worry: catcon.pl is there to help run scripts in containers and handles that for you.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-163110"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

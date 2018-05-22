@@ -1,0 +1,501 @@
+								<h1 class="entry-title">Adaptive Plan: How much can STATISTICS COLLECTOR buffer?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The 12c adaptive plan prepares two join methods (Hash Join and Nested Loop), actives the one that has the better cost for the estimated cardinality and computes the point of inflection in cardinality estimation where the best cost changes to the other join method. At execution time, rows are buffered by a STATISTICS COLLECTOR operation in order to see if the point of inflection is reached. If it doesn&#8217;t, the plan continues as planned. If it does, the alternative join method is activated. But buffering has a limit&#8230;
+<span id="more-8519"></span></p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr"><a href="https://twitter.com/ChrisAntognini">@ChrisAntognini</a> <a href="https://twitter.com/FranckPachot">@FranckPachot</a> True, Chris. Do you know the internal algorithm or an underscore parameter that controls the buffering limit?</p>
+<p>&mdash; Stefan Koehler (@OracleSK) <a href="https://twitter.com/OracleSK/status/727390667555627008">May 3, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>Let&#8217;s try to find this limit empirically.</p>
+<p>I create a table with enough rows:
+<pre>
+SQL&gt; create table demo1 (n constraint demo1pk primary key,x1) as select 0 , cast('x' as varchar2(4000)) from dual;
+Table created.
+SQL&gt; insert --+ append
+    into demo1 select 1e7+rownum ,'x' from xmltable('1 to 200000');
+200000 rows created.
+</pre>
+and a second table to join:
+<pre>
+SQL&gt; create table demo2 (n constraint demo2pk primary key,x2) as select 0 , 'x' from dual;
+Table created.
+</pre>
+I filled the DEMO1 table in two steps. First, CTAS with one row so that the statistics (online statistics gathering) favors nested loops. And I inserted lot of rows later because I want to fill the Adaptive Plan buffer. DEMO2 is a small table but I want the FULL TABLE SCAN on it to be a bit more expensive or hash join will be always choosen. I do that by faking the number of blocks:
+<pre>
+SQL&gt; exec dbms_stats.set_table_stats(user,'DEMO2',numblks=3000,no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.
+</pre>
+If I check the execution plan I see that NESTED LOOP is chosen because estimated number of rows is small (artificially set to 1 row):
+<pre>
+SQL&gt; explain plan for
+  2  select max(x1),max(x2) from demo1 join demo2 using(n);
+
+Explained.
+
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'+adaptive'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+Plan hash value: 604214593
+
+--------------------------------------------------------------------------------------------
+|   Id  | Operation                      | Name    | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------------------------
+|     0 | SELECT STATEMENT               |         |     1 |     8 |     4   (0)| 00:00:01 |
+|     1 |  SORT AGGREGATE                |         |     1 |     8 |            |          |
+|- *  2 |   HASH JOIN                    |         |     1 |     8 |     4   (0)| 00:00:01 |
+|     3 |    NESTED LOOPS                |         |     1 |     8 |     4   (0)| 00:00:01 |
+|     4 |     NESTED LOOPS               |         |     1 |     8 |     4   (0)| 00:00:01 |
+|-    5 |      STATISTICS COLLECTOR      |         |       |       |            |          |
+|     6 |       TABLE ACCESS FULL        | DEMO1   |     1 |     4 |     3   (0)| 00:00:01 |
+|  *  7 |      INDEX UNIQUE SCAN         | DEMO2PK |     1 |       |     0   (0)| 00:00:01 |
+|     8 |     TABLE ACCESS BY INDEX ROWID| DEMO2   |     1 |     4 |     1   (0)| 00:00:01 |
+|-    9 |    TABLE ACCESS FULL           | DEMO2   |     1 |     4 |     1   (0)| 00:00:01 |
+--------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("DEMO1"."N"="DEMO2"."N")
+   7 - access("DEMO1"."N"="DEMO2"."N")
+
+Note
+-----
+   - this is an adaptive plan (rows marked '-' are inactive)
+
+</pre>
+But the plan is adaptive and can switch to HASH JOIN of more rows than expected are encountered by STATISTICS COLLECTOR.</p>
+<p>I run it and gather run time statistics
+<pre>
+SQL&gt; alter session set statistics_level=all;
+Session altered.
+SQL&gt; select max(x1),max(x2) from demo1 join demo2 using(n);
+MAX(X1)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+M
+-
+x
+x
+</pre></p>
+<p>And here is the adaptive plan: Hash Join is activated because we have actually lot of rows (200000): </p>
+<p><pre>
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  d2y436sr1cx3r, child number 0
+-------------------------------------
+select max(x1),max(x2) from demo1 join demo2 using(n)
+
+Plan hash value: 740165205
+
+----------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name  | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  | Writes |  OMem |  1Mem | Used-Mem | Used-Tmp|
+----------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |       |      1 |        |      1 |00:00:02.04 |     372 |    423 |    483 |       |       |          |         |
+|   1 |  SORT AGGREGATE     |       |      1 |      1 |      1 |00:00:02.04 |     372 |    423 |    483 |       |       |          |         |
+|*  2 |   HASH JOIN         |       |      1 |      1 |      1 |00:00:02.04 |     372 |    423 |    483 |    11M|  4521K| 1262K (1)|    4096 |
+|   3 |    TABLE ACCESS FULL| DEMO1 |      1 |      1 |    200K|00:00:00.20 |     369 |    360 |      0 |       |       |          |         |
+|   4 |    TABLE ACCESS FULL| DEMO2 |      1 |      1 |      1 |00:00:00.01 |       3 |      0 |      0 |       |       |          |         |
+----------------------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("DEMO1"."N"="DEMO2"."N")
+   7 - access("DEMO1"."N"="DEMO2"."N")
+
+Note
+-----
+   - this is an adaptive plan
+</pre></p>
+<p>The point of inflection is 814:
+<pre>
+SQL&gt; column tracefile new_value tracefile
+SQL&gt; alter session set tracefile_identifier='cbo_trace';
+Session altered.
+
+SQL&gt; select tracefile from v$process where addr=(select paddr from v$session where sid=sys_context('userenv','sid'));
+
+TRACEFILE
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/cdb/CDB/trace/CDB_ora_3979_cbo_trace.trc
+
+SQL&gt; host &gt; &amp;tracefile.
+
+SQL&gt; exec dbms_sqldiag.dump_trace(p_sql_id=&gt;'d2y436sr1cx3r',p_child_number=&gt;0,p_component=&gt;'Compiler',p_file_id=&gt;'');
+PL/SQL procedure successfully completed.
+
+SQL&gt; host grep -E "^DP" &amp;tracefile. | tail
+DP - distinct placement
+DP: Found point of inflection for NLJ vs. HJ: card = 814.00
+</pre></p>
+<h3>Filling the buffer</h3>
+<p>So here, 814 rows were buffered and the plan switched to HASH JOIN. I want to know how many rows can be buffered, so I want to increase the point of inflection. Easy, if the cost of DEMO2 full table scan is higher then the NESTED LOOP will be cheaper than HASH JOIN even with more rows. Let&#8217;s fake the DEMO2 statistics to show a larger table:
+<pre>
+SQL&gt; exec dbms_stats.set_table_stats(user,'DEMO2',numblks=4000,no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.
+</pre></p>
+<p>And let&#8217;s run that again:</p>
+<p><pre>
+SQL&gt; select max(x1),max(x2) from demo1 join demo2 using(n);
+
+MAX(X1)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+M
+-
+x
+x
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  d2y436sr1cx3r, child number 0
+-------------------------------------
+select max(x1),max(x2) from demo1 join demo2 using(n)
+
+Plan hash value: 604214593
+
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name    | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |         |      1 |        |      1 |00:00:01.57 |     374 |    360 |
+|   1 |  SORT AGGREGATE               |         |      1 |      1 |      1 |00:00:01.57 |     374 |    360 |
+|   2 |   NESTED LOOPS                |         |      1 |      1 |      1 |00:00:01.57 |     374 |    360 |
+|   3 |    NESTED LOOPS               |         |      1 |      1 |      1 |00:00:01.57 |     373 |    360 |
+|   4 |     TABLE ACCESS FULL         | DEMO1   |      1 |      1 |    200K|00:00:00.20 |     369 |    360 |
+|*  5 |     INDEX UNIQUE SCAN         | DEMO2PK |    200K|      1 |      1 |00:00:00.42 |       4 |      0 |
+|   6 |    TABLE ACCESS BY INDEX ROWID| DEMO2   |      1 |      1 |      1 |00:00:00.01 |       1 |      0 |
+------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   5 - access("DEMO1"."N"="DEMO2"."N")
+
+Note
+-----
+   - this is an adaptive plan
+
+27 rows selected.
+
+SQL&gt; column tracefile new_value tracefile
+SQL&gt; alter session set tracefile_identifier='cbo_trace';
+Session altered.
+
+SQL&gt; select tracefile from v$process where addr=(select paddr from v$session where sid=sys_context('userenv','sid'));
+
+TRACEFILE
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/cdb/CDB/trace/CDB_ora_4083_cbo_trace.trc
+
+SQL&gt; host &gt; &amp;tracefile.
+SQL&gt; exec dbms_sqldiag.dump_trace(p_sql_id=&gt;'d2y436sr1cx3r',p_child_number=&gt;0,p_component=&gt;'Compiler',p_file_id=&gt;'');
+PL/SQL procedure successfully completed.
+
+SQL&gt; host grep -E "^DP" &amp;tracefile. | tail
+DP - distinct placement
+DP: Found point of inflection for NLJ vs. HJ: card = 1086.00
+</pre></p>
+<p>Read it from the end:</p>
+<ol>
+<li>The inflection point is higher: 1086, which was my goal</li>
+<li>The number of rows from DEMO1 is still 200000 rows, so it&#8217;s higher than the inflection point.</li>
+<li>We expect a HASH JOIN because the number of rows is higher than the inflection point</li>
+<li>But the plan stayed with NESTED LOOP because the buffering in STATISTICS COLLECTOR never reached the inflection point</li>
+</ol>
+<h3>Dichotomy</h3>
+<p>By Dichotomy, I&#8217;ve scripted similar tests to find the point where reaching the point of inflection do not trigger a plan switch.
+&#8216;JOIN&#8217; is the method chosen (from dbms_xplan.display_cursor after execution), &#8216;INFLECTION POINT&#8217; is the one gathered from 10053 trace and &#8216;STATBLKS&#8217; is the numblks I set for DEMO2 in order to vary the point of inflection.
+<pre>
+                JOIN     INFLECTION POINT       HASH_AREA_SIZE               BUFFER             STATBLKS                 LPAD
+              NESTED               271889              1000000              2175117              1000000                    1
+              NESTED               135823              1000000              1086590               500000                    1
+              NESTED                67789              1000000               542319               250000                    1
+              NESTED                33885              1000000               271087               125000                    1
+              NESTED                16943              1000000               135551                62500                    1
+              NESTED                 8471              1000000                67775                31250                    1
+              NESTED                 4238              1000000                33904                15625                    1
+              NESTED                 2120              1000000                16960                 7813                    1
+              NESTED                 1060              1000000                 8480                 3907                    1
+                HASH                  532              1000000                 4256                 1954                    1
+                HASH                  796              1000000                 6368                 2930                    1
+                HASH                  928              1000000                 7424                 3418                    1
+                HASH                  994              1000000                 7952                 3662                    1
+                HASH                 1026              1000000                 8208                 3784                    1
+              NESTED                 1044              1000000                 8352                 3845                    1
+                HASH                 1036              1000000                 8288                 3814                    1
+                HASH                 1040              1000000                 8320                 3829                    1
+              NESTED                 1042              1000000                 8336                 3837                    1
+                HASH                 1040              1000000                 8320                 3833                    1
+                HASH                 1040              1000000                 8320                 3835                    1
+              NESTED                 1042              1000000                 8336                 3836                    1
+</pre>
+I&#8217;ve added some variations on hash_area_size (my bad guess that it makes sense to buffer up to that amount because this is what will go to hash area size at least, if hash join is finally chosen) and on the DEMO1 row size (by varying an lpad on column X).
+For the moment, when point of inflection is less than 1041 a plan switch occurs and when it is higher than 1042 no plan switch occurs.</p>
+<p>But there are probably other parameters influencing because:</p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr"><a href="https://twitter.com/FranckPachot">@FranckPachot</a> <a href="https://twitter.com/OracleSK">@OracleSK</a> I just modified/run an example I have and I can confirm to see a switch with an inflection point at 21216.</p>
+<p>&mdash; Christian Antognini (@ChrisAntognini) <a href="https://twitter.com/ChrisAntognini/status/727908553961418752">May 4, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>Any idea welcome&#8230;</p>
+<h3>Update 30 mins. later</h3>
+<p>Thanks to Chris Antognini. It appears the parameter that influences the number of rows buffered is not the actual size of the row. The number of rows to buffer is calculated from the theoretical size of the columns. Which is very bad in my opinion given the number of applications that declares column size at their maximum. And I see no reason why this has to be set like that. Rows are of variable size and allocating buffers on column definition is not a good idea. That reminds <a href="https://recurrentnull.wordpress.com/2015/11/20/raising-the-fetch-size-good-or-bad-memory-management-in-oracle-jdbc-12c/" target="_blank">jdbc fetch size</a> very well described by Sigrid Keydana.</p>
+<p>Here is the limit for different size of the varchar2:
+<pre>
+                JOIN     INFLECTION POINT       HASH_AREA_SIZE          BUFFER SIZE             STATBLKS         VARCHAR SIZE
+              NESTED               155345                65536              3572954               572641                    1
+              NESTED                74899                65536              3894796               276092                   30
+              NESTED                63551                65536              3940220               234258                   40
+              NESTED                33289                65536              4061376               122802                  100
+              NESTED                12865                65536              4142848                47453                  300
+              NESTED                 7973                65536              4162422                29409                  500
+              NESTED                 4090                65536              4179980                15079                 1000
+              NESTED                 2072                65536              4189584                 7635                 2000
+              NESTED                 1388                65536              4194536                 5110                 3000
+</pre></p>
+<p>So it looks like oracle allocates a buffer of about few MB, calculates how many rows can fit there given their column definition, and limits the buffering to that number of rows.
+The nonsense in my opinion is that size calculated from column definition can be calculated at parse time, when the point of inflection is determined. It makes no sense to set a point of inflection higher than the number of rows that can be buffered.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-85200"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 7 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3451">
+				<div id="div-comment-3451" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/023ac148b28513c72fc2e2885b911e0f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://antognini.ch' rel='external nofollow' class='url'>Chris Antognini</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3451">
+			May 4, 2016 at 20 h 23 min</a>		</div>
+
+		<p>Salut Franck</p>
+<p>Try replace the VARCHAR2(4000) with something much smaller&#8230;</p>
+<p>HTH
+Chris
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-34521"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3451' onclick='return addComment.moveForm( "div-comment-3451", "3451", "respond", "8519" )' aria-label='Reply to Chris to Chris Antognini'>Reply to Chris</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-nicolas-jardot odd alt thread-odd thread-alt depth-1" id="comment-3458">
+				<div id="div-comment-3458" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/44aaa4979e6e6d88085c5337b3c385c5?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Nicolas Jardot</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3458">
+			May 5, 2016 at 12 h 01 min</a>		</div>
+
+		<p>Just a question that brings me to a quick guess: where the buffer is stored? I mean it&#8217;s in a memory pool somewhere so my guess is that buffer size may depends on stuff like NUM_CPU or the size of another memory pool. If you test on a small machine you probably get a smaller buffer and less rows fit in the buffer.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-34591"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3458' onclick='return addComment.moveForm( "div-comment-3458", "3458", "respond", "8519" )' aria-label='Reply to Nicolas to Nicolas Jardot'>Reply to Nicolas</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-3461">
+				<div id="div-comment-3461" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/023ac148b28513c72fc2e2885b911e0f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://antognini.ch' rel='external nofollow' class='url'>Chris Antognini</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3461">
+			May 5, 2016 at 15 h 54 min</a>		</div>
+
+		<p>Salut Franck</p>
+<p>This comment refers to the “Update 30 mins later” part. I wrote it because, I must admit, I don’t agree with some of your opinions. And, first of all, apologize if I’m prolix. But in that way I hope that the readers of your blog get a different point of view when they read this text.</p>
+<p>Let me start by making clear that the query optimizer and the execution engine are two separate components. Simply put, the query optimizer is responsible for generating optimal execution plans and the execution engine is responsible for running them. I know, that’s obvious. But, IMO, this is a very important point. In fact, the separation of concerns makes sure that modifications in one component don’t (necessarily) require modifications in the other. So, not because the implementation of the execution engine in 12.1 has some limitations (not being able to check an inflection point that is “too high”) it means that the implementation of the query optimizer should be limited as well. With the current state of affairs, when the execution engine will be improved, no modification in the query optimizer will be necessary. In fact, the query optimizer already generates an optimal plan (from its point of view).</p>
+<p>Having said that let me comment a couple of your opinions based on my limited knowledge (I would love to know more, e.g. being able to read the code, but that’s something that currently isn’t possible…).</p>
+<p>&gt; The nonsense in my opinion is that size calculated from column definition can be
+&gt; calculated at parse time, when the point of inflection is determined.</p>
+<p>For computing the inflection point the query optimizer uses object statistics. From what we can see, there is no specific improvement in the cost estimator. And that is a good thing. In fact, including other source of information (e.g. maximum size of a column) requires additional code. And more code means more complexity and therefore more bugs. In software development every time you add complexity you have to ask what the advantages of doing so are. In this case, IMO, none. In fact, no matter how complex the costing model would be, there is no way to know how much data will be returned to the statistics collector. The reason is quite simple: if the row source operation that the statistics collector calls applies a filter (something that’s common), the query optimizer can’t know how large the columns that fulfill the filter are (ok, with dynamic sampling it could be possible to get that information). </p>
+<p>In summary, IMO, it’s fine that the query optimizer estimates the inflection point only based on object statistics as it usually do.</p>
+<p>&gt; The number of rows to buffer is calculated from the theoretical size of the columns.
+&gt; Which is very bad in my opinion given the number of applications that declares column
+&gt; size at their maximum. And I see no reason why this has to be set like that.</p>
+<p>The data returned by the function implementing the row source operation called by the statistics collector can’t efficiently use a return by values (too much data). So, it ought to be a return by reference. Even though I never saw the code, IMO what happens is that the caller (the statistics collector) allocates the memory which is used to buffer the data. Then, it calls the row source operation that has to provide the data and requests a certain amount of rows to be written at a specific location in memory. Note that with such an implementation the row source operation that returns data is completely unaware of the statistics collector and, therefore, no modification in its code was necessary to introduce the feature. And that is a huge advantage when you have hundreds of row source operations that would be impacted. But let’s get back to the buffer. How much memory the statistics collector has to allocate *before* calling the rows source operation that returns data? The only safe “guess” is the maximum possible size. And, of course, if too much memory (whatever that means) is required the statistics collector can completely avoid doing the buffering and, therefore, considering the alternate join method. Simply put, it aborts the check of the inflection point and picks the default join method as the final one.</p>
+<p>Of course such an implementation can be improved. But, again, what are the pros and cons of doing so? Cons are the same I mentioned before (more code, more complexity, more bugs, …) and, maybe, given the number of changes that would be required, the feature would never be implemented. And, honestly, the only pros (being able to check a higher inflection point) isn’t soooo important. Especially if the code was correctly implemented :-).</p>
+<p>In summary, IMO, the current implementation can be improved but it’s not that bad. </p>
+<p>Also notice that aborting the adaptive join selection sooner in the process (i.e. during optimization) isn’t saving much overhead. In fact, the inflection point should be computed anyway and, if the statistics collector decides to abort, it can do so with very limited work.</p>
+<p>Best,
+Chris
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-34621"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3461' onclick='return addComment.moveForm( "div-comment-3461", "3461", "respond", "8519" )' aria-label='Reply to Chris to Chris Antognini'>Reply to Chris</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-3462">
+				<div id="div-comment-3462" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3462">
+			May 5, 2016 at 19 h 23 min</a>		</div>
+
+		<p>Hi Chris,
+Thanks a lot for your feedback which explains very good reasons for the implementation choice.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-34631"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3462' onclick='return addComment.moveForm( "div-comment-3462", "3462", "respond", "8519" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-3465">
+				<div id="div-comment-3465" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/0184285ab26b9780091a79a311bd304f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://jko-licorne.com/oracle/' rel='external nofollow' class='url'>jko</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3465">
+			May 6, 2016 at 10 h 14 min</a>		</div>
+
+		<p>Hi Franck,
+We can agree that the IP is calculated during execution time and the allocation of the memory required to store the rows for that calculation is done just before the execution of the chosen plan. Let’s see how complex the calculation can be and why, potentially, the way it is implemented is not that bad.
+The goal here is to have the most efficient number of rows buffered to calculate the best IP.
+<pre>
+The execution of the plan start
+	Allocate a predefined size for STATISTICS COLLECTOR phase (let’s say 16K)   --&gt;InitBuff
+	TotalRowsSize:=0
+	Rows:=0
+ 	Nested loop
+		If Enough Space in InitBuff
+			Store the rows in InitBuff
+			Collecting all columns information (data size)  --&gt; computing row size
+			TotalRowsSize += CurrentRowSize
+			Rows++
+		Else
+			Reallocate the InitBuff by adding more memory
+			SizeToAdd = (TotalRowsSize / Rows) * EstimatedRowNeeded
+		End if;
+		Compute the IP
+	EndLoop
+</pre>
+We clearly see that the overhead during execution can be significant.
+Another point is the value we could use for “EstimatedRowNeeded”.
+So I agree with Chris that the implementation is not perfect but works quiet well.
+And thank you Franck for raising this fantastic point.
+Cheers
+jko
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-34661"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3465' onclick='return addComment.moveForm( "div-comment-3465", "3465", "respond", "8519" )' aria-label='Reply to jko to jko'>Reply to jko</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-3472">
+				<div id="div-comment-3472" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ba77413ffe0bb48d9da467d649464a6c?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Thomas Teske</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3472">
+			May 6, 2016 at 21 h 31 min</a>		</div>
+
+		<p>Hello,</p>
+<p>two thoughts on the subject: it takes observation in applications to see the inflection happening. My experience is:
+ the plans can change and this is a great capability as such. So the question is: how often do we observe the wrong join method being applied? Under which circumstances does it happen? </p>
+<p>Regarding parameters: we have already many of them. I&#8217;d only ask for an additional documentation of such parameter,
+ if there is a material impact on an application. Then its really needed. The customer support team will advise in such situations.</p>
+<p>Another point of view: parsing is the simplest part here. Cost estimation is not simple (just think of problems involving many row sources &#8211; find a plan in a finite yet reasonable amount of processing steps) and finally implementing the access.
+Join efficiency is part of execution. Just think of the different join efficiency by join-method for row vs. column store.</p>
+<p>I&#8217;d be seriously interested to see application examples for this one. </p>
+<p>Kind regards
+  Thomas
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-34731"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3472' onclick='return addComment.moveForm( "div-comment-3472", "3472", "respond", "8519" )' aria-label='Reply to Thomas to Thomas Teske'>Reply to Thomas</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-3512">
+				<div id="div-comment-3512" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/dc43e6499ba6196ef99509ef5a7f3120?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.hourim.wordpress.com' rel='external nofollow' class='url'>Houri Mohamed</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3512">
+			May 13, 2016 at 15 h 50 min</a>		</div>
+
+		<p>Bonjour Franck,</p>
+<p>According to my little practical experience on system running 12c (I just started working on a 12c upgrade) the statistics collector is associated with a certain buffer size. This buffer size has multiple reasons like collecting statistics of the buffered data from the portion of the plan that feeds the STATISTICS COLLECTOR. These collected statics can be: number of rows returned, number of distinct values, number of unique values, maximum and minimum value, etc.… This buffer size serves also an important role in adaptive plan which is preventing a subsequent portion of the initial plan to start processing before the query engine is sure that it will definitely opt for the initial plan. I have the tendency to compare this couple (STATISTICS COLLECTOR, buffer size)  to the HASH JOIN BUFFERED operation in a parallel run with which Oracle ensure that only 2 DFOs can be active per DFO tree; but in the parallel run there is no limit to the buffering rather than the physical TEMP space.</p>
+<p>The third important point which I believe is related with this buffer size is this: it is only when the size of the rows buffered by the STATISTICS COLLECTOR exceeds the size of the buffer size that the SQL engine will start challenging the initial selected plan. I wrote challenging because exceeding the size of buffer size doesn’t mean that the initial plan will be systematically ignored. In other words, it is not because the buffered rows exceed to buffer size that a switch in the join will occur. When this limit is exceeded Oracle will start verifying certain criteria of the initial plan using the above mentioned statistics collected by the STATISTICS COLLECTOR. Depending on this verification Oracle will either switch or decide to go with the initial plan.</p>
+<p>That’s how I have understood the situation.</p>
+<p>Best regards
+Mohamed
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35131"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3512' onclick='return addComment.moveForm( "div-comment-3512", "3512", "respond", "8519" )' aria-label='Reply to Houri to Houri Mohamed'>Reply to Houri</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

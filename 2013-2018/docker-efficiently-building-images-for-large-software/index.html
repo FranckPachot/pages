@@ -1,0 +1,500 @@
+								<h1 class="entry-title">Docker: efficiently building images for large software</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I see increasing demand to build a Docker image for the Oracle Database. But the installation process for Oracle does not really fit the Docker way to install by layers: you need to unzip the distribution, install from it to the Oracle Home, remove the things that are not needed, strop the binaries,&#8230; Before addressing those specific issues, here are the little tests I&#8217;ve done to show how the build layers increase the size of the image.
+<span id="more-22241"></span>
+I&#8217;m starting with an empty docker repository on XFS filesystem:
+<pre>
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G   33M   80G   1% /var/lib/docker
+</pre></p>
+<h3>add, copy, rename and append</h3>
+<p>For the example, I create a 100MB file in the context:
+<pre>
+[root@VM121 docker]# mkdir -p /var/tmp/demo
+[root@VM121 docker]# dd if=/dev/urandom of=/var/tmp/demo/file0.100M count=100 bs=1M
+</pre></p>
+<p>Here his my docker file:
+<pre>
+ FROM alpine:latest as staging
+ WORKDIR /var/tmp
+ ADD  file0.100M .
+ RUN  cp file0.100M file1.100M
+ RUN  rm file0.100M
+ RUN  mv file1.100M file2.100M
+ RUN  dd if=/dev/urandom of=file2.100M seek=100 count=100 bs=1M
+</pre>
+The 1st step starts with an alpine image
+The 2nd step sets the working directory
+The 3rd step adds a 100M file from the context
+The 4th step copies the file, so that we have 200M in two files
+The 5th step removes the previous file, so that we have 100M in one file
+The 6th step renames the file, staying with only one 100M file
+The 7th step appends 100M to the file, leaving 200M in one file</p>
+<p>Here is the build with default option:
+<pre>
+[root@VM121 docker]# docker image build -t franck/demo /var/tmp/demo
+</pre></p>
+<p>The context, my 100M files is send first:
+<pre>
+Sending build context to Docker daemon  104.9MB
+</pre></p>
+<p>And here are my 7 steps:
+<pre>
+Step 1/7 : FROM alpine:latest as staging
+latest: Pulling from library/alpine
+ff3a5c916c92: Pull complete
+Digest: sha256:7df6db5aa61ae9480f52f0b3a06a140ab98d427f86d8d5de0bedab9b8df6b1c0
+Status: Downloaded newer image for alpine:latest
+ ---&gt; 3fd9065eaf02
+Step 2/7 : WORKDIR /var/tmp
+Removing intermediate container 93d1b5f21bb9
+ ---&gt; 131b3e6f34e7
+Step 3/7 : ADD  file0.100M .
+ ---&gt; 22ca0b2f6424
+Step 4/7 : RUN  cp file0.100M file1.100M
+ ---&gt; Running in b4b1b9c7e29b
+Removing intermediate container b4b1b9c7e29b
+ ---&gt; 8c7290a5c87e
+Step 5/7 : RUN  rm file0.100M
+ ---&gt; Running in 606e2c73d456
+Removing intermediate container 606e2c73d456
+ ---&gt; 5287e66b019c
+Step 6/7 : RUN  mv file1.100M file2.100M
+ ---&gt; Running in 10a9b379150e
+Removing intermediate container 10a9b379150e
+ ---&gt; f508f426f70e
+Step 7/7 : RUN  dd if=/dev/urandom of=file2.100M seek=100 count=100 bs=1M
+ ---&gt; Running in 9dcf6d80642c
+100+0 records in
+100+0 records out
+Removing intermediate container 9dcf6d80642c
+ ---&gt; f98304641c54
+Successfully built f98304641c54
+Successfully tagged franck/demo:latest
+</pre></p>
+<p>So, what&#8217;s the size of my docker repository after my image with this 200M file?
+<pre>
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  538M   80G   1% /var/lib/docker
+</pre></p>
+<p>I have more than 500MB here.</p>
+<p>Actually, besides the alpine image downloaded, which is only 4MB, the image I have build is 538MB:
+<pre>
+[root@VM121 docker]# docker image ls
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+franck/demo         latest              f98304641c54        Less than a second ago   528MB
+alpine              latest              3fd9065eaf02        2 months ago             4.15MB
+</pre></p>
+<p>We can better understand this size by looking at intermediate images:
+<pre>
+[root@VM121 docker]# docker image ls -a
+REPOSITORY          TAG                 IMAGE ID            CREATED             SIZE
+franck/demo         latest              f98304641c54        1 second ago        528MB
+&lt;none&gt;              &lt;none&gt;              f508f426f70e        27 seconds ago      319MB
+&lt;none&gt;              &lt;none&gt;              5287e66b019c        36 seconds ago      214MB
+&lt;none&gt;              &lt;none&gt;              8c7290a5c87e        37 seconds ago      214MB
+&lt;none&gt;              &lt;none&gt;              22ca0b2f6424        42 seconds ago      109MB
+&lt;none&gt;              &lt;none&gt;              131b3e6f34e7        47 seconds ago      4.15MB
+alpine              latest              3fd9065eaf02        2 months ago        4.15MB
+</pre></p>
+<p>The first one, &#8217;22ca0b2f6424&#8242; is from the step 3 which added the 100MB file
+The second one &#8216;8c7290a5c87e&#8217; is from the 4th step which copied the file, bringing the image to 200MB
+The third one &#8216;5287e66b019c&#8217; is from the 5th step which removed the file. I didn&#8217;t increase the size but didn&#8217;t remove anything either.
+The fourth one &#8216;f508f426f70e&#8217; is from the 6th step which renamed the file. But this, for docker, is like copying to a new layer and that adds 100MB
+Finally, the 7th step appended only 100MB, but this finally resulted to copy the full 200MB file to the new layer</p>
+<p>We can see all those operations, and size added at each step, from the image history:
+<pre>
+[root@VM121 docker]# docker image history franck/demo
+IMAGE               CREATED             CREATED BY                                      SIZE                COMMENT
+f98304641c54        1 second ago        /bin/sh -c dd if=/dev/urandom of=file2.100M …   210MB
+f508f426f70e        27 seconds ago      /bin/sh -c mv file1.100M file2.100M             105MB
+5287e66b019c        36 seconds ago      /bin/sh -c rm file0.100M                        0B
+8c7290a5c87e        37 seconds ago      /bin/sh -c cp file0.100M file1.100M             105MB
+22ca0b2f6424        42 seconds ago      /bin/sh -c #(nop) ADD file:339435a18aeeb1b69…   105MB
+131b3e6f34e7        47 seconds ago      /bin/sh -c #(nop) WORKDIR /var/tmp              0B
+3fd9065eaf02        2 months ago        /bin/sh -c #(nop)  CMD ["/bin/sh"]              0B
+&lt;missing&gt;           2 months ago        /bin/sh -c #(nop) ADD file:093f0723fa46f6cdb…   4.15MB
+</pre></p>
+<h3>All in one RUN</h3>
+<p>One workaround is to run everything in the same layer. Personally, I don&#8217;t like it because I don&#8217;t get the point of using a Dockerfile for just running one script.
+So, here is the Dockerfile with only one RUN command:
+<pre>
+ FROM alpine:latest as staging
+ WORKDIR /var/tmp
+ ADD  file0.100M .
+ RUN  cp file0.100M file1.100M                                      \
+  &amp;&amp;  rm file0.100M                                                 \
+  &amp;&amp;  mv file1.100M file2.100M                                      \
+  &amp;&amp;  dd if=/dev/urandom of=file2.100M seek=100 count=100 bs=1M
+</pre></p>
+<p>The build is similar except that there are fewer steps:
+<pre>
+[root@VM121 docker]# docker image build -t franck/demo /var/tmp/demo
+Sending build context to Docker daemon  104.9MB
+Step 1/4 : FROM alpine:latest as staging
+latest: Pulling from library/alpine
+ff3a5c916c92: Pull complete
+Digest: sha256:7df6db5aa61ae9480f52f0b3a06a140ab98d427f86d8d5de0bedab9b8df6b1c0
+Status: Downloaded newer image for alpine:latest
+ ---&gt; 3fd9065eaf02
+Step 2/4 : WORKDIR /var/tmp
+Removing intermediate container 707644c15547
+ ---&gt; d4528b28c85e
+Step 3/4 : ADD  file0.100M .
+ ---&gt; e26215766e75
+Step 4/4 : RUN  cp file0.100M file1.100M                                        &amp;&amp;  rm file0.100M                                                     &amp;&amp;  mv file1.100M file2.100M                                        &amp;&amp;  dd if=/dev/urandom of=file2.100M seek=100 count=100 bs=1M
+ ---&gt; Running in 49c2774851f4
+100+0 records in
+100+0 records out
+Removing intermediate container 49c2774851f4
+ ---&gt; df614ac1b6b3
+Successfully built df614ac1b6b3
+Successfully tagged franck/demo:latest
+</pre></p>
+<p>This leaves us with a smaller space usage::
+<pre>
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  340M   80G   1% /var/lib/docker
+</pre></p>
+<p>The image is smaller, but still larger than the final state (a 300MB image for only one 200MB file):
+<pre>
+[root@VM121 docker]# docker image ls
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+franck/demo         latest              df614ac1b6b3        Less than a second ago   319MB
+alpine              latest              3fd9065eaf02        2 months ago             4.15MB
+</pre></p>
+<p>This is because we have grouped the RUN steps, but the ADD has its own layer, adding a file that is removed later:
+<pre>
+[root@VM121 docker]# docker image ls -a
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+franck/demo         latest              df614ac1b6b3        Less than a second ago   319MB
+&lt;none&gt;              &lt;none&gt;              e26215766e75        20 seconds ago           109MB
+&lt;none&gt;              &lt;none&gt;              d4528b28c85e        22 seconds ago           4.15MB
+alpine              latest              3fd9065eaf02        2 months ago             4.15MB
+
+[root@VM121 docker]# docker image history franck/demo
+IMAGE               CREATED                  CREATED BY                                      SIZE                COMMENT
+df614ac1b6b3        Less than a second ago   /bin/sh -c cp file0.100M file1.100M         …   210MB
+e26215766e75        20 seconds ago           /bin/sh -c #(nop) ADD file:fe0262a4b800bf66d…   105MB
+d4528b28c85e        22 seconds ago           /bin/sh -c #(nop) WORKDIR /var/tmp              0B
+3fd9065eaf02        2 months ago             /bin/sh -c #(nop)  CMD ["/bin/sh"]              0B
+&lt;missing&gt;             2 months ago             /bin/sh -c #(nop) ADD file:093f0723fa46f6cdb…   4.15MB
+</pre></p>
+<p>This is the kind of issue we have when building an Oracle Database image. We need to ADD the zip file for the database distribution, and the latest bundle patch. It is removed later but still takes space on the image. Note that one workaround to avoid the ADD layer can be to get the files from an NFS or HTTP server with wget or curl in a RUN layer rather than an ADD one. There&#8217;s an example on <a href="http://www.oradba.ch/2018/03/smaller-oracle-docker-images/" target="_blank">Stefan Oehrli blog post</a>.</p>
+<h3>&#8211;squash</h3>
+<p>With the latest versions of docker, there&#8217;s an easy way to flatten all those intermediary images at the end.
+Here I&#8217;ve 18.03 and enabled experimental features:
+<pre>
+[root@VM121 docker]# docker info
+Containers: 0
+ Running: 0
+ Paused: 0
+ Stopped: 0
+Images: 8
+Server Version: 18.03.0-ce
+Storage Driver: overlay2
+ Backing Filesystem: xfs
+...
+
+[root@VM121 docker]# cat /etc/docker/daemon.json
+{
+  "experimental": true
+}
+</pre></p>
+<p>I start with the same as before but just add &#8211;squash to the build command
+<pre>
+[root@VM121 docker]# docker image build --squash -t franck/demo /var/tmp/demo
+</pre></p>
+<p>The output is similar but the image is an additional one, reduced down to the size of my final state (with one 200MB file):
+<pre>
+[root@VM121 docker]# docker image ls
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+franck/demo         latest              2ab439a723c4        Less than a second ago   214MB
+&lt;none&gt;              &lt;none&gt;              c3058e598b0a        3 seconds ago            528MB
+alpine              latest              3fd9065eaf02        2 months ago             4.15MB
+</pre></p>
+<p>The intermediate image list shows that all was done as without &#8216;&#8211;squash&#8217; but with an additional set which reduced the size:
+<pre>
+[root@VM121 docker]# docker image ls -a
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+franck/demo         latest              2ab439a723c4        Less than a second ago   214MB
+&lt;none&gt;              &lt;none&gt;              c3058e598b0a        3 seconds ago            528MB
+&lt;none&gt;              &lt;none&gt;              1f14d93a592e        23 seconds ago           319MB
+&lt;none&gt;              &lt;none&gt;              7563d40b650b        27 seconds ago           214MB
+&lt;none&gt;              &lt;none&gt;              8ed15a5059bd        28 seconds ago           214MB
+&lt;none&gt;              &lt;none&gt;              24b11b9026ce        31 seconds ago           109MB
+&lt;none&gt;              &lt;none&gt;              382bb71a6a4a        33 seconds ago           4.15MB
+alpine              latest              3fd9065eaf02        2 months ago             4.15MB
+</pre></p>
+<p>This step is visible in the image history as a &#8216;merge&#8217; step:
+<pre>
+[root@VM121 docker]#  docker image history franck/demo
+IMAGE               CREATED                  CREATED BY                                      SIZE                COMMENT
+2ab439a723c4        Less than a second ago                                                   210MB               merge sha256:c3058e598b0a30c606c1bfae7114957bbc62fca85d6a70c2aff4473726431394 to sha256:3fd9065eaf02feaf94d68376da52541925650b81698c53c6824d92ff63f98353
+&lt;missing&gt;             3 seconds ago            /bin/sh -c dd if=/dev/urandom of=file2.100M …   0B
+&lt;missing&gt;             23 seconds ago           /bin/sh -c mv file1.100M file2.100M             0B
+&lt;missing&gt;             27 seconds ago           /bin/sh -c rm file0.100M                        0B
+&lt;missing&gt;             28 seconds ago           /bin/sh -c cp file0.100M file1.100M             0B
+&lt;missing&gt;             31 seconds ago           /bin/sh -c #(nop) ADD file:14cef588b48ffbbf1…   0B
+&lt;missing&gt;             33 seconds ago           /bin/sh -c #(nop) WORKDIR /var/tmp              0B
+&lt;missing&gt;             2 months ago             /bin/sh -c #(nop)  CMD ["/bin/sh"]              0B
+&lt;missing&gt;             2 months ago             /bin/sh -c #(nop) ADD file:093f0723fa46f6cdb…   4.15MB
+</pre></p>
+<p>However, even if I have a smaller final image, my filesystem usage is even larger with this additional 210MB:
+<pre>
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  739M   80G   1% /var/lib/docker
+</pre></p>
+<p>Let&#8217;s prune it to get rid of those intermediate images:
+<pre>
+[root@VM121 docker]# docker image prune -f
+Deleted Images:
+deleted: sha256:c3058e598b0a30c606c1bfae7114957bbc62fca85d6a70c2aff4473726431394
+deleted: sha256:37ed4826d70def1978f9dc0ddf42618d951f65a79ce30767ac3a5037d514f8af
+deleted: sha256:1f14d93a592eb49a210ed73bf65e6886fcec332786d54b55d6b0e16fb8a8beda
+deleted: sha256:c65cf4c70aed04e9b57e7a2a4fa454d3c63f43c32af251d8c86f6f85f44b1757
+deleted: sha256:7563d40b650b2126866e8072b8df92d5d7516d86b25a2f6f99aa101bb47835ba
+deleted: sha256:31ee5456431e903cfd384b1cd7ccb7918d203dc73a131d4ff0b9e6517f0d51cd
+deleted: sha256:8ed15a5059bd4c0c4ecb78ad77ed75da143b06923d8a9a9a67268c62257b6534
+deleted: sha256:6be91d85dec6e1bda6f1c0d565e98dbf928b4ea139bf9cb666455e77a2d8f0d9
+deleted: sha256:24b11b9026ce738a78ce3f7b8b5d86ba3fdeb15523a30a7c22fa1e3712ae679a
+deleted: sha256:c0984945970276621780a7888adfde9c6e6ca475c42af6b7c54f664ad86f9c9f
+deleted: sha256:382bb71a6a4a7ddec86faa76bb86ea0c1a764e5326ad5ef68ce1a6110ae45754
+
+Total reclaimed space: 524.3MB
+</pre></p>
+<p>Now having only the squashed image:
+<pre>
+[root@VM121 docker]# docker image ls -a
+REPOSITORY          TAG                 IMAGE ID            CREATED             SIZE
+franck/demo         latest              2ab439a723c4        32 minutes ago      214MB
+alpine              latest              3fd9065eaf02        2 months ago        4.15MB
+
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  237M   80G   1% /var/lib/docker
+</pre></p>
+<h3>multi-stage build</h3>
+<p>Finally, you can do something similar to an intermediate squash using multi-stage build.</p>
+<p>Here is my Dockerfile:
+<pre>
+ FROM alpine:latest as staging
+ WORKDIR /var/tmp
+ ADD  file0.100M .
+ RUN  cp file0.100M file1.100M
+ RUN  rm file0.100M
+ RUN  mv file1.100M file2.100M
+ RUN  dd if=/dev/urandom of=file2.100M seek=100 count=100 bs=1M
+
+ FROM alpine:latest
+ WORKDIR /var/tmp
+ COPY --from=staging /var/tmp .
+</pre></p>
+<p>With multi-stage build, we can start the second stage from a different image, and add more steps, but here I just start with the same alpine image and copy the final layer of the previous build.</p>
+<p>We see something very similar to the &#8211;squash one:
+<pre>
+[root@VM121 docker]# docker image ls
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+franck/demo         latest              55f329385f8c        Less than a second ago   214MB
+&lt;none&gt;              &lt;none&gt;              fd26a00db784        8 seconds ago            528MB
+alpine              latest              3fd9065eaf02        2 months ago             4.15MB
+
+[root@VM121 docker]# docker image ls -a
+REPOSITORY          TAG                 IMAGE ID            CREATED             SIZE
+franck/demo         latest              55f329385f8c        1 second ago        214MB
+&lt;none&gt;              &lt;none&gt;              fd26a00db784        9 seconds ago       528MB
+&lt;none&gt;              &lt;none&gt;              9bf5be367b63        32 seconds ago      319MB
+&lt;none&gt;              &lt;none&gt;              531d78833ba8        35 seconds ago      214MB
+&lt;none&gt;              &lt;none&gt;              05dd68114743        36 seconds ago      214MB
+&lt;none&gt;              &lt;none&gt;              b9e5215a9fc8        39 seconds ago      109MB
+&lt;none&gt;              &lt;none&gt;              ab332f486793        41 seconds ago      4.15MB
+alpine              latest              3fd9065eaf02        2 months ago        4.15MB
+</pre>
+The history of the last stage shows the copy of 210MB from the previous one:
+<pre>
+[root@VM121 docker]# docker image history franck/demo
+IMAGE               CREATED             CREATED BY                                      SIZE                COMMENT
+55f329385f8c        1 second ago        /bin/sh -c #(nop) COPY dir:2b66b5c36eff5b51f…   210MB
+ab332f486793        41 seconds ago      /bin/sh -c #(nop) WORKDIR /var/tmp              0B
+3fd9065eaf02        2 months ago        /bin/sh -c #(nop)  CMD ["/bin/sh"]              0B
+&lt;missing&gt;           2 months ago        /bin/sh -c #(nop) ADD file:093f0723fa46f6cdb…   4.15MB
+</pre></p>
+<p>The usage of filesystem is similar to the &#8211;squash one. Even if we reduced the final image, all the intermediate states had to be stored:
+<pre>
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  737M   80G   1% /var/lib/docker
+</pre></p>
+<p>That looks good, if you accept to use a large intermediate space while building the image, which gives you the possibility to debug without re-running from the beginning, thanks to the layers in cache. However, you have still the inefficiency that each time you try the build, the context will be sent again even when not needed. And that is long with a 3GB .zip in the case of Oracle Database installation. Unfortunately, if you add the file to the .dockerignore once you know you have the ADD steps in cache, the next build attempt will not use the caches anymore. I would love to see a per-stage .dockerignore file for multi-stage builds. Or simply have docker realize that some files in the context will not be needed by the COPY or ADD that are not in cache yet.</p>
+<p>Sending the whole context at each build attempt, when debugging your Dockerfile, is not efficient at all and looks like punch-card time compilation where people sent the cards to be compiled during the night. One syntax error on the first line and you go for another day.</p>
+<p>One solution is to have all the required files in an NFS or HTTPd server and get them with ADD from the URL as mentioned earlier. </p>
+<h3>Multi-stage with multi-contexts</h3>
+<p>Another solution is to put all COPY or ADD from context in one Dockerfile to build the image containing all required files, and then build your image from it (and squash it at the end).</p>
+<p>Here is my first Dockerfile, just adding the files from the context:
+<pre>
+[root@VM121 docker]# ls /var/tmp/demo
+Dockerfile  file0.100M  nocontext
+[root@VM121 docker]# cat /var/tmp/demo/Dockerfile
+ FROM alpine:latest as staging
+ WORKDIR /var/tmp
+ ADD  file0.100M .
+</pre></p>
+<p>I build this &#8216;staging&#8217; image:
+<pre>
+[root@VM121 docker]# docker image build -t franck/stage0 /var/tmp/demo
+Sending build context to Docker daemon  104.9MB
+Step 1/3 : FROM alpine:latest as staging
+latest: Pulling from library/alpine
+ff3a5c916c92: Pull complete
+Digest: sha256:7df6db5aa61ae9480f52f0b3a06a140ab98d427f86d8d5de0bedab9b8df6b1c0
+Status: Downloaded newer image for alpine:latest
+ ---&gt; 3fd9065eaf02
+Step 2/3 : WORKDIR /var/tmp
+Removing intermediate container 0eeed8e0cfd2
+ ---&gt; a5db3b29c8e1
+Step 3/3 : ADD  file0.100M .
+ ---&gt; 2a34e1e981be
+Successfully built 2a34e1e981be
+Successfully tagged franck/stage0:latest
+</pre></p>
+<p>This one is the minimal one:
+<pre>
+[root@VM121 docker]# docker image ls
++ docker image ls
+REPOSITORY          TAG                 IMAGE ID            CREATED                  SIZE
+franck/stage0       latest              2a34e1e981be        Less than a second ago   109MB
+alpine              latest              3fd9065eaf02        2 months ago             4.15MB
+
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  139M   80G   1% /var/lib/docker
+</pre></p>
+<p>Now, I don&#8217;t need to send this context anymore during further development of my Dockerfile.
+I&#8217;ve added the following steps to a Dockerfile in another directory:
+<pre>
+[root@VM121 docker]# ls /var/tmp/demo/nocontext/
+Dockerfile
+[root@VM121 docker]# cat /var/tmp/demo/nocontext/Dockerfile
+ FROM franck/stage0 as stage1
+ WORKDIR /var/tmp
+ RUN  cp file0.100M file1.100M
+ RUN  rm file0.100M
+ RUN  mv file1.100M file2.100M
+ RUN  dd if=/dev/urandom of=file2.100M seek=100 count=100 bs=1M
+ FROM alpine:latest
+ WORKDIR /var/tmp
+</pre></p>
+<p>Here is the build, using multi-stage to get a squashed final image (you can also use &#8211;squash)
+<pre>
+[root@VM121 docker]# docker image build -t franck/demo /var/tmp/demo/nocontext
+
+Sending build context to Docker daemon  2.048kB
+Step 1/9 : FROM franck/stage0 as stage1
+ ---&gt; 2a34e1e981be
+Step 2/9 : WORKDIR /var/tmp
+Removing intermediate container eabf57a8de05
+...
+Successfully built 82478bfa260d
+Successfully tagged franck/demo:latest
+</pre></p>
+<p>At that point, there&#8217;s no advantage on space used as I keep all layers for easy Dockerfile development:
+<pre>
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  738M   80G   1% /var/lib/docker
+
+[root@VM121 docker]# docker image ls
+REPOSITORY          TAG                 IMAGE ID            CREATED              SIZE
+franck/demo         latest              82478bfa260d        About a minute ago   214MB
+&lt;none&gt;              &lt;none&gt;              5772ad68d208        About a minute ago   528MB
+franck/stage0       latest              2a34e1e981be        About a minute ago   109MB
+alpine              latest              3fd9065eaf02        2 months ago         4.15MB
+</pre></p>
+<p>But now, if I want to add an additional step:
+<pre>
+[root@VM121 docker]# cat &gt;&gt; /var/tmp/demo/nocontext/Dockerfile &lt;&lt;&lt; 'RUN chmod a+x /var/tmp'
+</pre></p>
+<p>I can re-build quickly, using cached layers, and without the need to send the context again:
+<pre>
+[root@VM121 docker]# docker image build -t franck/demo /var/tmp/demo/nocontext
+Sending build context to Docker daemon  2.048kB
+Step 1/10 : FROM franck/stage0 as stage1
+ ---&gt; 2a34e1e981be
+Step 2/10 : WORKDIR /var/tmp
+ ---&gt; Using cache
+ ---&gt; fa562926cc2b
+Step 3/10 : RUN  cp file0.100M file1.100M
+ ---&gt; Using cache
+ ---&gt; 31ac716f4d61
+Step 4/10 : RUN  rm file0.100M
+ ---&gt; Using cache
+ ---&gt; d7392cf51ad9
+Step 5/10 : RUN  mv file1.100M file2.100M
+ ---&gt; Using cache
+ ---&gt; 4854e503885b
+Step 6/10 : RUN  dd if=/dev/urandom of=file2.100M seek=100 count=100 bs=1M
+ ---&gt; Using cache
+ ---&gt; 5772ad68d208
+Step 7/10 : FROM alpine:latest
+ ---&gt; 3fd9065eaf02
+Step 8/10 : WORKDIR /var/tmp
+ ---&gt; Using cache
+ ---&gt; a5db3b29c8e1
+Step 9/10 : COPY --from=stage1 /var/tmp .
+ ---&gt; Using cache
+ ---&gt; 82478bfa260d
+Step 10/10 : RUN chmod a+x /var/tmp
+ ---&gt; 4a69ee40a938
+Successfully built 4a69ee40a938
+Successfully tagged franck/demo:latest
+</pre></p>
+<p>Once I&#8217;m ok with my final image, I can remove the intermediate ones:
+<pre>
+[root@VM121 docker]# docker image prune -f
+Deleted Images:
+deleted: sha256:5772ad68d20841197d1424f7c64edd21704e4c7b470acb2193de51ae8741385d
+deleted: sha256:bab572d749684d126625a74be4f01cc738742f9c112a940391e3533e61dd55b9
+deleted: sha256:4854e503885b4057809fe2867a743ae7898e3e06b329229519fdb5c9d8b10ac1
+deleted: sha256:de4acb90433c30d6a21cc3b4483adbd403d8051f3c7c31e6bc095a304606355a
+deleted: sha256:d7392cf51ad99d5d0b7a1a18d8136905c87bc738a5bc94dec03e92f5385bf9c8
+deleted: sha256:f037e7f973f4265099402534cd7ba409f35272701166d59a1be8e5e39508b07c
+deleted: sha256:31ac716f4d61f0048a75b8de6f18757970cf0670a0a3d711e4386bf098b32041
+deleted: sha256:2dccb363c5beb4daf45586383df6454b198f824d52676f70318444c346c0fe9a
+deleted: sha256:fa562926cc2b3cb56400e1068984bb4048f56713a3cf6dcfa3cf6d945023ebc4
+
+Total reclaimed space: 419.4MB
+</pre>
+And the staging one:
+<pre>
+[root@VM121 docker]# docker image rm franck/stage0
+Untagged: franck/stage0:latest
+Deleted: sha256:2a34e1e981be9154c31c5ee7eb942cc121267f4416b6fe502ab93f2dceafd98c
+Deleted: sha256:b996a1bdc829167f16dcbe58b717284764470661c3116a6352f15012e1dff07c
+</pre></p>
+<p>Finally, I optimized the developement of the Dockerfile and finished with the minimal size.
+<pre>
+[root@VM121 docker]# df -hT /var/lib/docker
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdc       xfs    80G  237M   80G   1% /var/lib/docker
+</pre></p>
+<h3>So what?</h3>
+<p>I&#8217;m always surprised by the lack of efficiency when building an image with a Dockerfile. Any serious application deployment involves several intermediate files and the way docker build is layered inflates the size and the time required. Efficient layering and snapshotting work at block level. Here, at file level, any byte of data modified in a file, even metadata such as the file name, is a whole file copy. But for common applications, the installation steps are not as simple adding new files. You may have files appended, object files added to libraries, then compiled, the stripped&#8230;</p>
+<p>In this post, I tested some recent features, such as multi-stage build and the experimental &#8211;squash, as well as a simple manual multi-stage build. Of course, you can do everything in the same layers, and even not use Dockerfiles at all, but then why using Docker? There&#8217;s also the <a href="https://www.packer.io/docs/builders/docker.html" target="_blank">Packer</a> approach that I&#8217;ve not tested yet. However, I like the Docker approach, but only when used correctly. Deploying an application, like Oracle Database, should use the layered build in the following way: additional steps for new options or new updates. This means that the files must be built elsewhere, in a staging container, and added in one step. And to be efficient, the context should be sent only when needed: when a non-cached ADD or COPY requires it.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-222420"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

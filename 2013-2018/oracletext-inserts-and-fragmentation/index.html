@@ -1,0 +1,210 @@
+								<h1 class="entry-title">OracleText: inserts and fragmentation</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>
+I plan to write several posts about OracleText indexes, which is a feature that is not used enough in my opinion. It&#8217;s available in all editions and can index small text or large documents to search by words. When you create an OracleText index, a few tables are created to store the words and the association between those words and the table row that contains the document. I&#8217;ll start to show how document inserts are processed.
+</p>
+<h3>Create the table and index</h3>
+<p>
+I&#8217;m creating a simple table with a CLOB
+</p>
+<pre>SQL&gt; create table DEMO_CTX_FRAG
+     (num number constraint DEMO_CTX_FRAG_PK primary key,txt clob);
+
+Table created.
+</pre>
+<p>and a simple OracleText on that column</p>
+<pre>SQL&gt; create index DEMO_CTX_INDEX on DEMO_CTX_FRAG(txt)
+     indextype is ctxsys.context;
+
+Index created.
+</pre>
+<p>That creates the following tables:</p>
+<ul>
+<li>DR$DEMO_CTX_INDEX$I which stores the tokens (e.g words)</li>
+<li>DR$DEMO_CTX_INDEX$K which index the documents (docid) and links them to the table ROWID</li>
+<li>DR$DEMO_CTX_INDEX$R which stores the opposite way navigation (get ROWID from a docid)</li>
+<li>DR$DEMO_CTX_INDEX$N which stores docid for deferred maintenance cleanup.</li>
+</ul>
+<h3>Inserts</h3>
+<p>
+I&#8217;m inserting a row with some text in the clob column
+</p>
+<pre>SQL&gt; insert into DEMO_CTX_FRAG values (0001,'Hello World');
+
+1 row created.
+</pre>
+<p>I commit</p>
+<pre>SQL&gt; commit;
+
+Commit complete.
+</pre>
+<p>And here is what we have in the OracleText tables:</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$K;
+no rows selected
+
+SQL&gt; select * from DR$DEMO_CTX_INDEX$R;
+no rows selected
+
+SQL&gt; select * from DR$DEMO_CTX_INDEX$I;
+no rows selected
+
+SQL&gt; select * from DR$DEMO_CTX_INDEX$N;
+no rows selected
+</pre>
+<p>Nothing is stored here yet. Which means that we cannot find our newly inserted row from an OracleText search.</p>
+<p>
+By default, all inserts maintain the OracleText tables asynchronously.
+The inserted row is referenced in a CTXSYS queuing table that stores the pending inserts:
+</p>
+<pre>SQL&gt; select * from CTXSYS.DR$PENDING;
+
+   PND_CID    PND_PID PND_ROWID          PND_TIMES P
+---------- ---------- ------------------ --------- -
+      1400          0 AAAXUtAAKAAABWlAAA 13-FEB-15 N
+</pre>
+<p>and we have a view over it:</p>
+<pre>SQL&gt; select pnd_index_name,pnd_rowid,pnd_timestamp from ctx_user_pending;
+
+PND_INDEX_NAME                 PND_ROWID          PND_TIMES
+------------------------------ ------------------ ---------
+DEMO_CTX_INDEX                 AAAXUtAAKAAABWlAAA 13-FEB-15
+</pre>
+</p>
+<h3>Synchronization</h3>
+<p>
+let&#8217;s synchronize:
+</p>
+<pre>SQL&gt; exec ctx_ddl.sync_index('DEMO_CTX_INDEX');
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>The queuing table has been processed:</p>
+<pre>SQL&gt; select pnd_index_name,pnd_rowid,pnd_timestamp from ctx_user_pending;
+
+no rows selected
+</pre>
+<p>and here is how that document is sotred in our OracleText tables.</p>
+<p>
+$K records one document (docid=1) and the table rowid that contains it:
+</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$K;
+
+     DOCID TEXTKEY
+---------- ------------------
+         1 AAAXUtAAKAAABWlAAA
+</pre>
+<p>$R table stores the docid -&gt; rowid is a non-relational way:</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$R;
+
+    ROW_NO DATA
+---------- ------------------------------------------------------------
+         0 00001752D0002800000569404141
+</pre>
+<p>How is it stored? It&#8217;s an array of ROWIDs which are fixed length. Then from the docid we can directly go to the offset and get the rowid. Because DATA is limited to 4000 bytes, there are several rows. But a docid determines the ROW_NO as well as the offset in DATA.</p>
+<p>
+$I stores the tokens (which are the words here as we have TEXT token &#8211; which is the type 0) as well as their location information:
+</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$I;
+
+TOKEN_TEXT TOKEN_TYPE TOKEN_FIRST TOKEN_LAST TOKEN_COUNT TOKEN_INFO
+---------- ---------- ----------- ---------- ----------- ----------
+HELLO               0           1          1           1 008801
+WORLD               0           1          1           1 008802
+</pre>
+<p>For each word it stores the range of docid that contains the work (token_first and token_last are those docid) and token_info stores in an binary way the occurrences of the word within the documents (it stores pairs of docid and offest within the document). It&#8217;s a BLOB but is limited to 4000 bytes so that it is stored inline. Which means that if a token is present in a lot of document, several lines in $I will be needed, each covering a different range of docid. This has changed in 12c and we will see that in future blog posts.</p>
+<p>
+Thus, we can have several rows for one token. This is the first cause of fragmentation. Searching for documents that contain such a word will have to read several lines of the $I table.</p>
+<p>The $N has nothing here because we synchronized only inserts and there is nothing to cleanup.
+</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$N;
+
+no rows selected
+</pre>
+</p>
+<h3>Several inserts</h3>
+<p>
+I will insert two lines, which also contain the &#8216;hello&#8217; word.
+</p>
+<pre>SQL&gt; insert into DEMO_CTX_FRAG values (0002,'Hello Moon, hello, hello');
+
+1 row created.
+
+SQL&gt; insert into DEMO_CTX_FRAG values (0003,'Hello Mars');
+
+1 row created.
+
+SQL&gt; commit;
+
+Commit complete.
+</pre>
+<p>And I synchronize:</p>
+<pre>SQL&gt; exec ctx_ddl.sync_index('DEMO_CTX_INDEX');
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>So, I&#8217;ve now 3 documents: </p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$K;
+
+     DOCID TEXTKEY
+---------- ------------------
+         1 AAAXUtAAKAAABWlAAA
+         2 AAAXUtAAKAAABWlAAB
+         3 AAAXUtAAKAAABWlAAC
+</pre>
+<p>The reverse mapping array has increased:</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$R;
+
+    ROW_NO DATA
+---------- ------------------------------------------------------------
+         0 00001752D000280000056940414100001752D00028000005694041420000
+</pre>
+<p>And now the tokens:</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$I;
+
+TOKEN_TEXT TOKEN_TYPE TOKEN_FIRST TOKEN_LAST TOKEN_COUNT TOKEN_INFO
+---------- ---------- ----------- ---------- ----------- ----------
+HELLO               0           1          1           1 008801
+WORLD               0           1          1           1 008802
+HELLO               0           2          3           2 0098010201
+MARS                0           3          3           1 008802
+MOON                0           2          2           1 008802
+</pre>
+<p>What is interesting here is that the previous lines (docid 1) have not been updated and new lines have been inserted for docid 2 and 3.</p>
+<ul>
+<li>&#8216;moon&#8217; is only in docid 2</li>
+<li>&#8216;mars&#8217; is only in docid 3</li>
+<li>&#8216;hello&#8217; is in 2 (token_count) documents, from docid 2 to docid 3 (token_first and token_last)</li>
+</ul>
+<p>
+This is the other cause of fragmentation coming from frequent sync. Each sync will add new rows. However, when multiple documents are processed in the same sync, then only one $I entry per token is needed.
+</p>
+<p>
+There is a third cause of fragmentation. We see here that the token_info is larger for that HELLO covering docid 2 to 3 because there are several occurrences of the token. All that must fit in memory when we synchronize. So it&#8217;s good to synchronize when we have several documents (so that the common tokens are not too fragmented) but we need also to have enough memory. The default is 12M and is usually too small. It can be increased with the &#8216;index memory&#8217; parameter of the index. And there is also a maximum set by ctx_adm.set_parameter for which the default (50M) is also probably too low.
+</p>
+<p>
+Nothing yet in the $N table that we will see in the next post:
+</p>
+<pre>SQL&gt; select * from DR$DEMO_CTX_INDEX$N;
+
+no rows selected
+</pre>
+</p>
+<h3>summary</h3>
+<p>
+The important points here is that inserted document are visible only after synchronization, and synchronizing too frequently will cause fragmentation. If you need to synchronize in real time (on commit) and you commit for each document inserted, then you will probably have to plan frequent index optimization. If on the other hand we are able to synchronize only when we have inserted a lot of documents, then fragmentation is reduced according that we had enough memory to process all documents in one pass.
+</p>
+<p>The <a href="http://www.dbi-services.com/index.php/blog/entry/oracletext-deletes-and-garbage">next</a> post will be about deletes and updates.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5800"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

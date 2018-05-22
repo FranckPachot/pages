@@ -1,0 +1,204 @@
+								<h1 class="entry-title">12.1.0.2 CDB views are now using CONTAINERS()</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I&#8217;ve blogged about <a href="http://blog.dbi-services.com/oracle-12c-cdb-metadata-a-object-links-internals/">multitenant internals</a> at the time when 12.1.0.1 was just released. Something has changed in 12.1.0.2 and blogging about it was in my todo list for a long time. Now the occasion to do it has been triggered by a question on Oracle Forums about <a href="https://community.oracle.com/thread/3628496">CDB_DATA_FILES not showing PDB$SEED datafiles</a> because there is an important change we must be aware of.</p>
+<p>In the previous blog, I have described how you can query PDB information using &#8216;container data objects&#8217;, like the CDB_ views that are created by catcdbviews.sql, defined with the CDB$VIEW clause, which looks like a table function (but is not). It was not documented, and implemented internally with parallel query, partitioning and fixed table. Lot of internal details from Laurent Leturgez <a href="http://laurent-leturgez.com/2014/02/25/oracle-database-12c-cdbview-function/">here</a>.</p>
+<p>12.1.0.2 has introduced the CONTAINERS() table function which does the same but is <a href="https://docs.oracle.com/database/121/ADMIN/cdb_mon.htm#ADMIN14319">documented</a>.</p>
+<p>And CDB_ views are now using the CONTAINERS() clause instead of CDB$VIEW() one.</p>
+<p>However, there is something different. By default the PDB$SEED is not queried. This comes from the initialization parameter exclude_seed_cdb_view which is true by default:
+<pre>SQL&gt; show parameter exclude_seed_cdb_view
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+exclude_seed_cdb_view                boolean     TRUE
+
+SQL&gt; select * from containers(dual);
+
+D     CON_ID
+- ----------
+X          3
+X          1
+</pre>
+You don&#8217;t see PDB$SEED here which is container id 2</p>
+<p>We can get back to the 12.1.0.1 behaviour by setting the parameter to false:
+<pre>SQL&gt; alter session set exclude_seed_cdb_view=false;
+
+Session altered.
+
+SQL&gt; select * from containers(dual);
+
+D     CON_ID
+- ----------
+X          2
+X          1
+X          3
+</pre></p>
+<p>So, what&#8217;s the point about that? If you are used to list the database datafiles by doing a select from DBA_DATA_FILES then you probably query CDB_DATA_FILES from root in multitenant. And you expect to have all files. You add control files and log file members and you have an exhaustive list of your database files. Maybe you use that in a backup or maintenance script.</p>
+<p>Then if you do that in 12.1.0.2 you will miss the PDB$SEED. Except if you set exclude_seed_cdb_view to false. You can&#8217;t rely on CDB_DATA_FILES and that&#8217;s the important point raised in the Oracle Forum post.</p>
+<p>I usually prefer to use RMAN for that and RMAN is right:</p>
+<p><pre>
+RMAN&gt; connect target /
+
+connected to target database: CDB1 (DBID=836194344)
+
+RMAN&gt; report schema;
+
+using target database control file instead of recovery catalog
+Report of database schema for database with db_unique_name CDB1
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------
+1    790      SYSTEM               YES     /ZFS01/oradata/CDB1/system01.dbf
+3    610      SYSAUX               NO      /ZFS01/oradata/CDB1/sysaux01.dbf
+4    160      UNDOTBS1             YES     /ZFS01/oradata/CDB1/undotbs01.dbf
+5    250      PDB$SEED:SYSTEM      NO      /ZFS01/oradata/CDB1/pdbseed/system01.dbf
+6    5        USERS                NO      /ZFS01/oradata/CDB1/users01.dbf
+7    490      PDB$SEED:SYSAUX      NO      /ZFS01/oradata/CDB1/pdbseed/sysaux01.dbf
+8    270      PDB1:SYSTEM          NO      /ZFS01/oradata/CDB1/PDB1/system01.dbf
+9    530      PDB1:SYSAUX          NO      /ZFS01/oradata/CDB1/PDB1/sysaux01.dbf
+10   40       PDB1:USERS           NO      /ZFS01/oradata/CDB1/PDB1/SAMPLE_SCHEMA_users01.dbf
+11   1345     PDB1:EXAMPLE         NO      /ZFS01/oradata/CDB1/PDB1/example01.dbf
+
+List of Temporary Files
+=======================
+File Size(MB) Tablespace           Maxsize(MB) Tempfile Name
+---- -------- -------------------- ----------- --------------------
+1    275      TEMP                 32767       /ZFS01/oradata/CDB1/temp01.dbf
+2    20       PDB$SEED:TEMP        32767       /ZFS01/oradata/CDB1/pdbseed/pdbseed_temp012014-11-01_08-57-07-AM.dbf
+3    20       PDB1:TEMP            32767       /ZFS01/oradata/CDB1/PDB1/PDB1_temp012014-11-01_09-10-16-AM.dbf
+</pre>
+Where CDB_DATA_FILES by default shows only:
+<pre>SQL&gt; select con_id,file_id,file_name from cdb_data_files;
+
+    CON_ID    FILE_ID FILE_NAME
+---------- ---------- ----------------------------------------------------
+         1          1 /ZFS01/oradata/CDB1/system01.dbf
+         1          3 /ZFS01/oradata/CDB1/sysaux01.dbf
+         1          6 /ZFS01/oradata/CDB1/users01.dbf
+         1          4 /ZFS01/oradata/CDB1/undotbs01.dbf
+         3          8 /ZFS01/oradata/CDB1/PDB1/system01.dbf
+         3          9 /ZFS01/oradata/CDB1/PDB1/sysaux01.dbf
+         3         10 /ZFS01/oradata/CDB1/PDB1/SAMPLE_SCHEMA_users01.dbf
+         3         11 /ZFS01/oradata/CDB1/PDB1/example01.dbf
+</pre></p>
+<h3>More internals&#8230;</h3>
+<p>Now what has change about CONTAINERS vs CDB$VIEW?
+<pre>
+SQL&gt; set autotrace trace explain
+SQL&gt; select * from cdb_data_files;
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 1439328272
+
+--------------------------------------------------------------------
+| Id  | Operation               | Name     | Rows  | Pstart| Pstop |
+--------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |          | 20004 |       |       |
+|   1 |  PX COORDINATOR         |          |       |       |       |
+|   2 |   PX SEND QC (RANDOM)   | :TQ10000 | 20004 |       |       |
+|   3 |    PX PARTITION LIST ALL|          | 20004 |     1 |   254 |
+|   4 |     FIXED TABLE FULL    | X$CDBVW$ | 20004 |       |       |
+--------------------------------------------------------------------
+</pre>
+It&#8217;s still using parallel processes on a partitioned fixed table
+<pre>
+SQL&gt; alter session set "_px_cdb_view_enabled"=FALSE;
+
+Session altered.
+
+SQL&gt; select * from cdb_data_files;
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2351439557
+
+---------------------------------------------------------------
+| Id  | Operation          | Name     | Rows  | Pstart| Pstop |
+---------------------------------------------------------------
+|   0 | SELECT STATEMENT   |          | 20004 |       |       |
+|   1 |  PARTITION LIST ALL|          | 20004 |     1 |   254 |
+|   2 |   FIXED TABLE FULL | X$CDBVW$ | 20004 |       |       |
+---------------------------------------------------------------
+
+SQL&gt; alter session set "_partition_cdb_view_enabled"=FALSE;
+
+Session altered.
+
+SQL&gt; select * from cdb_data_files;
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 1784620524
+
+-----------------------------------------------------
+| Id  | Operation        | Name     | Rows  | Bytes |
+-----------------------------------------------------
+|   0 | SELECT STATEMENT |          | 20004 |  8185K|
+|   1 |  FIXED TABLE FULL| X$CDBVW$ | 20004 |  8185K|
+-----------------------------------------------------
+</pre>
+And documented parameters _px_cdb_view_enabled and _partition_cdb_view_enabled still control it.</p>
+<p>Each partition is estimated to return 10000 rows (that&#8217;s hardcoded) so the estimation for 2 partitions (CDB$ROOT and PDB1) is about 20000.</p>
+<p>However, that was after I tried to gather statistics for cdb views:
+<pre>
+SQL&gt; select dbms_pdb.update_cdbvw_stats from dual;
+</pre>
+and I got statistics:
+<pre>
+SQL&gt; select * from  cdbvw_stats$ where objname='DBA_DATA_FILES';
+
+OBJNAME                        TIMESTAMP      FLAGS     ROWCNT     SPARE1
+------------------------------ --------- ---------- ---------- ----------
+DBA_DATA_FILES                 11-NOV-14          1          4
+</pre>
+which are the number of datafiles in my CDB$ROOT. So I expected the estimation to be about 8. But that will probably be for another blog post&#8230;</p>
+<p>What is important to know for the moment is that by default CDB_DATA_FILES don&#8217;t show all your database files.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5220"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1444">
+				<div id="div-comment-1444" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/04136d707d9765c22df44bebeef01a60?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Carlos Laguna</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1444">
+			April 27, 2015 at 22 h 15 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>Very interesting article!
+I was wondering if you have compared CDB$VIEW/CONTAINER performance to running individual queries in each PDB?</p>
+<p>I have observed a performance penalty as the number of pdb&#8217;s and rows increase. Have you seen the same behaviour?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14451"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1444' onclick='return addComment.moveForm( "div-comment-1444", "1444", "respond", "521" )' aria-label='Reply to Carlos to Carlos Laguna'>Reply to Carlos</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

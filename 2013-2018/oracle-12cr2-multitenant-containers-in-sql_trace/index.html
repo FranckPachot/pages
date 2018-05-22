@@ -1,0 +1,157 @@
+								<h1 class="entry-title">12cR2 multitenant containers in SQL_TRACE</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In multitenant you session can switch between containers. For example, since 12.1, a common user can switch explicitly between CDB$ROOT and any PDB with the &#8216;ALTER SYSTEM SET CONTAINER&#8217;. Any user connected to a PDB will also have it session switching implicitely when querying through metadata links and data links (new name for object links). In 12.1 there are no ways to trace this. This is fixed in 12.2
+<span id="more-10561"></span></p>
+<p>I set sql_trace and get the tracefile name:</p>
+<p><pre>SQL&gt; select value tracefile from v$diag_info where name='Default Trace File';
+
+TRACEFILE
+--------------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/cdb1/CDB1/trace/CDB1_ora_6307.trc
+
+SQL&gt; alter session set sql_trace=true;
+Session altered.
+</pre></p>
+<p>The container ID is CON_ID=1 because I&#8217;m connected to the root:</p>
+<p><pre>
+SQL&gt; host grep "^\*\*\*" &amp;tracefile
+
+*** 2016-09-04T16:08:17.968360+02:00 (CDB$ROOT(1))
+*** SESSION ID:(14.25101) 2016-09-04T16:08:17.968399+02:00
+*** CLIENT ID:() 2016-09-04T16:08:17.968405+02:00
+*** SERVICE NAME:(SYS$USERS) 2016-09-04T16:08:17.968410+02:00
+*** MODULE NAME:(sqlplus@VM115 (TNS V1-V3)) 2016-09-04T16:08:17.968415+02:00
+*** ACTION NAME:() 2016-09-04T16:08:17.968420+02:00
+*** CLIENT DRIVER:(SQL*PLUS) 2016-09-04T16:08:17.968425+02:00
+*** CONTAINER ID:(1) 2016-09-04T16:08:17.968430+02:00</pre></p>
+<p>In 12.1 you had no more information about the container in the trace file. This is improved in 12.2</p>
+<h3>Explicit ALTER SYSTEM SET CONTAINER</h3>
+<p>I&#8217;ll run a simple query, then change to container PDB (which is CON_ID=3 here) and run again a query:</p>
+<p><pre>SQL&gt; select * from dual;
+
+D
+-
+X
+
+SQL&gt; alter session set container=PDB;
+Session altered.
+
+SQL&gt; select * from dual;
+
+D
+-
+X</pre></p>
+<p>The lines with starting with &#8216;***&#8217; followed by a timestamp are not new. But now we also have the container name (here CON_NAME=PDB) and container ID (CON_ID=3):</p>
+<p><pre>SQL&gt; host grep "^\*\*\*" &amp;tracefile
+
+*** 2016-09-04T16:09:54.397448+02:00 (PDB(3))
+*** CONTAINER ID:(3) 2016-09-04T16:09:54.397527+02:00</pre></p>
+<p>You get those line for each ALTER SESSION SET CONTAINER and you have the CON_NAME and CON_ID of the PDB: (PDB(3))</p>
+<h3>Implicit switch though data link</h3>
+<p>I&#8217;m still in PDB and I&#8217;ll query a data link view: DBA_PDBS. Data link views (previously called &#8216;object link&#8217; views) query data from the CDB$ROOT even when you are in a PDB. DBA_PDBS show information from pluggable databases, which are stored in CDB$ROOT (because they must be available before the PDB is opened). </p>
+<p><pre>SQL&gt; select count(*) from dba_pdbs;
+
+  COUNT(*)
+----------
+         1
+
+</pre></p>
+<p>The execution of the query had to switch to CDB$ROOT (CON_ID=1) to get the rows and switch back to PDB (CON_ID=3):</p>
+<p><pre>
+SQL&gt; host grep "^\*\*\*" &amp;tracefile
+
+*** 2016-09-04T16:09:54.406379+02:00 (CDB$ROOT(1))
+*** 2016-09-04T16:09:54.406676+02:00 (PDB(3))</pre></p>
+<p>If you look at the detail you will see that my query is parsed in my container:
+<pre>
+=====================
+PARSING IN CURSOR #139807307349184 len=29 dep=0 uid=0 oct=3 lid=0 tim=203051393258 hv=2380449338 ad='896cae38' sqlid='3cngtnf6y5jju'
+select count(*) from dba_pdbs
+END OF STMT
+PARSE #139807307349184:c=0,e=53,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=2,plh=1333657383,tim=203051393256
+</pre>
+I think the following is to check that the table behind the data link view are valid in the PDB even if we don&#8217;t want to query them. This is only a parse call:
+<pre>
+=====================
+PARSING IN CURSOR #139807307295488 len=46 dep=1 uid=0 oct=3 lid=0 tim=203051393450 hv=1756598280 ad='7b5dfd58' sqlid='5ucyn75nb7408'
+SELECT * FROM NO_OBJECT_LINK("SYS"."DBA_PDBS")
+END OF STMT
+PARSE #139807307295488:c=0,e=26,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=810534000,tim=203051393449
+CLOSE #139807307295488:c=0,e=7,dep=1,type=1,tim=203051393490
+</pre>
+Then when I execute my query:
+<pre>
+EXEC #139807307349184:c=0,e=246,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=2,plh=1333657383,tim=203051393539
+</pre>
+my session switches to root:
+<pre>
+*** 2016-09-04T16:09:54.406379+02:00 (CDB$ROOT(1))
+</pre>
+and the recursive query is parsed and executed in CDB$ROOT:
+<pre>=====================
+PARSING IN CURSOR #139807307379504 len=170 dep=1 uid=0 oct=3 lid=0 tim=203051393687 hv=1291428476 ad='895c6940' sqlid='g34kja56gm8mw'
+SELECT /*+ NO_STATEMENT_QUEUING RESULT_CACHE (SYSOBJ=TRUE) */ CON_ID FROM NO_OBJECT_LINK("SYS"."DBA_PDBS") "DBA_PDBS" WHERE "DBA_PDBS"."CON_ID"=0 OR "DBA_PDBS"."CON_ID"=3
+END OF STMT
+PARSE #139807307379504:c=0,e=44,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=2042216988,tim=203051393685
+EXEC #139807307379504:c=0,e=48,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=2042216988,tim=203051393790
+FETCH #139807307379504:c=0,e=20,p=0,cr=0,cu=0,mis=0,r=1,dep=1,og=4,plh=2042216988,tim=203051393826
+STAT #139807307379504 id=1 cnt=1 pid=0 pos=1 obj=0 op='RESULT CACHE  8p3h095ufc042f32tf05b23qf3 (cr=0 pr=0 pw=0 str=1 time=18 us)'
+STAT #139807307379504 id=2 cnt=0 pid=1 pos=1 obj=0 op='NESTED LOOPS  (cr=0 pr=0 pw=0 str=0 time=0 us cost=2 size=16 card=1)'
+STAT #139807307379504 id=3 cnt=0 pid=2 pos=1 obj=161 op='TABLE ACCESS BY INDEX ROWID CONTAINER$ (cr=0 pr=0 pw=0 str=0 time=0 us cost=1 size=11 card=1)'
+STAT #139807307379504 id=4 cnt=0 pid=3 pos=1 obj=163 op='INDEX UNIQUE SCAN I_CONTAINER2 (cr=0 pr=0 pw=0 str=0 time=0 us cost=0 size=0 card=1)'
+STAT #139807307379504 id=5 cnt=0 pid=2 pos=2 obj=36 op='INDEX RANGE SCAN I_OBJ1 (cr=0 pr=0 pw=0 str=0 time=0 us cost=1 size=5 card=1)'
+CLOSE #139807307379504:c=0,e=4,dep=1,type=1,tim=203051393959</pre>
+You note that result cache is used for optimization and query is run with NO_OBJECT_LINK() to prevent further data links if any.</p>
+<p>Then, my session switches back to my PDB:
+<pre>
+*** 2016-09-04T16:09:54.406676+02:00 (PDB(3))
+</pre>
+and execution of my query finishes:
+<pre>
+FETCH #139807307349184:c=0,e=375,p=0,cr=0,cu=0,mis=0,r=1,dep=0,og=2,plh=1333657383,tim=203051393981
+STAT #139807307349184 id=1 cnt=1 pid=0 pos=1 obj=0 op='SORT AGGREGATE (cr=0 pr=0 pw=0 str=1 time=544 us)'
+STAT #139807307349184 id=2 cnt=1 pid=1 pos=1 obj=0 op='DATA LINK FULL DBA_PDBS (cr=0 pr=0 pw=0 str=1 time=525 us cost=1 size=1300 card=100)'
+FETCH #139807307349184:c=0,e=1,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=0,plh=1333657383,tim=203051394259
+CLOSE #139807307349184:c=0,e=10,dep=0,type=1,tim=203051397922
+</pre></p>
+<p>you see that the execution plan is explicit: &#8216;DATA LINK FULL&#8217; in 12.2 (it was FIXED TABLE FULL X$OBLNK$ in 12.1)</p>
+<h3>_diag_cdb_logging</h3>
+<p>This new behaviour is controlled by an underscore parameter:</p>
+<p><pre>SQL&gt; alter system set "_diag_cdb_logging"=thisIsMyWayToGetHelp;
+alter system set "_diag_cdb_logging"=thisIsMyWayToGetHelp
+*
+ERROR at line 1:
+ORA-00096: invalid value THISISMYWAYTOGETHELP for parameter _diag_cdb_logging,
+must be from among long, short, off</pre></p>
+<p>By default on 12.2 the parameter is set to SHORT and writes the traces as above.
+<pre>SQL&gt; alter system set "_diag_cdb_logging"=SHORT;</pre></p>
+<p>If you set it to OFF, you have same behavior as in 12.1: a &#8216;*** CONTAINER ID:&#8217; line is displayed for explicit SET CONTAINER but no more information.</p>
+<p>When set to LONG you get the CON_UID which may be useful for traces that cover plug/unplug operations:</p>
+<p><pre>SQL&gt; select con_id,name,dbid,con_uid,guid from v$containers;</p>
+<p>    CON_ID NAME           DBID    CON_UID GUID
+---------- -------- ---------- ---------- --------------------------------
+         1 CDB$ROOT  893728006          1 3817ED090B9766FDE0534440E40ABD67
+         2 PDB$SEED 1943618461 1943618461 3A29D20830E760B7E053734EA8C047BB
+         3 PDB      4128224117 4128224117 3A2C965DE81E15A8E053734EA8C023AC
+
+SQL&gt; host grep "^\*\*\*" &amp;tracefile
+*** 2016-09-04T16:50:43.462870+02:00 (PDB(3/4128224117))
+*** CONTAINER ID:(3) 2016-09-04T16:50:43.463067+02:00
+*** 2016-09-04T16:50:43.493035+02:00 (CDB$ROOT(1/1))
+*** 2016-09-04T16:50:43.495053+02:00 (PDB(3/4128224117))</pre></p>
+<p>If you want more information about CON_ID, CON_UID, GUID, and a lot more about multitenant, the<a href="https://www.amazon.com/gp/product/1259836096/ref=as_li_tl?ie=UTF8&amp;camp=1789&amp;creative=9325&amp;creativeASIN=1259836096&amp;linkCode=as2&amp;tag=seainoradbaon-20&amp;linkId=f6575b886a220385b09edc1a29f815c1" target="_blank"> Oracle Database 12c Release 2 Multitenant (Oracle Press) 1st Edition by Anton Els (Author), Vit Spinka (Author), Franck Pachot (Author)</a> goes into all details.</p>
+<p><a href="https://www.amazon.com/gp/product/1259836096/ref=as_li_tl?ie=UTF8&amp;camp=1789&amp;creative=9325&amp;creativeASIN=1259836096&amp;linkCode=as2&amp;tag=seainoradbaon-20&amp;linkId=f6575b886a220385b09edc1a29f815c1"><img border="0" src="https://ws-na.amazon-adsystem.com/widgets/q?_encoding=UTF8&amp;MarketPlace=US&amp;ASIN=1259836096&amp;ServiceVersion=20070822&amp;ID=AsinImage&amp;WS=1&amp;Format=_SL110_&amp;tag=seainoradbaon-20"></a><img src="https://ir-na.amazon-adsystem.com/e/ir?t=seainoradbaon-20&amp;l=am2&amp;o=1&amp;a=1259836096" width="1" height="1" border="0" alt="" style="border:none !important;margin:0px !important" /></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-105620" data-img="//ir-na.amazon-adsystem.com/e/ir?t=seainoradbaon-20&amp;l=am2&amp;o=1&amp;a=1259836096"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

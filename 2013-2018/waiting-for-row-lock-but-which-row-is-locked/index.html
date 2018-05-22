@@ -1,0 +1,155 @@
+								<h1 class="entry-title">Waiting for row lock. But which row is locked?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you are waiting on a locked row, the locked resource is the transaction that has locked the row. We have no information about which row is locked. Here is how to get it from V$SESSION.
+<span id="more-3628"></span>
+In a first session I lock a row in the SCOTT schema:
+<pre>
+SQL&gt; select * from SCOTT.SALGRADE where grade=1 for update ;
+
+     GRADE      LOSAL      HISAL
+---------- ---------- ----------
+         1        700       1200
+</pre>
+And in another session:
+<pre>
+SQL&gt; delete from SCOTT.SALGRADE;
+</pre>
+Of course it&#8217;s waiting. </p>
+<p>Let&#8217;s see the wait event:
+<pre>
+SQL&gt; select sid,state,event,p1raw,p1text from v$session where event like 'enq: %'
+
+   SID STATE   EVENT                          P1RAW            P1TEXT
+------ ------- ------------------------------ ---------------- ---------
+    54 WAITING enq: TX - row lock contention  0000000054580006 name|mode
+</pre>
+So I&#8217;ve a row lock contention.</p>
+<p>Here is more information from V$SESSION about the row that is locked:
+<pre>
+SQL&gt; select row_wait_obj#,row_wait_file#,row_wait_block#,row_wait_row# from v$session where event like 'enq: %';
+
+ROW_WAIT_OBJ# ROW_WAIT_FILE# ROW_WAIT_BLOCK# ROW_WAIT_ROW#
+------------- -------------- --------------- -------------
+       116760              6             211             0
+</pre>
+From there you can find which row is locked. It&#8217;s straightforward, but I&#8217;ve two warnings about it.</p>
+<p>First warning is that the ROW_WAIT_OBJ# is not the OBJECT_ID but the DATA_OBJECT_ID.
+You have to join with DBA_OBJECT and get the DATA_OBJECT_ID if you want to get the ROWID.
+<pre>
+SQL&gt; select owner,object_name,data_object_id from dba_objects where object_id=116760;
+
+OWNER      OBJECT_NAM DATA_OBJECT_ID
+---------- ---------- --------------
+SCOTT      SALGRADE           116760
+</pre>
+The ROW_WAIT_OBJ# is the OBJECT_ID but I need the DATA_OBJECT_ID to get the ROWID. Here it is the same, but just try to truncate the table (and insert back the data) and you will see that it is different. </p>
+<p>The second warning is about the ROW_WAIT_FILE# which is the the absolute file number.
+But you need the relative file number if you want to get the ROWID. </p>
+<p>We have to go though DBA_DATA_FILES to get it.
+<pre>
+SQL&gt; select relative_fno from dba_data_files where file_id=6;
+
+RELATIVE_FNO
+------------
+           6
+</pre>
+It&#8217;s the same number here, but if you have transported datafiles (or have more than 1024 datafiles), then you will see different numbers.</p>
+<p>Remember, the ROWID must change when a table is truncated (in order to be sure that we don&#8217;t read old data) and the ROWID must not change when we transport tablespaces (so that we don&#8217;t have to update all the blocks in the tablespace).</p>
+<p>So now, I can get the ROWID with dbms_rowid and get the row that is locked:</p>
+<p><pre>
+SQL&gt; select * from SCOTT.SALGRADE where rowid=dbms_rowid.rowid_create(1,116760,6,211,0);
+
+     GRADE      LOSAL      HISAL
+---------- ---------- ----------
+         1        700       1200
+</pre></p>
+<p>This is the ideal case. You find the row that is locked.
+For most of the mode 6 TX lock (exclusive) you will have that information because the session went to the row in order to see the lock, and that information was registered in V$SESSION.
+If you have a mode 4 TX lock (share) that can be different. You find those when the lock is at higher level than the row. For example ITL wait, or unique index entry, or referential integrity (I&#8217;m talking about TX mode 4 here, not TM locks). Then the information gotten from V$SESSION is incomplete. There is no row number, it can be an index block, etc.</p>
+<p>More information about locks at <a href="https://www.doag.org/konferenz/konferenzplaner/b.php?id=473721&amp;locS=1&amp;q=lock">DOAG 2015</a>.</p>
+<p>As a summary, here is the query to get the ROWID for which sessions are waiting on TX locks:
+<em>(fixed thanks to comment below.)</em>
+<pre>
+select s.p1raw,o.owner,o.object_name,
+dbms_rowid.rowid_create(1,o.data_object_id,f.relative_fno,s.row_wait_block#,s.row_wait_row#) row_id
+from v$session s
+join dba_objects o on s.row_wait_obj#=o.object_id
+join dba_segments m on o.owner=m.owner and o.object_name=m.segment_name
+join dba_data_files f on s.row_wait_file#=f.file_id and m.tablespace_name=f.tablespace_name
+where s.event like 'enq: TX%'
+</pre>
+From P1RAW, you have the lock type (5458 is TX in ascii) and the lock mode: 54580006 is mode 6 (exclusive) and 54580004 is mode 4 (share).</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-36290"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-430">
+				<div id="div-comment-430" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/4949cecf57c3761575668b6357f960ce?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">zhwsh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-430">
+			September 17, 2015 at 3 h 50 min</a>		</div>
+
+		<p>regexp_replace(s.p1raw)</p>
+<p>ORA-00938: not enough arguments for function
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-4311"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-430' onclick='return addComment.moveForm( "div-comment-430", "430", "respond", "3628" )' aria-label='Reply to zhwsh to zhwsh'>Reply to zhwsh</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-432">
+				<div id="div-comment-432" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-432">
+			September 17, 2015 at 8 h 00 min</a>		</div>
+
+		<p>Hi Zhwsh,
+Yes I wanted to extract lock type and mode from P1RAW then changed my mind.
+Thanks for the heads up. I fix it.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-4331"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-432' onclick='return addComment.moveForm( "div-comment-432", "432", "respond", "3628" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

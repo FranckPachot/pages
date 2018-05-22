@@ -1,0 +1,292 @@
+								<h1 class="entry-title">Generic query for multicriteria search &#8211; part II: BIND_AWARE (Adaptive Cursor Sharing)</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="https://blog.dbi-services.com/generic-query-for-multicriteria-search-part-i-useconcat-or-expansion">previous post</a> I explained the performance issue encountered when using a generic query to deal with optional search criteria on multiple columns. The statement was shared by all executions, was marked as bind sensitive, but never became bind aware. Let&#8217;s use the BIND_AWARE hint.</p>
+<h3>All binds null</h3>
+<p>I assign null for all of them &#8211; meaning that I don&#8217;t want to filter anything:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec :job_id:=null; :department_id:=null; :manager_id:=null; :employee_id:=null;
+PL/SQL procedure successfully completed.
+</pre>
+<p>and I run my generic query &#8211; but with the BIND_AWARE hint:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt;
+     SELECT /*+ BIND_AWARE */
+     COUNT(*)
+     FROM
+       (SELECT 1
+       FROM employees
+       WHERE (job_id = NVL(:job_id, job_id))
+       AND (department_id = NVL(:department_id, department_id))
+       AND (manager_id = NVL(:manager_id, manager_id))
+       AND (employee_id = NVL(:employee_id, employee_id))
+       )
+SQL&gt; /
+
+  COUNT(*)
+----------
+       105
+</pre>
+<p>and here is the plan:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last +outline'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  fhpytfwk0y4r3, child number 0
+-------------------------------------
+SELECT /*+ BIND_AWARE */ COUNT(*) FROM   (SELECT 1   FROM employees
+WHERE (job_id = NVL(:job_id, job_id))   AND (department_id =
+NVL(:department_id, department_id))   AND (manager_id =
+NVL(:manager_id, manager_id))   AND (employee_id = NVL(:employee_id,
+employee_id))   )
+
+Plan hash value: 3424141370
+
+------------------------------------------------------------------------------------
+| Id  | Operation                       | Name          | Starts | E-Rows | A-Rows |
+------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                |               |      1 |        |      1 |
+|   1 |  SORT AGGREGATE                 |               |      1 |      1 |      1 |
+|   2 |   CONCATENATION                 |               |      1 |        |    105 |
+|*  3 |    FILTER                       |               |      1 |        |    105 |
+|*  4 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      1 |    105 |    105 |
+|*  5 |      INDEX FULL SCAN            | EMP_EMP_ID_PK |      1 |    107 |    107 |
+|*  6 |    FILTER                       |               |      1 |        |      0 |
+|*  7 |     TABLE ACCESS BY INDEX ROWID | EMPLOYEES     |      0 |      1 |      0 |
+|*  8 |      INDEX UNIQUE SCAN          | EMP_EMP_ID_PK |      0 |      1 |      0 |
+------------------------------------------------------------------------------------
+
+Outline Data
+-------------
+
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$F5BB74E1")
+      MERGE(@"SEL$2")
+      OUTLINE_LEAF(@"SEL$F5BB74E1_1")
+      USE_CONCAT(@"SEL$F5BB74E1" 8 OR_PREDICATES(4))
+      OUTLINE_LEAF(@"SEL$F5BB74E1_2")
+      OUTLINE(@"SEL$1")
+      OUTLINE(@"SEL$2")
+      OUTLINE(@"SEL$F5BB74E1")
+      MERGE(@"SEL$2")
+      INDEX(@"SEL$F5BB74E1_1" "EMPLOYEES"@"SEL$2" ("EMPLOYEES"."EMPLOYEE_ID"))
+      BATCH_TABLE_ACCESS_BY_ROWID(@"SEL$F5BB74E1_1" "EMPLOYEES"@"SEL$2")
+      INDEX_RS_ASC(@"SEL$F5BB74E1_2" "EMPLOYEES"@"SEL$F5BB74E1_2" ("EMPLOYEES"."EMPLOYEE_ID"))
+      END_OUTLINE_DATA
+  */
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(:EMPLOYEE_ID IS NULL)
+   4 - filter(("DEPARTMENT_ID"=NVL(:DEPARTMENT_ID,"DEPARTMENT_ID") AND
+              "MANAGER_ID"=NVL(:MANAGER_ID,"MANAGER_ID") AND "JOB_ID"=NVL(:JOB_ID,"JOB_ID")))
+   5 - filter("EMPLOYEE_ID" IS NOT NULL)
+   6 - filter(:EMPLOYEE_ID IS NOT NULL)
+   7 - filter(("DEPARTMENT_ID"=NVL(:DEPARTMENT_ID,"DEPARTMENT_ID") AND
+              "MANAGER_ID"=NVL(:MANAGER_ID,"MANAGER_ID") AND "JOB_ID"=NVL(:JOB_ID,"JOB_ID")))
+   8 - access("EMPLOYEE_ID"=:EMPLOYEE_ID)
+
+</pre>
+<p>It&#8217;s the same plan as before. FULL SCAN in the index on EMPLOYEE_ID because the CBO estimates it&#8217;s the fastest way to get non null EMPLOYEE_ID.</p>
+<h3>query for one EMPLOYEE_ID</h3>
+<p>And now running the same query, but for a specific EMPLOYEE_ID</p>
+<pre>SQL&gt; exec :job_id:=null; :department_id:=null; :manager_id:=null; :employee_id:=0;
+PL/SQL procedure successfully completed.
+</pre>
+<pre>SQL&gt; /
+
+  COUNT(*)
+----------
+         0</pre>
+<p>A new cursor has been created for it:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last +outline'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+SQL_ID  fhpytfwk0y4r3, child number 1
+-------------------------------------
+SELECT /*+ BIND_AWARE */ COUNT(*) FROM   (SELECT 1   FROM employees
+WHERE (job_id = NVL(:job_id, job_id))   AND (department_id =
+NVL(:department_id, department_id))   AND (manager_id =
+NVL(:manager_id, manager_id))   AND (employee_id = NVL(:employee_id,
+employee_id))   )
+
+Plan hash value: 1540312732
+
+-------------------------------------------------------------------------------
+| Id  | Operation                 | Name           | Starts | E-Rows | A-Rows |
+-------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT          |                |      1 |        |      1 |
+|   1 |  SORT AGGREGATE           |                |      1 |      1 |      1 |
+|   2 |   CONCATENATION           |                |      1 |        |      0 |
+|*  3 |    FILTER                 |                |      1 |        |      0 |
+|*  4 |     TABLE ACCESS BY INDEX | EMPLOYEES      |      1 |      1 |      0 |
+|*  5 |      INDEX FULL SCAN      | EMP_MANAGER_IX |      1 |      1 |    106 |
+|*  6 |    FILTER                 |                |      1 |        |      0 |
+|*  7 |     TABLE ACCESS BY INDEX | EMPLOYEES      |      0 |      1 |      0 |
+|*  8 |      INDEX RANGE SCAN     | EMP_MANAGER_IX |      0 |      1 |      0 |
+-------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter(:MANAGER_ID IS NULL)
+   4 - filter(("EMPLOYEE_ID"=NVL(:EMPLOYEE_ID,"EMPLOYEE_ID") AND
+              "DEPARTMENT_ID"=NVL(:DEPARTMENT_ID,"DEPARTMENT_ID") AND "JOB_ID"=NVL(:JOB_ID,"JOB_ID")))
+   5 - filter("MANAGER_ID" IS NOT NULL)
+   6 - filter(:MANAGER_ID IS NOT NULL)
+   7 - filter(("EMPLOYEE_ID"=NVL(:EMPLOYEE_ID,"EMPLOYEE_ID") AND
+              "DEPARTMENT_ID"=NVL(:DEPARTMENT_ID,"DEPARTMENT_ID") AND "JOB_ID"=NVL(:JOB_ID,"JOB_ID")))
+   8 - access("MANAGER_ID"=:MANAGER_ID)
+</pre>
+<p>Now, the optimizer has chosen to full scan the index on MANAGER_ID. Once again the goal is not check if it is the right choice or not. But the important point is that thanks to BIND_AWARE a new cursor has been created and the OR Expansion occured for another predicate:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">Outline Data
+-------------
+
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$F5BB74E1")
+      MERGE(@"SEL$2")
+      OUTLINE_LEAF(@"SEL$F5BB74E1_1")
+      USE_CONCAT(@"SEL$F5BB74E1" 8 OR_PREDICATES(3))
+      OUTLINE_LEAF(@"SEL$F5BB74E1_2")
+      OUTLINE(@"SEL$1")
+      OUTLINE(@"SEL$2")
+      OUTLINE(@"SEL$F5BB74E1")
+      MERGE(@"SEL$2")
+      INDEX(@"SEL$F5BB74E1_1" "EMPLOYEES"@"SEL$2" ("EMPLOYEES"."MANAGER_ID"))
+      BATCH_TABLE_ACCESS_BY_ROWID(@"SEL$F5BB74E1_1" "EMPLOYEES"@"SEL$2")
+      INDEX_RS_ASC(@"SEL$F5BB74E1_2" "EMPLOYEES"@"SEL$F5BB74E1_2" ("EMPLOYEES"."MANAGER_ID"))
+      BATCH_TABLE_ACCESS_BY_ROWID(@"SEL$F5BB74E1_2" "EMPLOYEES"@"SEL$F5BB74E1_2")
+      END_OUTLINE_DATA
+  */
+</pre>
+<p>From the outline hints we can see that the 3rd predicate has been chosen, which is the one on MANAGER_ID. Note that the OR_PREDICATE part of the USE_CONCAT is not documented, and can become complex to control when other transformations change the order of predicates.</p>
+<h3>All combinations</h3>
+<p>I&#8217;ve run it with all combinations and it seems that the OR Expansion occured for the 4 predicate possibilities:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select distinct plan_table_output from table(dbms_xplan.display_cursor(sql_id=&gt;'fhpytfwk0y4r3',cursor_child_no=&gt;null,format=&gt;'basic +outline +peeked_binds')) where plan_table_output like '%USE_CONCAT%';
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+      USE_CONCAT(@"SEL$F5BB74E1" 8 OR_PREDICATES(4))
+      USE_CONCAT(@"SEL$F5BB74E1" 8 OR_PREDICATES(2))
+      USE_CONCAT(@"SEL$F5BB74E1" 8 OR_PREDICATES(3))
+      USE_CONCAT(@"SEL$F5BB74E1" 8 OR_PREDICATES(1))
+</pre>
+<p>And I&#8217;ve several cursors:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select child_number,predicate,range_id,low,high from v$sql_cs_selectivity where sql_id in ('a9taz8xhfu2kc','fhpytfwk0y4r3') order by sql_id,child_number;
+
+CHILD_NUMBER PREDICATE                                  RANGE_ID LOW        HIGH
+------------ ---------------------------------------- ---------- ---------- ----------
+           0 =EMPLOYEE_I                                       0 0.000000   0.000000
+           1 =MANAGER_ID                                       0 0.000000   0.000000
+           2 =DEPARTMENT                                       0 0.000000   0.000000
+           3 =JOB_ID                                           0 0.000000   0.000000
+           4 =EMPLOYEE_I                                       0 0.000000   0.005140
+</pre>
+<p>Is that sufficient? probably not. A dynamic query will probably find a better plan for a specific combination. But at least we have the possibility have several cursors and get a plan that has an efficient index access.</p>
+<p>You want more plans without having to do dynamic sampling? You can do that by changing any session parameter that causes an &#8216;optimizer mismatch&#8217;. For example, have a different one for each combination of fields that are null or not. Which optimizer parameter? It would be nice to have a dummy one so that it does not have any side effects. If you have an idea, please post.</p>
+<p>Of course there is this &#8220;_optimizer_random_plan&#8221; but do you want to play with an undocumented that has such a name? Maybe that will be for part III&#8230;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5930"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1398">
+				<div id="div-comment-1398" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1ae8b723f61e1bfe68b88dbeb97b9772?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Lothar</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1398">
+			March 5, 2015 at 6 h 45 min</a>		</div>
+
+		<p>I testet BIND_AWARE a year ago, Some improvement, but still not the plan I wanted. I talked to Mohammed Zailt (Head of Optimizer Development) about it.Maybe something will change.
+In the meantime I have an rather radical idea.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13991"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1398' onclick='return addComment.moveForm( "div-comment-1398", "1398", "respond", "592" )' aria-label='Reply to Lothar to Lothar'>Reply to Lothar</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1399">
+				<div id="div-comment-1399" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1399">
+			March 5, 2015 at 6 h 57 min</a>		</div>
+
+		<p>Hi Lothar,
+Thanks for your comment. I&#8217;m looking forward to see you radical idea. Only half solutions are coming to my mind and I still recommend dynamic SQL for that cases. I hope your idea will be voted up enough: <a href="https://community.oracle.com/ideas/3167" rel="nofollow">https://community.oracle.com/ideas/3167</a>
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14001"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1399' onclick='return addComment.moveForm( "div-comment-1399", "1399", "respond", "592" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1400">
+				<div id="div-comment-1400" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1400">
+			March 5, 2015 at 6 h 57 min</a>		</div>
+
+		<p>Hi Lothar,
+Thanks for your comment. I&#8217;m looking forward to see you radical idea. Only half solutions are coming to my mind and I still recommend dynamic SQL for that cases. I hope your idea will be voted up enough: <a href="https://community.oracle.com/ideas/3167" rel="nofollow">https://community.oracle.com/ideas/3167</a>
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14011"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1400' onclick='return addComment.moveForm( "div-comment-1400", "1400", "respond", "592" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

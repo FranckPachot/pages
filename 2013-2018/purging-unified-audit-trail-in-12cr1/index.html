@@ -1,0 +1,391 @@
+								<h1 class="entry-title">Purging Unified Audit Trail in 12cR1</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you want to empty a table you have two methods: delete and truncate. If, for any reason (see <a href="../12c-unified-auditing-and-audit_traildb-in-mixed-mode/index.html">previous post</a>) the Unified Audit Trail has become too big, you cannot directly delete or truncate the table. You must call the dbms_audit_mgmt.clean_audit_trail. But then you want to know if it will do slow deletes or quick truncates. Let&#8217;s trace it.
+<span id="more-15068"></span>
+I have filled my Unified Audit Trail with hundred of thousands failed logins:
+<pre>SQL&gt; select unified_audit_policies,action_name,count(*) from unified_audit_trail group by unified_audit_policies,action_name;
+
+UNIFIED_AUDIT_POLICIES                   ACTION_NAME            COUNT(*)
+---------------------------------------- -------------------- ----------
+                                         EXECUTE                       2
+ORA_LOGON_FAILURES                       LOGON                    255799</pre></p>
+<p>We have two methods to purge: purge records older than a timestamp or purge all.</p>
+<h3>Purge old</h3>
+<p>Auditing is different than logging. It&#8217;s a security feature. The goal is not to keep only recent information by specifying a retention. The goal is to read, process and archive the records, and then set a timestamp to the high water mark that has been processed. Then a background job will delete what is before this timestamp.</p>
+<p>I set the timestamp to 6 hours before now</p>
+<p><pre>SQL&gt; exec dbms_audit_mgmt.set_last_archive_timestamp(audit_trail_type=&gt;dbms_audit_mgmt.audit_trail_unified
+,last_archive_time=&gt;sysdate-6/24);
+PL/SQL procedure successfully completed.</pre></p>
+<p>And call the clean procedure:</p>
+<p><pre>SQL&gt; exec dbms_audit_mgmt.clean_audit_trail(audit_trail_type=&gt;dbms_audit_mgmt.audit_trail_unified
+,use_last_arch_timestamp=TRUE);
+PL/SQL procedure successfully completed.</pre></p>
+<p>This was fast but let&#8217;s look at the tkprof. Besides some select, I see a delete on the CLI_SWP$ table that stores the Unified Audit Trail in Secure File LOBs</p>
+<p><pre>delete from "CLI_SWP$2f516430$1$1" partition("HIGH_PART")
+where
+ max_time &lt; :1
+
+call     count       cpu    elapsed       disk      query    current        rows
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+Parse        1      0.00       0.00          0          0          0           0
+Execute      1      0.47       1.82         20        650      47548        6279
+Fetch        0      0.00       0.00          0          0          0           0
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+total        2      0.47       1.82         20        650      47548        6279
+
+Misses in library cache during parse: 1
+Misses in library cache during execute: 1
+Optimizer mode: ALL_ROWS
+Parsing user id: 7     (recursive depth: 1)
+Number of plan statistics captured: 1
+
+Rows (1st) Rows (avg) Rows (max)  Row Source Operation
+---------- ---------- ----------  ---------------------------------------------------
+         0          0          0  DELETE  CLI_SWP$2f516430$1$1 (cr=650 pr=20 pw=0 time=1827790 us)
+      6279       6279       6279   PARTITION RANGE SINGLE PARTITION: 1 1 (cr=248 pr=0 pw=0 time=15469 us cost=5 size=18020 card=530)
+      6279       6279       6279    TABLE ACCESS FULL CLI_SWP$2f516430$1$1 PARTITION: 1 1 (cr=248 pr=0 pw=0 time=10068 us cost=5 size=18020 card=530)</pre></p>
+<p>I will not go into the detail there. This delete may be optimized (120000 audit trail records were actually deleted here behind those 6000 rows. This table is partitioned, and we can expect that old partitions are truncated but there are many bugs with that. On lot of environments we see all rows in HIGH_PART.
+This is improved in 12cR2 and will be the subject of a future post. I you have a huge audit trail to purge, then conventional delete is not optimal.</p>
+<h3>Purge all</h3>
+<p>I have still lot of rows remaining.</p>
+<p><pre>SQL&gt; select unified_audit_policies,action_name,count(*) from unified_audit_trail group by unified_audit_policies,action_name;
+
+UNIFIED_AUDIT_POLICIES                   ACTION_NAME            COUNT(*)
+---------------------------------------- -------------------- ----------
+                                         EXECUTE                       4
+ORA_LOGON_FAILURES                       LOGON                    136149</pre></p>
+<p>When purging all without setting a timestamp, I expect a truncate which is faster than deletes. Let&#8217;s try it and trace it.</p>
+<p><pre>SQL&gt; exec dbms_audit_mgmt.clean_audit_trail(audit_trail_type=&gt;dbms_audit_mgmt.audit_trail_unified
+,use_last_arch_timestamp=FALSE);
+PL/SQL procedure successfully completed.</pre></p>
+<p>First, there seem to be an internal log acquired:
+<pre>SELECT LOCKID FROM DBMS_LOCK_ALLOCATED WHERE NAME = :B1 FOR UPDATE
+UPDATE DBMS_LOCK_ALLOCATED SET EXPIRATION = SYSDATE + (:B1 /86400) WHERE ROWID = :B2</pre></p>
+<p>Then a partition split:
+<pre>alter table "CLI_SWP$2f516430$1$1" split partition high_part at (3013381) into (partition "PART_6",  partition high_part lob(log_piece) store as securefile (cache logging    tablespace SYSAUX) tablespace "SYSAUX")</pre></p>
+<p>The split point is the current timestamp SCN:</p>
+<p><pre>SQL&gt; select scn_to_timestamp(3013381) from dual;
+
+SCN_TO_TIMESTAMP(3013381)
+---------------------------------------------------------------------------
+02-MAR-17 05.59.06.000000000 PM</pre></p>
+<p>This is the time when I&#8217;ve run the purge and this is probably used to &#8216;truncate&#8217; all previous partition but keep the on-going one.</p>
+<p>Then , there is no TRUNCATE in the trace, but something similar: some segments are dropped:</p>
+<p><pre>delete from seg$
+where
+ ts#=:1 and file#=:2 and block#=:3
+
+call     count       cpu    elapsed       disk      query    current        rows
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+Parse        1      0.00       0.00          0          0          0           0
+Execute      6      0.00       0.00          0         18         12           6
+Fetch        0      0.00       0.00          0          0          0           0
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+total        7      0.00       0.00          0         18         12           6</pre></p>
+<p>There is finally a delete, but with no rows to delete as the rows were in the dropped segments:</p>
+<p><pre>delete from &quot;CLI_SWP$2f516430$1$1&quot; partition(&quot;HIGH_PART&quot;)
+where
+ max_time &lt; :1
+
+call     count       cpu    elapsed       disk      query    current        rows
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+Parse        1      0.00       0.00          0          0          0           0
+Execute      1      0.00       0.00          0          3          0           0
+Fetch        0      0.00       0.00          0          0          0           0
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+total        2      0.00       0.00          0          3          0           0
+
+Misses in library cache during parse: 1
+Misses in library cache during execute: 1
+Optimizer mode: ALL_ROWS
+Parsing user id: 7     (recursive depth: 1)
+Number of plan statistics captured: 1
+
+Rows (1st) Rows (avg) Rows (max)  Row Source Operation
+---------- ---------- ----------  ---------------------------------------------------
+         0          0          0  DELETE  CLI_SWP$2f516430$1$1 (cr=3 pr=0 pw=0 time=61 us)
+         0          0          0   PARTITION RANGE SINGLE PARTITION: 1 1 (cr=3 pr=0 pw=0 time=57 us cost=5 size=2310 card=33)
+         0          0          0    TABLE ACCESS FULL CLI_SWP$2f516430$1$1 PARTITION: 1 1 (cr=3 pr=0 pw=0 time=48 us cost=5 size=2310 card=33)</pre></p>
+<h3>So what?</h3>
+<p>Cleaning the Unified Audit Trail is done with internal statements but looks like a delete when use_last_arch_timestamp=TRUE or a truncate when use_last_arch_timestamp=FALSE. This means that we can use this procedure when AUDSYS has grown too much. However, there are a few bug with this internal table, partitioned even when partitioning is not allowed. The implementation has changed in 12.2 so the next blog post will show the same test on 12<em>c</em>R2.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-150690"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 8 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7488">
+				<div id="div-comment-7488" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9977b980c53b8891af26373083db7f77?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">abhishek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7488">
+			May 11, 2017 at 10 h 27 min</a>		</div>
+
+		<p>12CRr1 SE in my case the  occupies 32 AUDSYS.SYS_LOB0000091751C00014$$   ans sysaux tablespace is full
+<pre>
+TABLESPACE_NAME                TOTAL ALLOC (MB) TOTAL PHYS ALLOC (MB)     USED (MB)  % USED
+
+SYSAUX                                65,535.97             65,440.00     33,014.63   50.38
+
+
+COMPONENT        MB SEGMENT_NAME                                                          SEGMENT_TYPE
+--------- --------- --------------------------------------------------------------------- ---------------
+NON_AWR    30,781.1 AUDSYS.SYS_LOB0000091751C00014$$                                      LOBSEGMENT
+NON_AWR     1,154.0 AUDSYS.CLI_SWP$b626fcd6$1$1                                           TABLE
+</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-74891"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7488' onclick='return addComment.moveForm( "div-comment-7488", "7488", "respond", "15068" )' aria-label='Reply to abhishek to abhishek'>Reply to abhishek</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-7489">
+				<div id="div-comment-7489" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9977b980c53b8891af26373083db7f77?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">abhishek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7489">
+			May 11, 2017 at 10 h 30 min</a>		</div>
+
+		<p><pre>
+TABLESPACE_NAME  TOTAL ALLOC (MB) TOTAL PHYS ALLOC (MB)  (MB)  % USED
+SYSAUX                         65,535.97             65,440.00        33,014.63                     50.38
+</pre></p>
+<p>1c) SYSAUX usage &#8211; Unregistered Schemas
+******************************************
+<pre>
+| This section displays schemas that are not registered
+| in V$SYSAUX_OCCUPANTS
+|
+| Schema  AUDSYS       occupies         32,139.2 MB
+</pre></p>
+<p>how can i solved the problem
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-74901"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7489' onclick='return addComment.moveForm( "div-comment-7489", "7489", "respond", "15068" )' aria-label='Reply to abhishek to abhishek'>Reply to abhishek</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-7524">
+				<div id="div-comment-7524" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9977b980c53b8891af26373083db7f77?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">abhishek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7524">
+			May 16, 2017 at 9 h 17 min</a>		</div>
+
+		<p>SYSAUX tablesapce is full NON AWR Component.
+After cleanup of unified audit trail does not release LOB segment space.
+<pre>
+TABLESPACE_NAME                TOTAL ALLOC (MB) TOTAL PHYS ALLOC (MB)     USED (MB)  % USED
+SYSAUX                                65,535.97             65,440.00     33,014.63   50.38
+
+COMPONENT        MB SEGMENT_NAME                                                          SEGMENT_TYPE
+--------- --------- --------------------------------------------------------------------- ---------------
+NON_AWR    30,781.1 AUDSYS.SYS_LOB0000091751C00014$$                                      LOBSEGMENT
+NON_AWR     1,154.0 AUDSYS.CLI_SWP$b626fcd6$1$1                                           TABLE
+</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75251"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7524' onclick='return addComment.moveForm( "div-comment-7524", "7524", "respond", "15068" )' aria-label='Reply to abhishek to abhishek'>Reply to abhishek</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment odd alt depth-2 parent" id="comment-9976">
+				<div id="div-comment-9976" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/c312584bb18095b0953e059d955a6131?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">preethi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-9976">
+			January 2, 2018 at 14 h 08 min</a>		</div>
+
+		<p>Hi Abhishek.</p>
+<p>Is the issue resolved.</p>
+<p>If yes, then how did u resolved it</p>
+<p>Regards,
+Preethi
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-99771"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-9976' onclick='return addComment.moveForm( "div-comment-9976", "9976", "respond", "15068" )' aria-label='Reply to preethi to preethi'>Reply to preethi</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment even depth-3" id="comment-10773">
+				<div id="div-comment-10773" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9977b980c53b8891af26373083db7f77?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">abhishek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10773">
+			April 28, 2018 at 9 h 04 min</a>		</div>
+
+		<p>for this we need to add one more datafile for SYSAUX coz datafile01 was full.</p>
+<p>for feature we disabled the unified audit trail MIXMODE.
+Disable the two default policies &#8211; this will turn off any Unified Auditing features:
+SQL&gt; noaudit policy ORA_SECURECONFIG;
+SQL&gt; noaudit policy ORA_LOGON_FAILURES;</p>
+<p>.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107741"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10773' onclick='return addComment.moveForm( "div-comment-10773", "10773", "respond", "15068" )' aria-label='Reply to abhishek to abhishek'>Reply to abhishek</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-10272">
+				<div id="div-comment-10272" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/8434c80f30ce6f470bd3d7449dc3f947?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://anilech.blogspot.com/' rel='external nofollow' class='url'>anilech</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10272">
+			January 25, 2018 at 13 h 27 min</a>		</div>
+
+		<p>Hi!
+<pre>
+SQL&gt; select owner||'."'||table_name||'"' t from dba_tables where table_name like 'CLI_SWP$%';
+
+T
+------------------------------------
+AUDSYS."CLI_SWP$18c7c2a9$1$1"
+
+SQL&gt; truncate table AUDSYS."CLI_SWP$18c7c2a9$1$1";
+truncate table AUDSYS."CLI_SWP$18c7c2a9$1$1"
+      &nbsp;                *
+FEHLER in Zeile 1:
+ORA-55941: DML- und DDL-Vorgänge sind auf Tabelle
+"AUDSYS"."CLI_SWP$18c7c2a9$1$1" nicht zulässig
+
+
+SQL&gt; shutdown immediate;
+...
+ORACLE-Instanz heruntergefahren.
+SQL&gt; startup upgrade;
+...
+Datenbank geöffnet.
+SQL&gt; truncate table AUDSYS."CLI_SWP$18c7c2a9$1$1";
+
+Tabelle mit TRUNCATE geleert.
+
+SQL&gt; shutdown immediate;
+SQL&gt; startup;
+</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-102731"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10272' onclick='return addComment.moveForm( "div-comment-10272", "10272", "respond", "15068" )' aria-label='Reply to anilech to anilech'>Reply to anilech</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-10275">
+				<div id="div-comment-10275" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10275">
+			January 25, 2018 at 14 h 16 min</a>		</div>
+
+		<p>Vielen Dank, Anilesh <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":)" class="wp-smiley" />
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-102761"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10275' onclick='return addComment.moveForm( "div-comment-10275", "10275", "respond", "15068" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-10641">
+				<div id="div-comment-10641" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/225dcf767882d77cea4a7efd2926946b?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Lourival Carlos Tedesco</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10641">
+			February 22, 2018 at 15 h 35 min</a>		</div>
+
+		<p>Thank You&#8230;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-106421"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10641' onclick='return addComment.moveForm( "div-comment-10641", "10641", "respond", "15068" )' aria-label='Reply to Lourival to Lourival Carlos Tedesco'>Reply to Lourival</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

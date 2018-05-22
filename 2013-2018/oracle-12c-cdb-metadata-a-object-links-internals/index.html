@@ -1,0 +1,1121 @@
+								<h1 class="entry-title">Oracle 12c CDB &#8211; metadata &amp; object links internals</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Warning: this is only geek stuff about internals on multitenant database dictionary, metadata, and object links. It has nothing to do with the operations that you can do on your database. Don&#8217;t try that in production or you can corrupt the whole dictionary.</p>
+<p>In 12 multitenant database (aka CDB) we know that each pluggable database is isolated in order to act as a standalone database. But they share some common resources because that&#8217;s the main reason to consolidate into one CDB. No problem for cpu, memory, redo and undo resources. They are managed by the instance which is at CDB level only. And most of the time the container can be identified from the service, from the tablespace, etc. It&#8217;s not difficult either for data because each PDB has it&#8217;s own set of tablespaces and the pluggable feature is just an extension of the transportable tablespace.</p>
+<p>What was probably more challenging for Oracle 12c architects is the way to implement the sharing of the dictionary.</p>
+<p>First, each PDB has its own metadata describing its own data. But metadata for the dictionary itself must be shared. For example all the dbms_xxx packages are stored only in CDB$ROOT container and PDB have metadata links for them.</p>
+<p>In addition to that, some dictionary data must be shared as well, such as some reference tables (AUDIT_ACTIONS) or common repositories (AWR data exposed as DBA_HIST_). They are stored only in CDB$ROOT container and each PDB defines a view with is just an object link for them.</p>
+<p>Finally, the CDB$ROOT container must be able to query data from all PDB, for example using the new CDB_ views. They are exposed as container data objects, but they actually query data that is stored in each PDB.</p>
+<p>But that sounds a bit magic isn&#8217;t it? The documentation doesn&#8217;t go very far on how it&#8217;s implemented internally. Fortunately, Oracle scripts in ?/rdbms/admin give a few clues. It shows how the SQL syntax is extended when running under &#8220;_ORACLE_SCRIPT&#8221;=true.</p>
+<p>So, geek stuff is coming now. Let&#8217;s try to create metadata and object links ourselves&#8230;</p>
+<p>The following is done after setting &#8220;_ORACLE_SCRIPT&#8221;=true in our session.
+You will see these new syntax elements: cdb$view(), sharing=metadata, sharing=object, common_data</p>
+<h3>Container data objects</h3>
+<p>First, let&#8217;s see how the root can view data from other containers.</p>
+<p>I am in the root container:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ CDB$ROOT
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 1</pre>
+<p>and create a regular table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create table DEMO_REG_TABLE sharing=none as select 111 dummy from dual;
+ Table created.
+SQL&gt; select * from DEMO_REG_TABLE;
+      DUMMY
+ ----------
+        111</pre>
+<p>Then I do exactly the same (but different data) in a PDB</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ PDB1
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 3
+SQL&gt; create table DEMO_REG_TABLE sharing=none as select 999 dummy from dual;
+ Table created.
+SQL&gt; select * from DEMO_REG_TABLE;
+      DUMMY
+ ----------
+        999</pre>
+<p>Now back in the root container, I&#8217;ll use the CDB$VIEW table function in order to see data from all PDB:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from  cdb$view(DEMO_REG_TABLE) where con_id in (1,3);
+      DUMMY     CON_ID
+ ---------- ----------
+        999          3
+        111          1</pre>
+<p>This is how container objects are defined. They use CDB$VIEW to run a query in each PDB, consolidate the result and add a CON_ID column to show where the data comes from.</p>
+<p>You want to know how it is implemented? It seems that it is doing a parallel query on each PDB.
+Here is the proof. Previously I used &#8216;con_id in (1,3)&#8217; because I&#8217;ve not created my table in all PDB.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from  cdb$view(DEMO_REG_TABLE);
+ select * from  cdb$view(DEMO_REG_TABLE)
+ *
+ ERROR at line 1:
+ ORA-12801: error signaled in parallel query server P002
+ ORA-00942: table or view does not exist</pre>
+<p>When the table is not found in a PDB the error comes from a parallel process.</p>
+<h3>Metadata links</h3>
+<p>Now I will create a function in both the CDB$ROOT container and in a PDB. But I don&#8217;t want to have the code stored twice. I&#8217;ll use SHARING=METADATA to define a metadata link.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ CDB$ROOT
+SQL&gt; show con_id
+CON_ID
+ ------------------------------
+ 1
+SQL&gt; create function DEMO_MDL_FUNCTION sharing=metadata
+   2  return varchar2 as dummy varchar2(100); begin select max(dummy) into dummy from DEMO_REG_TABLE; return dummy; end;
+   3  /
+ Function created.
+SQL&gt; select DEMO_MDL_FUNCTION from dual;
+ DEMO_MDL_FUNCTION
+ ------------------------------
+ 111</pre>
+<p>This is my function in CDB$ROOT, showing content from my regular table in CDB$ROOT.
+Now doing exactly the same in a PDB:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ PDB1
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 3
+SQL&gt; create function DEMO_MDL_FUNCTION sharing=metadata
+   2  return varchar2 as dummy varchar2(100); begin select max(dummy) into dummy from DEMO_REG_TABLE; return dummy; end;
+   3  /
+ Function created.
+SQL&gt; select DEMO_MDL_FUNCTION from dual;
+ DEMO_MDL_FUNCTION
+ ------------------------------
+ 999</pre>
+<p>Here it is. I have the same function in my PDB, showing content from the regular table in PDB.</p>
+<p>I can see the metadata for my function from the SYS.SOURCE$ dictionary table.
+Here in CDB$ROOT:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+ Session altered.
+SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO%');
+      OBJ#       LINE SOURCE
+ ---------- ---------- ------------------------------
+      95789          1 function DEMO_MDL_FUNCTION</pre>
+<p>but let&#8217;s see what I have in my PDB:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+ Session altered.
+SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO%');
+no rows selected</pre>
+<p>Nothing is stored in the PDB. Only the information (in OBJ$) that the object is a metadata link.</p>
+<p>But there is another magic if I query the DBA_SOURCE view:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from dba_source where name like 'DEMO%';
+OWNER NAME              TYPE      LINE TEXT                        ORIGIN_CON_ID
+ ----- ----------------- --------- ---- --------------------------- -------------
+ SYS   DEMO_MDL_FUNCTION FUNCTION     1 function DEMO_MDL_FUNCTION              1</pre>
+<p>DBA_SOURCE shows information from the CDB$ROOT, following the metadata links, and adds a ORIGIN_CON_ID column to see if the row is coming from the PDB dictionary or the CDB$ROOT dictionary. I&#8217;ll will detail that later by creating a &#8216;common data view&#8217;.</p>
+<h3>Object links</h3>
+<p>We have seen how the CDB$ROOT can store metadata for all the PDB. We will use it to create a table with metadata link. But in addition to that we will create an object link so that the table in CDB$ROOT will store the data for all PDB. I&#8217;ll use SHARING=METADATA to create the table and SHARING=OBJECT when creating the view.</p>
+<p>First I create the table in both containers:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ CDB$ROOT
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 1
+SQL&gt; create table DEMO_MDL_TABLE sharing=metadata as select 111 dummy from dual;
+ Table created.
+SQL&gt; alter session set container=pdb1;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ PDB1
+SQL&gt; show con_id
+CON_ID
+ ------------------------------
+ 3
+SQL&gt; create table DEMO_MDL_TABLE sharing=metadata as select 999 dummy  from dual;
+ Table created.</pre>
+<p>So the table is created in both containers. I&#8217;ve inserted different data in order to understand what happens. Let&#8217;s use db CDB$VIEW to show data from each container:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+ Session altered.
+SQL&gt; select * from  cdb$view(DEMO_MDL_TABLE) where con_id in (1,3);
+     DUMMY     CON_ID
+ ---------- ----------
+        999          3
+        111          1</pre>
+<p>I have two tables with same structure (because it is a metadata link). The CDB$ROOT one contains &#8216;111&#8217; and the PDB one contains &#8216;999&#8217;.</p>
+<p>I&#8217;ll create a view on it, defining it as an object link so that the data is shared:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ CDB$ROOT
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 1
+SQL&gt; create view DEMO_OBL_VIEW sharing=object as select * from DEMO_MDL_TABLE;
+ View created.
+SQL&gt; select * from DEMO_OBL_VIEW;
+      DUMMY
+ ----------
+        111</pre>
+<p>The view in CDB$ROOT shows data from the table in CDB$ROOT. Now let&#8217;s do the same in a PDB:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ PDB1
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 3
+SQL&gt; create view DEMO_OBL_VIEW sharing=object as select * from DEMO_MDL_TABLE;
+ View created.
+SQL&gt; select * from DEMO_OBL_VIEW;
+      DUMMY
+ ----------
+        111</pre>
+<p>The view in the PDB shows data from the table in CDB$ROOT. The query followed the object link instead of accessing the current container table.</p>
+<p>How data is stored in that container table? It is stored from the container. Think about AWR which run at CDB level and stores its data in WRM$ tables. Then each PDB can query them with the DBA_HIST_ views. But just in case you want to try, you can&#8217;t insert into an object link:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; insert into DEMO_OBL_VIEW select 9999 dummy from dual;
+ insert into DEMO_OBL_VIEW select 9999 dummy from dual
+             *
+ ERROR at line 1:
+ ORA-02030: can only select from fixed tables/views</pre>
+<p>This is a clue about the implementation. Object links are accessed through fixed tables. And if you explain plan from the PDB you will see it:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">---------------------------------------------
+ | Id  | Operation        | Name             |
+ ---------------------------------------------
+ |   0 | SELECT STATEMENT |                  |
+ |   1 |  FIXED TABLE FULL| X$OBLNK$aed0818c |
+ ---------------------------------------------</pre>
+<h3>Common data views</h3>
+<p>Finally, let&#8217;s see how a PDB can show data coming from the CDB$ROOT. Dictionary tables such as DBA_SOURCE must show common metadata as well as PDB metadata. It is defined as a &#8216;common data view&#8217; and I&#8217;ll create one here using COMMON_DATA:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ CDB$ROOT
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 1
+SQL&gt; create or replace view DEMO_INT_VIEW common_data (dummy,sharing) as select dummy,case when dummy='222' then 0 else 1 end from DEMO_MDL_TABLE;
+ View created.
+SQL&gt; select * from DEMO_INT_VIEW;
+     DUMMY    SHARING
+ ---------- ----------
+        111          1
+        222          0</pre>
+<p>I&#8217;ve added a &#8216;SHARING&#8217; column, that is required when using COMMON_DATA, in order to flag rows that are shared to other containers (1) and rows that are not (0). Here the line with &#8216;222&#8217; is private to my container and the others (&#8216;111&#8242;) can be seen by the PDB. And as usual, I&#8217;m doing exactly the same in the pdb:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+ Session altered.
+SQL&gt; show con_name
+ CON_NAME
+ ------------------------------
+ PDB1
+SQL&gt; show con_id
+ CON_ID
+ ------------------------------
+ 3
+SQL&gt; create or replace view DEMO_INT_VIEW common_data (dummy,sharing) as select dummy,case when dummy='222' then 0 else 1 end from DEMO_MDL_TABLE;
+ View created.
+SQL&gt; select * from DEMO_INT_VIEW;
+      DUMMY    SHARING ORIGIN_CON_ID
+ ---------- ---------- -------------
+        999          1             3
+        111          1             1</pre>
+<p>When in the PDB the COMMON_DATA view shows the shared rows from the CDB$ROOT table in addition to the the rows from PDB table.
+Of course, having read what is above, you expect to see a parallel process and a fixed table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; set autotrace on
+ SQL&gt; select * from DEMO_INT_VIEW;
+     DUMMY    SHARING ORIGIN_CON_ID
+ ---------- ---------- -------------
+        111          1             1
+        999          1             3
+Execution Plan
+ ----------------------------------------------------------
+ Plan hash value: 3158883863
+--------------------------------------------------------------------------------------------
+ |Id  | Operation               | Name            |Pstart|Pstop |   TQ  |IN-OUT| PQ Distrib |
+ --------------------------------------------------------------------------------------------
+ |  0 | SELECT STATEMENT        |                 |      |      |       |      |            |
+ |  1 |  PX COORDINATOR         |                 |      |      |       |      |            |
+ |  2 |   PX SEND QC (RANDOM)   | :TQ10000        |      |      | Q1,00 | P-&gt;S | QC (RAND)  |
+ |  3 |    PX PARTITION LIST ALL|                 |    1 |    2 | Q1,00 | PCWC |            |
+ |  4 |     FIXED TABLE FULL    | X$COMVW$e40eb386|      |      | Q1,00 | PCWP |            |
+ --------------------------------------------------------------------------------------------</pre>
+<p>The fixed table returns each container data as a partition, each gathered by a parallel process and returned to the query.</p>
+<p>This is enough about multitenant dictionary internals investigation.
+If you want more, have a look at ?/rdbms/admin/noncdb_to_pdb.sql which exposes all the magic that is done to transform a standalone dictionary to a linked one.
+If you want more conventional information about pluggable databases, and manipulate them as they are designed to, please come to our <a href="http://www.dbi-services.com/trainings/type/oracle-en/">Oracle 12c New Features workshops</a>.</p>
+<h3>Update on Nov. 11th 2014</h3>
+<p>Container data objects have changed in in first patchset. See <a href="https://blog.dbi-services.com/12102-cdb-views-are-now-using-containers">12.1.0.2 CDB views are now using CONTAINERS()</a> for information about it.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4330"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 21 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1205">
+				<div id="div-comment-1205" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/06a911192fccc261a242f1e690d3561a?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Fagner Santos</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1205">
+			June 18, 2014 at 14 h 17 min</a>		</div>
+
+		<p>Hi Franck!
+Thanks to share your knoledge! you post is perfect and explained exactly what I was looking for and didint find at oracle documents.</p>
+<p>Regards,</p>
+<p>Fagner
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12061"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1205' onclick='return addComment.moveForm( "div-comment-1205", "1205", "respond", "432" )' aria-label='Reply to Fagner to Fagner Santos'>Reply to Fagner</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1332">
+				<div id="div-comment-1332" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/896349331f8a46c61a20c02041153e14?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Ivica ARsov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1332">
+			December 28, 2014 at 1 h 27 min</a>		</div>
+
+		<p>Hi Franck,
+What I found strange is that according definition AUDIT_ACTIONS is object-linked, but still the data not shared to all pdbs from the root.</p>
+<p>CDB$ROOT:
+SQL> insert into audit_actions values (250,&#8217;a&#8217;);
+1 row created.
+SQL> commit;
+Commit complete.
+SQL> select count(*) from audit_actions;</p>
+<p>  COUNT(*)
+&#8212;&#8212;&#8212;-
+       213</p>
+<p>SQL></p>
+<p>PDB1:
+SQL> alter session set container=pdb1;
+Session altered.
+SQL> select count(*) from audit_actions;</p>
+<p>  COUNT(*)
+&#8212;&#8212;&#8212;-
+       212</p>
+<p>SQL></p>
+<p>Also the ROWIDs are different.</p>
+<p>Regards,
+Ivica
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13331"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1332' onclick='return addComment.moveForm( "div-comment-1332", "1332", "respond", "432" )' aria-label='Reply to Ivica to Ivica ARsov'>Reply to Ivica</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1333">
+				<div id="div-comment-1333" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1333">
+			December 28, 2014 at 9 h 27 min</a>		</div>
+
+		<p>Hi Ivica,
+Your comment is very interesting. AUDIT_ACTIONS was the first example I checked when investigating CDB dictionary and has mislead my comprehension (see <a href="http://www.dba-village.com/village/dvp_forum.OpenThread?ThreadIdA=69321#202961" rel="nofollow">http://www.dba-village.com/village/dvp_forum.OpenThread?ThreadIdA=69321#202961</a>).
+I think that we need a view above the table in order to share it (insert into PDB view will insert into CDB$ROOT table).
+I&#8217;ll check that and blog about it soon. cataudit.sql do not follow that rule but I think it&#8217;s a small bug.
+Best Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13341"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1333' onclick='return addComment.moveForm( "div-comment-1333", "1333", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1334">
+				<div id="div-comment-1334" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/896349331f8a46c61a20c02041153e14?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Ivica Arsov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1334">
+			December 28, 2014 at 14 h 46 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>Yes, it sharing works only for views, and since the AUDIT_ACTIONS is defined as table (without view) the sql goes directly into the table in the container you&#8217;re connected to.</p>
+<p>SQL> show con_id;</p>
+<p>CON_ID
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;
+1
+SQL> show con_name;</p>
+<p>CON_NAME
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;
+CDB$ROOT
+SQL>
+SQL>
+SQL> create table mytable sharing=object as select 111 col2 from dual;
+Table created.
+SQL> create view mytable_v sharing=object as select * from mytable;</p>
+<p>View created.</p>
+<p>SQL> alter session set container=pdb1;</p>
+<p>Session altered.</p>
+<p>SQL> create table mytable sharing=object as select 222 col2 from dual;</p>
+<p>Table created.</p>
+<p>SQL> create view mytable_v sharing=object as select * from mytable;</p>
+<p>View created.</p>
+<p>SQL> select * from mytable_v; &#8212; data retrieved from root container</p>
+<p>      COL2
+&#8212;&#8212;&#8212;-
+       111</p>
+<p>SQL> select * from mytable; &#8212; data retreived from pdb1 container</p>
+<p>      COL2
+&#8212;&#8212;&#8212;-
+       222</p>
+<p>SQL></p>
+<p>Interesting I needed table definitio in pdb container in order to create the view.
+After the view is created I can drop the table definition and the view&#8217;ll still work.</p>
+<p>SQL> show con_name;</p>
+<p>CON_NAME
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;
+PDB1
+SQL>
+SQL> drop table mytable;</p>
+<p>Table dropped.</p>
+<p>SQL> select * from mytable_v;</p>
+<p>      COL2
+&#8212;&#8212;&#8212;-
+       111</p>
+<p>SQL></p>
+<p>Regards,
+Ivica
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13351"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1334' onclick='return addComment.moveForm( "div-comment-1334", "1334", "respond", "432" )' aria-label='Reply to Ivica to Ivica Arsov'>Reply to Ivica</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1338">
+				<div id="div-comment-1338" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1338">
+			January 1, 2015 at 21 h 49 min</a>		</div>
+
+		<p>Hi Ivica,
+I didn&#8217;t expect that we can drop the underlying table and still use the view. The view should be invalidated. Are you still able to query the view after a flush shared_pool? Sometimes, objects remain in dictionary cache without being properly invalidated.
+I&#8217;ve posted my investigation about AUDIT_ACTIONS in a new post: <a href="http://www.dbi-services.com/index.php/blog/entry/oracle-multitenant-dictionary-object-links" rel="nofollow">http://www.dbi-services.com/index.php/blog/entry/oracle-multitenant-dictionary-object-links</a>
+Best regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13391"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1338' onclick='return addComment.moveForm( "div-comment-1338", "1338", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1340">
+				<div id="div-comment-1340" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/896349331f8a46c61a20c02041153e14?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Ivica Arsov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1340">
+			January 3, 2015 at 22 h 31 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>Your question lead me to test what will happen if I try to recompile the view.
+What I found interesting (seems like a bug) is that I received a message &#8220;compilation errors&#8221; after recompilation, but the view was still working.</p>
+<p>SQL>
+SQL> alter view mytable_v compile;</p>
+<p>Warning: View altered with compilation errors.</p>
+<p>SQL> select * from mytable_v;</p>
+<p>      COL2
+&#8212;&#8212;&#8212;-
+       111</p>
+<p>SQL></p>
+<p>After flushing the shared pool I hit an error.</p>
+<p>SQL> alter system flush shared_pool;</p>
+<p>System altered.</p>
+<p>SQL> select * from mytable_v;
+select * from mytable_v
+              *
+ERROR at line 1:
+ORA-00604: error occurred at recursive SQL level 1
+ORA-04063: view &#8220;SYS.MYTABLE_V&#8221; has errors</p>
+<p>Regards,
+Ivica
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13411"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1340' onclick='return addComment.moveForm( "div-comment-1340", "1340", "respond", "432" )' aria-label='Reply to Ivica to Ivica Arsov'>Reply to Ivica</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-4007">
+				<div id="div-comment-4007" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75234dd34f80230790f957f674492496?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://dba24.pl' rel='external nofollow' class='url'>Maciej Tokar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4007">
+			July 15, 2016 at 11 h 48 min</a>		</div>
+
+		<p>Hi Franck,
+I have some problems while trying to reproduce your examples. DEMO_MDL_FUNCTION function gets created without the sharing set to METADATA LINK, despite the sharing=metadata was used. This is SI 12.1 PSU Apr 2016.
+<pre>
+SQL&gt; show pdbs</p>
+<p>    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         3 PDB                         READ WRITE NO</p>
+<p>SQL&gt; create function DEMO_MDL_FUNCTION sharing=metadata
+return varchar2 as dummy varchar2(100);
+ begin
+select max(dummy) into dummy from DEMO_REG_TABLE;
+return dummy;
+ end;
+  /</p>
+<p>Function created.</p>
+<p>SQL&gt; column owner format a20
+SQL&gt; column object_name format a30</p>
+<p>SQL&gt; select owner,object_name,sharing from cdb_objects where object_name='DEMO_MDL_FUNCTION';</p>
+<p>OWNER                OBJECT_NAME                    SHARING
+-------------------- ------------------------------ -------------
+SYS                  DEMO_MDL_FUNCTION              NONE</p>
+<p>How it looks like from CDB's perspective:</p>
+<p>SQL&gt; column owner format a20
+SQL&gt; column object_name format a30
+SQL&gt; select owner,object_name,sharing,con_id from cdb_objects where object_name='DEMO_MDL_FUNCTION';</p>
+<p>OWNER                OBJECT_NAME                    SHARING           CON_ID
+-------------------- ------------------------------ ------------- ----------
+SYS                  DEMO_MDL_FUNCTION              METADATA LINK          1
+SYS                  DEMO_MDL_FUNCTION              NONE                   3
+</pre></p>
+<p>Ideas?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-40081"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4007' onclick='return addComment.moveForm( "div-comment-4007", "4007", "respond", "432" )' aria-label='Reply to Maciej to Maciej Tokar'>Reply to Maciej</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2 parent" id="comment-4009">
+				<div id="div-comment-4009" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4009">
+			July 15, 2016 at 16 h 06 min</a>		</div>
+
+		<p>Hi Maciej,
+Yes you&#8217;re right. Maybe it changed in 12.1.0.2
+In the latest release I have, it works when DEMO_REG_TABLE is sharing=metadata but not when sharing=none, which makes sense after all.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-40101"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4009' onclick='return addComment.moveForm( "div-comment-4009", "4009", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment even depth-3" id="comment-4010">
+				<div id="div-comment-4010" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75234dd34f80230790f957f674492496?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://dba24.pl' rel='external nofollow' class='url'>Maciej Tokar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4010">
+			July 15, 2016 at 17 h 29 min</a>		</div>
+
+		<p>That&#8217;s a pity, wanted to play more with it on my version. Great post Franck !!
+Are the internals explained in your book about Multitenancy?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-40111"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4010' onclick='return addComment.moveForm( "div-comment-4010", "4010", "respond", "432" )' aria-label='Reply to Maciej to Maciej Tokar'>Reply to Maciej</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-4029">
+				<div id="div-comment-4029" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4029">
+			July 18, 2016 at 12 h 32 min</a>		</div>
+
+		<p>Hi Maciej,
+I tested it and confirms that it works in 12.1.0.1 even when the table is sharing=NONE but requires sharing=METADATA in 12.1.0.2. Probably a check that all dependencies must have same structure. Not a bad idea.
+In the book we&#8217;re not talking about internals.
+There are some internals here: <a href="http://www.soug.ch/fileadmin/user_upload/SIGs/SOUG_DAY2_160623/MultitenantBeyondDocumentation_-_12cR1_version_dbi_Pachot.pdf" rel="nofollow">http://www.soug.ch/fileadmin/user_upload/SIGs/SOUG_DAY2_160623/MultitenantBeyondDocumentation_-_12cR1_version_dbi_Pachot.pdf</a>
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-40301"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4029' onclick='return addComment.moveForm( "div-comment-4029", "4029", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-4162">
+				<div id="div-comment-4162" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e63d7692871307bf567b6b9c0a798554?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">David</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4162">
+			August 3, 2016 at 18 h 31 min</a>		</div>
+
+		<p>Hi Franck,
+I have just tested some of your examples.</p>
+<p>I found that I cant use the sharing=metadata option for the creation of functions in Oracle 12.1.0.2.</p>
+<p>I get the error message ORA-65021: illegal use of SHARING clause.</p>
+<p>Am I missing something or has this changed since your blog?</p>
+<p>David
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41631"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4162' onclick='return addComment.moveForm( "div-comment-4162", "4162", "respond", "432" )' aria-label='Reply to David to David'>Reply to David</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-4171">
+				<div id="div-comment-4171" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4171">
+			August 4, 2016 at 9 h 32 min</a>		</div>
+
+		<p>Hi David,
+<pre>
+65021, 00000, "illegal use of SHARING clause"
+// *Cause:  A SHARING clause was encountered in unexpected context.
+// *Action: Do not use SHARING clause outside of Oracle-supplied scripts.
+</pre>
+Did you set “_ORACLE_SCRIPT”=true for your session before it?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41721"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4171' onclick='return addComment.moveForm( "div-comment-4171", "4171", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-4173">
+				<div id="div-comment-4173" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e63d7692871307bf567b6b9c0a798554?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">David</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4173">
+			August 4, 2016 at 16 h 48 min</a>		</div>
+
+		<p>Hi Franck,
+yes that was the issue!</p>
+<p>I have tried it and it works ok.</p>
+<p>One question I have related to this is that we want to create a number of functions that we want to work in all PDBs and CDB$ROOT.</p>
+<p>Can we use this approach to do it?</p>
+<p>Or should we create them with sharing=none?</p>
+<p>Regards</p>
+<p>David
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41741"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4173' onclick='return addComment.moveForm( "div-comment-4173", "4173", "respond", "432" )' aria-label='Reply to David to David'>Reply to David</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-4174">
+				<div id="div-comment-4174" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4174">
+			August 4, 2016 at 18 h 44 min</a>		</div>
+
+		<p>David, as in 12.1 it is undocumented, no you should not use that in a database where you may need support.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41751"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4174' onclick='return addComment.moveForm( "div-comment-4174", "4174", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-4178">
+				<div id="div-comment-4178" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1ca426ce67fcd24819a05f548a2b2eaa?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Zydrunas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4178">
+			August 5, 2016 at 14 h 53 min</a>		</div>
+
+		<p>Dear Franck,</p>
+<p>Your post was very useful for me in replicating gv$session  in PDB, as inside pluggable DB sessions constantly migrate from PDB to root container and so they are not visible from inside PDB and this prevents applications from being able to properly monitor their progress via the view.  Unfortunately I noticed one issue with this object level sharing. It seems that on PDB level data refreshes every half a minute, while on CDB it does immediately.</p>
+<p>Any ideas about such behavior?</p>
+<p>Here&#8217;s a test case..
+Create views on both CDB$ROOT and PDB </p>
+<p>create or replace view SCHEMA.TEST_SESSION sharing=object as select * from SYS.GV_$SESSION;</p>
+<p>run selects on each</p>
+<p>select sysdate,count(*) from ECBSYS.TEST_SESSION;</p>
+<p>You will notice that on CDB this view refreshes constantly, while on PDB it only refreshes twice per minute at 00 and 30 seconds.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41791"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4178' onclick='return addComment.moveForm( "div-comment-4178", "4178", "respond", "432" )' aria-label='Reply to Zydrunas to Zydrunas'>Reply to Zydrunas</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2 parent" id="comment-4179">
+				<div id="div-comment-4179" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4179">
+			August 5, 2016 at 17 h 07 min</a>		</div>
+
+		<p>Hi Zydrunas,</p>
+<p>That&#8217;s very interesting. Thanks.
+Here is how I reproduced it:</p>
+<p><pre>
+14:59:36 SQL&gt; connect / as sysdba
+Connected.
+14:59:36 SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+
+14:59:36 SQL&gt; alter session set "_oracle_script"=true;
+Session altered.
+
+14:59:36 SQL&gt; create view DEMOV sharing=object as select * from gv$session;
+View created.
+
+14:59:36 SQL&gt; alter session set container=PDB1;
+Session altered.
+
+14:59:36 SQL&gt; create view DEMOV sharing=object as select * from gv$session;
+View created.
+
+14:59:36 SQL&gt; alter session set "_oracle_script"=false;
+Session altered.
+
+14:59:36 SQL&gt;
+14:59:36 SQL&gt; set serveroutput on
+14:59:36 SQL&gt; declare
+14:59:36   2   x varchar2(100);
+14:59:36   3  begin
+14:59:36   4   for i in 1..120 loop
+14:59:36   5    dbms_lock.sleep(1);
+14:59:36   6    select to_char(current_timestamp)||' --&gt; '||max(last_call_et) into x from DEMOV;
+14:59:36   7    dbms_output.put_line(x);
+14:59:36   8   end loop;
+14:59:36   9  end;
+14:59:36  10  /
+05-AUG-16 02.59.37.687834 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.38.695735 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.39.695722 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.40.695820 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.41.695732 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.42.695725 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.43.695728 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.44.696733 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.45.696697 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.46.696687 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.47.696641 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.48.696721 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.49.696689 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.50.696741 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.51.696679 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.52.696703 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.53.696690 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.54.696697 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.55.696695 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.56.696702 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.57.696694 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.58.696723 PM +00:00 --&gt; 600411
+05-AUG-16 02.59.59.696703 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.00.696748 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.01.696734 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.02.696658 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.03.697672 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.04.697720 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.05.697699 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.06.697723 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.07.697672 PM +00:00 --&gt; 600411
+05-AUG-16 03.00.08.697679 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.09.697803 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.10.697727 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.11.697733 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.12.697750 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.13.697857 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.14.697836 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.15.697716 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.16.697758 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.17.697732 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.18.697777 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.19.697795 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.20.697836 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.21.697823 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.22.698842 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.23.698805 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.24.698768 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.25.698816 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.26.698845 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.27.699815 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.28.699735 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.29.699735 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.30.699758 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.31.699760 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.32.699791 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.33.699742 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.34.699745 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.35.699749 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.36.699726 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.37.699682 PM +00:00 --&gt; 600442
+05-AUG-16 03.00.38.699755 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.39.699686 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.40.699855 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.41.700684 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.42.700721 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.43.700728 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.44.700736 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.45.701710 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.46.701714 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.47.701718 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.48.701707 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.49.701782 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.50.701755 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.51.701700 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.52.701732 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.53.701696 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.54.701726 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.55.701685 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.56.701753 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.57.701740 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.58.701730 PM +00:00 --&gt; 600472
+05-AUG-16 03.00.59.701699 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.00.702759 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.01.702730 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.02.702775 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.03.702687 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.04.703725 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.05.703714 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.06.703757 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.07.703728 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.08.703839 PM +00:00 --&gt; 600472
+05-AUG-16 03.01.09.703819 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.10.704710 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.11.704797 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.12.704740 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.13.704758 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.14.704805 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.15.704719 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.16.704813 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.17.705944 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.18.706731 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.19.706840 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.20.707726 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.21.707812 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.22.708778 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.23.708697 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.24.708726 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.25.708789 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.26.708830 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.27.708795 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.28.709881 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.29.710826 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.30.711801 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.31.711736 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.32.711807 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.33.711830 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.34.711748 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.35.711716 PM +00:00 --&gt; 600503
+05-AUG-16 03.01.36.711725 PM +00:00 --&gt; 600503
+
+PL/SQL procedure successfully completed.
+</pre></p>
+<p>Note that this does not happen with a view on a regular table. I&#8217;ve no explanation for that, but as it is internal and undocumented&#8230; anything can happen.</p>
+<p>Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41801"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4179' onclick='return addComment.moveForm( "div-comment-4179", "4179", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-3 parent" id="comment-4183">
+				<div id="div-comment-4183" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4183">
+			August 5, 2016 at 19 h 53 min</a>		</div>
+
+		<p>Seems that some tables read through object link are queried with /*+ RESULT_CACHE (SYSOBJ=TRUE SHELFLIFE=30) */
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41841"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4183' onclick='return addComment.moveForm( "div-comment-4183", "4183", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment odd alt depth-4" id="comment-4203">
+				<div id="div-comment-4203" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1ca426ce67fcd24819a05f548a2b2eaa?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Zydrunas</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4203">
+			August 8, 2016 at 9 h 03 min</a>		</div>
+
+		<p>Dear Franck,</p>
+<p>Thanks, you helped me to resolve this issue by adding this hint /*+ RESULT_CACHE (SYSOBJ=TRUE SHELFLIFE=1) */  to my query
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-42041"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4203' onclick='return addComment.moveForm( "div-comment-4203", "4203", "respond", "432" )' aria-label='Reply to Zydrunas to Zydrunas'>Reply to Zydrunas</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2 parent" id="comment-4194">
+				<div id="div-comment-4194" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4194">
+			August 7, 2016 at 12 h 35 min</a>		</div>
+
+		<p>First part of the answer showing result cache: <a href="http://blog.dbi-services.com/multitenant-internals-how-object-links-are-parsedexecuted/" rel="nofollow">http://blog.dbi-services.com/multitenant-internals-how-object-links-are-parsedexecuted/</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41951"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4194' onclick='return addComment.moveForm( "div-comment-4194", "4194", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-3" id="comment-4196">
+				<div id="div-comment-4196" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4196">
+			August 7, 2016 at 18 h 16 min</a>		</div>
+
+		<p>And second part is there: <a href="http://blog.dbi-services.com/multitenant-internals-object-links-on-fixed-tables/" rel="nofollow">http://blog.dbi-services.com/multitenant-internals-object-links-on-fixed-tables/</a>
+Those 30 seconds are from &#8220;_cdb_view_rc_shelflife&#8221;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41971"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4196' onclick='return addComment.moveForm( "div-comment-4196", "4196", "respond", "432" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="pingback even thread-even depth-1" id="comment-4414">
+				<div id="div-comment-4414" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://dmitryremizov.wordpress.com/2016/09/08/oracle-12c-pluggable-and-common-directory-recreation-issue/' rel='external nofollow' class='url'>Oracle 12c pluggable and &#8220;common&#8221; directory recreation issue. | dmitry remizov&#039;s weblog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4414">
+			September 8, 2016 at 18 h 48 min</a>		</div>
+
+		<p>[&#8230;] a bit googling I found an excellent blog: <a href="http://blog.dbi-services.com/oracle-12c-cdb-metadata-a-object-links-internals/" rel="nofollow">http://blog.dbi-services.com/oracle-12c-cdb-metadata-a-object-links-internals/</a> that gave me an idea how to fix the issue (as usual ALTER SESSION SET “_oracle_script”=true [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-44151"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4414' onclick='return addComment.moveForm( "div-comment-4414", "4414", "respond", "432" )' aria-label='Reply to Oracle to Oracle 12c pluggable and &#8220;common&#8221; directory recreation issue. | dmitry remizov&#039;s weblog'>Reply to Oracle</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

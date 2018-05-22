@@ -1,0 +1,359 @@
+								<h1 class="entry-title">SLOB in the Cloud: how to check Cloud Services performance</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p><img style="float:right" src="../wp-insides/uploads/sites/2/2015/08/cloud-300x300.png" alt="cloud" width="50" height="50" />You buy resources on the Cloud, but they are mutualized, thanks to virtualization. Are you sure ou have the resources you paid for? When it comes to Oracle databases there are 3 ways to test performances:</p>
+<ul>
+<li>Run an application, or a simulation of an application, such as the excellent <a href="http://dominicgiles.com/swingbench.html" target="_blank">SwingBench</a> from Dominic Giles</li>
+<li>Run low-level calibration tools, such as <a href="http://docs.oracle.com/database/121/TGDBA/pfgrf_iodesign.htm#CACJEEDI" target="_blank">Orion</a> that simulate database, good when you have no database yet</li>
+<li>Or run something in the middle, and there is <a href="http://kevinclosson.net/slob/" target="_blank">SLOB</a>. SLOB has proven that it&#8217;s the right workload to measure IO or CPU performance, all from database calls, but independent on other factors.</li>
+</ul>
+<p>In order to run SLOB you have to create a database. Let&#8217;s do that in the Oracle Cloud Services in order to evaluate the performance.
+This exemple was done on the EMEA cloud based in Amterdam.</p>
+<h1>Create the VM</h1>
+<p>In <strong>Oracle Database Cloud Services</strong> click on <strong>Create Service</strong>
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/08/CaptureCreateCloud.jpg" rel="lightbox[3270]"><img src="../wp-insides/uploads/sites/2/2015/08/CaptureCreateCloud.jpg" alt="CaptureCreateCloud" width="656" height="258" class="alignnone size-full wp-image-3302" /></a>
+Choose <strong>Oracle Database Cloud Service &#8211; Virtual Image</strong> because I&#8217;ll create the database myself with dbca.
+Choose <strong>Oracle Database 12c Release 1</strong>
+Choose <strong>Enterprise Edition &#8211; Extreme Performance</strong> because I want all options
+I&#8217;ve chosen 2 OCPU (equivalent to 2 cores with 2 threads)</p>
+<h1>Create the Storage Volume</h1>
+<p>In <strong>Oracle Compute Cloud Service</strong>, click on storage and <strong>Create Storage volume</strong></p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/08/CaptureCloudEMEA-0011.jpg" rel="lightbox[3270]"><img src="../wp-insides/uploads/sites/2/2015/08/CaptureCloudEMEA-0011.jpg" alt="CaptureCloudEMEA-0011" width="1001" height="481" class="alignnone size-full wp-image-3274" /></a></p>
+<p>I want to measure IOPS so I choose the &#8216;optimized for latency&#8217;. Here are the different choices: </p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/08/CaptureCloudEMEA-0010.jpg" rel="lightbox[3270]"><img src="../wp-insides/uploads/sites/2/2015/08/CaptureCloudEMEA-0010.jpg" alt="CaptureCloudEMEA-0010" width="677" height="137" class="alignnone size-full wp-image-3278" /></a></p>
+<p>That&#8217;s all from the GUI, I&#8217;ll continue in command line. The VM is an OVM accessible with ssh.</p>
+<h1>Create 100G filesystem</h1>
+<p>Connect as root:</p>
+<p><pre>
+$ ssh opc@test-perf
+Authorized uses only. All activity may be monitored and reported.
+-bash-4.1$ id
+uid=500(opc) gid=500(opc) groups=500(opc)
+-bash-4.1$ sudo su
+</pre></p>
+<p>Check disk name:</p>
+<p><pre>
+[oracle@test-perf ~]$ lsblk
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+xvdb    202:16   0   21G  0 disk
+├─xvdb1 202:17   0  200M  0 part /boot
+├─xvdb2 202:18   0 15.8G  0 part /
+└─xvdb3 202:19   0    4G  0 part [SWAP]
+xvdc    202:32   0  100G  0 disk
+</pre></p>
+<p>Partition disk:</p>
+<p><pre>
+bash-4.1# fdisk /dev/xvdc
+Command (m for help): n
+Command action
+   e   extended
+   p   primary partition (1-4)
+p
+Partition number (1-4): 1
+First cylinder (1-13054, default 1):
+Using default value 1
+Last cylinder, +cylinders or +size{K,M,G} (1-13054, default 13054):
+Using default value 13054
+Command (m for help): w
+The partition table has been altered!
+</pre></p>
+<p>Check the partition is name:</p>
+<p><pre>
+bash-4.1# lsblk
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+xvdb    202:16   0   21G  0 disk
+├─xvdb1 202:17   0  200M  0 part /boot
+├─xvdb2 202:18   0 15.8G  0 part /
+└─xvdb3 202:19   0    4G  0 part [SWAP]
+xvdc    202:32   0  100G  0 disk
+└─xvdc1 202:33   0  100G  0 part
+</pre></p>
+<p>Create filesystem:</p>
+<p><pre>
+bash-4.1# mkfs -t ext4 /dev/xvdc1
+mke2fs 1.41.12 (17-May-2010)
+Filesystem label=
+OS type: Linux
+Block size=4096 (log=2)
+Fragment size=4096 (log=2)
+Stride=0 blocks, Stripe width=0 blocks
+...
+Writing inode tables: done
+Creating journal (32768 blocks): done
+Writing superblocks and filesystem accounting information: done
+...
+</pre></p>
+<p>Mount the filesystem</p>
+<p><pre>
+bash-4.1# mkdir /u02
+bash-4.1# ls -l /dev/disk/by-uuid | grep xvdc1
+lrwxrwxrwx 1 root root 11 Aug 27 15:13 d8012d1f-be4c-486a-8230-f4a1631910f7 -&gt; ../../xvdc1
+bash-4.1# echo "UUID=d8012d1f-be4c-486a-8230-f4a1631910f7 /u02                     ext4    defaults        0 0" &gt;&gt; /etc/fstab
+bash-4.1# mount /u02 ; chown oracle:oinstall /u02
+</pre></p>
+<p>Here it is</p>
+<p><pre>
+bash-4.1# lsblk
+NAME    MAJ:MIN RM  SIZE RO TYPE MOUNTPOINT
+xvdb    202:16   0   21G  0 disk
+├─xvdb1 202:17   0  200M  0 part /boot
+├─xvdb2 202:18   0 15.8G  0 part /
+└─xvdb3 202:19   0    4G  0 part [SWAP]
+xvdc    202:32   0  100G  0 disk
+└─xvdc1 202:33   0  100G  0 part /u02
+</pre></p>
+<h1>Install Oracle Software</h1>
+<p>It&#8217;s packaged in the image, preinstalled. Just untar it:</p>
+<p><pre></p>
+<p>bash-4.1# mkdir /u01 ; chown oracle:oinstall /u01 &amp;&amp; cd /u01
+bash-4.1# tar -xvf /scratch/db/db12102_bits.tar.gz
+drwxr-xr-x oracle/oinstall   0 2015-01-16 10:10 app/
+drwxr-xr-x oracle/oinstall   0 2014-07-21 18:41 app/oracle/
+drwxr-xr-x oracle/oinstall   0 2014-07-21 18:41 app/oracle/checkpoints/
+drwxr-xr-x oracle/oinstall   0 2014-09-25 17:08 app/oracle/product/
+drwxr-xr-x oracle/oinstall   0 2014-07-21 18:37 app/oracle/product/12.1.0/
+drwxr-xr-x oracle/oinstall   0 2015-04-22 14:41 app/oracle/product/12.1.0/dbhome_1/
+...
+app/oraInventory/logs/OPatch2014-09-25_02-19-13-PM.log
+app/oraInventory/logs/OPatch2015-03-20_06-39-10-PM.log
+app/oraInventory/logs/oraInstall2014-07-21_03-37-40PM.out
+app/oraInventory/logs/OPatch2014-10-12_09-21-02-PM.log
+app/oraInventory/orainstRoot.sh
+</pre></p>
+<p>Run orainstRoot.sh and root.sh</p>
+<p><pre>
+bash-4.1# app/oraInventory/orainstRoot.sh
+Changing permissions of /u01/app/oraInventory.
+Adding read,write permissions for group.
+Removing read,write,execute permissions for world.
+
+Changing groupname of /u01/app/oraInventory to oinstall.
+The execution of the script is complete.
+bash-4.1# app/oracle/product/12.1.0/dbhome_1/root.sh
+Check /u01/app/oracle/product/12.1.0/dbhome_1/install/root_test-perf_2015-08-27_15-29-05.log for the output of root script
+</pre></p>
+<p><strong>added 29-AUG-15</strong>
+By default sar is not running in this image. As root we have to:
+<pre>
+bash-4.1# mkdir -p /var/log/sa ; chmod a+r /var/log/sa
+</pre></p>
+<p>I remove the tar file because I need some space to create the database (limited space in trial), and don&#8217;t need to be root anymore.</p>
+<p><pre>
+bash-4.1# rm /scratch/db/db12102_bits.tar.gz
+bash-4.1# exit
+exit
+-bash-4.1$ exit
+logout
+Connection to 140.86.4.11 closed.
+</pre></p>
+<h1>Install SLOB</h1>
+<p>I&#8217;ve downloaded SLOB from <a href="http://kevinclosson.net/slob/">http://kevinclosson.net/slob/</a></p>
+<p><pre>
+$ scp 2015.07.16.slob_2.3.0.3-1.tar.gz oracle@test-perf:/home/oracle
+$ ssh oracle@test-perf
+Authorized uses only. All activity may be monitored and reported.
+[oracle@test-perf ~]$
+[oracle@test-perf ~]$ tar -zxvf 2015.07.16.slob_2.3.0.3-1.tar.gz
+</pre></p>
+<h1>Create SLOB database</h1>
+<p><pre>
+[oracle@test-perf ~]$ /u01/app/oracle/product/12.1.0/dbhome_1/bin/dbca -createDatabase -templateName General_Purpose.dbc -gdbName SLOB -sid SLOB -sysPassword oracle -systemPassword oracle -storageType FS -listeners LISTENER -sampleSchema false -databaseType MULTIPURPOSE -silent
+</pre></p>
+<p>And change instance parameters required by SLOB (they are in simple.ora)</p>
+<p><pre>
+[oracle@test-perf ~]$ . oraenv &lt;&lt;&lt; SLOB
+[oracle@test-perf ~]$ cd SLOB
+[oracle@test-perf SLOB]$ sqlplus / as sysdba
+SQL&gt; alter system reset sga_target;
+SQL&gt; create pfile from spfile;
+SQL&gt; shutdown immediate;
+SQL&gt; host  grep -v /data simple.ora &gt;&gt; $ORACLE_HOME/dbs/initSLOB.ora
+SQL&gt; create spfile from pfile;
+SQL&gt; startup
+SQL&gt; create bigfile tablespace IOPS datafile '/u02/IOPS.dbf' size 10M autoextend on next 10M maxsize unlimited;
+</pre></p>
+<p>I change the slob.conf to set SCALE to the maximum size that fit in /u01
+<pre>
+[oracle@test-perf SLOB]$ head slob.conf
+UPDATE_PCT=25
+RUN_TIME=300
+WORK_LOOP=0
+SCALE=95000M
+WORK_UNIT=64
+REDO_STRESS=LITE
+LOAD_PARALLEL_DEGREE=4
+</pre></p>
+<p>Now I can setup the SLOB tablespace. It&#8217;s long so I run it with nohup.</p>
+<p><pre>
+nohup sh setup.sh IOPS 1
+</pre></p>
+<p>and compile the wait kit
+<pre>
+[oracle@test-perf SLOB]$ ( cd ./wait_kit ; make ; )
+rm -fr *.o mywait trigger create_sem
+cc     -c -o mywait.o mywait.c
+cc -o mywait mywait.o
+cc     -c -o trigger.o trigger.c
+cc -o trigger trigger.o
+cc     -c -o create_sem.o create_sem.c
+cc -o create_sem create_sem.o
+cp mywait trigger create_sem ../
+rm -fr *.o
+</pre></p>
+<h1>Run PIOs test</h1>
+<p>I&#8217;ll test physical I/O latency.
+I restart the instance to reset counters (especially the V$EVENT_HISTOGRAM_MICRO because it&#8217;s not snapshotted by AWR)
+<pre>
+[oracle@test-perf SLOB]$ sqlplus / as sysdba
+SQL&gt; startup force
+</pre></p>
+<p>and run SLOB</p>
+<p><pre>
+[oracle@test-perf SLOB]$ sh runit.sh 1
+NOTIFY : 2015.08.28-04:05:33 :
+NOTIFY : 2015.08.28-04:05:33 : Conducting SLOB pre-test checks.
+
+UPDATE_PCT: 25
+RUN_TIME: 300
+WORK_LOOP: 0
+SCALE: 90000M (11520000 blocks)
+WORK_UNIT: 64
+REDO_STRESS: LITE
+HOT_SCHEMA_FREQUENCY: 0
+DO_HOTSPOT: FALSE
+HOTSPOT_MB: 8
+HOTSPOT_OFFSET_MB: 16
+HOTSPOT_FREQUENCY: 3
+THINK_TM_FREQUENCY: 0
+THINK_TM_MIN: .1
+THINK_TM_MAX: .5
+...
+NOTIFY : 2015.08.28-04:11:02 : SLOB test is complete.
+</pre></p>
+<p>You know I use Orachrome Lighty to look at performance statistics. Here is the workload:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/08/CaptureLighty.jpg" rel="lightbox[3270]"><img src="../wp-insides/uploads/sites/2/2015/08/CaptureLighty.jpg" alt="CaptureLighty" width="849" height="433" class="alignnone size-full wp-image-3351" /></a></p>
+<p>Most of I/0 are less than 1ms. As I&#8217;m in 12c I have more details from wait event histograms in microseconds:</p>
+<p><pre>
+column event format a30
+set linesize 120 pagesize 1000
+select event,wait_time_micro,wait_count,wait_time_format from v$event_histogram_micro where event like 'db file sequential read' order by event,wait_time_micro;
+</pre></p>
+<p><pre>
+EVENT                          WAIT_TIME_MICRO WAIT_COUNT WAIT_TIME_FORMAT
+------------------------------ --------------- ---------- ------------------------------
+db file sequential read                      1          0 1 microsecond
+db file sequential read                      2          0 2 microseconds
+db file sequential read                      4          0 4 microseconds
+db file sequential read                      8          0 8 microseconds
+db file sequential read                     16          0 16 microseconds
+db file sequential read                     32          0 32 microseconds
+db file sequential read                     64          0 64 microseconds
+db file sequential read                    128          0 128 microseconds
+db file sequential read                    256         27 256 microseconds
+db file sequential read                    512     390619 512 microseconds
+db file sequential read                   1024     172914 1 millisecond
+db file sequential read                   2048       3387 2 milliseconds
+db file sequential read                   4096       1709 4 milliseconds
+db file sequential read                   8192       1237 8 milliseconds
+db file sequential read                  16384         96 16 milliseconds
+db file sequential read                  32768         56 32 milliseconds
+db file sequential read                  65536          4 65 milliseconds
+db file sequential read                 131072          0 131 milliseconds
+db file sequential read                 262144          1 262 milliseconds
+</pre></p>
+<p>I&#8217;ll not comment the result here, that&#8217;s for future posts.
+I can confirm that filesystemio_options=setall because filesystem cache would be below 100us.</p>
+<h1>Run LIOs test</h1>
+<p>To test logical reads, I want all blocks in cache, so I increase the buffer cache:</p>
+<p><pre>
+SQL&gt; show parameter db_cache_size
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_cache_size                        big integer 112M</p>
+<p>
+SQL&gt; alter system set db_cache_size=2048M scope=spfile;
+System altered.
+
+SQL&gt; startup force;
+</pre></p>
+<p>and reduce the SCALE to 500M in slob.conf and set UPDATE to 0%</p>
+<p><pre>
+[oracle@test-perf SLOB]$ sh runit.sh 1
+NOTIFY : 2015.08.28-04:24:38 :
+NOTIFY : 2015.08.28-04:24:38 : Conducting SLOB pre-test checks.
+
+UPDATE_PCT: 0
+RUN_TIME: 300
+WORK_LOOP: 0
+SCALE: 500M (64000 blocks)
+WORK_UNIT: 64
+REDO_STRESS: LITE
+HOT_SCHEMA_FREQUENCY: 0
+DO_HOTSPOT: FALSE
+HOTSPOT_MB: 8
+HOTSPOT_OFFSET_MB: 16
+HOTSPOT_FREQUENCY: 3
+THINK_TM_FREQUENCY: 0
+THINK_TM_MIN: .1
+THINK_TM_MAX: .5
+...
+NOTIFY : 2015.08.28-04:36:15 : SLOB test is complete.
+</pre></p>
+<p>I check the activity from Lighty to that I&#8217;m sure I run only in CPU:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/08/CaptureLighty2.jpg" rel="lightbox[3270]"><img src="../wp-insides/uploads/sites/2/2015/08/CaptureLighty2.jpg" alt="CaptureLighty2" width="857" height="392" class="alignnone size-full wp-image-3357" /></a></p>
+<p>If you wonder what is the brown activity before, it&#8217;s log file switch when I&#8217;ve forgot to set UPDATE_PCT to 0</p>
+<p>SLOB gathers the AWR report where we check that buffer cache hit ratio is 100%, that DB CPU(s) per second is 1:</p>
+<p><pre>
+Load Profile                    Per Second   Per Transaction  Per Exec  Per Call
+~~~~~~~~~~~~~~~            ---------------   --------------- --------- ---------
+             DB Time(s):               1.0              13.1      0.00      2.92
+              DB CPU(s):               1.0              13.1      0.00      2.92
+      Background CPU(s):               0.0               0.0      0.00      0.00
+      Redo size (bytes):          17,786.6         233,499.7
+  Logical read (blocks):         587,373.4       7,710,960.9
+          Block changes:              73.5             965.0
+ Physical read (blocks):               0.5               5.9
+Physical write (blocks):               0.3               3.9
+       Read IO requests:               0.5               5.9
+      Write IO requests:               0.2               2.1
+           Read IO (MB):               0.0               0.1
+          Write IO (MB):               0.0               0.0
+           IM scan rows:               0.0               0.0
+Session Logical Read IM:
+             User calls:               0.3               4.5
+           Parses (SQL):               4.9              64.0
+      Hard parses (SQL):               0.0               0.3
+     SQL Work Area (MB):               0.1               1.9
+                 Logons:               0.1               0.8
+         Executes (SQL):           8,888.3         116,683.9
+              Rollbacks:               0.0               0.0
+           Transactions:               0.1</p>
+<p>Instance Efficiency Percentages (Target 100%)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            Buffer Nowait %:  100.00       Redo NoWait %:  100.00
+            Buffer  Hit   %:  100.00    In-memory Sort %:  100.00
+            Library Hit   %:  100.00        Soft Parse %:   99.52
+         Execute to Parse %:   99.95         Latch Hit %:  100.00
+Parse CPU to Parse Elapsd %:   80.00     % Non-Parse CPU:   99.99
+          Flash Cache Hit %:    0.00
+</pre></p>
+<p>Again more comments on future blog post, but that looks reasonable for and Intel(R) Xeon(R) CPU E5-2690 v2 @ 3.00GHz
+Compare with physical CPU: <a href="https://twitter.com/kevinclosson/status/636905086338342913">https://twitter.com/kevinclosson/status/636905086338342913</a></p>
+<h1>So what?</h1>
+<p>From what I tested, a 2 OCPU VM with 128GB storage on low latency storage, the expected performance is there. You should be able to follow the same procedure explained here (setup a VM with SLOB for PIO and LIO test). I think it&#8217;s a good idea to do that when you have a new cloud service just to be sure that everything is set up as expected.</p>
+<p>Big thanks to my colleague <a href="http://www.dbi-services.com/fr/dbi-services-et-ses-collaborateurs/equipe-dbi/vincent-matthey/">Vincent Matthey</a> for the setup of our trial on Cloud Services. His documentation (published soon) helped me a lot.
+And to <a href="https://twitter.com/kevinclosson">@kevinclosson</a> <a href="https://twitter.com/BertrandDrouvot">@BertrandDrouvot</a> <a href="https://twitter.com/OracleSK">@OracleSK</a> for their help interpreting the performance results.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-32710" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/08/cloud-300x300.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

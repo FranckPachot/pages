@@ -1,0 +1,219 @@
+								<h1 class="entry-title">Rebuilt index on increasing values after deletes?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Yesterday while giving our <a href="http://www.dbi-services.com/trainings/oracle-performance-tuning-training/">Oracle tuning workshop</a> I discussed with the customer about a job they have that rebuilds indexes every Sunday. Except in very rare cases Oracle indexes are maintained so that free space is reused by further inserts. But an index is an ordered structure. When we insert from a sequence, the value is always increasing, and go at the end of the index. And when we delete old data we delete index entries at the beginning of the index.
+Is this a case where we need to manage it ourselves?</p>
+<h3>Test case</h3>
+<p>As usual I reproduce the issue. Here is my DEMO table with a DEMOPK index on the primary key:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create table DEMO (id number constraint DEMOPK primary key);
+Table created.
+</pre>
+<p>I insert 10000 rows:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; begin
+  2   for i in 1..1e4 loop
+  3    insert into DEMO values(i);
+  4    commit;
+  5   end loop;
+  6  end;
+  7  /
+PL/SQL procedure successfully completed.
+</pre>
+<p>gather and check the stats:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select blocks,blevel,leaf_blocks from user_indexes join user_tables using(table_name) where index_name='DEMOPK';
+
+    BLOCKS     BLEVEL LEAF_BLOCKS
+---------- ---------- -----------
+        20          1          18
+</pre>
+<p>So I have 1 branch and 18 leaf blocks.</p>
+<h3>Fragmentation</h3>
+<p>I&#8217;ll check fragmentation from a user point of view. Having too much free space in leaf blocks is a problem with index range scan only. So let&#8217;s fo an index range scan from the beginning to the end of the index:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set statistics_level=all;
+Session altered.
+
+SQL&gt; select /*+ index(DEMO) */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+     10000
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------
+SQL_ID  7b6qc9m1cw3zd, child number 0
+-------------------------------------
+select /*+ index(DEMO) */ count(*) from DEMO
+
+Plan hash value: 3019291478
+
+-------------------------------------------------------------------------------------
+| Id  | Operation        | Name   | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |        |      1 |        |      1 |00:00:00.01 |      19 |
+|   1 |  SORT AGGREGATE  |        |      1 |      1 |      1 |00:00:00.01 |      19 |
+|   2 |   INDEX FULL SCAN| DEMOPK |      1 |  10000 |  10000 |00:00:00.01 |      19 |
+-------------------------------------------------------------------------------------
+</pre>
+<p>Exactly what we expected: 19 blocks reads is 1 branch and 18 leaves.</p>
+<p>I have a script that does the same &#8211; range scan on an index &#8211; and shows how many index entries we have in each block. The script is here: <a href="http://blog.dbi-services.com/how-i-measure-oracle-index-fragmentation/">How to measure Oracle index fragmentation</a>. Let&#8217;s run it on my index, with a bucket size large enough to see all blocks:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; @ index_fragmentation.sql
+
+        ID -&gt;         ID rows/block bytes/block %free space     blocks free
+---------- -- ---------- ---------- ----------- ----------- ---------- -----
+         1 -&gt;          1        578        8566                      1
+       579 -&gt;        579        571        8559                      1
+      1150 -&gt;       1150        571        8559                      1
+      1721 -&gt;       1721        571        8560                      1
+      2292 -&gt;       2292        571        8559                      1
+      2863 -&gt;       2863        571        8559                      1
+      3434 -&gt;       3434        571        8559                      1
+      4005 -&gt;       4005        571        8560                      1
+      4576 -&gt;       4576        571        8559                      1
+      5147 -&gt;       5147        571        8559                      1
+      5718 -&gt;       5718        571        8560                      1
+      6289 -&gt;       6289        571        8559                      1
+      6860 -&gt;       6860        571        8559                      1
+      7431 -&gt;       7431        571        8559                      1
+      8002 -&gt;       8002        571        8560                      1
+      8573 -&gt;       8573        571        8559                      1
+      9144 -&gt;       9144        571        8559                      1
+      9715 -&gt;       9715        286        4287          47          1 oo
+</pre>
+<p>Here are our 18 leaf blocks, covering values from 1 to 10000 (the ID displayed is the first one in each bucket &#8211; blocks here). The blocks are full (size is an approximation so this is why it&#8217;s a bit higher than 8k), with about 570 entries per block. This is expected because when we insert increasing values, the block split fills the block instead of doing a 50-50 split.</p>
+<h3>delete insert lifecycle</h3>
+<p>Here is what I want to reproduce: delete old rows at the beginning of the index and insert new rows at the end. I&#8217;ll do that for the same number of rows:10000 so I&#8217;m sure I&#8217;ve delete rows from all those 18 leaf blocks.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; begin
+  2   for i in 1..1e4 loop
+  3    delete from DEMO where id=i;
+  4    commit;
+  5    insert into DEMO values(i+1e4);
+  6    commit;
+  7   end loop;
+  8  end;
+  9  /
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>Then run my index range scan:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select /*+ index(DEMO) */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+     10000
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------
+SQL_ID  7b6qc9m1cw3zd, child number 0
+-------------------------------------
+select /*+ index(DEMO) */ count(*) from DEMO
+
+Plan hash value: 3019291478
+
+-------------------------------------------------------------------------------------
+| Id  | Operation        | Name   | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |        |      1 |        |      1 |00:00:00.01 |      24 |
+|   1 |  SORT AGGREGATE  |        |      1 |      1 |      1 |00:00:00.01 |      24 |
+|   2 |   INDEX FULL SCAN| DEMOPK |      1 |  10000 |  10000 |00:00:00.01 |      24 |
+-------------------------------------------------------------------------------------
+</pre>
+<p>Did I double the number of blocks to read? No.</p>
+<p>Do you think that we lost some space because we read 24 blocks instead of 19? Look at the numbers. The new numbers are above 10000 and are larger than the initial ones. It&#8217;s 4 bytes vs. 3 bytes.
+Don&#8217;t believe me?</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select min(rownum),max(rownum),sum(vsize(rownum)) from (select * from dual connect by 1000&gt;=level),(select * from dual connect by 20&gt;=level) group by ceil(rownum/10000);
+
+MIN(ROWNUM) MAX(ROWNUM) SUM(VSIZE(ROWNUM))
+----------- ----------- ------------------
+          1       10000              29801
+      10001       20000              39899
+</pre>
+<p>Yes&#8230; No place for guesses and myth&#8230; Everything can be measured&#8230; Do you know how many block we need when data in 18 blocks are increased by that ratio? 18 * (4/3) = 24 so we are not bad at all.</p>
+<p>The fact is that the 18 leaf blocks has only been increased to 20 leaf blocks:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; @ index_fragmentation.sql
+
+        ID -&gt;         ID rows/block bytes/block %free space     blocks free
+---------- -- ---------- ---------- ----------- ----------- ---------- -----
+     10001 -&gt;      10001        266        4254          47          1 oo
+     10267 -&gt;      10267        533        8523                      1
+     10800 -&gt;      10800        533        8522                      1
+     11333 -&gt;      11333        533        8523                      1
+     11866 -&gt;      11866        533        8523                      1
+     12399 -&gt;      12399        533        8522                      1
+     12932 -&gt;      12932        533        8523                      1
+     13465 -&gt;      13465        533        8523                      1
+     13998 -&gt;      13998        533        8522                      1
+     14531 -&gt;      14531        533        8523                      1
+     15064 -&gt;      15064        533        8523                      1
+     15597 -&gt;      15597        533        8522                      1
+     16130 -&gt;      16130        533        8523                      1
+     16663 -&gt;      16663        533        8523                      1
+     17196 -&gt;      17196        533        8522                      1
+     17729 -&gt;      17729        533        8523                      1
+     18262 -&gt;      18262        533        8523                      1
+     18795 -&gt;      18795        533        8522                      1
+     19328 -&gt;      19328        533        8523                      1
+     19861 -&gt;      19861        140        2237          72          1 ooo
+</pre>
+<p>and they are all full &#8211; except first and last one.</p>
+<p>This is optimal. Do the same test case and you will see that if you coalesce or shrink the index then the number of blocks will not change. More info about it in a previous blog post: <a href="http://blog.dbi-services.com/what-about-alter-index-shrink-space-/">index coalesce vs. shrink vs rebuild</a></p>
+<h3>Is it new?</h3>
+<p>Ok, I&#8217;ve run my tests on 12c and you want to know if it&#8217;s something new. No it&#8217;s not new.
+Oracle 7.3.3 reuses the deleted space as well:</p>
+<p><a class="easyblog-thumb-preview" title="CaptureORA73index.JPG" href="http://blog.dbi-services.com/images/easyblog_images/139/CaptureORA73index.JPG" rel="lightbox[2000]"><img title="b2ap3_thumbnail_CaptureORA73index.JPG" src="../images/easyblog_images/139/b2ap3_thumbnail_CaptureORA73index.JPG" alt="b2ap3_thumbnail_CaptureORA73index.JPG" /></a></p>
+<p>It&#8217;s the same test case except that here I&#8217;m with 2k block size.</p>
+<h3>Index rebuild</h3>
+<p>Do you think index rebuild can help, or at least is not harmful?</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter index DEMOPK rebuild;
+Index altered.
+
+SQL&gt; @ index_fragmentation.sql
+
+        ID -&gt;         ID rows/block bytes/block %free space     blocks free
+---------- -- ---------- ---------- ----------- ----------- ---------- -----
+     10001 -&gt;      10001        478        7644           5          1
+     10479 -&gt;      10479        479        7659           5          1
+     10958 -&gt;      10958        479        7659           5          1
+     11437 -&gt;      11437        479        7659           5          1
+     11916 -&gt;      11916        478        7644           5          1
+     12394 -&gt;      12394        479        7659           5          1
+     12873 -&gt;      12873        479        7659           5          1
+     13352 -&gt;      13352        479        7659           5          1
+     13831 -&gt;      13831        479        7659           5          1
+     14310 -&gt;      14310        478        7644           5          1
+     14788 -&gt;      14788        479        7659           5          1
+     15267 -&gt;      15267        479        7659           5          1
+     15746 -&gt;      15746        479        7659           5          1
+     16225 -&gt;      16225        479        7659           5          1
+     16704 -&gt;      16704        478        7644           5          1
+     17182 -&gt;      17182        479        7659           5          1
+     17661 -&gt;      17661        479        7659           5          1
+     18140 -&gt;      18140        479        7659           5          1
+     18619 -&gt;      18619        478        7644           5          1
+     19097 -&gt;      19097        479        7659           5          1
+     19576 -&gt;      19576        425        6794          15          1
+
+</pre>
+<p>The index rebuild has increased the size of the index. One more leaf block here. Because it has left 5% of free space in each block. And that free space will never be reused because there are no future rows that will go there.</p>
+<h3>Conclusion</h3>
+<p>Is the free space reused in an index on a sequence &#8211; always increasing &#8211; when we are purging old data?
+Answer is: yes&#8230; unless to are doing regular index rebuilds.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-20010" data-img="http://blog.dbi-services.com/images/easyblog_images/139/b2ap3_thumbnail_CaptureORA73index.JPG"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

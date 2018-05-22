@@ -1,0 +1,151 @@
+								<h1 class="entry-title">Query V$UNDOSTAT for relevant time window</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you have a query failing in &#8216;ORA-01555: snapshot too old: rollback segment number &#8230; with name &#8230; too small&#8217; you have two things to do:
+<ol>
+<li>Convince the developer that the rollback segment is not too small because the message text comes from old versions</li>
+<li>Find information about query duration, undo retention and stolen blocks statistics. This is the goal of this post</li>
+</ol>
+<p><span id="more-4128"></span></p>
+<p>The first information comes from the alert.log where every ORA-1555 is logged with the query and the duration:</p>
+<p><pre>Tue Sep 29 19:32:09 2015
+ORA-01555 caused by SQL statement below (SQL ID: 374686u5v0qsh, Query Duration=4626 sec, SCN: 0x0022.c823dc12):</pre></p>
+<h3>SCN</h3>
+<p>This means that at 19:32:09 the query 374686u5v0qsh running since  18:15:03 (4626 seconds ago) wasn&#8217;t able to find the undo blocks necessary to build the consistent image as of 18:15:02. How do I know that &#8216;as of&#8217; point-in-time? Usually it&#8217;s the beginning of the query, but there are cases where it can be earlier (in serializable isolation mode, flashback queries) or later (query restart for example).
+It&#8217;s better to check it: we have the SCN in hexadecimal given as &#8216;base&#8217; and &#8216;wrap&#8217; and we can convert it to a timestamp with the following formula:</p>
+<p><pre>
+SQL&gt; select scn_to_timestamp(to_number('0022','xxxxxxx')*power(2,32)+to_number('c823dc12','xxxxxxxxxxxxxxxxxxxxxx') ) from dual;
+
+SCN_TO_TIMESTAMP(TO_NUMBER('0022','XXXXXXX')*POWER(2,32)+TO_NUMBER('C823D
+-------------------------------------------------------------------------
+29-SEP-15 06.15.02.000000000 PM
+</pre></p>
+<p>Note that there can be a 3 second difference from the precision of SCN_TO_TIMESTAMP.</p>
+<h3>Undo statistics</h3>
+<p>Then I want to know the undo retention:</p>
+<p><pre>
+SQL&gt; show parameter undo_retention
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+undo_retention                       integer     900
+</pre></p>
+<p>900 seconds means that it is possible to get ORA-1555 after one hour because blocks expire after 15 minutes.</p>
+<p>We can check how the expired undo blocks where reused from V$UNDOSTAT but I use the following query to get only the lines that are relevant to my query (those that cover the query duration up to the ORA-1555 ) and only the non-zero columns:</p>
+<p><pre>
+select maxqueryid||' '||to_char(end_time,'hh24:mi')||' '||
+rtrim(lower(''
+--||decode(MAXCONCURRENCY,0,'','MAXCONCURRENCY='||MAXCONCURRENCY||' ')
+||decode(UNDOBLKS,0,'','UNDOBLKS='||UNDOBLKS||' ')
+||decode(ACTIVEBLKS,0,'','ACTIVEBLKS='||ACTIVEBLKS||' ')
+||decode(UNEXPIREDBLKS,0,'','UNEXPIREDBLKS='||UNEXPIREDBLKS||' ')
+||decode(EXPIREDBLKS,0,'','EXPIREDBLKS='||EXPIREDBLKS||' ')
+||decode(TUNED_UNDORETENTION,0,'','TUNED_UNDORETENTION(hour)='||to_char(TUNED_UNDORETENTION/60/60,'FM999.9')||' ')
+||decode(UNXPSTEALCNT,0,'','UNXPSTEALCNT='||UNXPSTEALCNT||' ')
+||decode(UNXPBLKRELCNT,0,'','UNXPBLKRELCNT='||UNXPBLKRELCNT||' ')
+||decode(UNXPBLKREUCNT,0,'','UNXPBLKREUCNT='||UNXPBLKREUCNT||' ')
+||decode(EXPSTEALCNT,0,'','EXPSTEALCNT='||EXPSTEALCNT||' ')
+||decode(EXPBLKRELCNT,0,'','EXPBLKRELCNT='||EXPBLKRELCNT||' ')
+||decode(EXPBLKREUCNT,0,'','EXPBLKREUCNT='||EXPBLKREUCNT||' ')
+||decode(SSOLDERRCNT,0,'','SSOLDERRCNT='||SSOLDERRCNT||' ')
+||decode(NOSPACEERRCNT,0,'','NOSPACEERRCNT='||NOSPACEERRCNT||' ')
+)) "undostats covering ORA-1555"
+ from (
+select BEGIN_TIME-MAXQUERYLEN/24/60/60 SSOLD_BEGIN_TIME,END_TIME SSOLD_END_TIME from V$UNDOSTAT where SSOLDERRCNT&gt;0
+) , lateral(select * from v$undostat
+ where end_time&gt;=ssold_begin_time and begin_time&lt;=ssold_end_time)
+order by end_time;
+/
+</pre></p>
+<p>Lateral join is possible in 12c, but there are other way to do the same in 11g.</p>
+<p>Here is a sample output:</p>
+<p><pre>
+undostats covering ORA-1555
+-------------------------------------------------------------------------------------------------------------
+f3yfg50ga0r8n 18:14 activeblks=224  unexpiredblks=90472 expiredblks=34048 tuned_undoretention(hour)=92.2
+f3yfg50ga0r8n 18:24 activeblks=736  unexpiredblks=90472 expiredblks=34560 tuned_undoretention(hour)=43.9 expstealcnt=1 expblkrelcnt=1280
+f3yfg50ga0r8n 18:34 activeblks=1504 unexpiredblks=64320 expiredblks=61024 tuned_undoretention(hour)=11.4 expstealcnt=2 expblkrelcnt=14208
+374686u5v0qsh 18:44 activeblks=1120 unexpiredblks=57792 expiredblks=54752 tuned_undoretention(hour)=11.4
+374686u5v0qsh 18:54 activeblks=1888 unexpiredblks=74112 expiredblks=42784 tuned_undoretention(hour)=11.4
+374686u5v0qsh 19:04 activeblks=864  unexpiredblks=90400 expiredblks=34816 tuned_undoretention(hour)=2.   expstealcnt=1 expblkrelcnt=9216
+374686u5v0qsh 19:14 activeblks=2784 unexpiredblks=91680 expiredblks=16896 tuned_undoretention(hour)=.9
+374686u5v0qsh 19:24 activeblks=1248 unexpiredblks=94232 expiredblks=3584  tuned_undoretention(hour)=.9
+374686u5v0qsh 19:34 activeblks=1504 unexpiredblks=94816 expiredblks=4352  tuned_undoretention(hour)=.9   ssolderrcnt=1
+f3yfg50ga0r8n 19:44 activeblks=2656 unexpiredblks=93024 expiredblks=2944  tuned_undoretention(hour)=1.
+</pre></p>
+<p>The ORA-1555 occurred where the ssolderrcnt is &gt; 0 and we see the number of blocks stolen before &#8211; all expired in this case.
+All the detail about the statistics are in the V$UNDOSTAT <a href="https://docs.oracle.com/database/121/REFRN/GUID-39DB6CBC-AF75-4C3A-A8E1-6C923F137246.htm#REFRN30295">documentation</a>.</p>
+<p>There is nothing more than V$UNDOSTAT here, but that query is easier if you are on command line.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-41290"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-2555">
+				<div id="div-comment-2555" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/617ac71947f9ef44d671b9ac14354ab8?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">julya</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2555">
+			January 11, 2016 at 14 h 28 min</a>		</div>
+
+		<p>The script, gives errorrs:</p>
+<p>ORA-00933: SQL command not properly ended
+00933. 00000 &#8211;  &#8220;SQL command not properly ended&#8221;
+*Cause:
+*Action:
+Error at Line: 20 Column: 12
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25561"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2555' onclick='return addComment.moveForm( "div-comment-2555", "2555", "respond", "4128" )' aria-label='Reply to julya to julya'>Reply to julya</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-2556">
+				<div id="div-comment-2556" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2556">
+			January 11, 2016 at 15 h 33 min</a>		</div>
+
+		<p>Hi, LATERAL is supported only in 12c.
+You can use it in 11g with:
+<pre>alter session set events '22829 trace name context forever';</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25571"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2556' onclick='return addComment.moveForm( "div-comment-2556", "2556", "respond", "4128" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

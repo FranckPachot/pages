@@ -1,0 +1,102 @@
+								<h1 class="entry-title">Postgres vs. Oracle access paths IX &#8211; Tid Scan</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="../postgres-vs-oracle-access-paths-viii/index.html" target="_blank">previous post</a> we have seen how Postgres and Oracle finds the table row from the index entry. It uses the TID / ROWID. I&#8217;ll focus on this access path and I will have covered all Postgres access paths to table data.</p>
+<h3>Oracle ACCESS BY ROWID</h3>
+<p>I start with Oracle because we already have seen the TABLE ACCESS BY ROWID. I&#8217;ll decompose an index acces to the table. The first step is getting the ROWID from the index entry:
+<pre>
+SQL&gt; select /*+  */  rowid from demo1  where n=1000;
+
+ROWID
+------------------
+AAASPkAAMAAABIaAAF</pre></p>
+<p>The ROWID contains the data object ID (to be able to identify the segment and then the tablespace), the relative file number within the tablespace, the block number within this file and the row number within the block. This can be stored in 10 bytes. When in an index entry, except if this is a global index on a partitioned table, we don&#8217;t need the object ID (because there&#8217;s a one-to-one relationship between the table and the index objects) and the only 6 bytes are stored in the index entry.</p>
+<p>This is a simple index access and the output (projection) is the ROWID:
+<pre>PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  32tsqy19ctmd4, child number 0
+-------------------------------------
+select /*+  */  rowid from demo1  where n=1000
+----------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |         |      1 |        |     1 (100)|      1 |00:00:00.01 |       2 |
+|*  1 |  INDEX UNIQUE SCAN| DEMO1_N |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       2 |
+----------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - access("N"=1000)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - ROWID[ROWID,10]</pre>
+</pre></p>
+<p>Now with the ROWID, I query a column from the table:
+<pre>SQL&gt; select /*+  */  a from demo1  where rowid='AAASPkAAMAAABIaAAF';
+
+         A
+----------
+         1</pre></p>
+<p>And the plan is exactly the &#8216;TABLE ACCESS&#8217; part we have seen in previous posts on index scans:
+<pre>PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  c46nq5t0sru8q, child number 0
+-------------------------------------
+select /*+  */  a from demo1  where rowid='AAASPkAAMAAABIaAAF'
+Plan hash value: 3196731035
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |       |      1 |        |     1 (100)|      1 |00:00:00.01 |       1 |
+|   1 |  TABLE ACCESS BY USER ROWID| DEMO1 |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       1 |
+-----------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "A"[NUMBER,22]
+</pre>
+There&#8217;s no Predicate section visible here, but the access is done on the ROWID which contains the file number, block number, and row number. This is the fastest way to get one row: reading only one buffer.</p>
+<h3>Postgres Tid Scan</h3>
+<p>Same idea in Postgres where we can query the TID (Tumple ID):
+<pre>
+select  ctid from demo1  where n=1000 ;
+  ctid
+---------
+ (142,6)
+(1 row)
+</pre></p>
+<p>Because my table is stored in a file (no tablespace with multiple data files here) the TID contains only the block number and the row number within the block.
+<pre>explain (analyze,verbose,costs,buffers) select  ctid from demo1  where n=1000 ;
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Index Scan using demo1_n on public.demo1  (cost=0.29..8.30 rows=1 width=6) (actual time=0.009..0.009 rows=1 loops=1)
+   Output: ctid
+   Index Cond: (demo1.n = 1000)
+   Buffers: shared hit=3
+ Planning time: 0.429 ms
+ Execution time: 0.023 ms</pre></p>
+<p>We already have seen the cost of this operation: 116 startup operations, 2 index pages read at random_page_cost=4 and 1 result row at cpu_tuple_cost=0.01 (note that the query planner does not count the cpu_index_tuple_cost here).</p>
+<p>Then here is the query using this TID:
+<pre>explain (analyze,verbose,costs,buffers) select  a from demo1  where ctid='(142,6)' ;
+                                              QUERY PLAN
+------------------------------------------------------------------------------------------------------
+ Tid Scan on public.demo1  (cost=0.00..4.01 rows=1 width=4) (actual time=0.006..0.006 rows=1 loops=1)
+   Output: a
+   TID Cond: (demo1.ctid = '(142,6)'::tid)
+   Buffers: shared hit=1
+ Planning time: 0.351 ms
+ Execution time: 0.017 ms
+</pre></p>
+<p>The cost estimation is very simple here: 1 seek()+read() at random_page_cost=4 and 1 result row at cpu_tuple_cost=0.01</p>
+<p>Since the post on Index Only Scan, I&#8217;m working on a vacuumed table with no modifications. Now that I have the simplest access path, I&#8217;ll show the same after an update, in the <a href="../postgres-vs-oracle-access-paths-x-update/index.html" target="_blank">next post</a>.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-183460"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

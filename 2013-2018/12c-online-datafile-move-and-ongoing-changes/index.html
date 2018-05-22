@@ -1,0 +1,351 @@
+								<h1 class="entry-title">12c online datafile move and ongoing changes</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Here is a long answer for a question on our forum about online move:
+<a href="http://blog.dbi-services.com/oracle-database-12c-moving-a-datafile-is-now-possible-online/#comment-2725" target="_blank">what is internal mechanism to store/keep ongoing changes in that particular datafile while copying is in progress</a>.
+<span id="more-7078"></span>
+The short answer is that there is absolutely no lock, just small synchronization and messaging between sessions. And a very small overhead while the move is running: sessions that write to a part that has already been copied must double write until the end of the operation. Let&#8217;s take an example.</p>
+<h3>Online move</h3>
+<p>I create a tablespace
+<pre>create tablespace TESTMOVE datafile '/tmp/TESTMOVE1.dbf' size 2000M;
+Tablespace created.</pre></p>
+<p>Then I move it online
+<pre>alter database move datafile '/tmp/TESTMOVE1.dbf' to '/tmp/TESTMOVE2.dbf';</pre></p>
+<h3>session longops</h3>
+<p>While it is running, I can see the progress from V$SESSION_LONGOPS
+<pre>   select * from v$session_longops where (sid,serial#) in ( select sid,serial# from v$session where sid=sys_context('userenv','sid') ) order by last_update_time desc;
+</pre>
+Here is the result (sorry for the format &#8211; html table from ancient testcase, converted to simple monospaced text)
+<pre>
+   SID SERIAL#        OPNAME         TARGET TARGET_DESC   SOFAR    TOTALWORK  UNITS     START_TIME      LAST_UPDATE_TIME  TIMESTAMP TIME_REMAINING ELAPSED_SECONDS CONTEXT                                   MESSAGE                                   USERNAME   SQL_ADDRESS    SQL_HASH_VALUE    SQL_ID     SQL_PLAN_HASH_VALUE   SQL_EXEC_START   SQL_EXEC_ID SQL_PLAN_LINE_ID SQL_PLAN_OPERATION SQL_PLAN_OPTIONS QCSID CON_ID
+    17      45 Online data file move 2      data file   2097152000 2097152000 bytes 05-jul-13 14:24:26 05-jul-13 14:26:55                        0             138       0 Online data file move: data file 2: 2097152000 out of 2097152000 bytes done FRANCK   000000007A68C930     2874426962 5qgz3pqpp8jkk                   0 05-jul-13 14:24:26    16777216
+</pre></p>
+<h3>some activity</h3>
+<p>Now I&#8217;m creating a table in that tablespace and a procedure do generated some DML on it:
+<pre>create table TEST (num ,txt) tablespace TESTMOVE as select rownum,to_char( date'-4712-01-01'+rownum-1,'Jsp') from (select * from dual connect by level &lt;=1000),(select * from dual connect by level &lt;=1000) order by 2;
+Table created.
+create table TEST2 tablespace TESTMOVE  as select * from TEST;
+Table created.
+create or replace procedure TESTACTIVITY as
+ begin
+  commit;
+  execute immediate &#039;truncate table TEST2 reuse storage&#039;;
+  for i in 1..1 loop
+   lock table TEST in exclusive mode;
+   insert /*+ APPEND */ into TEST2 select -num,txt from TEST;
+   commit;
+   delete from TEST2;
+   commit;
+  end loop;
+ end;
+ /
+Procedure created.
+</pre>
+I&#8217;m doing an APPEND insert so that my session is doing the writes (direct-write to the datafile)</p>
+<h3>without move</h3>
+<p>I run my procedure and query my session statistics
+<pre>
+exec TESTACTIVITY;
+PL/SQL procedure successfully completed.
+select name,value from v$mystat join v$statname using(statistic#) where value&gt;0 and name like '%physical%bytes%' order by 1;
+
+   NAME                                    VALUE
+   cell physical IO interconnect bytes 220946432
+   physical read bytes                 148291584
+   physical read total bytes           148291584
+   physical write bytes                 72654848
+   physical write total bytes           72654848
+</pre></p>
+<p>The procedure writes 70 MB and reads 140 MB</p>
+<h3>with background move</h3>
+<p>Let&#8217;s run the datafile move in background:
+<pre>
+variable job number
+exec dbms_job.submit(:job,q'[ begin execute immediate 'set role all'; execute immediate q'(alter database move datafile '/tmp/TESTMOVE2.dbf' to '/tmp/TESTMOVE1.dbf' )'; end; ]'); commit; dbms_lock.sleep(3);
+PL/SQL procedure successfully completed.</pre>
+If I query DBA_DATA_FILES, it&#8217;s not yet moved:
+<pre>
+select * from dba_data_files where tablespace_name='TESTMOVE';
+&amp;nnsp
+       FILE_NAME      FILE_ID TABLESPACE_NAME   BYTES    BLOCKS  STATUS   RELATIVE_FNO AUT MAXBYTES MAXBLOCKS INCREMENT_BY USER_BYTES USER_BLOCKS ONLINE_
+   /tmp/TESTMOVE2.dbf      20 TESTMOVE        2097152000 256000 AVAILABLE           20 NO         0         0            0 2096103424      255872 ONLINE</pre>
+which mean that my query will still read from the original location.</p>
+<p>However, when I run my procedure again:
+<pre>
+exec TESTACTIVITY;
+PL/SQL procedure successfully completed.
+select name,value from v$mystat join v$statname using(statistic#) where value&gt;0 and name like '%physical%bytes%' order by 1;
+
+   NAME                                    VALUE
+   cell physical IO interconnect bytes 292413440
+   physical read bytes                 147103744
+   physical read total bytes           147103744
+   physical write bytes                 72654848
+   physical write total bytes          145309696
+</pre></p>
+<p>You see the difference: &#8216;physical write total bytes&#8217; is the double of the 70M. The write is actually writing to both files.
+This is how it works. During the move, all sessions read from the original files and write to the original file, which is consistent.
+In addition to that, when the write is done on a block that has already been copied to the destination, then the session also writes to the destination. This is the double write. And the end, the destination file is consistent: all blocks are copied and maintained up to date.</p>
+<p>Actually, I&#8217;ve run my procedure several times and see the same statistics, and after several executions I get:
+<pre>
+   NAME                                    VALUE
+   cell physical IO interconnect bytes 249946112
+   physical read bytes                 146915328
+   physical read total bytes           147423232
+   physical write bytes                 72654848
+   physical write total bytes          102522880
+</pre>
+and my online move has finished during that time. Once the move is done, all session will read from the new file and then the double write is not needed.</p>
+<p>At the end, the dictionary is updated to address the new file, and the old one can be deleted:
+<pre>
+select * from dba_data_files where tablespace_name='TESTMOVE';
+
+       FILE_NAME      FILE_ID TABLESPACE_NAME   BYTES    BLOCKS  STATUS   RELATIVE_FNO AUT MAXBYTES MAXBLOCKS INCREMENT_BY USER_BYTES USER_BLOCKS ONLINE_
+   /tmp/TESTMOVE1.dbf      20 TESTMOVE        2097152000 256000 AVAILABLE           20 NO         0         0            0 2096103424      255872 ONLINE
+</pre></p>
+<h3>trace and alert.log</h3>
+<p>Note that when you trace, you see the write wait events on both files, but they have the same FILE_ID</p>
+<p>In the alert.log you can see the different phases:</p>
+<p><pre>Moving datafile /tmp/TESTMOVE1.dbf (2) to /tmp/TESTMOVE2.dbf
+</pre>
+From there, the move has created the second file and has signaled to the other sessions (including DBWR) that they must write to both, and the the copy starts (‘db file sequential read’ and ‘db file single write’ in 1MB chunks)</p>
+<p>Then when all blocks are copied:
+<pre>Move operation committed for file /tmp/TESTMOVE2.dbf
+</pre>
+and the sessions can read and write on the new file
+<pre>Completed: alter database move datafile '/tmp/TESTMOVE1.dbf' to '/tmp/TESTMOVE2.dbf'</pre></p>
+<p>This is a very nice feature. Oracle introduced it for the ILM option (in order to move cold data to cheaper disks automatically &#8211; and automatically means that it must be online) but we can also use it to migrate to new storage, to ASM, or to balance the datafile on multiple filesystems.</p>
+<p>It&#8217;s possible in Enterprise Edition without options and it&#8217;s my preferred 12c new feature for database administration. We start with it when teaching our 12c new feature training. This year, because everybody waits for 12.2 we have not planned fixed dates for that workshop, but deliver it on demand: <a href="http://www.dbi-services.com/trainings/oracle-12c-new-features-workshop/" target="_blank">http://www.dbi-services.com/trainings/oracle-12c-new-features-workshop/</a></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-70790"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 8 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-3786">
+				<div id="div-comment-3786" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/72cb63242736ee2968e1b31eadb89794?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">saurabh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3786">
+			June 18, 2016 at 1 h 39 min</a>		</div>
+
+		<p>Hello Franck,</p>
+<p>Its really a nice feature from oracle and you demonstrated it in a very informative way.
+I have some queries on the same.
+1. As you said during the move write will happen to both the datafiles ( Old and New) , Suppose i am moving the datafile to different mount point and the old data file mount point gets full to 100%. Then what will happen to the move.
+2. what will happen to new file on new mount point.
+3. What information will be contained in Control file for this datafile move.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37871"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3786' onclick='return addComment.moveForm( "div-comment-3786", "3786", "respond", "7078" )' aria-label='Reply to saurabh to saurabh'>Reply to saurabh</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-3791">
+				<div id="div-comment-3791" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3791">
+			June 18, 2016 at 19 h 28 min</a>		</div>
+
+		<p>Hi,
+To follow-up on your questions, I&#8217;ve tested the resize of datafile while it is moving and it works without any problem: <a href="http://blog.dbi-services.com/12c-online-datafile-move-and-resize/" rel="nofollow">http://blog.dbi-services.com/12c-online-datafile-move-and-resize/</a>
+About controlfile, the info is stored which makes the cleanup automatic in case of crash (except if you had to restore a controlfile backup)
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37921"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3791' onclick='return addComment.moveForm( "div-comment-3791", "3791", "respond", "7078" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-odd thread-alt depth-1" id="comment-3789">
+				<div id="div-comment-3789" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3789">
+			June 18, 2016 at 16 h 42 min</a>		</div>
+
+		<p>Hi Saurabh,
+Thanks for your feedback.
+I don&#8217;t think there is something special if the source mount point is 100%. The writes are modifying blocks that are already allocated, so no problem here. If we try to resize the file while it is being moved, we get an error (ORA-63000) but automatic resize may happen concurrently for autoextensible datafiles.
+In the controlfile, you have both files but you see only the old one in &#8216;backup controlfile to trace&#8217; until the move is completed.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37901"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3789' onclick='return addComment.moveForm( "div-comment-3789", "3789", "respond", "7078" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1 parent" id="comment-4647">
+				<div id="div-comment-4647" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6062141e73482b7a79e01357da4d7e39?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">ANJANKUMAR</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4647">
+			September 25, 2016 at 10 h 52 min</a>		</div>
+
+		<p>Hi Frank ,</p>
+<p>Please clear my confusion, If we are doing online without taking tbs or datafile down tym in oracle 12c ,
+alter database move will work on the database level but how about the OS level renaming or relocating of the datafiles will happen.. will it change on both database and OS level ?</p>
+<p>Thanks
+Anjan
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-46481"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4647' onclick='return addComment.moveForm( "div-comment-4647", "4647", "respond", "7078" )' aria-label='Reply to ANJANKUMAR to ANJANKUMAR'>Reply to ANJANKUMAR</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-4648">
+				<div id="div-comment-4648" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4648">
+			September 25, 2016 at 10 h 56 min</a>		</div>
+
+		<p>Hi Anjan,
+It takes care of OS level move and you have the possibility to KEEP the old file.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-46491"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4648' onclick='return addComment.moveForm( "div-comment-4648", "4648", "respond", "7078" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-4649">
+				<div id="div-comment-4649" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6062141e73482b7a79e01357da4d7e39?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">ANJANKUMAR</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4649">
+			September 25, 2016 at 11 h 02 min</a>		</div>
+
+		<p>Thanks a lot Sir for quick response <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":)" class="wp-smiley" /> I am very eager to learn on every minute things on DBA. If any queries i will post on it.</p>
+<p>Thanks Again.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-46501"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4649' onclick='return addComment.moveForm( "div-comment-4649", "4649", "respond", "7078" )' aria-label='Reply to ANJANKUMAR to ANJANKUMAR'>Reply to ANJANKUMAR</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-4650">
+				<div id="div-comment-4650" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6062141e73482b7a79e01357da4d7e39?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">ANJANKUMAR</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4650">
+			September 25, 2016 at 11 h 08 min</a>		</div>
+
+		<p>Hi Franck ,</p>
+<p> Need to know what is the advantage of sqlplus /nolog and how it works. Can please briefly explain on this command. I tried to search on this and didnt get proper information.</p>
+<p>Thanks
+Anjan
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-46511"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4650' onclick='return addComment.moveForm( "div-comment-4650", "4650", "respond", "7078" )' aria-label='Reply to ANJANKUMAR to ANJANKUMAR'>Reply to ANJANKUMAR</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-4656">
+				<div id="div-comment-4656" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4656">
+			September 25, 2016 at 16 h 54 min</a>		</div>
+
+		<p>Hi, very simple with /nolog sqlplus does not connect immediately. You connect later with the &#8220;connect&#8221; command.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-46571"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4656' onclick='return addComment.moveForm( "div-comment-4656", "4656", "respond", "7078" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

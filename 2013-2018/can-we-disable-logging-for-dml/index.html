@@ -1,0 +1,168 @@
+								<h1 class="entry-title">Oracle 12c: Can we disable logging for DML?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>If we don&#8217;t mind about loosing our changes, then can we disable logging for DML? This is a question I&#8217;ve heard a lot. Ok, you don&#8217;t need to recover your changes but Oracle may want to recover the consistency of its datafiles anyway. And that&#8217;s why datafiles blocks changed though the buffer cache always generate redo.</p>
+<p>But yes, in 12c you can do DML and generate only minimal redo. All DML: even updates and deletes. And that post is not about underscore parameters that allows corruption.</p>
+<p>Here is the idea: all changes to datafiles done through the buffer cache must generate redo. So we will:</p>
+<ul>
+<li>Do our DML only in a Global Temporary Tables, which are in tempfiles &#8211; not protected by redo</li>
+<li>Copy the data to our permanent table with direct path operation only, which can be done with NOLOGGING</li>
+</ul>
+<div>However, that is appropriate only when you have exclusive access to the table for the operation. Think of it as an ETL step that must do some updates for example. It&#8217;s not ACID. ACID needs undo for the ACI and redo for the D , but here we want to avoid redo and undo as much as possible.</div>
+<h3>The test case</h3>
+<p>Here is our table with its indexes:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create table DEMO_PER (id constraint DEMO_PER_PK primary key,n) as select rownum n , 0 from (select * from dual connect by level ≤ 1000),(select * from dual connect by level  ≤ 1000)
+
+SQL&gt; create index DEMO_PER_IX on DEMO_PER(n)
+Index DEMO_PER_IX created.
+</pre>
+<p>The data is about 44MB of redo:</p>
+<pre class="brush: actionscript3; gutter: false; first-line: 1">SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where name like 'redo size' and value&gt;0
+
+NAME                      VALUE
+-------------------- ----------
+redo size              46178212
+</pre>
+<p>And I save it&#8217;s DDL in order to check later than it has not changed during the operation:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; spool ddl1.txt
+SQL&gt; ddl DEMO_PER
+
+  CREATE TABLE "DEMO"."DEMO_PER"
+   (    "ID" NUMBER,
+        "N" NUMBER,
+         CONSTRAINT "DEMO_PER_PK" PRIMARY KEY ("ID")
+  USING INDEX PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "USERS"  ENABLE
+   ) SEGMENT CREATION IMMEDIATE
+  PCTFREE 10 PCTUSED 40 INITRANS 1 MAXTRANS 255
+ NOCOMPRESS LOGGING
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "USERS"
+
+  CREATE INDEX "DEMO"."DEMO_PER_IX" ON "DEMO"."DEMO_PER" ("N")
+  PCTFREE 10 INITRANS 2 MAXTRANS 255 COMPUTE STATISTICS
+  STORAGE(INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "USERS"
+SQL&gt; spool off
+</pre>
+<p>If you wonder what is that &#8216;ddl&#8217; command, I&#8217;m just enjoying <a href="http://krisrice.blogspot.ch/2014/12/what-is-sdsql.html">sdsql</a>.</p>
+<h3>GTT</h3>
+<p>I create a GTT with same structure that will be used for my updates:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create global temporary table DEMO_TMP on commit preserve rows as select * from DEMO_PER where rownum=0
+Global temporary TABLE created.
+
+SQL&gt; create index DEMO_TMP_IX on DEMO_TMP (id,n)
+Index DEMO_TMP_IX created.
+</pre>
+<p>&nbsp;</p>
+<h3>Copy all needed data in the GTT and do our DML on it</h3>
+<p>I use a direct-path insert that generates no undo:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; insert /*+ append */ into DEMO_TMP select * from DEMO_PER
+1,000,000 rows inserted.
+SQL&gt; commit
+committed.
+</pre>
+<p>Then, and this is where I need to be in 12c, I can do any DML on my GTT without generating any redo (because undo is generated into the tempfiles instead of the undo tablespace):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set temp_undo_enabled=true
+Session altered.
+</pre>
+<p>And then I&#8217;ll do a dome DML that yould have generated hundred of MB if there were done on the permanent table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; insert into DEMO_TMP select id , 1 from DEMO_TMP
+1,000,000 rows inserted.
+
+SQL&gt; delete from DEMO_TMP where n=0
+1,000,000 rows deleted.
+
+SQL&gt; update DEMO_TMP set id=id+1, n=n+1
+1,000,000 rows updated.
+</pre>
+<p>&nbsp;</p>
+<h3>Copy the changed data to the permanent table</h3>
+<p>In order to generate no redo we need to set the table in nologging and insert in direct-path, and avoid all index maintenance.
+First we truncate the table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; truncate table DEMO_PER
+Table DEMO_PER truncated.
+</pre>
+<p>and put table and indexes in NOLOGGING:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter table DEMO_PER nologging
+Table DEMO_PER altered.
+
+SQL&gt; alter index DEMO_PER_IX nologging
+Index DEMO_PER_IX altered.
+</pre>
+<p>and disable indexes (the primary key has to be disabled and here the index created by the constraint is dropped when disabling it):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter index DEMO_PER_IX unusable
+Index DEMO_PER_IX altered.
+
+SQL&gt; alter table DEMO_PER disable constraint DEMO_PER_PK
+Table DEMO_PER altered.
+</pre>
+<p>then we insert our data from the GTT:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; insert /*+ append */ into DEMO_PER select * from DEMO_TMP
+1,000,000 rows inserted.
+</pre>
+<p>And then we need to recreate indexes:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter table DEMO_PER logging
+Table DEMO_PER altered.
+</pre>
+<p>The indexes must be created in nologging (even for the one created with the primary key):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter table DEMO_PER modify constraint DEMO_PER_PK using index nologging
+Table DEMO_PER altered.
+
+SQL&gt; alter table DEMO_PER enable constraint DEMO_PER_PK
+Table DEMO_PER altered.
+
+SQL&gt; alter index DEMO_PER_IX rebuild nologging
+Index DEMO_PER_IX altered.
+</pre>
+<p>Finally, we must put back table and indexes in LOGGING:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter index DEMO_PER_PK logging
+Index DEMO_PER_PK altered.
+
+SQL&gt; alter index DEMO_PER_IX logging
+Index DEMO_PER_IX altered.
+
+SQL&gt; alter table DEMO_PER logging
+Table DEMO_PER altered.
+</pre>
+<h3>How much redo?</h3>
+<pre class="brush: sql; gutter: true; first-line: 1">Command=redosize
+SQL&gt; redosize
+SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where name like 'redo size' and value&gt;0
+
+NAME                      VALUE
+-------------------- ----------
+redo size               8175384
+</pre>
+<p>this is less than 1MB.</p>
+<h3>Checking DDL</h3>
+<p>As I&#8217;m in sdsql I generate the DDL with the &#8216;ddl&#8217; command and compare it with &#8216;diff&#8217; to the initial one:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; spool ddl2.txt
+SQL&gt; ddl DEMO_PER
+SQL&gt; spool off
+SQL&gt; host diff ddl1.txt ddl2.txt
+</pre>
+<p>No difference <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":)" class="wp-smiley" /></p>
+<h3>Conclusion</h3>
+<p>We can avoid most of the redo even for DML operations. However, this is only for offline jobs and it&#8217;s always to implement the modifications in the &#8216;insert /*+ append */&#8217; statement rather than doing updates and deletes. This is specific to 12c when we can avoid redo generated to protect undo. This is not the default as it has been introduced by Oracle to be able to update GTT in an Active Data Guard configuration, but we can use it on the primary. GGT don&#8217;t need recovery, so they don&#8217;t need redo.</p>
+<p>Of course, you need to backup at the end. Look at the <a href="https://blog.dbi-services.com/the-consequences-of-nologging-in-oracle">consequences of NOLOGGING</a></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5530"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

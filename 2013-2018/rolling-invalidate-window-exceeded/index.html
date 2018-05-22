@@ -1,0 +1,339 @@
+								<h1 class="entry-title">Rolling Invalidate Window Exceeded</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Today I was doing a hard parse storm post-mortem analysis. One hypothesis was rolling invalidation causing invalidation, but figures didn&#8217;t match. I often reproduce the hypothesis to check the numbers to be sure I interpret them correctly. Especially the timestamps in V$SQL_SHARED_CURSOR.REASON. And as it may help others (including myself in the future) I share the test case.
+<span id="more-10359"></span>
+I create a table with one row (12c online statistics gathering, so num_rows is 1) and then insert one more row.
+<pre>
+21:31:26 SQL&gt; create table DEMO as select * from dual;
+Table created.
+21:31:26 SQL&gt; insert into DEMO select * from dual;
+1 row created.
+21:31:26 SQL&gt; commit;
+Commit complete.
+</pre>
+I run a query on the table. I don&#8217;t care about the result, so let&#8217;s put it something that will be useful later: the UTC time as the number of seconds since Jan 1st, 1970 (aka Epoch)
+<pre>
+21:32:52 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585572
+                                                               1472585572
+</pre>
+The execution plan cardinality estimation is 1 row as this is what is in object statistics.
+<pre>
+21:32:52 SQL&gt; select * from table(dbms_xplan.display_cursor(null,null));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  61x2h0y9zv0r6, child number 0
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+
+Plan hash value: 4000794843
+
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     1 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+</pre>
+I gather statistics with all default attributes, so rolling invalidation occurs.
+<pre>
+21:32:52 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+PL/SQL procedure successfully completed.
+</pre></p>
+<p>At this time, the cursor has been parsed only once:
+<pre>
+21:32:52 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------
+            0          1           1          1 2016-08-30/21:32:51 2016-08-30/21:32:51 30-AUG-16 21:32:51
+</pre></p>
+<p>By default the invalidation window is 5 hours. I don&#8217;t want to wait so I set it to something shorter- 15 seconds:
+<pre>
+21:32:54 SQL&gt; alter system set "_optimizer_invalidation_period"=15;
+System altered.
+</pre></p>
+<p>There will not be any invalidation until the next execution. To prove it I wait 20 seconds, run the query again and check the execution plan:
+<pre>
+21:33:12 SQL&gt; select (sysdate-date'1970-01-01')*24*3600 from DEMO;
+
+(SYSDATE-DATE'1970-01-01')*24*3600
+----------------------------------
+                        1472592792
+                        1472592792
+
+21:33:12 SQL&gt; select * from table(dbms_xplan.display_cursor('61x2h0y9zv0r6',null));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  61x2h0y9zv0r6, child number 0
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+
+Plan hash value: 4000794843
+
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     1 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+</pre>
+This is still the old cursor (child number 0) with old stats (num_rows=1)</p>
+<p>However, from this point rolling invalidation occurs: a random timestamp is generated within the rolling window (15 seconds here &#8211; 5 hours in default database).</p>
+<p>I don&#8217;t know how to see this timestamp at that point (comments welcome) so I run the query several times within this 15 seconds window to see when it occurs:
+<pre>
+21:33:16 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585596
+                                                               1472585596
+
+21:33:19 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585599
+                                                               1472585599
+
+21:33:22 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585602
+                                                               1472585602
+
+21:33:25 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585605
+                                                               1472585605
+
+21:33:28 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585608
+                                                               1472585608
+
+21:33:31 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585611
+                                                               1472585611
+</pre>
+After those runs, I check that I have a new execution plan with new estimation from new statistics (num_rows=2):
+<pre>
+21:33:31 SQL&gt; select * from table(dbms_xplan.display_cursor('61x2h0y9zv0r6',null));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  61x2h0y9zv0r6, child number 0
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+
+Plan hash value: 4000794843
+
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     1 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+
+SQL_ID  61x2h0y9zv0r6, child number 1
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+
+Plan hash value: 4000794843
+
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     2 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+</pre>
+Yes, I have a new child cursor, child number 1. A new cursor means that I have a reason in V$SQL_SHARED_CURSOR:
+<pre>
+21:33:31 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='61x2h0y9zv0r6';
+
+CHILD_NUMBER REASON
+------------ --------------------------------------------------------------------------------
+           0 &lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Win
+             dow Exceeded(2)&lt;/reason&gt;&lt;size&gt;0x0&lt;/size&gt;&lt;details&gt;already_processed&lt;/details&gt;&lt;/Ch
+             ildNode&gt;&lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invali
+             date Window Exceeded(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;invalidation_window&gt;1472585604&lt;
+             /invalidation_window&gt;&lt;ksugctm&gt;1472585607&lt;/ksugctm&gt;&lt;/ChildNode&gt;
+
+           1
+</pre>
+Child cursor number 0 has not been shared because of rolling invalidation. The invalidation_window number, 1472585604, is the timestamp set by rolling invalidation, set at first parse call after stats gathering, and defined within the rolling window that follows. After this one (1472585604 is 21:33:24 in my GMT+2 timezone) the cursor will not be shared and a new hard parse occurs. I think that ksugctm is the timestamp when the new cursor is created. 1472585607 is 21:33:27 here in Switzerland. You see the corresponding timestamps in V$SQL:
+<pre>
+21:33:31 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------
+            0          1           5          5 2016-08-30/21:32:51 2016-08-30/21:32:51 30-AUG-16 21:33:24
+            0          1           2          2 2016-08-30/21:32:51 2016-08-30/21:33:27 30-AUG-16 21:33:30
+</pre></p>
+<p>Ok. Important thing is that the &#8216;rolling invalidation&#8217; is not an invalidation (as V$SQL.INVALIDATIONS=0) of the cursor, but just non-sharing of the child.</p>
+<p>If we gather statistics with immediate invalidation, it&#8217;s different:
+<pre>
+21:33:31 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO',no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.
+
+21:33:34 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585614
+                                                               1472585614
+21:33:34 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='61x2h0y9zv0r6';
+
+CHILD_NUMBER REASON
+------------ --------------------------------------------------------------------------------
+           0 &lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Win
+             dow Exceeded(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;invalidation_window&gt;1472585604&lt;/invalid
+             ation_window&gt;&lt;ksugctm&gt;1472585607&lt;/ksugctm&gt;&lt;/ChildNode&gt;&lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;
+             /ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Window Exceeded(2)&lt;/reason&gt;&lt;s
+             ize&gt;0x0&lt;/size&gt;&lt;details&gt;already_processed&lt;/details&gt;&lt;/ChildNode&gt;
+</pre>
+I&#8217;ve only one child here, a new one, and I&#8217;m not sure the reason has a meaning.
+<pre>
+21:33:34 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------
+            1          2           1          1 2016-08-30/21:32:51 2016-08-30/21:33:33 30-AUG-16 21:33:33
+</pre>
+This is an invalidation of the cursor. Old children cursors are removed and the proud parent is marked as invalidated 1 time.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-103600"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-4331">
+				<div id="div-comment-4331" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/08b4eccce68cd521b54671abb0442ae1?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://jonathanlewis.wordpress.com' rel='external nofollow' class='url'>Jonathan Lewis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4331">
+			August 31, 2016 at 13 h 03 min</a>		</div>
+
+		<p>Interesting.</p>
+<p>I wonder if there would be any differences if you connected with another session, or disconnected and re-connected between executions &#8211; running the query every three seconds might have got the query into your session cursor cache which could conceivably have made a difference regarding invalidation/rolling window.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-43321"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4331' onclick='return addComment.moveForm( "div-comment-4331", "4331", "respond", "10359" )' aria-label='Reply to Jonathan to Jonathan Lewis'>Reply to Jonathan</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-4332">
+				<div id="div-comment-4332" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4332">
+			August 31, 2016 at 13 h 17 min</a>		</div>
+
+		<p>Hi Jonathan,
+From what I&#8217;ve seen it&#8217;s the execution that counts to set the timestamp. Not the parse call. A dbms_sql.parse does not trigger the invalidation. But call to dbms_sql.execute after stats gathering is enough.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-43331"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4332' onclick='return addComment.moveForm( "div-comment-4332", "4332", "respond", "10359" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-4334">
+				<div id="div-comment-4334" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75234dd34f80230790f957f674492496?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://dba24.pl' rel='external nofollow' class='url'>Maciej Tokar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4334">
+			August 31, 2016 at 18 h 46 min</a>		</div>
+
+		<p>Franck,</p>
+<p>Is the timestamp in REASON column in the unix timestamp format that you subtract -date&#8217;1970-01-01&#8242; from the current_timestamp??
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-43351"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4334' onclick='return addComment.moveForm( "div-comment-4334", "4334", "respond", "10359" )' aria-label='Reply to Maciej to Maciej Tokar'>Reply to Maciej</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-even depth-1" id="comment-4335">
+				<div id="div-comment-4335" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4335">
+			August 31, 2016 at 21 h 00 min</a>		</div>
+
+		<p>Hi Maciej, yes it is Unix Epoch time. I&#8217;ll have to check if it&#8217;s the same on Windows&#8230;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-43361"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4335' onclick='return addComment.moveForm( "div-comment-4335", "4335", "respond", "10359" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

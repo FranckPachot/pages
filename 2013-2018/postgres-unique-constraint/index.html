@@ -1,0 +1,215 @@
+								<h1 class="entry-title">Postgres unique constraint</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p><a href="http://sql-au-coeur-des-performances.fr/" target="_blank"></a>I&#8217;ll start a series on Postgres vs. Oracle access paths because I know Oracle and I learn Postgres. While preparing it, I came upon some surprises because I&#8217;m so used to Oracle that I take some behavior as granted for any SQL databases. I recently posted a <a href="https://twitter.com/FranckPachot/status/888867529954820097" target="_blank">tweet</a> about one of them, comparing latest Postgres version to earliest Oracle version I have on my laptop.
+The goal of the tweet was exactly what I said above: show my surprise, using Oracle 7 as a reference because this is the version where I started to learn SQL. And there&#8217;s no judgment behind this surprise: I can&#8217;t compare a software I use for more than 20 years with one I&#8217;m just learning. I have a big admiration for the Oracle design and architecture choices. But I&#8217;ve also a big admiration for what the Postgres community is doing.
+<span id="more-17854"></span>
+In my tweet I&#8217;ve updated a primary key. I think I&#8217;ve never designed in real life a primary key that has to be updated later. For each table we need a key that is immutable to identify rows for referential integrity constraints, or for replication. The value must be known from the first insert (which means the columns are declared not null) and the value is never updated. It makes sense to use a primary key for that as it is unique and not null.</p>
+<p>Actually, a better case would be a simple unique constraint where we just exchange two rows. A real-life example is a list of items, having probably a surrogate key as the primary key, and a unique key including an item number. When the user wants to move up one item, we just run an update on two rows, exchanging their numbers. The unique constraint just ensures that we have only distinct values so that a select &#8230; order by will always return the values in the same order.</p>
+<p>All similar cases have the same consequence: when you process row by row the update, the uniqueness may be violated. But at the end of the statement, the constraint is still valid.</p>
+<p>Here is the initial example with updating all rows:</p>
+<p><pre>
+create table demo as select generate_series n from generate_series(1,2);
+SELECT 2
+alter table demo add constraint demo_pk primary key(n);
+ALTER TABLE
+select * from demo;
+ n
+---
+ 1
+ 2
+(2 rows)
+
+begin transaction;
+BEGIN
+update demo set n=n-1;
+UPDATE 2
+select * from demo;
+ n
+---
+ 0
+ 1
+(2 rows)
+</pre>
+This works. I&#8217;ve inserted the rows in ascending order of n. Decreasing the value doesn&#8217;t violate the uniqueness at any time because it reads rows from the beginning to the end.</p>
+<p>However, when we increase the value, we have a duplicate value until we process the next row. And by default, Postgres fails:
+<pre>
+update demo set n=n+1;
+ERROR:  duplicate key value violates unique constraint "demo_pk"
+DETAIL:  Key (n)=(1) already exists.
+</pre></p>
+<p>The bad thing is that the behavior of the application depends on the physical order of the rows and the order where they are processed. This violates the Codd rule about physical independence. In addition to that, the SQL statements should behave as processing the set of rows rather than low-level row-by-row processing.</p>
+<p>But there is also a very good thing: because the constraint is validated row by row, you know which value violates the constraint (here: &#8220;DETAIL:  Key (n)=(1) already exists&#8221; ).</p>
+<p>So my statement failed and this in Postgres seems to fail the whole transaction:
+<pre>
+commit;
+ROLLBACK
+</pre></p>
+<p>My second surprise is that the failure of one statement cancels the whole transaction. I see no error at commit, but it simply tells me that it has done a rollback instead of the commit.</p>
+<h3>deferrable</h3>
+<p>So, I compared with Oracle where this statement is always successful, because temporary violations that are resolved later, within the same statement, do not violate the constraint. I compared it with the oldest version I have on my laptop (Oracle 7.3) to show that it is something I&#8217;ve never seen as a new feature because I started with Oracle 7. And this kind of thing is the reason why I like SQL. Doing the same with a procedural language requires an intermediate update to be sure that there is no duplicate at any time.</p>
+<p>The Postgres community is very responsive, especially when we may think that something works better in Oracle than Postgres (which was not the case here and which was not the goal of my tweet anyway &#8211; but tweets are short and may not express the tone properly).</p>
+<p>Quickly a solutions were proposed: deferred constraint (example in <a href="https://www.commandprompt.com/blog/postgres_deferred_primary_keys/" target="_blank">this</a> blog post). </p>
+<p>I know deferred constraints in Oracle. They are similar in Postgres and here is the solution proposed:</p>
+<p><pre>
+alter table demo drop constraint demo_pk;
+ALTER TABLE
+alter table demo add constraint demo_pk primary key(n) deferrable initially deferred;
+ALTER TABLE
+begin transaction;
+BEGIN
+update demo set n=n-1;
+UPDATE 2
+select * from demo;
+ n
+---
+ 0
+ 1
+(2 rows)
+
+update demo set n=n+1;
+UPDATE 2
+</pre></p>
+<p>That seems good. Because the constraint validation is deferred, the update is successful. </p>
+<p>However, this is not what I want. I want the previous statement to succeed, but I want the following statement to fail:
+<pre>
+insert into demo values(1);
+INSERT 0 1
+</pre></p>
+<p>Because constraint is deferred, this statement is successful and it is only at commit that it fails:
+<pre>
+commit;
+ERROR:  duplicate key value violates unique constraint "demo_pk"
+DETAIL:  Key (n)=(1) already exists.
+</pre></p>
+<p>Why do I think this is not the good solution? First, because I want the statement to fail as soon as possible. And in addition to that, I want the commit to be fast. Doing expensive things at commit should be avoided, if possible. It is the point where all work is supposed to be done and you just want to save it (make it durable and visible to others).</p>
+<h3>deferrable initially immediate</h3>
+<p>Actually, the solution is to declare the constraint as deferrable, but not deferred.
+<pre>
+alter table demo drop constraint demo_pk;
+ALTER TABLE
+alter table demo add constraint demo_pk primary key(n) deferrable initially immediate;
+ALTER TABLE
+</pre>
+This says that it is deferrable, but not deferred (except if you decide to set the constraint deferred for your transaction). That way it accepts temporary constraint violation if they are resolved at the end of the statement.</p>
+<p>Now, my update statement is sucessful:
+<pre>
+begin transaction;
+BEGIN
+update demo set n=n-1;
+UPDATE 2
+select * from demo;
+ n
+---
+ 0
+ 1
+(2 rows)
+update demo set n=n+1;
+UPDATE 2
+</pre></p>
+<p>Any other statement that violates the constraint fails immediately:
+<pre>
+insert into demo values(1);
+ERROR:  duplicate key value violates unique constraint "demo_pk"
+DETAIL:  Key (n)=(1) already exists.
+commit;
+ROLLBACK
+</pre></p>
+<h3>Documentation</h3>
+<p>The nice thing is that this is documented! I didn&#8217;t find it immediately because it is in the &#8216;Compatibility&#8217; part of the <a href="https://blog.dbi-services.com/postgres-unique-constraint/'create&#32;table'&#32;documentation" target="_blank">&#8216;create table&#8217; documentation</a>. I&#8217;m not yet used to the Postgres documentation. I stopped at the &#8216;DEFERRED&#8217; definition which mentions: <i>A constraint that is not deferrable will be checked immediately after every command</i> </p>
+<p>But later Compatibility adds something more specific to the unique constraint:
+<i>
+Non-deferred Uniqueness Constraints
+When a UNIQUE or PRIMARY KEY constraint is not deferrable, PostgreSQL checks for uniqueness immediately whenever a row is inserted or modified. The SQL standard says that uniqueness should be enforced only at the end of the statement; this makes a difference when, for example, a single command updates multiple key values. To obtain standard-compliant behavior, declare the constraint as DEFERRABLE but not deferred (i.e., INITIALLY IMMEDIATE). Be aware that this can be significantly slower than immediate uniqueness checking.
+</i></p>
+<p>That&#8217;s another good point. Postgres documentation is clear and gives the right solution. We just have to read it to the end.</p>
+<p>A side note for my French speaking readers here to mention that the Postgres documentation has been translated into French by <a href="http://blog.guillaume.lelarge.info/" target="_blank">Guillaume Lelarge</a>, who also translated Markus Winand book and <a href="http://use-the-index-luke.com/fr" target="_blank">website</a>. Translation is as good as the original in both cases.</p>
+<h3>Performance</h3>
+<p>The documentation mentions &#8216;significantly slower&#8217;. Here is a test on 100000 rows with non deferable constraint:
+<pre>
+create table demo as select generate_series n from generate_series(1,100000);
+SELECT 100000
+alter table demo add constraint demo_pk primary key(n);
+ALTER TABLE
+vacuum demo;
+VACUUM
+select * from pgstatindex('demo_pk');
+ version | tree_level | index_size | root_block_no | internal_pages | leaf_pages | empty_pages | deleted_pages | avg_leaf_density | leaf_fragmentation
+---------+------------+------------+---------------+----------------+------------+-------------+---------------+------------------+--------------------
+       2 |          1 |    2260992 |             3 |              1 |        274 |           0 |             0 |            89.83 |                  0
+(1 row)
+</pre>
+Here is the update n=n-1 where all rows are updated but none violates the constraint at any time:
+<pre>
+explain (analyze,verbose,costs,buffers)update demo set n=n-1;
+                                                        QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------
+ Update on public.demo  (cost=0.00..1693.00 rows=100000 width=10) (actual time=425.699..425.699 rows=0 loops=1)
+   Buffers: shared hit=578646 read=1202 dirtied=1267
+   -&gt;  Seq Scan on public.demo  (cost=0.00..1693.00 rows=100000 width=10) (actual time=0.013..16.186 rows=100000 loops=1)
+         Output: (n - 1), ctid
+         Buffers: shared hit=443
+</pre></p>
+<p>This update has read 578646+1202=579848 buffers.</p>
+<p>Now creating the deferrable constraint:
+<pre>
+alter table demo drop constraint demo_pk;
+ALTER TABLE
+alter table demo add constraint demo_pk primary key(n) deferrable initially immediate;
+ALTER TABLE
+vacuum demo;
+VACUUM
+select * from pgstatindex('demo_pk');
+ version | tree_level | index_size | root_block_no | internal_pages | leaf_pages | empty_pages | deleted_pages | avg_leaf_density | leaf_fragmentation
+---------+------------+------------+---------------+----------------+------------+-------------+---------------+------------------+--------------------
+       2 |          1 |    2260992 |             3 |              1 |        274 |           0 |             0 |            89.83 |                  0
+</pre>
+And do the n=n+1 update:
+<pre>
+explain (analyze,verbose,costs,buffers)update demo set n=n+1;
+                                                        QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------
+ Update on public.demo  (cost=0.00..2135.00 rows=100000 width=10) (actual time=481.868..481.868 rows=0 loops=1)
+   Buffers: shared hit=679405 read=760 dirtied=825
+   -&gt;  Seq Scan on public.demo  (cost=0.00..2135.00 rows=100000 width=10) (actual time=0.268..16.329 rows=100000 loops=1)
+         Output: (n + 1), ctid
+         Buffers: shared hit=885
+ Planning time: 0.237 ms
+ Trigger PK_ConstraintTrigger_75314 for constraint demo_pk: time=174.976 calls=99999
+ Execution time: 663.799 ms
+</pre>
+This read more buffers and we can see that an internal trigger (PK_ConstraintTrigger_75314) has been run to re-check the unique constraint at the end of the statement. But only 17% more here for this special case where all rows are updated.</p>
+<p>However, a more realistic test case exchanging only two values is much cheaper:</p>
+<p><pre>
+explain (analyze,verbose,costs,buffers) update demo set n=case when n=2 then 2000 when n=2000 then 2 end where n in (2,2000);
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Update on public.demo  (cost=8.85..16.60 rows=2 width=10) (actual time=0.079..0.079 rows=0 loops=1)
+   Buffers: shared hit=23
+   -&gt;  Bitmap Heap Scan on public.demo  (cost=8.85..16.60 rows=2 width=10) (actual time=0.016..0.055 rows=2 loops=1)
+         Output: CASE WHEN (n = 2) THEN 2000 WHEN (n = 2000) THEN 2 ELSE NULL::integer END, ctid
+         Recheck Cond: (demo.n = ANY ('{2,2000}'::integer[]))
+         Heap Blocks: exact=3
+         Buffers: shared hit=9
+         -&gt;  Bitmap Index Scan on demo_pk  (cost=0.00..8.85 rows=2 width=0) (actual time=0.009..0.009 rows=4 loops=1)
+               Index Cond: (demo.n = ANY ('{2,2000}'::integer[]))
+               Buffers: shared hit=6
+ Planning time: 0.137 ms
+ Trigger PK_ConstraintTrigger_75322 for constraint demo_pk: time=0.005 calls=1
+ Execution time: 0.120 ms
+</pre></p>
+<p>In my opinion, the overhead here is totally acceptable, especially given the fact that this re-check displays exactly which value violates the constraint in case there is a duplicate.</p>
+<p>But I&#8217;m going too fast here. I&#8217;ve not even started my blog series about access paths where I&#8217;ll explain the cost of the execution plans, starting from the most simple: Seq Scan. Follow my <a href="http://feeds.feedburner.com/FranckPachot" target="_blank"> blog </a>or <a href="https://twitter.com/FranckPachot" target="_blank">twitter</a> to get informed. There will be nothing about &#8216;which is better, Oracle or Postgres?&#8217;. But I&#8217;m convinced that knowing the difference helps to understand how it works, and to design an application that has the correct behavior if ported from one to the other.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-178550"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

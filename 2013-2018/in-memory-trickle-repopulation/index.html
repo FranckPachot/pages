@@ -1,0 +1,201 @@
+								<h1 class="entry-title">In-memory trickle repopulation</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the &#8216;traditional&#8217; row store, the indexes are maintained at the same time as rows are changed. It&#8217;s different with the In-memory Column Store. Changes are maintained by background processes. When rows are changed, the Snapshot Metadata Units (SMU) logs the changes and In-Memory Compression Units (IMCU) are re-populated asynchronously. Let&#8217;s see an example.
+<span id="more-4395"></span></p>
+<h3>test case</h3>
+<p>I create a one million rows table inmemory and I ensure that it is populated in memory:
+<pre>
+SQL&gt; create table DEMO inmemory tablespace IOPS as select rownum num,mod(rownum,10) ten from xmltable('1 to 1000000');
+Table created.
+
+SQL&gt; alter session set "_inmemory_populate_wait"=true;
+Session altered.
+
+SQL&gt; set timing on
+SQL&gt; select count(*) from DEMO;
+
+  COUNT(*)
+----------
+   1000000
+
+Elapsed: 00:00:04.32
+</pre>
+I&#8217;ve used the &#8220;_inmemory_populate_wait&#8221; to wait for the first population and see how long it takes. It is not set for the following sessions.</p>
+<h3>Invalidation and repopulation statistics</h3>
+<p>For the moment, all rows are populated in memory
+<pre>
+SQL&gt; select to_char(sysdate,'hh24:mi:ss') "now",load_scn,total_rows,invalid_rows,invalid_blocks from V$IM_SMU_HEAD;
+
+now      LOAD_SCN         TOTAL_ROWS INVALID_ROWS INVALID_BLOCKS
+-------- ---------------- ---------- ------------ --------------
+16:03:19 940920160            491079            0              0
+16:03:19 940920160            508921            0              0
+
+SQL&gt; select prepopulated,repopulated,trickle_repopulated,num_rows,num_blocks,time_to_populate,to_char(timestamp,'hh24:mi:ss') timestamp from V$IM_HEADER;
+
+PREPOPULATED REPOPULATED TRICKLE_REPOPULATED   NUM_ROWS NUM_BLOCKS TIME_TO_POPULATE TIMESTAM
+------------ ----------- ------------------- ---------- ---------- ---------------- --------
+           0           0                   0     491079        874              534 16:03:16
+           0           0                   0     508921        908              506 16:03:16
+</pre>
+As far as i know the TIME_TO_POPULATE is in milliseconds. It&#8217;s the minimum I ever seen with In-memory.</p>
+<h3>Consistent gets</h3>
+<p>Everything being in memory, a select should not read any block from the buffer cache:
+<pre>
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 4000794843
+-----------------------------------------------------------------------------------
+| Id  | Operation                  | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+-----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |      |   100K|   781K|    32   (4)| 00:00:01 |
+|*  1 |  TABLE ACCESS INMEMORY FULL| DEMO |   100K|   781K|    32   (4)| 00:00:01 |
+-----------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - inmemory("TEN"&lt;0)
+       filter(&quot;TEN&quot;&lt;0)
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+          3  consistent gets
+          0  physical reads
+          0  redo size
+        307  bytes sent via SQL*Net to client
+        489  bytes received via SQL*Net from client
+          1  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          0  rows processed
+</pre>
+3 consistent gets are (probably) from the dictionary.
+The IM statistics show that all rows have been read from the IM columns store:
+<pre>
+NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+IM scan rows                                                        1000000
+IM scan rows optimized                                              1000000
+</pre></p>
+<h3>Update</h3>
+<p>Let&#8217;s update 20000 rows (that is 2% of total rows)
+<pre>
+SQL&gt;  UPDATE DEMO set ten=ten+1 where rownum&lt;=20000
+20000 rows updated.
+
+SQL&gt; commit;
+Commit complete.
+</pre></p>
+<h3>Invalid rows</h3>
+<p>The updated rows are now stale in the IMCS, they are marked as &#8216;invalid&#8217; in the IMCS metadata:
+<pre>
+SQL&gt; select to_char(sysdate,'hh24:mi:ss') "now",load_scn,total_rows,invalid_rows,invalid_blocks from V$IM_SMU_HEAD;
+
+now      LOAD_SCN         TOTAL_ROWS INVALID_ROWS INVALID_BLOCKS
+-------- ---------------- ---------- ------------ --------------
+16:03:30 940920160            491079        20000             35
+16:03:30 940920160            508921            0              0
+
+SQL&gt; select prepopulated,repopulated,trickle_repopulated,num_rows,num_blocks,time_to_populate,to_char(timestamp,'hh24:mi:ss') timestamp from V$IM_HEADER;
+
+PREPOPULATED REPOPULATED TRICKLE_REPOPULATED   NUM_ROWS NUM_BLOCKS TIME_TO_POPULATE TIMESTAM
+------------ ----------- ------------------- ---------- ---------- ---------------- --------
+           0           0                   0     491079        874              534 16:03:16
+           0           0                   0     508921        908              506 16:03:16
+</pre>
+No repopulation yet, the updates are only marked as invalid.
+There are 20000 invalid rows and they are stored in 35 blocks in the row store.</p>
+<h3>Hybrid select</h3>
+<p>In that state, a select will have to read those 20000 rows from the buffer cache. Here are the statistics:
+<pre>
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+         38  consistent gets
+          0  physical reads
+          0  redo size
+        307  bytes sent via SQL*Net to client
+        489  bytes received via SQL*Net from client
+          1  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          0  rows processed
+
+NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+IM scan rows                                                        1000000
+IM scan rows optimized                                              1000000
+IM scan rows cache                                                    20000
+IM scan blocks cache                                                     35
+</pre>
+35 additional consistent gets, which is the number of invalid blocks for gotten from buffer cache.</p>
+<p>This is where In-Memory may not be very efficient for tables that have concurrent updates. The FULL TABLE SCAN plan is used, but may have to get some blocks from the row store. Of course, if the changes are not committed or were commited after the start of your query, some undo blocks have to be read as well.</p>
+<h3>Repopulation</h3>
+<p>Repopulation is asynchronous. Even after my select which had to read the 20000 updated rows nothing has changed in the IMCS:
+<pre>
+SQL&gt; select to_char(sysdate,'hh24:mi:ss') "now",load_scn,total_rows,invalid_rows,invalid_blocks from V$IM_SMU_HEAD;
+
+now      LOAD_SCN         TOTAL_ROWS INVALID_ROWS INVALID_BLOCKS
+-------- ---------------- ---------- ------------ --------------
+16:03:35 940920160            491079        20000             35
+16:03:35 940920160            508921            0              0
+
+SQL&gt; select prepopulated,repopulated,trickle_repopulated,num_rows,num_blocks,time_to_populate,to_char(timestamp,'hh24:mi:ss') timestamp from V$IM_HEADER;
+
+PREPOPULATED REPOPULATED TRICKLE_REPOPULATED   NUM_ROWS NUM_BLOCKS TIME_TO_POPULATE TIMESTAM
+------------ ----------- ------------------- ---------- ---------- ---------------- --------
+           0           0                   0     491079        874              534 16:03:16
+           0           0                   0     508921        908              506 16:03:16
+</pre>
+The IMCO process that coordinates repopulation wakes up every two minutes and checks to see if any population tasks need to be completed (described <a href="http://www.oracle.com/technetwork/database/in-memory/overview/twp-oracle-database-in-memory-2245633.html" target="_blank">here</a>) so we may have that suboptimal behaviour (read invalid blocks from buffer cache) for a few minutes.
+Here is how I wait until there is no invalid rows:
+<pre>
+SQL&gt; declare n number; begin for i in 1..500 loop select sum(invalid_rows) into n from V$IM_SMU_HEAD; exit when n=0; dbms_lock.sleep(1); end loop; end;
+  2  /
+PL/SQL procedure successfully completed.
+</pre>
+It took a bit less than 2 minutes here.
+Let&#8217;s check now the statistics:
+<pre>
+SQL&gt; select to_char(sysdate,'hh24:mi:ss') "now",load_scn,total_rows,invalid_rows,invalid_blocks from V$IM_SMU_HEAD;
+
+now      LOAD_SCN         TOTAL_ROWS INVALID_ROWS INVALID_BLOCKS
+-------- ---------------- ---------- ------------ --------------
+16:05:17 940920320            491079            0              0
+16:05:17 940920160            508921            0              0
+
+SQL&gt; select prepopulated,repopulated,trickle_repopulated,num_rows,num_blocks,time_to_populate,to_char(timestamp,'hh24:mi:ss') timestamp from V$IM_HEADER;
+
+PREPOPULATED REPOPULATED TRICKLE_REPOPULATED   NUM_ROWS NUM_BLOCKS TIME_TO_POPULATE TIMESTAM
+------------ ----------- ------------------- ---------- ---------- ---------------- --------
+           0           1                   1     491079        874              539 16:05:16
+           0           0                   0     508921        908              506 16:03:16
+</pre>
+No invalid rows anymore, 1 repopulation.
+It&#8217;s &#8216;trickle&#8217; repopulation here &#8211; the one that occur when a small percentage of rows are invalid. When there is more rows, then full repopulation is done.</p>
+<p>I don&#8217;t know the exact threshold for trickle repopulation. I&#8217;ve shown the 20000 rows update here because its about the limit for trickle repopulation. When updating 3% of rows I got full repopulation. Here is the stats after changing 30000 rows:
+<pre>
+PREPOPULATED REPOPULATED TRICKLE_REPOPULATED   NUM_ROWS NUM_BLOCKS TIME_TO_POPULATE TIMESTAM
+------------ ----------- ------------------- ---------- ---------- ---------------- --------
+           0           1                   0     491079        874              577 16:51:08
+           0           0                   0     508921        908              466 16:50:55
+</pre>
+There is something to note here. It seems that the trickle repopulation has taken the same time (5 seconds) than the full repopulation. I&#8217;ve a small exemple here, and there may be some minimal time which is not proportional to data to repopulate.</p>
+<h3>So what?</h3>
+<p>For sure, if you want to implement In-Memory option, you should do a Proof of Concept and measure the benefit in your context. Then you have to analyze which tables to put in memory, which compression level, how many repopulation servers (and you need CPU for them) and the maximum percentage used for trickle repopulation.
+In-Memory option is a very good way to improve analytics on OLTP databases, but it is not as straightforward as a simple &#8216;flip a switch&#8217;.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-43960"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

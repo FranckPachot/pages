@@ -1,0 +1,106 @@
+								<h1 class="entry-title">Instance Caging and multitenant: do the right setting</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you want to do instance caging, you have to set manually CPU_COUNT and to set a resource manager plan. If you set only the CPU_COUNT no instance caging will occur. Except during the maintenance window where the maintenance plan is set internally. You don&#8217;t want that kind of unpredictable behavior, so the recommandation is to always set a resource plan when you set manually CPU_COUNT. Here is another reason for such an unpredictable behavior.
+<span id="more-9124"></span>
+I&#8217;ve run 16 sessions running CPU. I&#8217;m in multitenant and they are connected to CDB$ROOT.
+<pre>
+[oracle@CDB ~]$ jobs
+[1]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[2]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[3]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[4]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[5]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[6]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[7]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[8]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[9]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[10]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[11]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[12]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[13]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[14]   Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[15]-  Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+[16]+  Running                 sqlplus / as sysdba &lt;&lt;&lt; &quot;exec loop null; end loop;&quot; &amp;
+</pre>
+I&#8217;ve set CPU_COUNT to 8:
+<pre>
+SQL&gt; show spparameter cpu_count
+
+SID      NAME                          TYPE        VALUE
+-------- ----------------------------- ----------- ----------------------------
+*        cpu_count                     integer     8
+</pre>
+but no resource manager plan:
+<pre>
+SQL&gt; show   parameter resource_manager_plan
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+resource_manager_plan                string
+</pre></p>
+<p>However, instance caging occurs:
+<pre>
+SQL&gt; connect / as sysdba
+Connected.
+SQL&gt; select count(*),con_id,session_state,event from v$active_session_history
+  2  where sample_time&gt;sysdate-1/24/60/60 group by con_id,session_state,event;
+
+  COUNT(*)     CON_ID SESSION EVENT
+---------- ---------- ------- ------------------------------
+        20          1 WAITING resmgr:cpu quantum
+        12          1 ON CPU
+</pre>
+Here you can see on the left that CPU usage has been limited to 8 user processes.
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/06/CaptureRESMGR005.png" rel="lightbox[9124]"><img src="../wp-insides/uploads/sites/2/2016/06/CaptureRESMGR005.png" alt="CaptureRESMGR005" width="1282" height="571" class="alignnone size-full wp-image-9127" /></a></p>
+<p>Any idea why instance caging occurred when there are no visible resource plan? And what did I do at 08:57 PM in order to stop instance caging?
+Well, I did:
+<pre>
+SQL&gt; alter pluggable database pdb close;
+</pre></p>
+<p>Now you understand. A resource plan was set for the PDB:
+<pre>
+SQL&gt; alter session set container=PDB;
+
+Session altered.
+
+SQL&gt; show con_id
+
+CON_ID
+------------------------------
+3
+SQL&gt;
+SQL&gt; show spparameter cpu_count
+
+SID      NAME                          TYPE        VALUE
+-------- ----------------------------- ----------- ----------------------------
+*        cpu_count                     integer
+SQL&gt;
+SQL&gt; show   parameter resource_manager_plan
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+resource_manager_plan                string      DEFAULT_PLAN
+</pre></p>
+<p>So be careful if you set CPU_COUNT manually, any settings that activates the Resource Manager. And setting a resource manager plan in a PDB activates the Resource manager for the instance as soon as the PDB is open (read/write or read only).</p>
+<p>So the recommandation is: when you set CPU_COUNT in a CDB, then always set a Resource Manager Plan at CDB level. CDB_DEFAULT_PLAN is there for that:</p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr"><a href="https://twitter.com/FranckPachot">@franckpachot</a> <a href="https://twitter.com/lleturgez">@lleturgez</a> if you use non-default CPU_COUNT w/o RM &#8211; you&#39;re already doing it wrong, but I agree. your example bites more!</p>
+<p>&mdash; Maris Elsins (@MarisElsins) <a href="https://twitter.com/MarisElsins/status/741738199257612294">June 11, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>(by the way, more information about resource manager and 12c in Maris Elsins <a href="http://www.slideshare.net/mariselsins/c15lv-db12c-all-you-need-to-know-about-the-resource-manager">presentation</a>)</p>
+<p>If you are in Standard Edition, or Enterprise Edition without the multitenant option, you have only one PDB per CDB. This means that you have probably multiple instances on one server and instance caging is of crucial importance there. Setting the resource_manager_plan to CDB_DEFAULT_PLAN is sufficient to activate instance caging in a single-tenant instance:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/06/CaptureRESMGR006.png" rel="lightbox[9124]"><img src="../wp-insides/uploads/sites/2/2016/06/CaptureRESMGR006.png" alt="CaptureRESMGR006" width="313" height="172" class="alignnone size-full wp-image-9131" /></a></p>
+<p>With multitenant option, you may create a custom plan with multiple directives. Instance caging is important even when you have only one instance on the server because the database scheduler is more efficient than the OS one. But that&#8217;s probably for a future blog post.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-91250" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/06/CaptureRESMGR005.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

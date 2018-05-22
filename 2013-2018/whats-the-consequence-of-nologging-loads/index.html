@@ -1,0 +1,154 @@
+								<h1 class="entry-title">What&#8217;s the consequence of NOLOGGING loads?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you load data in direct-path and have the NOLOGGING attribute set, you minimize redo generation, but you take the risk, in case of media recovery, to loose the data in the blocks that you&#8217;ve loaded. So you probably run a backup as soon as the load is done. But what happens if you have a crash, with media failure, before the backup is finish?</p>
+<p>I encountered recently the situation but &#8211; probably because of a bug &#8211; the result was not exactly what I expected. Of course, before saying that it&#8217;s a bug I need to clear any doubt about what I think is the normal situation. So I&#8217;ve reproduced the normal situation and I&#8217;m sharing it here in case someone wants to see how to handle it.</p>
+<p>First, let me emphasize something that is very important. I didn&#8217;t say that you can loose the data that you&#8217;ve loaded. You loose the data which were in the blocks that have been allocated by your load. It may concern conventional DML happening long time after the nologging load. And anyway, you probably loose the whole table (or partition) because as you will see the proper way to recover from nologging recovery is to truncate the table (or partition).</p>
+<p>I&#8217;m in 12c so I can run my SQL statements from RMAN. I create a DEMO tablespace and a 1000 rows table in it:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; echo set on
+
+RMAN&gt; create tablespace DEMO datafile '/tmp/demo.dbf' size 10M;
+Statement processed
+
+RMAN&gt; create table DEMO.DEMO pctfree 99 tablespace DEMO nologging as select * from dual connect by level commit;
+Statement processed
+</pre>
+<p>Imagine that I&#8217;ve a media failure and I have to restore my tablespace:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; alter tablespace DEMO offline;
+Statement processed
+
+
+RMAN&gt; restore tablespace DEMO;
+Starting restore at 04-SEP-14
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=8 device type=DISK
+
+creating datafile file number=2 name=/tmp/demo.dbf
+restore not done; all files read only, offline, or already restored
+Finished restore at 04-SEP-14
+</pre>
+<p>and recover up to the point of failure:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; recover tablespace DEMO;
+Starting recover at 04-SEP-14
+using channel ORA_DISK_1
+
+starting media recovery
+media recovery complete, elapsed time: 00:00:01
+
+Finished recover at 04-SEP-14
+
+RMAN&gt; alter tablespace DEMO online;
+Statement processed
+</pre>
+<p>Then here is what happen when I want to query the table where I&#8217;ve loaded data without logging:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; select count(*) from DEMO.DEMO;
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of sql statement command at 09/04/2014 16:21:27
+ORA-01578: ORACLE data block corrupted (file # 2, block # 131)
+ORA-01110: data file 2: '/tmp/demo.dbf'
+ORA-26040: Data block was loaded using the NOLOGGING option
+</pre>
+<p>Let&#8217;s see that:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; validate tablespace DEMO;
+Starting validate at 04-SEP-14
+using channel ORA_DISK_1
+channel ORA_DISK_1: starting validation of datafile
+channel ORA_DISK_1: specifying datafile(s) for validation
+input datafile file number=00002 name=/tmp/demo.dbf
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:01
+List of Datafiles
+=================
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+2    OK     167            974          1280            6324214
+  File Name: /tmp/demo.dbf
+  Block Type Blocks Failing Blocks Processed
+  ---------- -------------- ----------------
+  Data       0              0
+  Index      0              0
+  Other      0              306
+
+Finished validate at 04-SEP-14
+</pre>
+<p>167 blocks have been marked as corrupt.</p>
+<p>The solution is to truncate the concerned table.</p>
+<p>And if you don&#8217;t know what are the tables that are concerned then you need to check v$database_block_corruption and dba_extents. So, my advise is that the tables loaded in NOLOGGING should be documented in the recovery plan, with the way to reload the data. Of course, that&#8217;s not an easy task because NOLOGGING is usually done by developers and recovery is done by the DBA. The other alternative is to prevent any NOLOGGING operation and put the database in FORCE LOGGING. In a Data Guard configuration, you should do that anyway.</p>
+<p>So I truncate my table:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; truncate table DEMO.DEMO;
+Statement processed
+</pre>
+<p>and if I check my tablespace, I still see the blocks as &#8216;Marked Corrupt':</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; validate tablespace DEMO;
+Starting validate at 04-SEP-14
+using channel ORA_DISK_1
+channel ORA_DISK_1: starting validation of datafile
+channel ORA_DISK_1: specifying datafile(s) for validation
+input datafile file number=00002 name=/tmp/demo.dbf
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:01
+List of Datafiles
+=================
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+2    OK     167            974          1280            6324383
+  File Name: /tmp/demo.dbf
+  Block Type Blocks Failing Blocks Processed
+  ---------- -------------- ----------------
+  Data       0              0
+  Index      0              0
+  Other      0              306
+
+Finished validate at 04-SEP-14
+</pre>
+<p>This is the normal behaviour. The blocks are still marked as corrupt until they are formatted again.</p>
+<p>I put back my data;</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; insert /*+ append */ into DEMO.DEMO select * from dual connect by level commit;
+Statement processed
+</pre>
+<p>And check my tablespace again:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; validate tablespace DEMO;
+Starting validate at 04-SEP-14
+using channel ORA_DISK_1
+channel ORA_DISK_1: starting validation of datafile
+channel ORA_DISK_1: specifying datafile(s) for validation
+input datafile file number=00002 name=/tmp/demo.dbf
+channel ORA_DISK_1: validation complete, elapsed time: 00:00:01
+List of Datafiles
+=================
+File Status Marked Corrupt Empty Blocks Blocks Examined High SCN
+---- ------ -------------- ------------ --------------- ----------
+2    OK     0              974          1280            6324438
+  File Name: /tmp/demo.dbf
+  Block Type Blocks Failing Blocks Processed
+  ---------- -------------- ----------------
+  Data       0              167
+  Index      0              0
+  Other      0              139
+
+Finished validate at 04-SEP-14
+</pre>
+<p>The 167 corrupted blocks have been reused, now being safe and containing my newly loaded data.</p>
+<p>This is the point I wanted to validate because I&#8217;ve seen a production database where the blocks remained marked as corrupted. The load has allocated exents containing those blocks but, fortunately, has avoided to put rows in it. However, monitoring is still reporting corrupt blocks and we have to fix that as soon as we can move the tables to another tablespace.</p>
+<p>Last point. If you want to see if some tablespace had NOLOGGING operations since the last backup, run:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; report unrecoverable;
+Report of files that need backup due to unrecoverable operations
+File Type of Backup Required Name
+---- ----------------------- -----------------------------------
+2    full                    /tmp/demo.dbf
+</pre>
+<p>This is an indication that you should backup that datafile now. Knowing the objects concerned if a lot more complex&#8230;</p>
+<p>I&#8217;ll not open a SR as I can&#8217;t reproduce the issue I encountered (corrupt flag remaining after reallocating blocks) but if anyone had that kind of issue, please share.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4840"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

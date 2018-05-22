@@ -1,0 +1,208 @@
+								<h1 class="entry-title">RAC buffer states: XCUR, SCUR, PI, CI</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In RAC, blocks are copied across instances by the Global Cache Service. In single instance, we have only two status: CR for consistent read clones where undo is applied, and CUR for the current version that can be modified (then being a dirty block). I&#8217;ts a bit more complex in RAC. Here is a brief example to show the buffer status in Global Cache.</p>
+<h3>SCUR: shared current</h3>
+<p>I connect to one instance (I have a few singleton services. service ONE is on instance 3 and service TWO is on instance 1)</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect demo/demo@//192.168.78.252/ONE.racattack
+Connected.</pre>
+<p>and I query a row by ROWID in order to read only one block</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select rowid,DEMO.* from DEMO where rowid='&amp;rowid1';
+old   1: select rowid,DEMO.* from DEMO where rowid='&amp;rowid1'
+new   1: select rowid,DEMO.* from DEMO where rowid='AAAXqxAALAAACUkAAD'
+
+ROWID                      ID          N
+------------------ ---------- ----------
+AAAXqxAALAAACUkAAD         10         10</pre>
+<p>Here is the status of the buffer in the buffer cache:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select inst_id,class#,status,lock_element_addr,dirty,temp,ping,stale,direct,new from gv$bh where objd=(select data_object_id from dba_objects where owner='DEMO' and object_name='DEMO') and status!='free' order by inst_id;
+
+   INST_ID     CLASS# STATUS     LOCK_ELEMENT_ADD D T P S D N
+---------- ---------- ---------- ---------------- - - - - - -
+         3          1 scur       00000000B9FEA060 N N N N N N</pre>
+<p>The block has been read from disk by my instance. Without modification it is in SCUR status: it&#8217;s the current version of the block and can be shared.</p>
+<h3>SCUR copies</h3>
+<p>Now connecting to another instance</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect demo/demo@//192.168.78.252/TWO.racattack
+Connected.</pre>
+<p>and reading the same block</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select rowid,DEMO.* from DEMO where rowid='&amp;rowid1';
+old   1: select rowid,DEMO.* from DEMO where rowid='&amp;rowid1'
+new   1: select rowid,DEMO.* from DEMO where rowid='AAAXqxAALAAACUkAAD'
+
+ROWID                      ID          N
+------------------ ---------- ----------
+AAAXqxAALAAACUkAAD         10         10</pre>
+<p>let&#8217;s see what I have in my Global Cache:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select inst_id,class#,status,lock_element_addr,dirty,temp,ping,stale,direct,new from gv$bh where objd=(select data_object_id from dba_objects where owner='DEMO' and object_name='DEMO') and status!='free' order by inst_id,lock_element_addr;
+
+   INST_ID     CLASS# STATUS     LOCK_ELEMENT_ADD D T P S D N
+---------- ---------- ---------- ---------------- - - - - - -
+         1          1 scur       00000000B0FAADC0 N N N N N N
+         3          1 scur       00000000B9FEA060 N N N N N N</pre>
+<p>non modified blocks can be shared: I have a copy on each instance.</p>
+<h3>XCUR: exclusive current</h3>
+<p>I&#8217;ll start a new case, I flush the buffer cache</p>
+<p>connecting to the first instance</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect demo/demo@//192.168.78.252/ONE.racattack
+Connected.</pre>
+<p>I&#8217;m now doing a modification with a select for update (which writes the lock in the block, so it&#8217;s a modification)</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select rowid,DEMO.* from DEMO where rowid='&amp;rowid1' for update;
+old   1: select rowid,DEMO.* from DEMO where rowid='&amp;rowid1' for update
+new   1: select rowid,DEMO.* from DEMO where rowid='AAAXqxAALAAACUkAAD' for update
+
+ROWID                      ID          N
+------------------ ---------- ----------
+AAAXqxAALAAACUkAAD         10         10
+now the status in buffer cache is different:
+
+SQL&gt; select inst_id,class#,status,lock_element_addr,dirty,temp,ping,stale,direct,new from gv$bh where objd=(select data_object_id from dba_objects where owner='DEMO' and object_name='DEMO') and status!='free' order by inst_id,lock_element_addr;
+
+   INST_ID     CLASS# STATUS     LOCK_ELEMENT_ADD D T P S D N
+---------- ---------- ---------- ---------------- - - - - - -
+         3          1 cr         00               N N N N N N
+         3          1 xcur       00000000B9FEA060 Y N N N N N</pre>
+<p>So I have two buffers for the same block. The buffer that has been read and will not be current anymore because it has the rows before the modifications. It stays in consistent read (CR) status. The modified one is then the current one but cannot be shared: its the XCUR buffer where modifications will be done.</p>
+<h3>CR consistent read</h3>
+<p>Now I&#8217;ll read it from the second instance</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect demo/demo@//192.168.78.252/TWO.racattack
+Connected.
+SQL&gt; select rowid,DEMO.* from DEMO where rowid='&amp;rowid1';
+old   1: select rowid,DEMO.* from DEMO where rowid='&amp;rowid1'
+new   1: select rowid,DEMO.* from DEMO where rowid='AAAXqxAALAAACUkAAD'
+
+ROWID                      ID          N
+------------------ ---------- ----------
+AAAXqxAALAAACUkAAD         10         10</pre>
+<p>the block is read and I&#8217;ve another CR buffer:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select inst_id,class#,status,lock_element_addr,dirty,temp,ping,stale,direct,new from gv$bh where objd=(select data_object_id from dba_objects where owner='DEMO' and object_name='DEMO') and status!='free' order by inst_id,lock_element_addr;
+
+   INST_ID     CLASS# STATUS     LOCK_ELEMENT_ADD D T P S D N
+---------- ---------- ---------- ---------------- - - - - - -
+         1          1 cr         00               N N N N N N
+         3          1 cr         00               N N N N N N
+         3          1 xcur       00000000B9FEA060 Y N N N N N</pre>
+<p>the CR buffer is at another SCN. A block can have several CR blocks (by default up to 6 per instance)</p>
+<h3>PI: past image</h3>
+<p>Let&#8217;s do a modification from the other instance</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect demo/demo@//192.168.78.252/TWO.racattack
+Connected.
+SQL&gt; select rowid,DEMO.* from DEMO where rowid='&amp;rowid1' for update;
+old   1: select rowid,DEMO.* from DEMO where rowid='&amp;rowid1' for update
+new   1: select rowid,DEMO.* from DEMO where rowid='AAAXqxAALAAACUkAAD' for update
+
+ROWID                      ID          N
+------------------ ---------- ----------
+AAAXqxAALAAACUkAAD         10         10</pre>
+<p>My modification must be done on the current version, which must be shipped to my instance</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select inst_id,class#,status,lock_element_addr,dirty,temp,ping,stale,direct,new from gv$bh where objd=(select data_object_id from dba_objects where owner='DEMO' and object_name='DEMO') and status!='free' order by inst_id,lock_element_addr;
+
+   INST_ID     CLASS# STATUS     LOCK_ELEMENT_ADD D T P S D N
+---------- ---------- ---------- ---------------- - - - - - -
+         1          1 cr         00               N N N N N N
+         1          1 cr         00               N N N N N N
+         1          1 xcur       00000000B0FAADC0 Y N N N N N
+         3          1 cr         00               N N N N N N
+         3          1 pi         00000000B9FEA060 Y N N N N N</pre>
+<p>and the previous current version remains as a PI &#8211; past image. It cannot be used for consistent reads but it is kept for recovery: if current block is lost, redo can be applied to the past image to recover it. See <a href="https://community.oracle.com/thread/919350">Jonathan Lewis</a> explanation.</p>
+<h3>Checkpoint</h3>
+<p>As the past images are there in case of recovery, they are not needed once an instance has checkpointed the current block.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect sys/oracle@//192.168.78.252/ONE.racattack as sysdba
+Connected.
+SQL&gt; alter system checkpoint;
+System altered.</pre>
+<p>afer the checkpoint on the instance that has the XCUR, there is no dirty buffer in any instance:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select inst_id,class#,status,lock_element_addr,dirty,temp,ping,stale,direct,new from gv$bh where objd=(select data_object_id from dba_objects where owner='DEMO' and object_name='DEMO') and status!='free' order by inst_id,lock_element_addr;
+
+   INST_ID     CLASS# STATUS     LOCK_ELEMENT_ADD D T P S D N
+---------- ---------- ---------- ---------------- - - - - - -
+         1          1 cr         00               N N N N N N
+         1          1 cr         00               N N N N N N
+         1          1 xcur       00000000B0FAADC0 N N N N N N
+         3          1 cr         00               N N N N N N
+         3          1 cr         00               N N N N N N</pre>
+<p>the PI became a consistent read.</p>
+<h3>Summary</h3>
+<p>Here are the states we have seen here:</p>
+<p><b>XCUR</b>: current version of the block &#8211; holding an exclusive lock for it</p>
+<p><b>SCUR</b>: current version of the block that can be share because no modification were done</p>
+<p><b>CR</b>: only valid for consistent read, after applying the necessary undo to get it back to requried SCN</p>
+<p><b>PI</b>: past image of a modified current block, kept until the latest version is checkpointed</p>
+<p>and the other possible states:</p>
+<p><b>FREE</b>: The buffer is not currently in use.</p>
+<p><b>READ</b>: when the block is being read from disk</p>
+<p><b>MREC</b>: when the block is being recovered for media recovery</p>
+<p><b>IREC</b>: when the block is being recovered for crash recovery</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-24360"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1510">
+				<div id="div-comment-1510" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e9b2c2c7ba2fb990c453bb5a7d020ed7?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Brian Peasland</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1510">
+			June 25, 2015 at 20 h 47 min</a>		</div>
+
+		<p>This is a great explanation of the status values. Better than the docs (<a href="http://docs.oracle.com/database/121/REFRN/GUID-A8230335-47C4-4707-A866-678DD8D322A8.htm#REFRN30029" rel="nofollow">http://docs.oracle.com/database/121/REFRN/GUID-A8230335-47C4-4707-A866-678DD8D322A8.htm#REFRN30029</a>). </p>
+<p>It might be beneficial to others to take note of the Consistent Read section. Note that the Buffer Cache has two &#8216;cr&#8217; blocks, one in inst 1 and the other in inst 3. This is because the block was modified on inst 3. So a cr image of the block is reconstructed in inst 3. The block is the sent, via a &#8216;gc cr block %&#8217; transfer to inst 1. Hence the two CR copies of that same block in GV$BH.   </p>
+<p>Good stuff!</p>
+<p>Thanks,
+Brian
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-15111"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1510' onclick='return addComment.moveForm( "div-comment-1510", "1510", "respond", "2435" )' aria-label='Reply to Brian to Brian Peasland'>Reply to Brian</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1519">
+				<div id="div-comment-1519" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1519">
+			June 29, 2015 at 14 h 01 min</a>		</div>
+
+		<p>Hi Brian,
+Thanks for your feedback and remark.
+Regardsm
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-15201"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1519' onclick='return addComment.moveForm( "div-comment-1519", "1519", "respond", "2435" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

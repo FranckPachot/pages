@@ -1,0 +1,150 @@
+								<h1 class="entry-title">The consequences of NOLOGGING in Oracle</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>While answering to a <a href="https://community.oracle.com/message/12335937#12335937">question</a> on Oracle forum about NOLOGGING consequences, I provided a test case that deserves a bit more explanation. Nologging operations are good to generate minimal redo on bulk operations (direct-path inserts, index creation/rebuild). But in case we have to restore a backup that was made before the nologging operation, we loose data. And even if we can accept that, we have some manual operations to do.</p>
+<p>Here is the full testcase.</p>
+<p>I create a tablespace and backup it:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; create tablespace demo datafile '/tmp/demo.dbf' size 10M; 
+Statement processed
+RMAN&gt; backup tablespace demo; 
+Starting backup at 23-MAR-14 
+allocated channel: ORA_DISK_1 
+channel ORA_DISK_1: SID=30 device type=DISK 
+channel ORA_DISK_1: starting full datafile backup set 
+channel ORA_DISK_1: specifying datafile(s) in backup set 
+input datafile file number=00005 name=/tmp/demo.dbf 
+channel ORA_DISK_1: starting piece 1 at 23-MAR-14 
+channel ORA_DISK_1: finished piece 1 at 23-MAR-14 
+piece handle=/u01/app/oracle/fast_recovery_area/U1/backupset/2014_03_23/o1_mf_nnndf_TAG20140323T160453_9lxy0pfb_.bkp tag=TAG20140323T160453 comment=NONE 
+channel ORA_DISK_1: backup set complete, elapsed time: 00:00:01 
+Finished backup at 23-MAR-14</pre>
+<p>I create a table and an index, both in NOLOGGING</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; create table demo ( dummy not null ) tablespace demo nologging as select * from dual connect by level Statement processed
+RMAN&gt; create index demo on demo(dummy) tablespace demo nologging; 
+Statement processed</pre>
+<p>Note how I like 12c for doing anything from RMAN&#8230;
+Because I will need it later, I do a treedump of my index:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; begin 
+2&gt;  for o in (select object_id from dba_objects where owner=user and object_name='DEMO' and object_type='INDEX') 
+3&gt;   loop execute immediate 'alter session set tracefile_identifier=''treedump'' events ''immediate trace name treedump level '||o.object_id||''''; 
+4&gt; end loop; 
+5&gt; end; 
+6&gt; / 
+Statement processed</pre>
+<p>Here is the content of my treedump trace file:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>----- begin tree dump 
+branch: 0x140008b 20971659 (0: nrow: 2, level: 1) 
+   leaf: 0x140008c 20971660 (-1: nrow: 552 rrow: 552) 
+   leaf: 0x140008d 20971661 (0: nrow: 448 rrow: 448) 
+----- end tree dump</pre>
+<p>Because of the nologging, the tablespace is &#8216;unrecoverable&#8217; and we will see what it means.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; report unrecoverable; 
+Report of files that need backup due to unrecoverable operations 
+File Type of Backup Required Name 
+---- ----------------------- ----------------------------------- 
+5    full or incremental     /tmp/demo.dbf</pre>
+<p>RMAN tells me that I need to do a backup, which is the right thing to do after nologging operations. But here my goal is to show what happens when we have to restore a backup that was done before the nologging operations.</p>
+<p>I want to show that the issue does not only concern the data that I&#8217;ve loaded, but any data that may come later in the blocks that have been formatted by the nologging operation. So I&#8217;m deleteing the rows and inserting a new one.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>2&gt; delete from demo; 
+Statement processed
+RMAN&gt; insert into demo select * from dual; 
+Statement processed</pre>
+<p>Time to restore the tablespace from the backup that has been done before the nologging operation:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; alter tablespace demo offline; 
+Statement processed
+RMAN&gt; restore tablespace demo; 
+Starting restore at 23-MAR-14 
+using channel ORA_DISK_1
+channel ORA_DISK_1: starting datafile backup set restore 
+channel ORA_DISK_1: specifying datafile(s) to restore from backup set 
+channel ORA_DISK_1: restoring datafile 00005 to /tmp/demo.dbf 
+channel ORA_DISK_1: reading from backup piece /u01/app/oracle/fast_recovery_area/U1/backupset/2014_03_23/o1_mf_nnndf_TAG20140323T160453_9lxy0pfb_.bkp 
+channel ORA_DISK_1: piece handle=/u01/app/oracle/fast_recovery_area/U1/backupset/2014_03_23/o1_mf_nnndf_TAG20140323T160453_9lxy0pfb_.bkp tag=TAG20140323T160453 
+channel ORA_DISK_1: restored backup piece 1 
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:01 
+Finished restore at 23-MAR-14
+RMAN&gt; recover tablespace demo; 
+Starting recover at 23-MAR-14 
+using channel ORA_DISK_1
+starting media recovery 
+media recovery complete, elapsed time: 00:00:00
+Finished recover at 23-MAR-14
+RMAN&gt; alter tablespace demo online; 
+Statement processed</pre>
+<p>We can check the unrecoverable tablespace</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; report unrecoverable; 
+Report of files that need backup due to unrecoverable operations 
+File Type of Backup Required Name 
+---- ----------------------- ----------------------------------- 
+5    full or incremental     /tmp/demo.dbf</pre>
+<p>but we don&#8217;t know which objects are concerned until we try to read from them:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; select /*+ full(demo) */ count(*) from demo; 
+RMAN-00571: =========================================================== 
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS =============== 
+RMAN-00571: =========================================================== 
+RMAN-03002: failure of sql statement command at 03/23/2014 16:05:03 
+ORA-01578: ORACLE data block corrupted (file # 5, block # 131) 
+ORA-01110: data file 5: '/tmp/demo.dbf' 
+ORA-26040: Data block was loaded using the NOLOGGING option
+RMAN&gt; select /*+ index(demo) */ count(*) from demo; 
+RMAN-00571: =========================================================== 
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS =============== 
+RMAN-00571: =========================================================== 
+RMAN-03002: failure of sql statement command at 03/23/2014 16:05:04 
+ORA-01578: ORACLE data block corrupted (file # 5, block # 140) 
+ORA-01110: data file 5: '/tmp/demo.dbf' 
+ORA-26040: Data block was loaded using the NOLOGGING option</pre>
+<p>So I can&#8217;t read from the table because of block (file # 5, block # 131) which is corrupted and I can&#8217;t read from the index because of block (file # 5, block # 140) which is corrupted. The reason is that recovery was not possible on them as there was no redo to protect them from the time they were formatted (by the nologging operation).</p>
+<p>Let&#8217;s see which blocks were reported:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; select segment_type,header_file,header_block , dbms_utility.make_data_block_address(header_file,header_block) from dba_segments where owner=user and segment_name='DEMO'; 
+SEGMENT_TYPE       HEADER_FILE HEADER_BLOCK 
+------------------ ----------- ------------ 
+DBMS_UTILITY.MAKE_DATA_BLOCK_ADDRESS(HEADER_FILE,HEADER_BLOCK) 
+-------------------------------------------------------------- 
+INDEX                        5          138 
+                                                      20971658
+TABLE                        5          130 
+                                                      20971650
+RMAN&gt; select dbms_utility.make_data_block_address(5, 140) from dual;
+DBMS_UTILITY.MAKE_DATA_BLOCK_ADDRESS(5,140) 
+------------------------------------------- 
+                                   20971660</pre>
+<p>The full scan failed as soon as it reads the block 131 which is the first one that contains data. The segment header block itself was protected by redo.</p>
+<p>For the index the query failed on block 140 which is the first leaf (this is why I did a treedump above). The root branch (which is always the next after the segment header) seem to be protected by redo even for nologging operation. The reason why I checked that is because in the first testcase I posted in the forum, I had a very small table for which the index was so small that it had only one leaf &#8211; which is the root branch as well &#8211; so the index was still recovrable.</p>
+<p>The important point to know is that the index is still valid:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; select status from all_indexes where index_name='DEMO'; 
+STATUS   
+-------- 
+VALID</pre>
+<p>And the only solution is to truncate the table:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"><samp></samp>RMAN&gt; truncate table demo; 
+Statement processed
+RMAN&gt; select /*+ full(demo) */ count(*) from demo; 
+  COUNT(*) 
+---------- 
+         0
+RMAN&gt; select /*+ index(demo) */ count(*) from demo; 
+  COUNT(*) 
+---------- 
+         0</pre>
+<p>no corruption anymore, but no data either&#8230;</p>
+<p>Last point: if you have only the indexes that are unrecoverable, you can rebuild them. But because the index is valid, Oracle will try to read it in order to rebuild it &#8211; and fail with ORA-26040. You have to make then unusable before.</p>
+<p>The core message is:</p>
+<ul>
+<li>Use nologging only when you accept to loose data and you accept to have some manual operations to do after recovery (so document it): truncate table, make indexes unusable and rebuild.</li>
+<li>Backup the unrecoverable tablespaces as soon as you can after your nologging operations</li>
+<li>If you need redo for other goals (such as standby database) use force logging.</li>
+</ul>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4220"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

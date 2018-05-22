@@ -1,0 +1,210 @@
+								<h1 class="entry-title">ALTER TABLE INMEMORY</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In-Memory Column Store is amazing. It brings very good performance to full table scans. I&#8217;t easy: just &#8216;flip a switch&#8217; and you accelerate all reporting queries on your table, without thinking about what to index and how. But in this post, I would like to warn you about the consequences when you just flip that switch. The new full table scan plan will replace the old ones&#8230; even before the table is populated in memory&#8230;
+I&#8217;m not sure that it is the expected behaviour. In my opinion the CBO should consider INMEMORY plans only once the population is done. But here is the exemple.</p>
+<h3>Test case</h3>
+<p>Here is the testcase. I have a table DEMO with bitmap indexes on its columns:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:04:54 SQL&gt; create table DEMO compress as
+12:04:54   2  with M as (select substr(dbms_random.string('U',1),1,1) U from dual connect by 10&gt;=level)
+12:04:54   3  select M1.U U1, M2.U U2, M3.U U3, M4.U U4 from M M1,M M2, M M3, M M4, (select * from dual connect by 1000&gt;=level)
+12:04:54   4  /
+Table created.
+
+12:05:00 SQL&gt; create bitmap index DEMO_U1 on DEMO(U1);
+Index created.
+12:05:01 SQL&gt; create bitmap index DEMO_U2 on DEMO(U2);
+Index created.
+12:05:03 SQL&gt; create bitmap index DEMO_U3 on DEMO(U3);
+Index created.
+12:05:04 SQL&gt; create bitmap index DEMO_U4 on DEMO(U4);
+Index created.
+</pre>
+<p>And my test query on those columns:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:05:05 SQL&gt; alter session set statistics_level=all;
+Session altered.
+12:05:05 SQL&gt; select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E') and U4='B';
+no rows selected
+</pre>
+<p>with its execution plan:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:05:06 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'iostats last'));
+
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------------------
+SQL_ID  64skw45ghn5a0, child number 0
+-------------------------------------
+select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E')
+and U4='B'
+
+Plan hash value: 3881032911
+
+---------------------------------------------------------------------------------------
+| Id  | Operation                      | Name    | Starts | E-Rows | A-Rows | Buffers |
+---------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT               |         |      1 |        |      0 |       2 |
+|   1 |  HASH UNIQUE                   |         |      1 |      2 |      0 |       2 |
+|   2 |   TABLE ACCESS BY INDEX ROWID  | DEMO    |      1 |   4070 |      0 |       2 |
+|   3 |    BITMAP CONVERSION TO ROWIDS |         |      1 |        |      0 |       2 |
+|   4 |     BITMAP AND                 |         |      1 |        |      0 |       2 |
+|   5 |      BITMAP MERGE              |         |      1 |        |      0 |       2 |
+|*  6 |       BITMAP INDEX RANGE SCAN  | DEMO_U2 |      1 |        |      0 |       2 |
+|*  7 |      BITMAP INDEX SINGLE VALUE | DEMO_U1 |      1 |        |      0 |       0 |
+|*  8 |      BITMAP INDEX SINGLE VALUE | DEMO_U4 |      1 |        |      0 |       0 |
+|   9 |      BITMAP OR                 |         |      1 |        |      0 |       0 |
+|* 10 |       BITMAP INDEX SINGLE VALUE| DEMO_U3 |      1 |        |      0 |       0 |
+|* 11 |       BITMAP INDEX SINGLE VALUE| DEMO_U3 |      1 |        |      0 |       0 |
+---------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   6 - access("U2"&gt;'X')
+       filter("U2"&gt;'X')
+   7 - access("U1"='A')
+   8 - access("U4"='B')
+  10 - access("U3"='A')
+  11 - access("U3"='E')
+
+
+34 rows selected.
+</pre>
+<p>Good. I&#8217;m happy with that plan. But I&#8217;ve In-Memory option so probably I can get rid of those bitmap indexes.</p>
+<h3>alter table INMEMORY</h3>
+<p>Let&#8217;s put that query in memory:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:05:06 SQL&gt; alter table DEMO inmemory priority none memcompress for query high;
+Table altered.
+</pre>
+<p>and run that query again</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:05:06 SQL&gt; select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E') and U4='B';
+no rows selected
+
+12:05:07 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'iostats last'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  64skw45ghn5a0, child number 0
+-------------------------------------
+select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E')
+and U4='B'
+
+Plan hash value: 51067428
+
+------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name | Starts | E-Rows | A-Rows | Buffers | Reads  |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |      |      1 |        |      0 |   13740 |  13736 |
+|   1 |  HASH UNIQUE                |      |      1 |      2 |      0 |   13740 |  13736 |
+|*  2 |   TABLE ACCESS INMEMORY FULL| DEMO |      1 |   4070 |      0 |   13740 |  13736 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - inmemory(("U2"&gt;'X' AND "U1"='A' AND "U4"='B' AND INTERNAL_FUNCTION("U3")))
+       filter(("U2"&gt;'X' AND "U1"='A' AND "U4"='B' AND INTERNAL_FUNCTION("U3")))
+</pre>
+<p>Here is my problem. Now that I have defined the table to be populated into the In-Memory Column Store, then the CBO choose an In-Memory plan for my query.</p>
+<p>This is a FULL TABLE SCAN because you can only do full table scans from the In-Memory Column Store. But I have a problem. The column store is not yet populated:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:05:07 SQL&gt; select segment_name,inmemory_size,bytes_not_populated from v$im_segments;
+no rows selected
+</pre>
+<p>So the FULL TABLE SCAN occured on the row store. Look at the statistics above: 1370 logical reads from the buffer cache. And 13736 physical reads because that table is not in the buffer cache. I always used index access for it before, so the table blocks are not in buffer cache. And the full table scan has good change to be done in direct-path.
+<strong>I still have a very good access from the bitmap indexes &#8211; which are still there &#8211; but now I&#8217;m now doing a very expensive full table scan.</strong></p>
+<h3>Population</h3>
+<p>Look at the same query two seconds later:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:05:09 SQL&gt; select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E') and U4='B';
+no rows selected
+
+12:05:09 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'iostats last'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  64skw45ghn5a0, child number 0
+-------------------------------------
+select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E')
+and U4='B'
+
+Plan hash value: 51067428
+
+------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name | Starts | E-Rows | A-Rows | Buffers | Reads  |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |      |      1 |        |      0 |   11120 |  11117 |
+|   1 |  HASH UNIQUE                |      |      1 |      2 |      0 |   11120 |  11117 |
+|*  2 |   TABLE ACCESS INMEMORY FULL| DEMO |      1 |   4070 |      0 |   11120 |  11117 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - inmemory(("U2"&gt;'X' AND "U1"='A' AND "U4"='B' AND INTERNAL_FUNCTION("U3")))
+       filter(("U2"&gt;'X' AND "U1"='A' AND "U4"='B' AND INTERNAL_FUNCTION("U3")))
+</pre>
+<p>It is just a bit better: 11117 physical reads instead of 13736. This is because some In-Memory Compression Units are already there in the In-Memory Column Store:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:05:10 SQL&gt; select segment_name,inmemory_size,bytes_not_populated from v$im_segments;
+
+SEGMENT_NA INMEMORY_SIZE      BYTES BYTES_NOT_POPULATED
+---------- ------------- ---------- -------------------
+DEMO             6815744  117440512            88973312
+</pre>
+<p>Among the 117440512 bytes (which is 14336 8k blocks) only 88973312 are not yet populated (10861 8k blocks). This is why a bit earlier the query still had to read 11120 blocks from buffer cache.</p>
+<p>Let&#8217;s wait 1 minute for population. Remember that during that time, the population uses a lot of CPU in order to read the row store blocs, put it in column, compress it and store it into the column store.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:06:04 SQL&gt; select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E') and U4='B';
+no rows selected
+
+12:06:04 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'iostats last'));
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------
+SQL_ID  64skw45ghn5a0, child number 0
+-------------------------------------
+select distinct * from DEMO where U1='A' and U2&gt;'X' and U3 in ('A','E')
+and U4='B'
+
+Plan hash value: 51067428
+
+---------------------------------------------------------------------------------
+| Id  | Operation                   | Name | Starts | E-Rows | A-Rows | Buffers |
+---------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |      |      1 |        |      0 |       3 |
+|   1 |  HASH UNIQUE                |      |      1 |      2 |      0 |       3 |
+|*  2 |   TABLE ACCESS INMEMORY FULL| DEMO |      1 |   2546 |      0 |       3 |
+---------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - inmemory(("U1"='A' AND "U4"='B' AND "U2"&gt;'X' AND INTERNAL_FUNCTION("U3")))
+       filter(("U1"='A' AND "U4"='B' AND "U2"&gt;'X' AND INTERNAL_FUNCTION("U3")))
+</pre>
+<p>Ok. not only 3 blocks were read from buffer cache. I have now good performance that I can compare with what I had with the bitmap indexes.</p>
+<p>This is because population is completed:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">12:06:15 SQL&gt; select segment_name,inmemory_size,bytes,bytes_not_populated from v$im_segments;
+
+SEGMENT_NA INMEMORY_SIZE      BYTES BYTES_NOT_POPULATED
+---------- ------------- ---------- -------------------
+DEMO            31195136  117440512                   0
+</pre>
+<h3>Conclusion</h3>
+<p>My conclusion is that altering a table to populate it into the In-memory Column Store looks like an easy operation. But it is not. When you do that:</p>
+<ul>
+<li>You change the plans to FULL TABLE SCAN which will not be optimal until the table is fully populated.</li>
+<li>You trigger the population which will increase a lot your server CPU usage</li>
+<li>you have the risk to get tables only partially populated in case you&#8217;re in RAC, or if you don&#8217;t have enough space in the inmemory_size</li>
+</ul>
+<p>So this is something to plan and to monitor. And you will also need to think about what happens if your instance crashes and you have to restart it. How long will it take to get back to correct performance?
+And that&#8217;s even without asking yourself yet if you can drop those bitmap indexes that are superseeded by the In-Memory column store now.</p>
+<p>Of course, there are solutions for any problem. if you are on Exadata, then SmartScan will come to the rescue until the IMCS is populated. Full table scan is offloaded to storage nodes. Database node CPU resources are available for quick population. In that way, they are complementary.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-19050"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

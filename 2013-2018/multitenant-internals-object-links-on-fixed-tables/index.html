@@ -1,0 +1,202 @@
+								<h1 class="entry-title">Multitenant internals: object links on fixed tables</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The <a href="http://blog.dbi-services.com/multitenant-internals-how-object-links-are-parsedexecuted/" target="_blank">previous post</a> partly answered to the original question (why an object link to V$SESSION is refreshed only every 30 seconds): recursive queries on shared=object views. Now let&#8217;s see what is different with fixed tables.
+<span id="more-10160"></span>
+Disclaimer: this is research only. Don&#8217;t do that anywhere else than a lab. This is implicit when the title is &#8216;internals&#8217;.</p>
+<h3>Result cache</h3>
+<p>When query on a shared=object view is executed from a PDB, the session switches to the CDB to run a recursive query to get the rows. This query uses result cache by adding the following hint:
+<pre>/*+ RESULT_CACHE (SYSOBJ=TRUE) */</pre></p>
+<p>This enables result cache for the rows fetched by this query, and even for system object. The &#8216;SYSOBJ=TRUE&#8217; is there because the &#8220;_rc_sys_obj_enabled&#8221; defaults to true.</p>
+<p>Here is the result cache from the previous post (I flushed the result cache just before the second run because in 12<em>c</em> hard parsing is also using a lot the result cache):</p>
+<p><pre>
+16:34:00 SQL&gt; select con_id,sql_id,rows_processed,plan_hash_value,executions,parse_calls,fetches,buffer_gets,sql_text from v$sql where  plan_hash_value in (3598352655,3551671056) order by last_active_time;
+
+    CON_ID SQL_ID        ROWS_PROCESSED PLAN_HASH_VALUE EXECUTIONS PARSE_CALLS    FETCHES BUFFER_GETS SQL_TEXT
+---------- ------------- -------------- --------------- ---------- ----------- ---------- ----------- --------------------------------------------------------------------------------
+         1 350gg6247sfa6            200      3598352655          2           2          2          26 SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE) */ ID,NUM FROM NO_OBJECT_LINK("SYS"."DEMOV
+         3 bynmh7xm4bf54              0      3598352655          0           5          0          51 SELECT * FROM NO_OBJECT_LINK("SYS"."DEMOV")
+         3 duy45bn72jr35            200      3551671056          2           2         16         269 select id from DEMOV where num column name format a120 trunc
+16:34:00 SQL&gt; select type,status,name,row_count from v$result_cache_objects order by row_count desc fetch first 10 rows only;
+
+TYPE       STATUS    NAME                                                                                                                      ROW_COUNT
+---------- --------- ------------------------------------------------------------------------------------------------------------------------ ----------
+Result     Published SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE) */ ID,NUM FROM NO_OBJECT_LINK("SYS"."DEMOV") "DEMOV" WHERE "DEMOV"."NUM"&lt;=100             100
+Dependency Published SYS.DEMOT                                                                                                                         0
+Dependency Published SYS.DEMOV                                                                                                                         0
+</pre></p>
+<p>As with regular result cache, there is dependency tracking: as soon as the underlying table has some modification, the cache will be invalidated. So this query is always guaranteed to get fresh results.</p>
+<h3>Invalidation</h3>
+<p>I did the same when deleting half of the rows before the second execution in order to invalidate the result cache:</p>
+<p><pre>
+16:43:46 SQL&gt; select con_id,sql_id,rows_processed,plan_hash_value,executions,parse_calls,fetches,buffer_gets,sql_text from v$sql where  plan_hash_value in (3598352655,3551671056) order by last_active_time;
+
+    CON_ID SQL_ID        ROWS_PROCESSED PLAN_HASH_VALUE EXECUTIONS PARSE_CALLS    FETCHES BUFFER_GETS SQL_TEXT
+---------- ------------- -------------- --------------- ---------- ----------- ---------- ----------- --------------------------------------------------------------------------------
+         1 350gg6247sfa6            150      3598352655          2           2          2          26 SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE) */ ID,NUM FROM NO_OBJECT_LINK("SYS"."DEMOV
+         3 bynmh7xm4bf54              0      3598352655          0           5          0          51 SELECT * FROM NO_OBJECT_LINK("SYS"."DEMOV")
+         3 duy45bn72jr35            150      3551671056          2           2         13         269 select id from DEMOV where num column name format a120 trunc
+16:43:46 SQL&gt; select type,status,name,row_count from v$result_cache_objects order by row_count desc fetch first 10 rows only;
+
+TYPE       STATUS    NAME                                                                                                                      ROW_COUNT
+---------- --------- ------------------------------------------------------------------------------------------------------------------------ ----------
+Result     Invalid   SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE) */ ID,NUM FROM NO_OBJECT_LINK("SYS"."DEMOV") "DEMOV" WHERE "DEMOV"."NUM"&lt;=100             100
+Result     Published SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE) */ ID,NUM FROM NO_OBJECT_LINK(&quot;SYS&quot;.&quot;DEMOV&quot;) &quot;DEMOV&quot; WHERE &quot;DEMOV&quot;.&quot;NUM&quot;&lt;=100              50
+Dependency Published SYS.DEMOT                                                                                                                         0
+Dependency Published SYS.DEMOV                                                                                                                         0
+</pre></p>
+<p>I&#8217;ve 100 rows from the first run, invalidated, and them 50 rows from the second one.</p>
+<p>Note that I&#8217;ve the same result when I set &#8220;_disable_cdb_view_rc_invalidation&#8221;=true. Sometimes undocumented parameters behavior cannot be guessed only from their name.</p>
+<h3>Fixed tables</h3>
+<p>I&#8217;ve run the same testcase but with the following definition of DEMOV:
+<pre>
+create view DEMOV sharing=object as select saddr id, rownum num from V$SESSION;
+</pre></p>
+<p>Here is the trace of the recursive query run in CDB$ROOT, at first execution:</p>
+<p><pre>PARSING IN CURSOR #140436732146672 len=112 dep=1 uid=0 oct=3 lid=0 tim=769208810641 hv=3298783355 ad='108ee92f0' sqlid=' 10qf9kb29yw3v'
+SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE SHELFLIFE=30) */ ID,NUM FROM "SYS"."DEMOV" "DEMOV" WHERE "DEMOV"."NUM"&lt;=100
+END OF STMT
+PARSE #140436732146672:c=4000,e=10614,p=0,cr=6,cu=0,mis=1,r=0,dep=1,og=4,plh=350654732,tim=769208810640
+EXEC #140436732146672:c=0,e=17,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=350654732,tim=769208810701
+FETCH #140436732146672:c=1000,e=961,p=0,cr=0,cu=0,mis=0,r=53,dep=1,og=4,plh=350654732,tim=769208811687
+STAT #140436732146672 id=1 cnt=53 pid=0 pos=1 obj=0 op=&#039;RESULT CACHE  byq3fbkawmkm34gtfk1csvwv52 (cr=0 pr=0 pw=0 time=877 us)&#039;
+STAT #140436732146672 id=2 cnt=53 pid=1 pos=1 obj=98258 op=&#039;VIEW  DEMOV (cr=0 pr=0 pw=0 time=655 us cost=0 size=171 card=9)&#039;
+STAT #140436732146672 id=3 cnt=53 pid=2 pos=1 obj=0 op=&#039;COUNT  (cr=0 pr=0 pw=0 time=652 us)&#039;
+STAT #140436732146672 id=4 cnt=53 pid=3 pos=1 obj=0 op=&#039;NESTED LOOPS  (cr=0 pr=0 pw=0 time=597 us cost=0 size=306 card=9)&#039;
+STAT #140436732146672 id=5 cnt=53 pid=4 pos=1 obj=0 op=&#039;NESTED LOOPS  (cr=0 pr=0 pw=0 time=436 us cost=0 size=270 card=9)&#039;
+STAT #140436732146672 id=6 cnt=53 pid=5 pos=1 obj=0 op=&#039;FIXED TABLE FULL X$KSLWT (cr=0 pr=0 pw=0 time=219 us cost=0 size=352 card=44)&#039;
+STAT #140436732146672 id=7 cnt=53 pid=5 pos=2 obj=0 op=&#039;FIXED TABLE FIXED INDEX X$KSUSE (ind:1) (cr=0 pr=0 pw=0 time=101 us cost=0 size=22 card=1)&#039;
+STAT #140436732146672 id=8 cnt=53 pid=4 pos=2 obj=0 op=&#039;FIXED TABLE FIXED INDEX X$KSLED (ind:2) (cr=0 pr=0 pw=0 time=70 us cost=0 size=4 card=1)&#039;</pre></p>
+<p>The difference here is that SHELFLIFE=30 has been added to the generated result cache hint.</p>
+<p>The second run has very short parse time (c=0) because it&#8217;s a soft parse but you also see very short fetch time (c=0) because it&#8217;s a cache hit:</p>
+<p><pre>PARSING IN CURSOR #140436733602136 len=112 dep=1 uid=0 oct=3 lid=0 tim=769208821904 hv=3298783355 ad='108ee92f0' sqlid=' 10qf9kb29yw3v'
+SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE SHELFLIFE=30) */ ID,NUM FROM "SYS"."DEMOV" "DEMOV" WHERE "DEMOV"."NUM"&lt;=100
+END OF STMT
+PARSE #140436733602136:c=0,e=29,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=350654732,tim=769208821904
+EXEC #140436733602136:c=0,e=13,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=350654732,tim=769208821955
+FETCH #140436733602136:c=0,e=18,p=0,cr=0,cu=0,mis=0,r=53,dep=1,og=4,plh=350654732,tim=769208821990</pre></p>
+<p>When I look at the result cache, there were no invalidations:
+<pre>TYPE       STATUS    NAME                                                                                                                      ROW_COUNT
+---------- --------- ------------------------------------------------------------------------------------------------------------------------ ----------
+Result     Published SELECT /*+ RESULT_CACHE (SYSOBJ=TRUE SHELFLIFE=30) */ ID,NUM FROM "SYS"."DEMOV" "DEMOV" WHERE "DEMOV"."NUM"&lt;=100                 55
+Dependency Published SYS.DEMOV                                                                                                                         0</pre></p>
+<p>When SHELFLIFE is set in a result cache hint, there is no dependency tracking. I&#8217;ve described <a href="http://blog.dbi-services.com/resultcache-hint-expiration-options/" target="_blank">RESULT_CACHE hint expiration options</a> in a previous post.</p>
+<p>The V$ views are on fixed tables, structures in memory, where there is no dependency tracking possibility. This is probably why the recursive query for sharing=object views use a SHELFLIFE instead.</p>
+<p>This means that if you create an object link view on a fixed table the query will show same result for the next executions for 30 seconds.</p>
+<h3>&#8220;_cdb_view_rc_shelflife&#8221;</h3>
+<p>I&#8217;ve tested a shared=object view on V$SESSION as an <a href="http://blog.dbi-services.com/oracle-12c-cdb-metadata-a-object-links-internals/#comment-4179" target="_blank">answer to a previous blog comment</a>. My query selects MAX(LAST_ET_CALL) which is supposed to increase every second for the inactive sessions. And we see that the result changes only every 30 seconds.</p>
+<p>Those 30 seconds are parametered by &#8220;_cdb_view_rc_shelflife&#8221;. Here is the same test where I set &#8220;_cdb_view_rc_shelflife&#8221; to 5 seconds:</p>
+<p><pre>
+15:31:48 SQL&gt; alter session set "_cdb_view_rc_shelflife"=5;
+Session altered.
+
+15:31:48 SQL&gt; set serveroutput on
+15:31:48 SQL&gt; declare
+15:31:48   2   x varchar2(100);
+15:31:48   3  begin
+15:31:48   4   for i in 1..60 loop
+15:31:48   5    dbms_lock.sleep(1);
+15:31:48   6    select to_char(current_timestamp)||' --&gt; '||max(last_call_et) into x from DEMOV;
+15:31:48   7    dbms_output.put_line(x);
+15:31:48   8   end loop;
+15:31:48   9  end;
+15:31:48  10  /
+
+07-AUG-16 03.31.49.852081 PM +00:00 --&gt; 775144
+07-AUG-16 03.31.50.863742 PM +00:00 --&gt; 775144
+07-AUG-16 03.31.51.863753 PM +00:00 --&gt; 775144
+07-AUG-16 03.31.52.864697 PM +00:00 --&gt; 775144
+07-AUG-16 03.31.53.864706 PM +00:00 --&gt; 775144
+07-AUG-16 03.31.54.864726 PM +00:00 --&gt; 775144
+07-AUG-16 03.31.55.864669 PM +00:00 --&gt; 775150
+07-AUG-16 03.31.56.864711 PM +00:00 --&gt; 775150
+07-AUG-16 03.31.57.864754 PM +00:00 --&gt; 775150
+07-AUG-16 03.31.58.864702 PM +00:00 --&gt; 775150
+07-AUG-16 03.31.59.864711 PM +00:00 --&gt; 775150
+07-AUG-16 03.32.00.864779 PM +00:00 --&gt; 775150
+07-AUG-16 03.32.01.865710 PM +00:00 --&gt; 775156
+07-AUG-16 03.32.02.866738 PM +00:00 --&gt; 775156
+07-AUG-16 03.32.03.866719 PM +00:00 --&gt; 775156
+07-AUG-16 03.32.04.866787 PM +00:00 --&gt; 775156
+07-AUG-16 03.32.05.866758 PM +00:00 --&gt; 775156
+07-AUG-16 03.32.06.866805 PM +00:00 --&gt; 775156
+07-AUG-16 03.32.07.867738 PM +00:00 --&gt; 775162
+07-AUG-16 03.32.08.868743 PM +00:00 --&gt; 775162
+07-AUG-16 03.32.09.868727 PM +00:00 --&gt; 775162
+07-AUG-16 03.32.10.868724 PM +00:00 --&gt; 775162
+07-AUG-16 03.32.11.868758 PM +00:00 --&gt; 775162
+07-AUG-16 03.32.12.869763 PM +00:00 --&gt; 775167
+07-AUG-16 03.32.13.870741 PM +00:00 --&gt; 775167
+07-AUG-16 03.32.14.870742 PM +00:00 --&gt; 775167
+07-AUG-16 03.32.15.870721 PM +00:00 --&gt; 775167
+07-AUG-16 03.32.16.870734 PM +00:00 --&gt; 775167
+07-AUG-16 03.32.17.870883 PM +00:00 --&gt; 775167
+07-AUG-16 03.32.18.872741 PM +00:00 --&gt; 775173
+07-AUG-16 03.32.19.873837 PM +00:00 --&gt; 775173
+</pre></p>
+<p>And here is the same test after setting:
+<pre>
+SQL&gt; exec dbms_result_cache.bypass(true);
+</pre></p>
+<p>I&#8217;ve not tested, but I expect the same in Standard Edition where result cache is disabled</p>
+<p><pre>
+07-AUG-16 03.43.32.158741 PM +00:00 --&gt; 775846
+07-AUG-16 03.43.33.185793 PM +00:00 --&gt; 775847
+07-AUG-16 03.43.34.186633 PM +00:00 --&gt; 775848
+07-AUG-16 03.43.35.186738 PM +00:00 --&gt; 775849
+07-AUG-16 03.43.36.187696 PM +00:00 --&gt; 775850
+07-AUG-16 03.43.37.188684 PM +00:00 --&gt; 775851
+07-AUG-16 03.43.38.188692 PM +00:00 --&gt; 775852
+07-AUG-16 03.43.39.189755 PM +00:00 --&gt; 775853
+07-AUG-16 03.43.40.190697 PM +00:00 --&gt; 775854
+07-AUG-16 03.43.41.191763 PM +00:00 --&gt; 775855
+07-AUG-16 03.43.42.192706 PM +00:00 --&gt; 775856
+07-AUG-16 03.43.43.193736 PM +00:00 --&gt; 775857
+</pre></p>
+<h3>Conclusion</h3>
+<p>Don&#8217;t be afraid. There are very few sharing=object views in the dictionary, and only few of them have dependencies on fixed tables:
+<pre>
+SQL&gt; select owner,name,referenced_name from dba_dependencies
+     where (referenced_owner,referenced_name) in (select 'SYS',view_name from v$fixed_view_definition union select 'SYS',name from v$fixed_table)
+     and (owner,name,type) in (select owner,object_name,object_type from dba_objects where sharing='OBJECT LINK')
+     ;
+
+OWNER                          NAME                           REFERENCED_NAME
+------------------------------ ------------------------------ ------------------------------
+SYS                            INT$DBA_HIST_SQLSTAT           X$MODACT_LENGTH
+SYS                            INT$DBA_HIST_ACT_SESS_HISTORY  X$MODACT_LENGTH
+SYS                            INT$DBA_OUTSTANDING_ALERTS     X$KELTGSD
+SYS                            INT$DBA_OUTSTANDING_ALERTS     X$KELTSD
+SYS                            INT$DBA_OUTSTANDING_ALERTS     X$KELTOSD
+SYS                            INT$DBA_ALERT_HISTORY          X$KELTGSD
+SYS                            INT$DBA_ALERT_HISTORY          X$KELTSD
+SYS                            INT$DBA_ALERT_HISTORY          X$KELTOSD
+SYS                            INT$DBA_ALERT_HISTORY_DETAIL   X$KELTGSD
+SYS                            INT$DBA_ALERT_HISTORY_DETAIL   X$KELTSD
+SYS                            INT$DBA_ALERT_HISTORY_DETAIL   X$KELTOSD
+SYS                            DEMOV                          GV$SESSION
+
+6 rows selected.
+</pre>
+I&#8217;ve described how AWR views are stacked onto each other in a <a href="http://blog.dbi-services.com/12c-multitenant-internals-awr-tables-and-views/" target="_blank">previous post</a>.</p>
+<p>And don&#8217;t worry, you don&#8217;t need to have a fresh view of those X$ tables. As an example, behind DBA_HIST_ACTIVE_SES_HISTORY the fixed table X$MODACT_LENGTH holds only the length of module and action strings:
+<pre>SQL&gt; select * from X$MODACT_LENGTH;
+
+ADDR                   INDX    INST_ID     CON_ID  KSUMODLEN  KSUACTLEN
+---------------- ---------- ---------- ---------- ---------- ----------
+00007FF2EF280920          0          1          0         48         32</pre></p>
+<p>And the others (X$KELTSD, X$KELTGSD, X$KELTOSD) are the structures behind V$ALERT_TYPES that are not supposed to change.</p>
+<p>So don&#8217;t panic. The multitenant architecture has some strange implementation stuff, but mostly harmless&#8230;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-101610"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

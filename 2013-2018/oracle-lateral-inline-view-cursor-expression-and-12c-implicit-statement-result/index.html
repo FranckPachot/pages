@@ -1,0 +1,233 @@
+								<h1 class="entry-title">Oracle lateral inline view, cursor expression and 12c implicit statement result</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I&#8217;ll present here 3 ways to run a query for each result of another query. Let&#8217;s take an exemple: get all executions plan (select from dbms_xplan.display_cursor) for each of my queries (identified from v$sql). The 90&#8217;s way was to run the first query, which generates the second queries into a spool file, and execute that file. Here are easier ways, some of them coming from 12c new features lateral join and implicit statement result.</p>
+<h3>Test case</h3>
+<p>I&#8217;m running 2 queries and will identify them from their module (APPINFO from sqlplus) and user:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect scott/tiger
+Connected.
+
+SQL&gt; set appinfo DEMO
+
+SQL&gt; select * from DEPT;
+SQL&gt; select * from EMP;
+</pre>
+<p>I don&#8217;t show the result &#8211; you know it &#8211; but here is how I identify the queries:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select sql_id,child_number,sql_text from v$sql where plan_hash_value&gt;0 and module='DEMO' and parsing_schema_name='SCOTT';
+
+SQL_ID        CHILD_NUMBER SQL_TEXT
+------------- ------------ ------------------------------
+5aht0fch310ca            0 select * from EMP
+18wrqtcj3ksap            0 select * from DEPT
+</pre>
+<p>And I want to run dbms_xplan.display_cursor(sql_id,child_number) for each of them. Here are 3 ways to do it</p>
+<h3>Cursor expression</h3>
+<p>Do you know cursor expressions? In your SELECT expressions, you can have a query. Your client will retrieve it as a cursor and have to run it. sqlplus and sqldeveloper does that. Here is an example:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select
+  cursor (select * from table(dbms_xplan.display_cursor(sql_id,child_number,format=&gt;'TYPICAL'))) PLAN
+  from
+  (select * from v$sql where plan_hash_value&gt;0 and module='DEMO' and parsing_schema_name='SCOTT')
+ /
+
+</pre>
+<p>which gives the following result:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PLAN
+--------------------
+CURSOR STATEMENT : 1
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  5aht0fch310ca, child number 0
+-------------------------------------
+select * from EMP
+
+Plan hash value: 3956160932
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| EMP  |    14 |   532 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+13 rows selected.
+
+CURSOR STATEMENT : 1
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  18wrqtcj3ksap, child number 0
+-------------------------------------
+select * from DEPT
+
+Plan hash value: 3383998547
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEPT |     4 |    80 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+13 rows selected.
+
+</pre>
+<p>This is possible on all versions, and the output can change depending on the tool you use. sqlplus handles it as above, running each cursor.</p>
+<h3>implicit statement result</h3>
+<p>You want to do it from pl/sql? That&#8217;s possible. But you have to format the output yourself with dbms_output.</p>
+<p>Except if you are in 12c and use the &#8216;implicit statement result&#8217; new feature:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; declare
+  r sys_refcursor;
+ begin
+  for c in
+  (select * from v$sql where plan_hash_value&gt;0 and module='DEMO' and parsing_schema_name='SCOTT')
+  loop
+   open r for select * from table(dbms_xplan.display_cursor(c.sql_id,c.child_number));
+   dbms_sql.return_result(r);
+  end loop;
+ end;
+ /
+PL/SQL procedure successfully completed.
+</pre>
+<p>which gives the following result:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">ResultSet #1
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  5aht0fch310ca, child number 0
+-------------------------------------
+select * from EMP
+
+Plan hash value: 3956160932
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| EMP  |    14 |   532 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+13 rows selected.
+
+ResultSet #2
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  18wrqtcj3ksap, child number 0
+-------------------------------------
+select * from DEPT
+
+Plan hash value: 3383998547
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEPT |     4 |    80 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+13 rows selected.
+
+</pre>
+<p>This is similar to the previous approach in the way that the client has to manage the result.</p>
+<h3>Lateral inline view</h3>
+<p>This is my preferred way which is only SQL and do not depend on the client formatting. A lateral inline view is a subquery that you put in the FROM clause, using the LATERAL keyword, and which can use data from the other tables on the left of it in the FROM clause:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select plan_table_output from
+  (select * from v$sql where plan_hash_value&gt;0 and module='DEMO' and parsing_schema_name='SCOTT'),
+  lateral (select * from table(dbms_xplan.display_cursor(sql_id,child_number)))
+ ;
+</pre>
+<p>which gives the following result:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  5aht0fch310ca, child number 0
+-------------------------------------
+select * from EMP
+
+Plan hash value: 3956160932
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| EMP  |    14 |   532 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+SQL_ID  18wrqtcj3ksap, child number 0
+-------------------------------------
+select * from DEPT
+
+Plan hash value: 3383998547
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEPT |     4 |    80 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+</pre>
+<p>This is a 12c new feature. It existed on previous versions but not enabled by default and not documented, but you can set it with the following event:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; host oerr ora 22829
+
+SQL&gt; alter session set events '22829 trace name context forever';
+</pre>
+<p>12c came with a lot of nice improvement in SQL and PL/SQL and they are available in all editions.</p>
+<h3>Update</h3>
+<p>What is very cool about twitter is that sometimes I have to update my blog post as soon as it is published. In that case it seems that I ignored the simplest way to do that since 9i:</p>
+<blockquote lang="en"><p><a href="https://twitter.com/FranckPachot">@FranckPachot</a> Why not just &#8220;from v$sql, table(dbms_xplan.display_cursor(&#8230;))&#8221;? Left correlation is official and it works since 9i</p>
+<p>— Vladimir Sitnikov (@VladimirSitnikv) <a href="https://twitter.com/VladimirSitnikv/status/544177719458934784">December 14, 2014</a></p></blockquote>
+<p>So here it is:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">SQL&gt; select plan_table_output from
+  2   v$sql,
+  3   table(dbms_xplan.display_cursor(sql_id,child_number))
+  4  where plan_hash_value&gt;0 and module='DEMO' and parsing_schema_name='SCOTT'
+  5  ;
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------
+SQL_ID  5aht0fch310ca, child number 0
+-------------------------------------
+select * from EMP
+
+Plan hash value: 3956160932
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| EMP  |    14 |   532 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+SQL_ID  18wrqtcj3ksap, child number 0
+-------------------------------------
+select * from DEPT
+
+Plan hash value: 3383998547
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     3 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEPT |     4 |    80 |     3   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+
+26 rows selected.
+
+</pre>
+<p>That does not invalidate this blog post because I wanted to show those 3 features. It&#8217;s just my example which was badly chosen because dbms_xplan returns a table expression and left correlation can be used for it.</p>
+<p>Thanks to Vladimir Sitnikov, I learned a 9i feature while blogging about 12c new feature <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":)" class="wp-smiley" /></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5480"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

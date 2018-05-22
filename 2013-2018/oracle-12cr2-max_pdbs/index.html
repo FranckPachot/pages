@@ -1,0 +1,353 @@
+								<h1 class="entry-title">Oracle 12cR2: MAX_PDBS</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Oracle database 12.2 is there on the Database Cloud Service, in multitenant. In EE High Performance or Extreme Performance, you have the multitenant option: you can create 4096 pluggable database (instead of 252 in 12.1). If you are in lower services, you can create only one user PDB (not counting application root and proxy PDB). If you are in Standard Edition, it&#8217;s simple: it is a hard limit. If you are in simple Enterprise Edition without option, then you have a way to be sure you stay under the limit: MAX_PDBS parameters.
+<span id="more-12598"></span></p>
+<h3>Containers and Plugable Databases</h3>
+<p>A CDB is a container (CON_ID=0) that contains containers:</p>
+<ul>
+<li>CDB$ROOT (CON_ID=1)</li>
+<li>PDB$SEED (CON_ID=2)</li>
+<li>User created PDBs (CON_ID between 3 and 4098)</li>
+</ul>
+<p>Here is how I show it:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/08/CaptureCON_ID.png" rel="lightbox[12598]"><img src="../wp-insides/uploads/sites/2/2016/08/CaptureCON_ID.png" alt="CaptureCON_ID" width="803" height="518" class="alignnone size-full wp-image-10182" /></a></p>
+<h3>MAX_PDBS</h3>
+<p>In 12.1 you have no supported way to prevent creating more than one PDB. In 12.2 you have a parameter, MAX_PDBS, which is documented as the maximum number of user created pluggable database. You you can expect it to have the maximum of 4096 but it&#8217;s actually 4098 and this is the default value:
+<pre>
+SQL&gt; show parameter max_pdbs
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_pdbs                             integer     4098
+</pre>
+So to be sure, let&#8217;s create many pluggable databases.</p>
+<p>I have one pluggable database, PDB1, opened in read-only:
+<pre>
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         3 PDB1                           READ ONLY  NO
+</pre>
+And use the following script to clone them:
+<pre> for i in {1..5000} ; do echo "connect / as sysdba"; echo "create pluggable database pdb$i$RANDOM from pdb1 snapshot copy;" ; echo 'select max(con_id),count(*) from dba_pdbs;' ; echo "host df -h /u01 /u02" ; done | sqlplus / as sysdba</pre>
+until it fails with:
+<pre>
+SQL&gt; create pluggable database pdb49613971 from pdb1 snapshot copy
+                          *
+ERROR at line 1:
+ORA-65010: maximum number of pluggable databases created
+</pre></p>
+<p>Note that I use clonedb=true snapshot copy because I don&#8217;t want to fill up my filesystem:
+<pre>
+SQL&gt; show parameter clonedb
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+clonedb                              boolean     TRUE
+clonedb_dir                          string      /u02/oradata/CDB1
+
+SQL&gt; host du -h /u02/oradata/CDB1/CDB1_bitmap.dbf
+31M     /u02/oradata/CDB1/CDB1_bitmap.dbf
+</pre>
+As you see I&#8217;ve put the bitmap file outside of $ORACLE_HOME/dbs because in 12.2 we have a parameter for that. So many new features&#8230;
+In addition to that I had to increase sga, processes and db_files.</p>
+<p>Here I have my 4097 PDBs
+<pre>
+SQL&gt; select max(con_iount(*) from dba_pdbs;
+
+MAX(CON_ID)   COUNT(*)
+----------- ----------
+       4098       4097</pre></p>
+<p>which includes PDB$SEED. This means 4098 containers inside of my CDB:</p>
+<p><pre>SQL&gt; select max(con_id),count(*) from v$containers;
+
+MAX(CON_ID)   COUNT(*)
+----------- ----------
+       4098       4098</pre></p>
+<p><pre>SQL&gt; set pagesize 1000 linesize 1000
+select min(con_id),max(con_id),count(*),substr(listagg(name,',' on overflow truncate)within group(order by con_id),1,30) from v$containers;SQL&gt;
+
+MIN(CON_ID) MAX(CON_ID)   COUNT(*) SUBSTR(LISTAGG(NAME,','ONOVERFLOWTRUNCATE)WITHINGROUP(ORDERBYCON_ID),1,30)
+----------- ----------- ---------- ------------------------------------------------------------------------------------------------------------------------
+          1        4098       4098 CDB$ROOT,PDB$SEED,PDB1,PDB2105</pre></p>
+<p>So basically you can&#8217;t reach the MAX_PDBS default with user created PDBs.</p>
+<h3>But&#8230;</h3>
+<p>What is really cool with &#8216;cloud first&#8217; is that we can test it, all on the same platform, probably hit bugs that will be fixed before the on-premises version. This is a great way to ensure that the version is stable when we will put production on it. </p>
+<p>I have one PDB:
+<pre>
+SQL*Plus: Release 12.2.0.1.0 Production on Thu Nov 10 12:12:25 2016
+
+Copyright (c) 1982, 2016, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.2.0.1.0 - 64bit Production
+
+12:12:25 SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         3 PDB1                           MOUNTED
+</pre>
+I drop it:
+<pre>
+12:12:26 SQL&gt; drop pluggable database pdb1 including datafiles;
+Pluggable database dropped.
+</pre>
+I set MAX_PDBS to one:
+<pre>
+
+12:12:44 SQL&gt; show parameter max_pdbs
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_pdbs                             integer     4098
+
+12:13:24 SQL&gt; alter system set max_pdbs=1 scope=memory;
+System altered.
+
+12:13:45 SQL&gt; show parameter max_pdbs
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_pdbs                             integer     1
+</pre>
+And then try to re-create my PDB:
+<pre>
+12:13:54 SQL&gt; create pluggable database PDB1 admin user pdbadmin identified by oracle;
+create pluggable database PDB1 admin user pdbadmin identified by oracle
+*
+ERROR at line 1:
+ORA-65010: maximum number of pluggable databases created
+</pre></p>
+<p>This is not what I expected. Let&#8217;s try to increase MAX_PDBS to two, even if I&#8217;m sure to have only one user PDB:</p>
+<p><pre>
+12:14:07 SQL&gt; alter system set max_pdbs=2 scope=memory;
+System altered.
+
+12:14:18 SQL&gt; create pluggable database PDB1 admin user pdbadmin identified by oracle;
+Pluggable database created.
+</pre>
+Ok. Let&#8217;s drop it and re-create it again:
+<pre>
+12:15:20 SQL&gt; drop pluggable database PDB1 including datafiles;
+Pluggable database dropped.
+
+12:16:02 SQL&gt; create pluggable database PDB1 admin user pdbadmin identified by oracle;
+create pluggable database PDB1 admin user pdbadmin identified by oracle
+*
+ERROR at line 1:
+ORA-65010: maximum number of pluggable databases created
+</pre>
+That&#8217;s bad. It seems that the previously dropped PDBs are still counted:
+<pre>
+12:16:07 SQL&gt; alter system set max_pdbs=3 scope=memory;
+System altered.
+
+12:16:17 SQL&gt; create pluggable database PDB1 admin user pdbadmin identified by oracle;
+Pluggable database created.
+
+12:17:10 SQL&gt; show pdbs;
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         3 PDB1                           MOUNTED
+12:18:14 SQL&gt; drop pluggable database PDB1 including datafiles;
+Pluggable database dropped.
+
+12:18:28 SQL&gt; create pluggable database PDB1 admin user pdbadmin identified by oracle;
+create pluggable database PDB1 admin user pdbadmin identified by oracle
+*
+ERROR at line 1:
+ORA-65010: maximum number of pluggable databases created
+</pre></p>
+<p>Probably a small bug there. Some counters not reset maybe.</p>
+<h3></h3>
+<p>I&#8217;ve dropped one PDB from the CDB where I reached the limit of 4096:</p>
+<p><pre>
+SQL&gt; select count(*) from dba_pdbs where con_id&gt;2;
+
+  COUNT(*)
+----------
+      4095
+</pre></p>
+<p>I can set MAX_PDBS to 4095 if I and to prevent creating a new one:
+<pre>
+SQL&gt; alter system set max_pdbs=4095;
+System altered.
+</pre></p>
+<p>What if I want to set it lower than the number of PDBs I have? An error message would be nice, but probably not this one:
+<pre>
+SQL&gt; alter system set max_pdbs=4094;
+alter system set max_pdbs=4094
+*
+ERROR at line 1:
+ORA-32017: failure in updating SPFILE
+ORA-65331: DDL on a data link table is outside an application action.
+</pre></p>
+<p>Anyway, now that MAX_PDBS is set to 4095 I can&#8217;t create another one:
+<pre>
+SQL&gt; create pluggable database PDB2 from PDB1;
+create pluggable database PDB2 from PDB1
+*
+ERROR at line 1:
+ORA-65010: maximum number of pluggable databases created
+</pre>
+which is the goal of this parameter and confirms that it counts the user created PDBs and not the all containers.</p>
+<p>Here it seems that I can re-create my last PDB when I increase the MAX_PDBS:
+<pre>
+SQL&gt; alter system set max_pdbs=4096;
+System altered.
+SQL&gt; create pluggable database PDB2 from PDB1;
+Pluggable database created.
+</pre></p>
+<p>By the way, here is how the multitenant feature usage is detected:
+<pre>
+SQL&gt; select name feature_name,version,detected_usages,aux_count
+     from dba_feature_usage_statistics
+     where name like '%Pluggable%' or name like '%Multitenant%';
+
+FEATURE_NAME
+--------------------------------------------------------------------------------
+VERSION           DETECTED_USAGES  AUX_COUNT
+----------------- --------------- ----------
+Oracle Multitenant
+12.2.0.1.0                      3       4096
+</pre></p>
+<p>The detected usage just means that I&#8217;m in a CDB. The AUX_COUNT tells me if I require the multitenant option. But that&#8217;s for a future blog post.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-125990" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/08/CaptureCON_ID.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-5380">
+				<div id="div-comment-5380" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/393a81f7fe83e569522c58bd47fd802a?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.xenialab.it/meo/web/index5.htm' rel='external nofollow' class='url'>meo</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5380">
+			November 17, 2016 at 0 h 34 min</a>		</div>
+
+		<p>A small typo I think:
+ (instead of 252 in 12.2) &#8211;&gt;  (instead of 252 in 12.1)
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-53811"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5380' onclick='return addComment.moveForm( "div-comment-5380", "5380", "respond", "12598" )' aria-label='Reply to meo to meo'>Reply to meo</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-5400">
+				<div id="div-comment-5400" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5400">
+			November 17, 2016 at 11 h 17 min</a>		</div>
+
+		<p>Hi, thanks a lot I fixed it. Best Regards, Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-54011"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5400' onclick='return addComment.moveForm( "div-comment-5400", "5400", "respond", "12598" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-7014">
+				<div id="div-comment-7014" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/b58f618ed1eb1c8035e2850c6a4f155e?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">skant</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7014">
+			February 27, 2017 at 14 h 30 min</a>		</div>
+
+		<p>Hi  Franck
+How oracle allow to set max_pdbs value more than 4098
+<pre>
+SQL&gt; alter system set max_pdbs=5000;
+
+System altered.
+
+SQL&gt;  show parameter max_pdbs
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_pdbs                             integer     5000
+</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-70151"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7014' onclick='return addComment.moveForm( "div-comment-7014", "7014", "respond", "12598" )' aria-label='Reply to skant to skant'>Reply to skant</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7015">
+				<div id="div-comment-7015" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7015">
+			February 27, 2017 at 14 h 36 min</a>		</div>
+
+		<p>Hi Skant,
+Yes. Actually it should not allow more than 4096 because it is the number of user created PDBs. The default 4098 is already above what is possible.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-70161"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7015' onclick='return addComment.moveForm( "div-comment-7015", "7015", "respond", "12598" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

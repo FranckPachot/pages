@@ -1,0 +1,267 @@
+								<h1 class="entry-title">Oracle 12cR2: Online tablespace encryption</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>By default, all data is visible in the datafiles. Transparent Tablespace Encryption (TDE) can be used to get them encrypted. It requires Enterprise Edition plus Advanced Security Option. Except in the Oracle Cloud when it is available &#8211; and mandatory &#8211; in all editions. And we can foresee that security policies will be enforced in the future years, by law or because companies realize their files can be stolen. This means that lot of databases will have to be encrypted, and this may take too long to do it during a maintenance window. In 12.2 we can encrypt online. Online means that we can do it while our application is running, but of course there is a performance overhead on the system.
+<span id="more-14981"></span>
+I&#8217;ve run a SLOB workload with reads and writes (PCT_UPDATE=25). Four times the same workload:
+<ul>
+<li>during the first one, I encrypted the tablespace online</li>
+<li>the second one is running on the encrypted tablespace</li>
+<li>during the third one, I decrypted the tablespace online</li>
+<li>the fourth one is running on the decrypted tablespace</li>
+</ul>
+<p>Here is the ASH visualized with Orachrome Lighty:</p>
+<p><a href="../wp-insides/uploads/sites/2/2017/02/Online_encryption_ASH_Response_Time.png" rel="lightbox[14981]"><img src="../wp-insides/uploads/sites/2/2017/02/Online_encryption_ASH_Response_Time.png" alt="Online_encryption_ASH_Response_Time" width="1709" height="177" class="alignnone size-full wp-image-14982" /></a></p>
+<p>The dark blue is &#8216;db file sequential read&#8217; is ny 4 SLOB sessions activity. Light blue is all background activity (DBWR, LGWR) and the encrypt/decrypt (db file parallel write).
+The green is CPU activity. The brown is free buffer gets: DBWR can&#8217;t keep up with the rate of changes we are doing, while encrypting the tablespace.</p>
+<p>You may wonder how I was able to have un-encrypted tablespaces on 12.2 which is available only on the Oracle Cloud where encryption is mandatory. This is explained in <a href="../oracle-public-cloud-12cr2-tde-is-not-an-option/index.html" target="_blank">Oracle Public Cloud 12cR2: TDE is not an option</a>. This means that I created the SLOB database and I have created the wallet.</p>
+<h3>Configure the TDE keystore</h3>
+<p>I&#8217;ve created the directory
+<pre>mkdir -p /u01/app/oracle/admin/SLOB/tde_wallet
+</pre>
+I declared it in sqlnet.ora
+<pre>ENCRYPTION_WALLET_LOCATION=(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY=/u01/app/oracle/admin/SLOB/tde_wallet)))
+</pre>
+I created the wallet
+<pre>administer key management create keystore '/u01/app/oracle/admin/SLOB/tde_wallet' identified by oracle;
+</pre>
+Opened it
+<pre>administer key management set keystore open identified by oracle;
+</pre>
+Created the master key
+<pre>administer key management set key identified by oracle with backup;
+</pre>
+Optionally created an auto-login wallet
+<pre>administer key management create auto_login keystore from keystore '/u01/app/oracle/admin/SLOB/tde_wallet' identified by oracle;
+</pre></p>
+<h3>Statspack</h3>
+<p>I’ll show some statistics for the following runs: Inital (when not encrypted), Encryption (when encryption is running concurrently), Encrypted (when tablespace encryption has been completed), Decryption (when decrypt is running concurrently) and Decrypted (once decryption is completed).</p>
+<h3>Run on non-encrypted tablespace</h3>
+<p><pre>Load Profile              Per Second    Per Transaction    Per Exec    Per Call
+~~~~~~~~~~~~      ------------------  ----------------- ----------- -----------
+      DB time(s):                4.0                0.1        0.02        6.39
+       DB CPU(s):                0.4                0.0        0.00        0.68
+       Redo size:        1,064,743.9           18,829.0
+   Logical reads:           15,635.7              276.5
+   Block changes:            7,293.4              129.0
+  Physical reads:            9,451.4              167.1
+ Physical writes:            3,303.2               58.4</pre></p>
+<p><pre>Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+db file sequential read                        817,591       1,000      1   48.9
+log file parallel write                         12,258         408     33   20.0
+db file parallel write                          18,284         217     12   10.6
+CPU time                                                       128           6.3
+db file parallel read                           46,263         121      3    5.9</pre></p>
+<p><pre>Time Model System Stats  DB/Inst: SLOB/SLOB  Snaps: 26-27
+-&gt; Ordered by % of DB time desc, Statistic name
+
+Statistic                                       Time (s) % DB time
+----------------------------------- -------------------- ---------
+sql execute elapsed time                         1,201.2     100.0
+DB CPU                                             127.8      10.6
+PL/SQL execution elapsed time                        1.7        .1
+parse time elapsed                                   0.0        .0
+connection management call elapsed                   0.0        .0
+hard parse elapsed time                              0.0        .0
+Tablespace encryption elapsed time                   0.0        .0
+repeated bind elapsed time                           0.0        .0
+DB time                                          1,201.7</pre></p>
+<h3>Run during tablespace encryption</h3>
+<p>As soon as I started this SLOB run, I started the encryption:
+<pre>alter tablespace IOPS encryption encrypt;</pre></p>
+<p><pre>Load Profile              Per Second    Per Transaction    Per Exec    Per Call
+~~~~~~~~~~~~      ------------------  ----------------- ----------- -----------
+      DB time(s):                4.8                0.1        0.03        8.27
+       DB CPU(s):                0.4                0.0        0.00        0.72
+       Redo size:          644,447.5           18,839.1
+   Logical reads:            9,441.5              276.0
+   Block changes:            4,412.8              129.0
+  Physical reads:            5,702.6              166.7
+ Physical writes:            1,952.0               57.1</pre></p>
+<p><pre>Time Model System Stats  DB/Inst: SLOB/SLOB  Snaps: 28-29
+-&gt; Ordered by % of DB time desc, Statistic name
+
+Statistic                                       Time (s) % DB time
+----------------------------------- -------------------- ---------
+sql execute elapsed time                         1,455.0      99.9
+DB CPU                                             126.9       8.7
+Tablespace encryption elapsed time                  15.4       1.1
+Tablespace encryption cpu time                      12.1        .8</pre></p>
+<p><pre>
+Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+db file sequential read                        546,294         660      1   30.8
+free buffer waits                               30,704         325     11   15.2
+log file parallel write                          8,057         304     38   14.2
+db file parallel write                           9,929         260     26   12.1
+db file async I/O submit                         6,304         185     29    8.7
+</pre></p>
+<p><pre>Statistic                                      Total     per Second    per Trans
+--------------------------------- ------------------ -------------- ------------
+session logical reads                      2,860,788        9,441.5        276.0
+consistent gets                            2,154,358        7,110.1        207.9
+blocks decrypted                             850,557        2,807.1         82.1
+blocks encrypted                           1,042,777        3,441.5        100.6</pre></p>
+<h3>Run on encrypted tablespace</h3>
+<p><pre>Load Profile              Per Second    Per Transaction    Per Exec    Per Call
+~~~~~~~~~~~~      ------------------  ----------------- ----------- -----------
+      DB time(s):                4.0                0.1        0.02        6.95
+       DB CPU(s):                0.5                0.0        0.00        0.95
+       Redo size:        1,057,446.8           18,806.5
+   Logical reads:           15,534.1              276.3
+   Block changes:            7,248.4              128.9
+  Physical reads:            9,415.8              167.5
+ Physical writes:            3,266.7               58.1</pre></p>
+<p><pre>Time Model System Stats  DB/Inst: SLOB/SLOB  Snaps: 30-31
+-&gt; Ordered by % of DB time desc, Statistic name
+
+Statistic                                       Time (s) % DB time
+----------------------------------- -------------------- ---------
+sql execute elapsed time                         1,201.1      99.9
+DB CPU                                             164.7      13.7
+Tablespace encryption elapsed time                  19.0       1.6
+Tablespace encryption cpu time                      10.1        .8</pre></p>
+<p><pre>Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+db file sequential read                        824,329         958      1   47.3
+log file parallel write                         12,207         416     34   20.5
+db file parallel write                          17,405         202     12   10.0
+CPU time                                                       166           8.2
+db file parallel read                           46,394         113      2    5.6</pre></p>
+<p><pre>Statistic                                      Total     per Second    per Trans
+--------------------------------- ------------------ -------------- ------------
+session logical reads                      4,706,832       15,534.1        276.3
+consistent gets                            3,546,519       11,704.7        208.2
+blocks decrypted                           2,852,666        9,414.7        167.4
+blocks encrypted                             989,254        3,264.9         58.1
+</pre></p>
+<h3>Run during tablespace decryption</h3>
+<p>As soon as I started this SLOB run, I started the decryption:
+<pre>alter tablespace IOPS encryption decrypt;</pre></p>
+<p><pre>Load Profile              Per Second    Per Transaction    Per Exec    Per Call
+~~~~~~~~~~~~      ------------------  ----------------- ----------- -----------
+      DB time(s):                4.9                0.2        0.04        7.56
+       DB CPU(s):                0.4                0.0        0.00        0.61
+       Redo size:          606,680.3           19,111.0
+   Logical reads:            8,817.1              277.8
+   Block changes:            4,121.4              129.8
+  Physical reads:            5,294.9              166.8
+ Physical writes:            1,827.2               57.6</pre></p>
+<p><pre>Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+db file sequential read                        515,429         629      1   25.9
+free buffer waits                               34,335         362     11   14.9
+log file parallel write                          7,287         293     40   12.1
+direct path write                                7,703         275     36   11.3
+db file parallel write                           9,966         270     27   11.1</pre></p>
+<p><pre>Time Model System Stats  DB/Inst: SLOB/SLOB  Snaps: 32-33
+-&gt; Ordered by % of DB time desc, Statistic name
+
+Statistic                                       Time (s) % DB time
+----------------------------------- -------------------- ---------
+sql execute elapsed time                         1,464.6      99.9
+DB CPU                                             117.9       8.0
+Tablespace encryption elapsed time                   9.4        .6
+Tablespace encryption cpu time                       4.6        .3</pre></p>
+<p><pre>Statistic                                Total     per Second    per Trans
+--------------------------------- ------------------ -------------- ------------
+session logical reads                      2,662,776        8,817.1        277.8
+consistent gets                            2,001,129        6,626.3        208.7
+blocks decrypted                           1,026,940        3,400.5        107.1
+blocks encrypted                             696,105        2,305.0         72.6
+</pre></p>
+<h3>Run on decrypted tablespace</h3>
+<p><pre>Load Profile              Per Second    Per Transaction    Per Exec    Per Call
+~~~~~~~~~~~~      ------------------  ----------------- ----------- -----------
+      DB time(s):                4.0                0.1        0.02        6.79
+       DB CPU(s):                0.4                0.0        0.00        0.72
+       Redo size:        1,060,856.5           18,876.7
+   Logical reads:           15,565.8              277.0
+   Block changes:            7,258.6              129.2
+  Physical reads:            9,418.8              167.6
+ Physical writes:            3,330.5               59.3</pre></p>
+<p><pre>Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+db file sequential read                        818,717         999      1   42.1
+log file parallel write                         11,799         421     36   17.8
+direct path write                                8,887         299     34   12.6
+db file parallel write                          18,817         222     12    9.4
+CPU time                                                       129           5.4</pre></p>
+<p><pre>Time Model System Stats  DB/Inst: SLOB/SLOB  Snaps: 34-35
+-&gt; Ordered by % of DB time desc, Statistic name
+
+Statistic                                       Time (s) % DB time
+----------------------------------- -------------------- ---------
+sql execute elapsed time                         1,201.1     100.0
+DB CPU                                             127.1      10.6
+PL/SQL execution elapsed time                        1.7        .1
+parse time elapsed                                   0.0        .0
+connection management call elapsed                   0.0        .0
+Tablespace encryption cpu time                       0.0        .0
+Tablespace encryption elapsed time                   0.0        .0</pre></p>
+<p><pre>Statistic                                Total     per Second    per Trans
+--------------------------------- ------------------ -------------- ------------
+session logical reads                      4,685,294       15,565.8        277.0
+consistent gets                            3,528,610       11,723.0        208.6
+blocks decrypted                                 271            0.9          0.0
+blocks encrypted                                  10            0.0          0.0
+</pre></p>
+<h3>Observations</h3>
+<p>During encryption and decryption, we have contention on &#8216;free buffer waits&#8217;. When running a workload that is I/O bound, and with updates, the DBWR cannot keep-up when encryption/decryption is running in parallel. Online encryption works like online datafile move: there is a double write, one the the current file and one to the file encrypted one. Only when completed, the reads and writes are directed to ne new file and the old one is removed.</p>
+<p>The statistics &#8216;blocks decrypted&#8217; and &#8216;block encrypted&#8217; are related to reads and writes from an encrypted tablespace.</p>
+<p>The Time Model &#8216;Tablespace encryption&#8217; statistics are significant only when the tablespace is encrypted, or during encryption/decryption. But the time is not so significant: 1% of DB Time. I&#8217;m not completely sure about how to interpret it and it is not yet documented. From my test, it looks like it measures the overhead of reading from encrypted tablespaces.</p>
+<p>But fore sure, having the tablespaces encrypted is not a big overhead, and online encryption can be useful to avoid a large maintenance window (it can take few hours to encrypt hundred of GB) but don&#8217;t run it at a time where you have lot of modifications.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-149820" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/02/Online_encryption_ASH_Response_Time.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7008">
+				<div id="div-comment-7008" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/4101b66e48a0d5f5daf9adcb2b9eb8d0?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.tiento.pl' rel='external nofollow' class='url'>Adam Boliński</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7008">
+			February 27, 2017 at 7 h 02 min</a>		</div>
+
+		<p>Franck thanks for this testing I was very curios what is the impact for enc/dec if it is 1% it is great .
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-70091"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7008' onclick='return addComment.moveForm( "div-comment-7008", "7008", "respond", "14981" )' aria-label='Reply to Adam to Adam Boliński'>Reply to Adam</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

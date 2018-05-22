@@ -1,0 +1,169 @@
+								<h1 class="entry-title">12c Multitenant: PDB spfile parameters for standby database</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In multitenant, the spfile parameters at pluggable database level are not stored in the spfile but in the CDB$ROOT table SYS.PDB_SPFILE$
+If you open the standby database in read only for reporting, which is one reason to get Active Data Guard option, you may want different optimizer settings suited for reporting. In non-CDB it&#8217;s easy: the standby has its own spfile where parameters can be changed. But for a pluggable database, it&#8217;s stored in a table which is impossible to update in a read-only database, but there&#8217;s a solution.
+<span id="more-7578"></span>
+Let&#8217;s say I&#8217;m not a big fan of Adaptive Dynamic Sampling for my OLTP application and set the optimizer_dynamic_sampling to 0 in my PDB:
+<pre>
+SQL&gt; alter session set container=PDB001;
+Session altered.
+SQL&gt; alter system set optimizer_dynamic_sampling=0 scope=spfile;
+System altered.
+SQL&gt; show spparameter optimizer_dynamic_sampling;
+SID      NAME                          TYPE        VALUE
+-------- ----------------------------- ----------- -------------------------
+*        optimizer_dynamic_sampling    integer     0
+</pre>
+As I said this is stored in the CDB$ROOT:
+<pre>
+SQL&gt; select db_uniq_name,pdb_uid,sid,name,value$ from pdb_spfile$;
+DB_UNIQ    PDB_UID SID NAME                       VALUE
+------- ---------- --- -------------------------- -----
+CDB     4058593923 *   optimizer_dynamic_sampling 0
+</pre>
+Interesting things here. First, the pluggable database is identified by its PDB_UID which do not change on unplug/plug rather than the CON_ID which is related to the CDB.
+Second there is a db_unique_name here which is the one of the CDB</p>
+<h3>Ignored in Standby</h3>
+<p>Now in my standby, which value do I have?
+<pre>
+SQL&gt; alter session set container=PDB001;
+Session altered.
+SQL&gt; show parameter optimizer_dynamic_sampling;
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_dynamic_sampling           integer     2
+</pre>
+This is the default value. Actually, no spfile parameter is set in the standby:
+<pre>
+SQL&gt; show spparameter optimizer_dynamic_sampling;
+SID      NAME                          TYPE        VALUE
+-------- ----------------------------- ----------- ----------------------------
+*        optimizer_dynamic_sampling    integer
+</pre>
+That&#8217;s not bad here but I want more. I want to set the level to 8 for my reporting activity here.
+If I want to set it I&#8217;ll get: &#8220;ORA-65099: Operation cannot be performed when the CDB is not open&#8221; because it&#8217;s stored in the PDB_SPFILE$ table and we cannot update a table in a read-only database. I can change the value at CDB level, but this is not what I want to do. Let&#8217;s have a look at that PDB_SPFILE$ in the standby:
+<pre>
+SQL&gt; select db_uniq_name,pdb_uid,sid,name,value$ from pdb_spfile$;
+DB_UNIQ    PDB_UID SID NAME                       VALUE
+------- ---------- --- -------------------------- -----
+CDB     4058593923 *   optimizer_dynamic_sampling 0
+</pre>
+Of course, the table is replicated. It&#8217;s the same than in the primary database. This is where the DB_UNIQ_NAME columns is used: the parameter is not used here because the standby CDB has a different unique name.</p>
+<h3>Change in Standby</h3>
+<p>So how to change the parameter in the standby? Just change it in the primary but specify which db_unique_name it belongs to.
+Back in the primary:
+<pre>
+SQL&gt; alter session set container=PDB001;
+Session altered.
+SQL&gt; alter system set optimizer_dynamic_sampling=8 scope=spfile db_unique_name='CDB_ADG';
+System altered.
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+SQL&gt; select db_uniq_name,pdb_uid,sid,name,value$ from pdb_spfile$;
+DB_UNIQ    PDB_UID SID NAME                       VALUE
+------- ---------- --- -------------------------- -----
+CDB     4058593923 *   optimizer_dynamic_sampling 0
+CDB_ADG 4058593923 *   optimizer_dynamic_sampling 8
+</pre>
+This is perfect. The database has both entries, and when in the standby I open the PDB read only it get the right value:
+<pre>
+SQL&gt; show spparameter optimizer_dynamic_sampling;
+SID      NAME                          TYPE        VALUE
+-------- ----------------------------- ----------- ----------------------------
+*        optimizer_dynamic_sampling    integer     8
+</pre></p>
+<h3>Reset</h3>
+<p>If I want to remove a parameter from spfile, I can use the ALTER SYSTEM RESET for it. If I want to remove it on the primary, then no problem no need to specify the db_unique_name as the current one is the default. But let&#8217;s try to reset the one for the standby:
+<pre>
+SQL&gt; alter session set container=PDB001;
+Session altered.
+SQL&gt; alter system reset optimizer_dynamic_sampling scope=spfile db_unique_name='CDB_ADG';
+System altered.
+</pre>
+But there&#8217;s a bug. The db_unique_name is ignored so the wrong one has been removed:
+<pre>
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+SQL&gt; select db_uniq_name,pdb_uid,sid,name,value$ from pdb_spfile$;
+DB_UNIQ    PDB_UID SID NAME                       VALUE
+------- ---------- --- -------------------------- -----
+CDB_ADG 4058593923 *   optimizer_dynamic_sampling 8
+</pre>
+If I try it again, I&#8217;ll get a &#8220;ORA-32010: cannot find entry to delete in SPFILE&#8221;</p>
+<h3>Bug</h3>
+<p>This is a bug and I&#8217;ll put the bug number as soon as My Oracle Support engineer dares to reproduce that 3 lines test-case.</p>
+<h3>Workaround</h3>
+<p>The workaround is easy. It&#8217;s stored in a table so you can just remove the row and commit. I&#8217;ve sql_traced it, it&#8217;s just a delete except that it uses the wrong db_unique_name. That trace is my Plan B to get a bug opened for that. The 4 lines test case in case of the 3 lines one is not sufficient&#8230;</p>
+<h3>Documentation</h3>
+<p>You don&#8217;t find that db_unique_name clause in the ALTER SYSTEM documentation. However, it&#8217;s documented in MOS Doc ID 2101638.1
+The reset is not documented at all, but there&#8217;s no reason to have a SET command without a RESET. Ok, I know for scope=memory you have a SET without RESET, but that&#8217;s another problem. And Enhancement Request to fill.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-75790"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-6178">
+				<div id="div-comment-6178" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/873325eb3744f471624bd3801acfe538?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Alexei</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6178">
+			January 12, 2017 at 23 h 25 min</a>		</div>
+
+		<p>Have you been able to file a bug? What is the bug number?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-61791"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6178' onclick='return addComment.moveForm( "div-comment-6178", "6178", "respond", "7578" )' aria-label='Reply to Alexei to Alexei'>Reply to Alexei</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-6183">
+				<div id="div-comment-6183" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6183">
+			January 13, 2017 at 16 h 07 min</a>		</div>
+
+		<p>Hi Alexei,
+Bug 22967827 &#8211; ora-32010 during alter system reset pdb parameter against active data guard cdb
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-61841"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6183' onclick='return addComment.moveForm( "div-comment-6183", "6183", "respond", "7578" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

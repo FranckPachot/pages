@@ -1,0 +1,333 @@
+								<h1 class="entry-title">OCM 12c preparation: Materialized View explain_rewrite</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When I passed the OCM 11g exam, I had to prepare the &#8216;Manage Materialized Views to improve rewrite&#8217; topic. Now that I&#8217;m preparing the <a href="https://education.oracle.com/pls/web_prod-plq-dad/db_pages.getpage?page_id=5001&amp;get_params=p_exam_id:12COCMU" title="12COCMU" target="_blank">12c upgrade</a> I checked quickly what I&#8217;ve prepared&#8230; and it doesn&#8217;t work. This post is about query rewrite, a bug in 12c, how to understand why it doesn&#8217;t rewrite, and how rewrite is accepted when constraints are not enforced and when materialized view is stale.
+<span id="more-3061"></span></p>
+<h1>SCOTT</h1>
+<p>
+I start with the SCOTT schema where I alter EMP to define DEPTNO as not null, meaning that I&#8217;ve a one-to-many association.
+<pre>
+SQL&gt; host sqlplus / as sysdba @ ?/rdbms/admin/utlsampl
+SQL&gt; alter table SCOTT.EMP modify ( DEPTNO not null);
+Table altered.
+</pre>
+And I&#8217;ll need a few additional grants for my test.
+<pre>
+SQL&gt; grant create materialized view, select any dictionary to scott;
+Grant succeeded.
+</pre>
+</p>
+<h1>Create materialized view</h1>
+<p>
+I&#8217;m creating a materialized view that join the two tables DEPT and EMP
+<pre>
+SQL&gt; connect scott/tiger
+Connected.
+SQL&gt;
+SQL&gt; create materialized view TEST_MV enable query rewrite
+  2   as
+  3   select * from DEPT join EMP using (DEPTNO);
+Materialized view created.
+</pre>
+I check that query_rewrite_integrity is enabled
+<pre>
+SQL&gt; show parameter rewrite
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+query_rewrite_enabled                string      TRUE
+query_rewrite_integrity              string      enforced
+</pre>
+and run a query on EMP. The query should be able to read the materialized view instead of the table, because it has all rows and all columns. Because the cost may not be better, I force the query rewrite with the REWRITE_OR_ERROR hint: force the rewrite and fail if not possible.
+<pre>
+SQL&gt; set autotrace on explain
+SQL&gt; select /*+ rewrite_or_error */ * from EMP;
+select /*+ rewrite_or_error */ * from EMP
+                                      *
+ERROR at line 1:
+ORA-30393: a query block in the statement did not rewrite
+
+SQL&gt; set autotrace off
+</pre>
+Hummm. No rewrite. If you try it on 11.2.0.3 query rewrite occurs. But not in 11.2.0.4 not in 12.1
+</p>
+<h1>Explain rewrite</h1>
+<p>
+When you have to understand why query rewrite do not occur, you can have more information with <strong>dbms_mview.explain_rewrite</strong>. In 11g we had the possibility to do it easily with dbconsole, but in 12c there is nothing in EM Express nor in SQL Developer. If I&#8217;m wrong, please tell me.
+</p>
+<p>
+Thus, we have to use it in command line. First, we need to create the EXPLAIN_REWRITE table to store the result.
+<pre>
+SQL&gt; @ ?/rdbms/admin/utlxrw.sql
+</pre>
+</p>
+<p>
+<pre>
+SQL&gt; Rem
+SQL&gt; Rem $Header: rdbms/admin/utlxrw.sql /main/7 2011/05/20 12:21:56 traney Exp $
+SQL&gt; Rem
+SQL&gt; Rem utlxrw.sql
+SQL&gt; Rem
+SQL&gt; Rem Copyright (c) 2000, 2011, Oracle and/or its affiliates.
+SQL&gt; Rem All rights reserved.
+SQL&gt; Rem
+SQL&gt; Rem    NAME
+SQL&gt; Rem      utlxrw.sql - Create the output table for EXPLAIN_REWRITE
+SQL&gt; Rem
+SQL&gt; Rem    DESCRIPTION
+SQL&gt; Rem     Outputs of the EXPLAIN_REWRITE goes into the table created
+SQL&gt; Rem     by utlxrw.sql (called REWRITE_TABLE). So utlxrw must be
+SQL&gt; Rem     invoked before any EXPLAIN_REWRITE tests.
+SQL&gt; Rem
+SQL&gt; Rem    NOTES
+SQL&gt; Rem      If user specifies a different name in EXPLAIN_REWRITE, then
+SQL&gt; Rem      it should have been already created before calling EXPLAIN_REWRITE.
+SQL&gt; Rem
+SQL&gt; Rem    MODIFIED   (MM/DD/YY)
+SQL&gt; Rem    traney	04/05/11 - 35209: long identifiers dictionary upgrade
+SQL&gt; Rem    desingh	10/19/05 - bug#4401918:change join_back cols lengths
+SQL&gt; Rem    mthiyaga	04/29/05 - Remove unncessary comment
+SQL&gt; Rem    mthiyaga	06/08/04 - Add rewritten_txt field
+SQL&gt; Rem    mthiyaga	10/10/02 - Add extra columns
+SQL&gt; Rem    mthiyaga	09/27/00 - Create EXPLAIN_REWRITE output table
+SQL&gt; Rem    mthiyaga	09/27/00 - Created
+SQL&gt; Rem
+SQL&gt; Rem
+SQL&gt; CREATE TABLE REWRITE_TABLE(
+  2  		       statement_id	     VARCHAR2(30),  -- id for the query
+  3  		       mv_owner 	     VARCHAR2(128),  -- owner of the MV
+  4  		       mv_name		     VARCHAR2(128),  -- name of the MV
+  5  		       sequence 	     INTEGER,	    -- sequence no of the error msg
+  6  		       query		     VARCHAR2(4000),-- user query
+  7  		       query_block_no	     INTEGER,	    -- block no of the current subquery
+  8  		       rewritten_txt	     VARCHAR2(4000),-- rewritten query
+  9  		       message		     VARCHAR2(512), -- EXPLAIN_REWRITE error msg
+ 10  		       pass		     VARCHAR2(3),   -- rewrite pass no
+ 11  		       mv_in_msg	     VARCHAR2(128),  -- MV in current message
+ 12  		       measure_in_msg	     VARCHAR2(30),  -- Measure in current message
+ 13  		       join_back_tbl	    VARCHAR2(4000),-- Join back table in current msg
+ 14  		       join_back_col	    VARCHAR2(4000),-- Join back column in current msg
+ 15  		       original_cost	     INTEGER,	    -- Cost of original query
+ 16  		       rewritten_cost	     INTEGER,	    -- Cost of rewritten query
+ 17  		       flags		     INTEGER,	    -- associated flags
+ 18  		       reserved1	     INTEGER,	    -- currently not used
+ 19  		       reserved2	     VARCHAR2(10))  -- currently not used
+ 20  /
+
+Table created.
+</pre>
+and call the explain_rewrite procedure with the statement, and to materialized view:
+<pre>
+SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+
+PL/SQL procedure successfully completed.
+</pre>
+and check the result:
+<pre>
+SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;
+
+  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01150: query did not rewrite
+         2 QSM-01219: no suitable materialized view found to rewrite th
+           is query
+</pre>
+But there is no reason there. It&#8217;s like the materialized view cannot even be considered for query rewrite. Well, I&#8217;ll not go into the detail here. I&#8217;ve opened bug 17651484 for that. There is a problem since 11.2.0.4 where query uses ANSI join. I like ANSI join syntax, but here I have to avoid them.
+</p>
+<h1>Without ANSI join</h1>
+<p>
+<pre>
+SQL&gt; drop materialized view TEST_MV;
+Materialized view dropped.</p>
+<p>SQL&gt; create materialized view TEST_MV enable query rewrite
+  2   as
+  3   select DNAME,EMP.* from DEPT , EMP where DEPT.DEPTNO=EMP.DEPTNO;</p>
+<p>Materialized view created.
+</pre>
+and now check rewrite:
+<pre>
+SQL&gt; set autotrace on explain
+SQL&gt; select /*+ rewrite_or_error */ * from EMP;
+
+     EMPNO ENAME      JOB              MGR HIREDATE         SAL       COMM     DEPTNO
+---------- ---------- --------- ---------- --------- ---------- ---------- ----------
+      7369 SMITH      CLERK           7902 17-DEC-80        800                    20
+      7499 ALLEN      SALESMAN        7698 20-FEB-81       1600        300         30
+      7521 WARD       SALESMAN        7698 22-FEB-81       1250        500         30
+      7566 JONES      MANAGER         7839 02-APR-81       2975                    20
+      7654 MARTIN     SALESMAN        7698 28-SEP-81       1250       1400         30
+      7698 BLAKE      MANAGER         7839 01-MAY-81       2850                    30
+      7782 CLARK      MANAGER         7839 09-JUN-81       2450                    10
+      7788 SCOTT      ANALYST         7566 19-APR-87       3000                    20
+      7839 KING       PRESIDENT            17-NOV-81       5000                    10
+      7844 TURNER     SALESMAN        7698 08-SEP-81       1500          0         30
+      7876 ADAMS      CLERK           7788 23-MAY-87       1100                    20
+      7900 JAMES      CLERK           7698 03-DEC-81        950                    30
+      7902 FORD       ANALYST         7566 03-DEC-81       3000                    20
+      7934 MILLER     CLERK           7782 23-JAN-82       1300                    10</p>
+<p>14 rows selected.</p>
+<p>Execution Plan
+----------------------------------------------------------
+Plan hash value: 1627509066</p>
+<p>----------------------------------------------------------------------------------------
+| Id  | Operation                    | Name    | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT             |         |    14 |   546 |     3   (0)| 00:00:01 |
+|   1 |  MAT_VIEW REWRITE ACCESS FULL| TEST_MV |    14 |   546 |     3   (0)| 00:00:01 |
+----------------------------------------------------------------------------------------</p>
+<p>SQL&gt; set autotrace off
+</pre>
+Good. Query rewrite occured. Here is the output from explain rewrite:
+<pre>
+SQL&gt; delete from REWRITE_TABLE;
+2 rows deleted.
+
+SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;</p>
+<p>  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01151: query was rewritten
+         2 QSM-01033: query rewritten with materialized view, TEST_MV
+</pre>
+From now, I&#8217;ll use only explain_rewrite to check different variations.
+</p>
+<h1>Disabled constraint</h1>
+<p>
+Constraints are not only there to verify integrity constraints, but also to give information to the optimizer. I&#8217;ve added the not null before because using the join instead of the table is possible only when we know that all rows from EMP have a matching row in DEPT. Now let&#8217;s see what happens if I remove the constraint:
+<pre>
+SQL&gt; alter table EMP disable constraint FK_DEPTNO;
+Table altered.</p>
+<p>SQL&gt; delete from REWRITE_TABLE;
+2 rows deleted.</p>
+<p>SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;</p>
+<p>  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01150: query did not rewrite
+         2 QSM-01110: query rewrite not possible with materialized view
+            TEST_MV because it contains a join between tables (EMP and
+           DEPT) that is not present in the query and that potentially
+           eliminates rows needed by the query
+         3 QSM-01052: referential integrity constraint on table, EMP, n
+           ot VALID in ENFORCED integrity mode
+</pre>
+The explain rewrite tells me everything. The join may eliminate rows, and the disabled constraint cannot ensure that no rows are eliminated.
+</p>
+<h1>RELY constraint</h1>
+<p>
+If you know that your data verifies the constraint, and don&#8217;t want the overhead to validate it, you can alter the constraint to RELY so that the optimizer can rely on it.
+<pre>
+SQL&gt; alter table EMP modify constraint FK_DEPTNO rely;
+Table altered.</p>
+<p>SQL&gt; delete from REWRITE_TABLE;
+3 rows deleted.</p>
+<p>SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;</p>
+<p>  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01150: query did not rewrite
+         2 QSM-01110: query rewrite not possible with materialized view
+            TEST_MV because it contains a join between tables (EMP and
+           DEPT) that is not present in the query and that potentially
+           eliminates rows needed by the query
+         3 QSM-01052: referential integrity constraint on table, EMP, n
+           ot VALID in ENFORCED integrity mode
+</pre>
+But that&#8217;s not enough. We have to read the last message. It&#8217;s not sufficient to have the constraint in RELY, we have to be trusted by the query rewrite.
+<pre>
+SQL&gt; alter session set query_rewrite_integrity=trusted;
+Session altered.</p>
+<p>SQL&gt; delete from REWRITE_TABLE;
+3 rows deleted.</p>
+<p>SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;</p>
+<p>  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01151: query was rewritten
+         2 QSM-01033: query rewritten with materialized view, TEST_MV
+</pre>
+Good. Now query rewrite occurs because I told the optimizer that it can RELY on the foreign key for the current data, and I told the query rewrite that it can trust me.</p>
+<h1>STALE</h1>
+<p>
+Ok, but my constraint is still disabled. New DML will not be verified. The RELY concerns only current data. So what happens if I insert a row in EMP that has no matching DEPT?
+<pre>
+SQL&gt; insert into EMP (EMPNO,ENAME,DEPTNO) values (9999,'rebel',50);
+1 row created.
+
+SQL&gt; commit;
+Commit complete.
+</pre>
+<pre>
+SQL&gt; delete from REWRITE_TABLE;
+2 rows deleted.</p>
+<p>SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;</p>
+<p>  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01150: query did not rewrite
+         2 QSM-01031: materialized view, TEST_MV, is stale in TRUSTED i
+           ntegrity mode
+</pre>
+Because changes have been done, the materialized view is stale. We need to lower the query rewrite security level if we still want query rewrite:
+<pre>
+SQL&gt; alter session set query_rewrite_integrity=stale_tolerated;
+Session altered.</p>
+<p>SQL&gt; delete from REWRITE_TABLE;
+2 rows deleted.</p>
+<p>SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;</p>
+<p>  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01151: query was rewritten
+         2 QSM-01033: query rewritten with materialized view, TEST_MV
+</pre>
+But then the select with query rewrite will not show all rows, because the row I&#8217;ve inserted into EMP is not in the join result.
+</p>
+<h1>ENFORCED</h1>
+</p>
+<p>So trusted may show wrong results when the constraint is not enabled. You need to enforce query rewrite integrity to avoid that.
+<pre>
+SQL&gt; alter session set query_rewrite_integrity=enforced;
+Session altered.</p>
+<p>SQL&gt; delete from REWRITE_TABLE;
+2 rows deleted.</p>
+<p>SQL&gt; exec dbms_mview.explain_rewrite('select * from EMP','TEST_MV');
+PL/SQL procedure successfully completed.</p>
+<p>SQL&gt; select sequence,message from REWRITE_TABLE  order by statement_id,sequence;</p>
+<p>  SEQUENCE MESSAGE
+---------- ------------------------------------------------------------
+         1 QSM-01150: query did not rewrite
+         2 QSM-01110: query rewrite not possible with materialized view
+            TEST_MV because it contains a join between tables (EMP and
+           DEPT) that is not present in the query and that potentially
+           eliminates rows needed by the query
+         3 QSM-01052: referential integrity constraint on table, EMP, n
+           ot VALID in ENFORCED integrity mode
+</pre>
+In this case, query rewrite do not occur because the foreign key is not enforced by oracle (not enabled).
+</p>
+<h1>Conclusion</h1>
+<p>
+Query rewrite depends on referential integrity. When <strong>query_rewrite_integrity=enforced</strong>, the referential integrity must be enforced by oracle (constraint is validated and enabled). When <strong>query_rewrite_integrity=trusted</strong>, you are responsible about data integrity, and control whether rewrite can rely on your constraint, and even tolerate stale materialized view.
+</p>
+<p>
+Don&#8217;t forget to call <strong>dbms_mview.explain_rewrit</strong>e after creating the <strong>rewrite_table</strong> with <strong>utlxrw.sql</strong></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-30620"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

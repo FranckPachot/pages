@@ -1,0 +1,74 @@
+								<h1 class="entry-title">Multitenant dictionary: what is consolidated and what is not</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The <a href="https://docs.oracle.com/database/121/CNCPT/cdblogic.htm#CNCPT89255" target="_blank">documentation</a> says that for <i>Reduction of duplication</i> and <i>Ease of database upgrade</i> the <i>Oracle-supplied objects such as data dictionary table definitions and PL/SQL packages are represented only in the root</i>. </p>
+<p>Unfortunately, this is only partly true. System PL/SQL packages are only in root but system table definition are replicated into all PDBs.
+<span id="more-19428"></span></p>
+<p>This post is an extension of a <a href="https://blog.dbi-services.com/multitenant-dictionary-what-is-stored-only-in-cdbroot/" target="_blank">previous blog</a> post which was on 12<em>c</em>R1. This one is on 12<em>c</em>R2.</p>
+<p>As I did at Open World and will do at DOAG, I show multitenant internals by creating a metadata link procedure. When I do a simple &#8216;describe&#8217; when connected to a PDB, the sql_trace shows that the session switches to the CDB$ROOT to get the procedure information:
+<pre>
+*** 2017-11-05T16:17:36.339126+01:00 (CDB$ROOT(1))
+=====================
+PARSING IN CURSOR #140420856738440 len=143 dep=1 uid=0 oct=3 lid=0 tim=101728244788 hv=2206365737 ad='7f60a7f0' sqlid='9fjf75a1s4y19'
+select procedure#,procedurename,properties,itypeobj#, properties2 from procedureinfo$ where obj#=:1 order by procedurename desc, overload# desc
+END OF STMT</pre></p>
+<p>All information about the system PL/SQL procedures is stored in the root only. The PDB has only a dummy row in OBJ$ to mention that it is a metadata link. And this is why you pay for the multitenant option: consolidation of all system dictionary objects into the root only. You save space (on disk and related memory) and you have only one place to upgrade. </p>
+<p>But this is implemented only for some objects, like PL/SQL procedures, but not for others like table and indexes. If you &#8216;describe&#8217; a metadata link table when connected to a PDB you will not see any switch to CDB$ROOT in the sql_trace:
+<pre>
+*** 2017-11-05T13:01:53.541231+01:00 (PDB1(3))
+PARSING IN CURSOR #139835947128936 len=86 dep=1 uid=0 oct=3 lid=0 tim=98244321664 hv=2195287067 ad='75f823b8' sqlid='32bhha21dkv0v'
+select col#,intcol#,charsetid,charsetform from col$ where obj#=:1 order by intcol# asc
+END OF STMT
+PARSE #139835947128936:c=0,e=158,p=0,cr=0,cu=0,mis=1,r=0,dep=1,og=4,plh=3765558045,tim=98244321664
+BINDS #139835947128936:
+ Bind#0
+  oacdty=02 mxl=22(22) mxlc=00 mal=00 scl=00 pre=00
+  oacflg=08 fl2=1000001 frm=00 csi=00 siz=24 off=0
+  kxsbbbfp=7f2e124fef10  bln=22  avl=03  flg=05
+  value=747
+EXEC #139835947128936:c=1000,e=603,p=0,cr=0,cu=0,mis=1,r=0,dep=1,og=4,plh=3765558045,tim=98244322311
+FETCH #139835947128936:c=0,e=15,p=0,cr=3,cu=0,mis=0,r=1,dep=1,og=4,plh=3765558045,tim=98244322342
+FETCH #139835947128936:c=0,e=1,p=0,cr=0,cu=0,mis=0,r=1,dep=1,og=4,plh=3765558045,tim=98244322356
+FETCH #139835947128936:c=0,e=4,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=3765558045,tim=98244322369
+STAT #139835947128936 id=1 cnt=2 pid=0 pos=1 obj=0 op='SORT ORDER BY (cr=3 pr=0 pw=0 str=1 time=16 us cost=3 size=234 card=13)'
+STAT #139835947128936 id=2 cnt=2 pid=1 pos=1 obj=21 op='TABLE ACCESS CLUSTER COL$ (cr=3 pr=0 pw=0 str=1 time=11 us cost=2 size=234 card=13)'
+STAT #139835947128936 id=3 cnt=1 pid=2 pos=1 obj=3 op='INDEX UNIQUE SCAN I_OBJ# (cr=2 pr=0 pw=0 str=1 time=6 us cost=1 size=0 card=1)'
+CLOSE #139835947128936:c=0,e=1,dep=1,type=3,tim=98244322439
+</pre></p>
+<p>Here all information about the columns is read from COL$ in the PDB. And if you look at TAB$ (tables), COL$ (table columns), IND$ (indexes), CONS$ and CDEF$ (constraints), you will see that they contain rows in a PDB where no user objects have been created. This is the case for all information related to tables: they are stored in CDB$ROOT and replicated into all other containers: PDB$SEED and all user created PDB. Only the information related to non-data objects, are stored only in one container.</p>
+<p>I&#8217;ve run a query to count the rows in CDB$ROOT and PDB$SEED and here is the result:
+<a href="../wp-insides/uploads/sites/2/2017/11/CaptureMultitenantNumRows.png" rel="lightbox[19428]"><img src="../wp-insides/uploads/sites/2/2017/11/CaptureMultitenantNumRows.png" alt="CaptureMultitenantNumRows" width="1134" height="852" class="aligncenter size-full wp-image-19430" /></a></p>
+<p>All rows in OBJ$ are replicated, which is expected because this is where the metadata link information is stored. But you see also all information related to tables that are also replicated, such as the 100000+ columns in COL$. And this is the reason why you do not see a big consolidation benefit when you look at the size of the SYSTEM tablespace in pluggable databases which do no contain any user data:
+<pre>
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------
+1    820      SYSTEM               YES     /u01/oradata/CDB1A/system01.dbf
+3    630      SYSAUX               NO      /u01/oradata/CDB1A/sysaux01.dbf
+4    80       UNDOTBS1             YES     /u01/oradata/CDB1A/undotbs01.dbf
+5    250      PDB$SEED:SYSTEM      NO      /u01/oradata/CDB1A/pdbseed/system01.dbf
+6    390      PDB$SEED:SYSAUX      NO      /u01/oradata/CDB1A/pdbseed/sysaux01.dbf
+7    5        USERS                NO      /u01/oradata/CDB1A/users01.dbf
+8    100      PDB$SEED:UNDOTBS1    NO      /u01/oradata/CDB1A/pdbseed/undotbs01.dbf
+9    270      PDB1:SYSTEM          YES     /u01/oradata/CDB1A/PDB1/system01.dbf
+10   440      PDB1:SYSAUX          NO      /u01/oradata/CDB1A/PDB1/sysaux01.dbf
+11   100      PDB1:UNDOTBS1        YES     /u01/oradata/CDB1A/PDB1/undotbs01.dbf
+12   5        PDB1:USERS           NO      /u01/oradata/CDB1A/PDB1/users01.dbf
+</pre></p>
+<p>Here I have 250MB in PDB$SEED which is supposed to contain only links to the 820GB SYSTEM tablespace, but there is a lot more than that.</p>
+<p>So, basically, not all the dictionary is consolidated in multitenant but only the non-data part such as those PL/SQL packages and the dictionary views definition. You can think about the multitenant option consolidation as an extension to sharing the Oracle Home among several databases. It concerns the software part only. But the part of the dictionary which contains data about system objects is replicated into all containers, and is read locally without a context switch. This also means that a patch or upgrade on them has to be run in all containers.</p>
+<p>With the fact that some information is replicated and some are not, comes the complexity to manage that in the dictionary views, and this will be the subject of the <a href="../multitenant-internals-int-and-intint-views/index.html" target="_blank">next blog post</a> about INT$INT$ views.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-194290" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/11/CaptureMultitenantNumRows.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

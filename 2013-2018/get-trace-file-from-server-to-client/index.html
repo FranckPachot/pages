@@ -1,0 +1,169 @@
+								<h1 class="entry-title">Get trace file from server to client</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The old way to get a user dump trace file, for sql_trace (10046), Optimizer compilation trace (10053), lock trace (10704), Optimizer execution trace (10507),&#8230; is to go to the server trace directory. But if you don&#8217;t have access to the server (as in the &#9729;) the modern (12<em>c</em>R2) way is to select from V$DIAG_TRACE_FILE_CONTENTS. Before everybody is on 12.2 I&#8217;m sharing here a sqlplus script that I use for a long time to get the trace file to the client.
+<span id="more-15542"></span>
+This is a script to run with sqlplus passing as a parameter the name of the trace file you want to write to (because the original name on the server is not very meaningful). I close all cursors to get all info such as STAT lines. I get the trace file name from v$diag_info. If a directory exists I use it. If not I create one, named UDUMP, which I&#8217;ll remove at the end. Then the file is read by utl_file and spooled on client though dbms_output. At the end, I remove the trace file from the server.</p>
+<p>Here is the script &#8211; comments welcome.</p>
+<p><pre>set serveroutput on feedback off verify off termout off linesize 1024 trimspool on echo off
+spool &amp;1..trc
+declare
+ fd utl_file.file_type;
+ line varchar2(1024);
+ l_tracename varchar2(512);
+ l_directory_path all_directories.directory_path%TYPE;
+ l_directory_name all_directories.directory_name%TYPE;
+ l_directory_created boolean;
+ procedure t (msg in varchar2) is begin dbms_output.put_line(msg); end;
+begin
+ /* use old parameter _cached_open_cursors to close all open cursors */
+ for r in (select 1 from v$session_cursor_cache where count&gt;0) loop
+  dbms_session.set_close_cached_open_cursors(true);
+  rollback;
+  commit;
+  dbms_session.set_close_cached_open_cursors(false);
+ end loop;
+ /* get trace directory and trace file name */
+ select value into l_directory_path from v$diag_info where name='Diag Trace';
+ select substr(replace(value,l_directory_path,''),2) into l_tracename from v$diag_info where name='Default Trace File';
+ /* get directory name for it, or try to create it */
+ l_directory_created:=false;
+ begin
+  select directory_name into l_directory_name from all_directories where directory_path = l_directory_path and rownum=1;
+ exception
+  when no_data_found then
+   begin
+    l_directory_name:='UDUMP';
+    execute immediate 'create directory '||l_directory_name||' as '''||l_directory_path||'''';
+    l_directory_created:=true;
+   exception when others then
+    raise_application_error(-20000,'You must CREATE DIRECTORY '||l_directory_name||' as ''' ||l_directory_path||'''; or be granted CREATE DIRECTORY.');
+   end;
+ end;
+ /* opens the trace file */
+ begin
+  fd:=utl_file.fopen(l_directory_name,l_tracename,'R');
+ exception when others then
+    raise_application_error(-20001,'Impossible to open file: '||l_tracename||' in '||l_directory_name||' ( '||l_directory_path||' )');
+ end;
+ /* read the trace file and prints it */
+ begin
+  loop
+   begin
+    utl_file.get_line(fd,line);
+    dbms_output.put_line(line);
+   exception
+    when no_data_found then exit;
+    when others then
+     dbms_output.put_line('!!! error while reading file '||l_tracename||' in '||l_directory_name||' ( '||l_directory_path||' )');
+   end;
+  end loop;
+  /* close and remove the file from the server */
+  utl_file.fclose(fd);
+  utl_file.fremove(l_directory_name,l_tracename);
+ exception
+  when others then
+   raise_application_error(-20002,'Impossible to remove: '||l_tracename||' in '||l_directory_name||' ( '||l_directory_path||' )');
+ end;
+ begin
+  /* drop directory if created */
+  if l_directory_created then execute immediate 'drop directory '||l_directory_name; end if;
+ exception
+  when others then
+   raise_application_error(-20002,'Impossible to remove directory: '||l_directory_name||' ( '||l_directory_path||' )'||sqlerrm);
+ end;
+end;
+/
+spool off
+</pre></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-155430"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-9485">
+				<div id="div-comment-9485" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e1110cd0d87aa8738f48d4d486e1db3c?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Javier</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-9485">
+			November 29, 2017 at 14 h 19 min</a>		</div>
+
+		<p>Hi Franck,
+I was checking your code as I&#8217;m in need of getting trace files located my remote DB machine.
+As I don&#8217;t have access to this remote server, Thought your code could help. </p>
+<p>Anyway, after launching this piece of code, I&#8217;ve been returned  this error message:
+<pre>
+ERROR in line 1:
+ORA-20001: Impossible to open file: SPR01_ora_43123096.trc in UDUMP ( /oradesa11g/diag/rdbms/spr01/SPR01/trace )
+ORA-06512: in line 38
+</pre></p>
+<p>Just changed the code (adding sqlerrm and sqlcode) a bit to show the real error happening at the following sentence: utl_file.fopen(l_directory_name,l_tracename,&#8217;R&#8217;);</p>
+<p>I ended up with the error:
+<pre>
+ORA-20001: Impossible to open file: SPR01_ora_24314224.trc in UDUMP ( /oradesa11g/diag/rdbms/spr01/SPR01/trace ) ORA-29283: invalid file operation
+</pre></p>
+<p>Checked on Don Burleson site for a quick error explanation (<a href="http://www.dba-oracle.com/t_ora_29283_invalid_file_operation.htm" rel="nofollow">http://www.dba-oracle.com/t_ora_29283_invalid_file_operation.htm</a>) and it seems to be a problem with privilege access at SO level.</p>
+<p>If I have not misunderstand you, the only way to do what I am expecting would be having access privileges to the DB server OR having 12cR2 in order to use that mentioned view?</p>
+<p>Thanks in advance and thanks for this recipe.</p>
+<p>Btw, I would delete the t procedure you are not longer using.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-94861"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-9485' onclick='return addComment.moveForm( "div-comment-9485", "9485", "respond", "15542" )' aria-label='Reply to Javier to Javier'>Reply to Javier</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-9489">
+				<div id="div-comment-9489" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-9489">
+			November 29, 2017 at 17 h 35 min</a>		</div>
+
+		<p>You should not waste time on this dba-oracle.com in my opinion <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" />
+Access privileges cannot be a problem because the file is written and read by same user and even same process.
+Are you sure the file is there? Maybe you didn&#8217;t trace anything.
+You can run this before to be sure there&#8217;s something written to the trace:
+<pre>
+exec dbms_system.ksdwrt(1,'hello');
+</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-94901"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-9489' onclick='return addComment.moveForm( "div-comment-9489", "9489", "respond", "15542" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

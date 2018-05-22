@@ -1,0 +1,164 @@
+								<h1 class="entry-title">12cR2: lockdown profiles and ORA-01219</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you cannot open a database, you will get some users unhappy. When you cannot open multitenant database, then the number of unhappy users is multiplied by the number of PDBs. I like to encounter problems in my lab before seeing them in production. Here is a case where I&#8217;ve lost a file. I don&#8217;t care about the tablespace, but would like to put it offline and at least be able to open the database.
+<span id="more-14904"></span></p>
+<h3>ORA-01113</h3>
+<p>So, it&#8217;s my lab, I dropped a file while the database was down. The file belongs to a PDB but I cannot open the CDB:
+<pre>
+SQL&gt; startup
+ORACLE instance started.
+
+Total System Global Area 1577058304 bytes
+Fixed Size                  8793208 bytes
+Variable Size            1124074376 bytes
+Database Buffers          436207616 bytes
+Redo Buffers                7983104 bytes
+Database mounted.
+ORA-01113: file 23 needs media recovery
+ORA-01110: data file 23: '/tmp/STATSPACK.dbf'
+</pre>
+Yes this is a lab, I like to put datafiles in /tmp (lab only) and I was testing my Statspack scripts for an article to be published soon. I&#8217;ve removed the file and have no backup. I recommand to do nasty things on labs, because those things sometimes happen on production systems and better be prepared. This recommandation supposes you cannot mistake your lab prompt with a production one of course.</p>
+<h3>ORA-01157</h3>
+<p>The database is in mount. I cannot open it:
+<pre>
+SQL&gt; alter database open;
+alter database open
+*
+ERROR at line 1:
+ORA-01157: cannot identify/lock data file 23 - see DBWR trace file
+ORA-01110: data file 23: '/tmp/STATSPACK.dbf'
+</pre>
+This is annoying. I would like to deal with this datafile later and open the CDB. I accept that the PDB it belongs to (PDB1 here) cannot be opened but I wish I can open the other ones quickly.</p>
+<h3>ORA-01219</h3>
+<p>Let&#8217;s go to the PDB and take the datafile offline:
+<pre>
+SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; alter database datafile 23 offline for drop;
+alter database datafile 23 offline for drop
+*
+ERROR at line 1:
+ORA-00604: error occurred at recursive SQL level 1
+ORA-01219: database or pluggable database not open: queries allowed on fixed tables or views only
+</pre></p>
+<p>This is quite annoying. I know that the database is not open. I know that the pluggable database is not open. I want to put a datafile offline, and this is an operation that concerns only the controlfile. No need to have the database opened. Actually, I need to put this datafile offline in order to open the CDB.</p>
+<h3>SQL_TRACE</h3>
+<p>This is annoying, but you know why Oracle is the best database system: troubleshooting. I have an error produced by recursive SQL (ORA-00604) and I want to know the SQL statement that raised this error:</p>
+<p><pre>
+SQL&gt; alter session set sql_trace=true;
+alter session set sql_trace=true;
+*
+ERROR at line 1:
+ORA-00604: error occurred at recursive SQL level 1
+ORA-01219: database or pluggable database not open: queries allowed on fixed tables or views only
+</pre></p>
+<p>Oh yes, I forgot that I cannot issue any SQL statement. But you know why Oracle is the best database system: troubleshooting.</p>
+<p><pre>
+SQL&gt; oradebug setmypid
+Statement processed.
+SQL&gt; oradebug EVENT 10046 TRACE NAME CONTEXT FOREVER, LEVEL 12;
+Statement processed.
+
+SQL&gt; alter database datafile 23 offline for drop;
+alter database datafile 23 offline for drop
+*
+ERROR at line 1:
+ORA-00604: error occurred at recursive SQL level 1
+ORA-01219: database or pluggable database not open: queries allowed on fixed tables or views only
+
+SQL&gt; oradebug EVENT 10046 TRACE NAME CONTEXT OFF;
+Statement processed.
+SQL&gt; oradebug TRACEFILE_NAME
+/u01/app/oracle/diag/rdbms/orcl/orcl1/trace/orcl1_ora_20258.trc
+</pre></p>
+<p>Here is the trace:
+<pre>
+*** 2017-02-21T13:36:51.239026+01:00 (PDB1(3))
+=====================
+PARSING IN CURSOR #140359700679600 len=34 dep=0 uid=0 oct=35 lid=0 tim=198187306591 hv=3069536809 ad='7b8db148' sqlid='dn9z45avgauj9'
+alter database datafile 12 offline
+END OF STMT
+PARSE #140359700679600:c=3000,e=71171,p=0,cr=0,cu=0,mis=1,r=0,dep=0,og=1,plh=0,tim=198187306590
+WAIT #140359700679600: nam='PGA memory operation' ela= 30 p1=327680 p2=1 p3=0 obj#=-1 tim=198187307242
+WAIT #140359700679600: nam='control file sequential read' ela= 14 file#=0 block#=1 blocks=1 obj#=-1 tim=198187307612
+WAIT #140359700679600: nam='control file sequential read' ela= 13 file#=0 block#=16 blocks=1 obj#=-1 tim=198187307743
+WAIT #140359700679600: nam='control file sequential read' ela= 6 file#=0 block#=18 blocks=1 obj#=-1 tim=198187307796
+WAIT #140359700679600: nam='control file sequential read' ela= 9 file#=0 block#=1119 blocks=1 obj#=-1 tim=198187307832
+</pre>
+This is expected. I&#8217;m in PDB1 (container id 3) and run my statement to put the datafile offline.
+And then it switches to CDB$ROOT (container 0):
+<pre>
+*** 2017-02-21T13:36:51.241022+01:00 (CDB$ROOT(1))
+=====================
+PARSING IN CURSOR #140359700655928 len=248 dep=1 uid=0 oct=3 lid=0 tim=198187308584 hv=1954812753 ad='7b67d9c8' sqlid='6qpmyqju884uj'
+select ruletyp#, ruleval, status, ltime                                       from lockdown_prof$                                                           where prof#=:1 and level#=:2                                                  order by ltime
+END OF STMT
+PARSE #140359700655928:c=2000,e=625,p=0,cr=0,cu=0,mis=1,r=0,dep=1,og=4,plh=0,tim=198187308583
+=====================
+PARSE ERROR #140359700655928:len=249 dep=1 uid=0 oct=3 lid=0 tim=198187308839 err=1219
+select ruletyp#, ruleval, status, ltime                                       from lockdown_prof$                                                           where prof#=:1 and level#=:2                                                  order by ltime
+
+*** 2017-02-21T13:36:51.241872+01:00 (PDB1(3))
+EXEC #140359700679600:c=4000,e=2684,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=0,tim=198187309428
+ERROR #140359700679600:err=604 tim=198187309511
+</pre>
+I have a parse error when reading LOCKDOWN_PROF$ in the root container. It is a table, a dictionary table stored in SYSTEM tablespace. The CDB is not open. It is not accessible, reason for the error message.</p>
+<p>Then, I remember that I&#8217;ve set a lockdown profile at CDB level. It doesn&#8217;t make sense for CDB$ROOT, but I&#8217;ve set it to get it as default for all new created PDBs. Any statement that may be disabled by a lockdown profile has to read the lockdown profile rules stored in root. And here I learn that this occurs when parsing the DDL statement, not at execution time.</p>
+<p>In my opinion this is a bug. Either I should not set pdb_lockdown at CDB level, or it shouldn&#8217;t be checked when the CDB is closed. Because then any DDL will fail. I&#8217;m not blocked by the lockdown profile here. Just because the lockdown profile cannot be read.</p>
+<h3>pdb_lockdown</h3>
+<p>Now I know how to workaround the problem: unset the lockdown profile, offline my datafile, open the CDB, open the PDB, drop the tablespace.</p>
+<p><pre>SQL&gt; alter system set pdb_lockdown='';
+System altered.
+SQL&gt; alter session set container=pdb1;
+Session altered.
+SQL&gt; alter database datafile 23 offline for drop;
+Database altered.
+SQL&gt; alter session set container=cdb$root;
+Session altered.
+SQL&gt; alter database open;</pre></p>
+<p>Lockdown profile is a very nice feature allowing fine grain control on what can be done by users on a PDB, even admins ones. But it is a new mecanism, leading to situations we have never seen before. Don&#8217;t forget the power (and fun) of troubleshooting.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-149050"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-6981">
+				<div id="div-comment-6981" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e2c1145be5d8ca527fde31649dd4f446?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://weibo.com/tomszrp' rel='external nofollow' class='url'>thomas</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6981">
+			February 24, 2017 at 6 h 52 min</a>		</div>
+
+		<p>it fixed on opc in my test
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-69821"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6981' onclick='return addComment.moveForm( "div-comment-6981", "6981", "respond", "14904" )' aria-label='Reply to thomas to thomas'>Reply to thomas</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

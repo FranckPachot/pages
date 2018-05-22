@@ -1,0 +1,176 @@
+								<h1 class="entry-title">Oracle multitenant dictionary: upgrade</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This is a second part of the <a href="http://www.dbi-services.com/index.php/blog/entry/oracle-multitenant-dictionary-metadata-links">previous post</a> about metadata link. I&#8217;ve shown how a sharing=metadata function becomes a sharing=none function when it is changed in the pdb &#8211; i.e when not having the same DDL, not having a different signature.</p>
+<p>Here is another experimentation doing the opposite: change the function in root and see what happens in the pdb. Again playing with internals in order to understand the &#8216;upgrade by unplug-plug&#8217; feature available in 12c multi-tenant (and single-tenant).</p>
+<h3>Create shared function</h3>
+<p>I&#8217;m doing the same as in the previous post:</p>
+<pre>SQL&gt; alter session set "_oracle_script"=true;
+Session altered.
+
+SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+SQL&gt; create function DEMO_FUNCTION1 sharing=metadata return varchar2 as begin return 'demo'; end;
+  2  /
+Function created.
+
+SQL&gt; create function DEMO_FUNCTION0 sharing=metadata return varchar2 as begin return DEMO_FUNCTION1; end;
+  2  /
+Function created.
+
+SQL&gt; grant execute on DEMO_FUNCTION0 to public;
+Grant succeeded.
+</pre>
+<pre class="brush: sql; gutter: true; first-line: 1">now in the pdb:</pre>
+<pre>SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; create function DEMO_FUNCTION1 sharing=metadata return varchar2 as begin return 'demo'; end;
+  2  /
+Function created.
+
+SQL&gt; create function DEMO_FUNCTION0 sharing=metadata return varchar2 as begin return DEMO_FUNCTION1; end;
+  2  /
+Function created.</pre>
+<h3>Check multitenant dictionary</h3>
+<p>First in <strong>root</strong>:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS   FLAGS SHAR SIGNATURE
+----- -------------- ------ ------- ---- --------------------------------
+92370 DEMO_FUNCTION0      1 5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+92369 DEMO_FUNCTION1      1 5308416 MDL  0BCDC8C960AD833F95F0595EEBB70745
+</pre>
+<p>And in the <strong>pdb</strong>:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS   FLAGS SHAR SIGNATURE
+----- -------------- ------ ------- ---- --------------------------------
+91829 DEMO_FUNCTION0      1 5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+91828 DEMO_FUNCTION1      1 5308416 MDL  0BCDC8C960AD833F95F0595EEBB70745
+</pre>
+<p>Nothing special here: different object_id but same signature and sharing=metadata.</p>
+<h3>Upgrade the root</h3>
+<p>I&#8217;m now &#8216;upgrading&#8217; the function DEMO_FUNCTION1 in the <strong>root</strong>:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; create or replace function DEMO_FUNCTION1 sharing=metadata return varchar2 as begin return 'demo v2'; end;
+  2  /
+Function created.
+</pre>
+<p>and nothing in the<strong> pdb</strong></p>
+<p>Here is what is stored in both container dictionaries:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS      FLAGS SHAR SIGNATURE
+----- -------------- ------ ---------- ---- --------------------------------
+92370 DEMO_FUNCTION0      1    5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+92369 DEMO_FUNCTION1      1    5308416 MDL  9772AA08AFD3F9F90BC9BDB9DE35A1F8
+
+SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+ OBJ# LINE SOURCE
+----- ---- --------------------------------------------------
+92370    1 function DEMO_FUNCTION0                  return va
+           rchar2 as begin return DEMO_FUNCTION1; end;
+
+92369    1 function DEMO_FUNCTION1                  return va
+                      rchar2 as begin return 'demo v2'; end;
+SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS      FLAGS SHAR SIGNATURE
+----- -------------- ------ ---------- ---- --------------------------------
+91829 DEMO_FUNCTION0      1    5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+91828 DEMO_FUNCTION1      1    5308416 MDL  0BCDC8C960AD833F95F0595EEBB70745
+
+SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+no rows selected
+</pre>
+<p>Ok. In the <strong>root</strong> the function has changed, and has a new signature. But nothing changed in the <strong>pdb</strong>. The DDL you did in the<strong> root</strong> has changed only the <strong>root</strong> dictionary.</p>
+<p>Then, what happens if we execute the function from the <strong>pdb</strong>?</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; select DEMO_FUNCTION1 from dual;
+
+DEMO_FUNCTION1
+--------------------------------------------
+demo v2
+
+SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select DEMO_FUNCTION1 from dual;
+
+DEMO_FUNCTION1
+--------------------------------------------
+demo
+</pre>
+<p>The<strong> pdb</strong> function returns the old value. Do you think it&#8217;s an expected result because <strong>pdb</strong> has not been upgraded? No. we have a problem here. Look at the above queries on SOURCE$: the code that returns &#8216;demo&#8217; is not stored anywhere.</p>
+<p>When we run something that is not stored anywhere, it probably comes from a cache invalidation that did not occur. Let&#8217;s flush the shared pool:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; alter system flush shared_pool;
+System altered.
+
+SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select DEMO_FUNCTION1 from dual;
+
+DEMO_FUNCTION1
+--------------------------------------------
+demo v2
+</pre>
+<p>Good. We see the upgraded version now. We didn&#8217;t have anything to do in the <strong>pdb</strong>. The metadata link is still use and this is how &#8216;upgrade by unplug-plug&#8217; works: when the upgrade concerns only sharing=metadata oracle objects that are stored only in<strong> root</strong>, then the <strong>pdb</strong> is automatically upgraded as it follows the links. This is how we can apply quickly a patch or a PSU: plug it into a CDB that already has the patch applied.</p>
+<p>So, what happened to the signature?</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS      FLAGS SHAR SIGNATURE
+----- -------------- ------ ---------- ---- --------------------------------
+91829 DEMO_FUNCTION0      5    5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+91828 DEMO_FUNCTION1      1    5308416 MDL  9772AA08AFD3F9F90BC9BDB9DE35A1F8
+
+SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+no rows selected
+
+</pre>
+<p>The function has been recompiled when it was executed. It has never been invalidated (and that&#8217;s why we had to flush the shared pool) but the load which has followed the metadata link has detected that the signature is not the same and has recompiled it. The signature is the same. And dependent objects are invalidated (they will be recompiled when executed).</p>
+<p>This is a correct behaviour except the fact that we had to flush the shared pool. Anyway, that occurs only when we upgrade the <strong>root</strong> which should flush the shared pool or when we plug a new <strong>pdb</strong> which has nothing yet in shared pool.</p>
+<p>However, when you upgrade from 12.1.0.1 to 12.1.0.2 there are a lot of changes and a lot of dependencies and updating the signatures is not sufficient. The datapatch script has to update our application metadata, which is stored into the <strong>pdb</strong> dictionary. And this is why &#8216;upgrade by unplug-plug&#8217; is not a lot faster than a non-CDB upgrade. But that may be improved in future versions.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5590"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

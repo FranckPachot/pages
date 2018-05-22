@@ -1,0 +1,206 @@
+								<h1 class="entry-title">SecureFiles on multi-datafiles tablespaces</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When we have a tablespace with multiple datafiles, we are used to seeing the datafiles filled evenly, the extents being allocated in a round-robin fashion. In the old time, we used that to maximize performance, distributing the tables to all disks. Today, we use LVM striping, maximum Inter-Policy,  ASM even distribution. And we may even use bigfile tablespaces, so that we don&#8217;t care about having multiple datafiles.
+<span id="more-16000"></span>
+But recently, during test phase of migration, I came upon something like this:
+<a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/04/SecureFile003.png" rel="lightbox[16000]"><img src="../wp-insides/uploads/sites/2/2017/04/SecureFile003-1024x436.png" alt="SecureFile003" width="1024" height="436" class="alignnone size-large wp-image-16006" /></a></p>
+<p>To reproduce the case, I&#8217;ve created a tablespace with 8 datafiles:
+<pre>
+SQL&gt; create tablespace MYTABS datafile
+  2  '/tmp/MYTABS01.dbf' size 1M autoextend on maxsize 100M,
+  3  '/tmp/MYTABS02.dbf' size 1M autoextend on maxsize 100M,
+  4  '/tmp/MYTABS03.dbf' size 1M autoextend on maxsize 100M,
+  5  '/tmp/MYTABS04.dbf' size 1M autoextend on maxsize 100M,
+  6  '/tmp/MYTABS05.dbf' size 1M autoextend on maxsize 100M,
+  7  '/tmp/MYTABS06.dbf' size 1M autoextend on maxsize 100M,
+  8  '/tmp/MYTABS07.dbf' size 1M autoextend on maxsize 100M,
+  9  '/tmp/MYTABS08.dbf' size 1M autoextend on maxsize 100M
+ 10  /
+
+Tablespace created.
+</pre></p>
+<h3>SecureFiles</h3>
+<p>This was a 11g to 12c migration, with Data Pump, and a good occasion to convert all LOB to SecureFiles with the transform=lob_storage:securefile parameter. And this tablespace is the one where the LOB segments are stored. I reproduced it with:</p>
+<p><pre>SQL&gt; create table MYTABLE ( x clob ) tablespace USERS
+  2  LOB(x) store as securefile MYLOBSEG (tablespace MYTABS disable storage in row);
+
+Table created.
+</pre></p>
+<p>Then I inserted about 80MB:</p>
+<p><pre>SQL&gt; insert into MYTABLE select lpad('x',100000) from xmltable('1 to 8000') ;
+8000 rows created.
+
+SQL&gt; select file_id,file_name,blocks,user_blocks from dba_data_files where tablespace_name='MYTABS' order by file_id;
+
+   FILE_ID FILE_NAME                          BLOCKS USER_BLOCKS
+---------- ------------------------------ ---------- -----------
+        61 /tmp/MYTABS01.dbf                     128         120
+        62 /tmp/MYTABS02.dbf                     128         120
+        63 /tmp/MYTABS03.dbf                     128         120
+        64 /tmp/MYTABS04.dbf                    9344        9336
+        65 /tmp/MYTABS05.dbf                     128         120
+        66 /tmp/MYTABS06.dbf                     128         120
+        67 /tmp/MYTABS07.dbf                     128         120
+        68 /tmp/MYTABS08.dbf                     128         120
+
+8 rows selected.
+
+SQL&gt; select file_id,segment_type,sum(blocks) from dba_extents where tablespace_name='MYTABS' group by file_id,segment_type order by file_id,segment_type;
+
+   FILE_ID SEGMENT_TYPE       SUM(BLOCKS)
+---------- ------------------ -----------
+        64 LOBSEGMENT                9216
+        65 LOBINDEX                     8
+        65 LOBSEGMENT                  24
+</pre></p>
+<p>And I continued to load rows, and observed the datafiles filled to their maxsize one after the other, without numeric or alphabetical order.</p>
+<p><pre>SQL&gt; select file_id,file_name,blocks,user_blocks from dba_data_files where tablespace_name='MYTABS' order by file_id;
+
+   FILE_ID FILE_NAME                          BLOCKS USER_BLOCKS
+---------- ------------------------------ ---------- -----------
+        61 /tmp/MYTABS01.dbf                    8320        8312
+        62 /tmp/MYTABS02.dbf                   12416       12408
+        63 /tmp/MYTABS03.dbf                   12416       12408
+        64 /tmp/MYTABS04.dbf                   12416       12408
+        65 /tmp/MYTABS05.dbf                     128         120
+        66 /tmp/MYTABS06.dbf                     128         120
+        67 /tmp/MYTABS07.dbf                     128         120
+        68 /tmp/MYTABS08.dbf                     128         120
+
+8 rows selected.
+
+SQL&gt; select file_id,segment_type,sum(blocks) from dba_extents where tablespace_name='MYTABS' group by file_id,segment_type order by file_id,segment_type;
+
+   FILE_ID SEGMENT_TYPE       SUM(BLOCKS)
+---------- ------------------ -----------
+        61 LOBSEGMENT                8192
+        62 LOBSEGMENT               12288
+        63 LOBSEGMENT               12288
+        64 LOBSEGMENT               12288
+        65 LOBINDEX                     8
+        65 LOBSEGMENT                  24</pre></p>
+<p>Here are some screenshots during this load</p>
+<p><a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/04/SecureFile001.png" rel="lightbox[16000]"><img src="../wp-insides/uploads/sites/2/2017/04/SecureFile001-1024x436.png" alt="SecureFile001" width="1024" height="436" class="alignnone size-large wp-image-16004" /></a></p>
+<p><a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/04/SecureFile002.png" rel="lightbox[16000]"><img src="../wp-insides/uploads/sites/2/2017/04/SecureFile002-1024x436.png" alt="SecureFile002" width="1024" height="436" class="alignnone size-large wp-image-16005" /></a></p>
+<p><a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/04/SecureFile003.png" rel="lightbox[16000]"><img src="../wp-insides/uploads/sites/2/2017/04/SecureFile003-1024x436.png" alt="SecureFile003" width="1024" height="436" class="alignnone size-large wp-image-16006" /></a></p>
+<h3>BasicFiles</h3>
+<p>This occurs only with SecureFiles. With the same load into LOB stored as BasicFile I got the following distribution:
+<a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/04/SecureFile004.png" rel="lightbox[16000]"><img src="../wp-insides/uploads/sites/2/2017/04/SecureFile004-1024x436.png" alt="SecureFile004" width="1024" height="436" class="alignnone size-large wp-image-16009" /></a></p>
+<p>Note that the inserts to BasicFile were about two times slower than the same into SecureFiles. </p>
+<h3>So what?</h3>
+<p>I don&#8217;t see any bad consequences about that, and this may even be an improvement when concurrent sessions are loading the LOBs. When the datafile picked-up looks random, a guess is that it depends on a process ID to try to distribute the concurrent load. And if you want to distribute data over multiple disks, then you should do it at a lower level. However, it is 30 years behavior that changes and it&#8217;s better to be aware of it: datafiles may reach their maxsize even when the tablespace is not full. I order to be sure that it is the expected behavior, I opened an SR with easy to reproduce testcase. Status is &#8216;review update&#8217; for 9 days (SR 3-14677784041) and I&#8217;ll update this post is I get an answer.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-160010" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/04/SecureFile003-1024x436.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-7365">
+				<div id="div-comment-7365" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6c43bcbd04861948195a1e938b0b38cb?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Clemens Bleile</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7365">
+			April 23, 2017 at 19 h 28 min</a>		</div>
+
+		<p>Hi Franck,
+this may be related to deduplication (which requires the advanced compression option). I.e. better deduplication possible if everything remains in a single file initially?
+Interestingly the distribution over all files work correctly if you create the LOB deduplicated and change it to keep_duplicates:
+<pre>
+create table MYTABLE ( x clob ) tablespace USERS
+LOB(x) store as securefile MYLOBSEG (tablespace MYTABS disable storage in row deduplicate);
+insert into MYTABLE select lpad('x',100000) from xmltable('1 to 8000') ;
+--&gt; 256 Blocks allocated in file /tmp/MYTABS04.dbf
+</pre>
+When you then do a
+<pre>alter table mytable modify lob (x) (keep_duplicates);</pre>
+the lob-data is redistributed equally over all files. I.e. after the command completed the testcase showed 1152 Blocks allocated in each and every datafile of the MYTABS tablespace.</p>
+<p>Regards
+Clemens
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73661"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7365' onclick='return addComment.moveForm( "div-comment-7365", "7365", "respond", "16000" )' aria-label='Reply to Clemens to Clemens Bleile'>Reply to Clemens</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7366">
+				<div id="div-comment-7366" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7366">
+			April 24, 2017 at 11 h 26 min</a>		</div>
+
+		<p>Thanks Clemens,
+Yes, it seems that alter table distributes evenly. However, it seems it does not release previous space: <a href="https://twitter.com/FranckPachot/status/856438458935541761" rel="nofollow">https://twitter.com/FranckPachot/status/856438458935541761</a>
+&#8230; I&#8217;ll need to investigate further those SecureFiles to trust them&#8230;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73671"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7366' onclick='return addComment.moveForm( "div-comment-7366", "7366", "respond", "16000" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-7367">
+				<div id="div-comment-7367" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6c43bcbd04861948195a1e938b0b38cb?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Clemens Bleile</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7367">
+			April 24, 2017 at 11 h 55 min</a>		</div>
+
+		<p>Hello Franck,</p>
+<p>if you switch off &#8220;Tablespace-level space (Extent) pre-allocation.&#8221; then the extents are allocated evenly across the files. E.g.</p>
+<p>ALTER SYSTEM SET &#8220;_ENABLE_SPACE_PREALLOCATION&#8221; = 0 scope=memory;</p>
+<p>See My Oracle Support Note:
+SMCO (Space Management Coordinator) For Autoextend On Datafiles And How To Disable/Enable (Doc ID 743773.1)
+and
+<a href="https://technology.amis.nl/wp-content/uploads/2013/04/SecureFile-Lobs.pdf" rel="nofollow">https://technology.amis.nl/wp-content/uploads/2013/04/SecureFile-Lobs.pdf</a></p>
+<p>Regards
+Clemens
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73681"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7367' onclick='return addComment.moveForm( "div-comment-7367", "7367", "respond", "16000" )' aria-label='Reply to Clemens to Clemens Bleile'>Reply to Clemens</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

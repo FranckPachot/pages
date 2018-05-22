@@ -1,0 +1,135 @@
+								<h1 class="entry-title">12c Multitenant internals: PDB replay DDL for common users</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In multitenant, you can create common Users, Roles, and Profiles. You create them in CDB$ROOT, with the CONTAINER=ALL clause (which is optional because it is the only possible value when connected to CDB$ROOT) but they are visible to all containers. As the goal of multitenant is to avoid to duplicate common metadata to all containers, You may think that they are visible through those magic metadata links. But that&#8217;s actually wrong: they are simply replicated with a very simple mechanism: the DDL for common objects is replayed into each user PDB.
+<span id="more-20219"></span>
+I&#8217;m connected to CDB2&#8217;s CDB$ROOT and I have two pluggable databases:
+<pre>
+SQL&gt; show pdbs
+
+  CON_ID CON_NAME   OPEN MODE    RESTRICTED
+  ------ --------   ---- ----    ----------
+       2 PDB$SEED   READ ONLY    NO
+       3 PDB1       READ WRITE   NO
+       4 PDB2       MOUNTED
+</pre></p>
+<p>PDB1 is opened and PDB2 is closed.</p>
+<h3>PDB_SYNC$</h3>
+<p>In this example, I&#8217;ll query PDB_SYNC$ which is the table where Oracle stores all DDL for common users, roles, or profiles in order to be able to replay it later:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id=1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP    SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------    ------ -----                ----             --------   --------     ------   ------- -------
+       1        0    852610 26-jan-17 02:57:26   CTXSYS                      SYS               5         1 alter user CTXSYS account unlock identified by *^@
+       1        0    853177 26-jan-17 02:57:34   CTXSYS                      SYS               5         2 alter user CTXSYS password expire account lock^@
+       1        0   1405359 26-jan-17 03:31:31   SYSTEM                      SYS               5         3 alter user system account lock password expire^@
+       1        0   1408693 23-dec-17 11:34:43   SYS                         SYS               5         4 alter user sys account unlock identified by *^@
+       1        0   1408703 23-dec-17 11:34:43   SYSTEM                      SYS               5         5 alter user system account unlock identified by *^@
+       1        0         0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1         5
+</pre></p>
+<p>I excluded the bitand(flags,8)=8 because it concerns application containers. I query with the container() to show the con_id but this is for con_id=1 which is the CDB$ROOT.</p>
+<p>You can see some DDL for CTXSYS recorded on January 26th which is the day where this release (12.2.0.1) was built. I used a template with datafiles to create the CDB with DBCA. And you see some DDL to unlock SYS and SYSTEM on December 23rd when I created the database. You can also see that they are ordeded in sequence with REPLAY#.</p>
+<p>More interesting is the OPCODE=-1 which is PDB$LASTREPLAY and looks like the last value of REPLAY#. This means that on this container, CDB$ROOT, all statements where REPLAY#&lt;=5 was run.</p>
+<p>With a similar query, I query the opened PDBs:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id&gt;1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP   SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------   ------ -----                ----             --------   --------     ------   ------- -------
+       3        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1         5
+</pre></p>
+<p>There only one row here in CON_ID=3, which is PDB1: the PDB$LASTREPLAY mentioning that all statements up to REPLAY=5 have been run also in this container.
+I don&#8217;t see PDB2 (CON_ID=4) here because the container() clause cannot query closed containers.</p>
+<h3>CONTAINER=ALL DDL</h3>
+<p>I&#8217;ll run some common DLL to create a profile, a role and a user:
+<pre>
+SQL&gt; create profile C##PROFILE1 limit inactive_account_time 15 container=all;
+Profile C##PROFILE1 created.
+
+SQL&gt; create role C##ROLE1 container=all;
+Role C##ROLE1 created.
+
+SQL&gt; create user C##USER1 identified by oracle container=all;
+User C##USER1 created.
+
+SQL&gt; alter user C##USER1 profile C##PROFILE1;
+User C##USER1 altered.
+
+SQL&gt; grant C##ROLE1 to C##USER1 container=all;
+Grant succeeded.
+</pre></p>
+<p>The C## prefix is mandatory to isolate the common user namespace. You can change it with the common_prefix parameter. You can even set it to the empty string, but then you have a risk of namespace collision when you plug a PDB between CDB having different common profiles or roles.
+The CONTAINER=ALL is the default and the only possibility when connected to CDB$ROOT so it is optional. I recommend to mention it explicitly in order to avoid problems when running the same DDL in CDB$ROOT and in PDBs.</p>
+<p>All those DDL have been recorded into PDB_SYNC$ and the REPLAY# has been increased:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id=1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP    SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------    ------ -----                ----             --------   --------     ------   ------- -------
+       1        0    852610 26-jan-17 02:57:26   CTXSYS                      SYS               5         1 alter user CTXSYS account unlock identified by *^@
+       1        0    853177 26-jan-17 02:57:34   CTXSYS                      SYS               5         2 alter user CTXSYS password expire account lock^@
+       1        0   1405359 26-jan-17 03:31:31   SYSTEM                      SYS               5         3 alter user system account lock password expire^@
+       1        0   1408693 23-dec-17 11:34:43   SYS                         SYS               5         4 alter user sys account unlock identified by *^@
+       1        0   1408703 23-dec-17 11:34:43   SYSTEM                      SYS               5         5 alter user system account unlock identified by *^@
+       1        0   1466615 29-dec-17 09:26:56   C##PROFILE1                 SYS               7         6 create profile C##PROFILE1 limit inactive_account_time 15 container=all^@
+       1        0   1466641 29-dec-17 09:26:57   C##ROLE1                    SYS               3         7 create role C##ROLE1 container=all^@
+       1        0   1466748 29-dec-17 09:26:58   C##USER1                    SYS               1         8 create user C##USER1 identified by * container=all^@
+       1        0   1466812 29-dec-17 09:26:59   C##USER1                    SYS               5         9 alter user C##USER1 profile C##PROFILE1^@
+       1        0   1466853 29-dec-17 09:26:59   C##USER1         C##ROLE1   SYS              10        10 grant C##ROLE1 to C##USER1 container=all^@
+       1        0         0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+</pre></p>
+<p>PDB1 (CON_ID=3) was opened read write, and then has been synchronized (the DDL has been run in the container to create the same profile, role and user) and the PDB$LASTREPLAY has been updated in this container to show that all has been done:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id&gt;1 and bitand(flags,8)!=8 order by con_id,opcode,replay#;
+%nbsp;
+  CON_ID   SCNWRP   SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------   ------ -----                ----             --------   --------     ------   ------- -------
+       3        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+</pre></p>
+<h3>MOUNTED or READ ONLY</h3>
+<p>I open the PDB2 read only because I want to see what is in PDB_SYNC$ there. But READ ONLY means that the DDL cannot be run because no write is allowed in the local dictionary.
+<pre>
+SQL&gt; alter pluggable database PDB2 open read only;
+Pluggable database PDB2 altered.
+</pre></p>
+<p>Running the same query as above, I can see that PDB2 (CON_ID=4) is synchronized only up to the statements with REPLAY#=5 because my DDL was not replicated there.
+<pre>SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id&gt;1 and bitand(flags,8)!=8 order by con_id,opcode,replay#;
+
+  CON_ID   SCNWRP   SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------   ------ -----                ----             --------   --------     ------   ------- -------
+       3        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+       4        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1         5
+</pre></p>
+<h3>Sync at OPEN</h3>
+<p>When I open PDB2 in read write mode, the DDL can be synchronized:
+<pre>
+SQL&gt; alter pluggable database PDB2 open read write force;
+Pluggable database PDB2 altered.
+</pre></p>
+<p>At open, the DDL from REPLAY#&gt;5 has been replayed and once opened the PDB is in sync with CDB$ROOT:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id&gt;1 and bitand(flags,8)!=8 order by con_id,opcode,replay#;
+
+  CON_ID   SCNWRP   SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------   ------ -----                ----             --------   --------     ------   ------- -------
+       3        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+       4        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+</pre></p>
+<h3>So what?</h3>
+<p>The common users, roles and profiles are not stored only in CDB$ROOT to be shared, but rather replicated to all PDBs. The DDL is replicated synchronously to all opened pluggable databases in read write, and stored into the CDB$ROOT PDB_SYNC$ table to be replayed later when non-synced PDBs are opened. I&#8217;ll show in the <a href="../12c-multitenant-internals-pdb_plug_in_violations/index.html" target="_blank">next post</a> what happens when the DDL is in error.</p>
+<p>Note that even when all pluggable databases are opened read write, the DDL is stored and they are purged later (when replayed on all PDBs) because they are needed when you create a new PDB and open it. The PDB$SEED has REPLAY#=0 for PDB$LASTREPLAY which means that all statements will be replayed.</p>
+<p>This is 12.2.0.1 where this mechanism is only for common users, roles and profiles having DDL in CDB$ROOT. With application containers, more than that is recorded: all DML and DDL run between the &#8216;begin install/upgrade/patch&#8217; and &#8216;end install/upgrade/patch&#8217; in the application root. Then, the statements can be replayed into the application PDB with a simple SYNC command. In the future release (18<i>c</i>) we expect to have that application root behavior ported to CDB$ROOT so that we don&#8217;t have to run catupgrd.sql in all containers. Then the PDB will probably be patched or upgraded when opened.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-202200"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
