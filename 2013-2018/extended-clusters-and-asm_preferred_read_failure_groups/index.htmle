@@ -1,0 +1,143 @@
+This was first published on <a href=https://blog.dbi-services.com/extended-clusters-and-asm_preferred_read_failure_groups>https://blog.dbi-services.com/extended-clusters-and-asm_preferred_read_failure_groups</a> (2016-05-27)
+								<h1 class="entry-title">Extended clusters and asm_preferred_read_failure_groups</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you have 2 sites that are not too far you can build an extended cluster. You have one node on each site. And you can also use ASM normal redundancy to store data on each site (each diskgroup has a failure group for each site). Writes are multiplexed, so the latency between the two sites increases the write time. By default, reads can be done from one or the other site. But we can, and should, define that preference goes to local reads.
+<span id="more-8855"></span></p>
+<p>The setup is easy. In the ASM instance you list the failure groups that are on the same site, with the &#8216;asm_preferred_read_failure_groups&#8217; parameter. You set that with an ALTER SYSTEM SCOPE=spfile SID=&#8230; because you will have different values for each instance. Of course, that supposes that you know the SID of the ASM instance that run on a specific site. If you are in Flex ASM, don&#8217;t ask. Wait 12.2 or read Bertrand Drouvot <a href="https://bdrouvot.wordpress.com/2013/07/02/flex-asm-12c-12-1-and-extended-rac-be-careful-to-unpreferred-read/" target="_blank">blog post</a></p>
+<p>I&#8217;m on an extended cluster where the two sites have between 0.3 and 0.4 milliseconds of latency. I&#8217;m checking the storage with SLOB so this is the occasion to check how asm_preferred_read_failure_groups helps in I/O latency.</p>
+<p>I use a simple SLOB configuration for physical I/O, read only, single block, and check the wait event histogram for &#8216;db file sequential read&#8217;.
+Here is an example of output:
+<pre>
+EVENT                          WAIT_TIME_MICRO WAIT_COUNT WAIT_TIME_FORMAT
+------------------------------ --------------- ---------- ------------------------------
+db file sequential read                      1          0 1 microsecond
+db file sequential read                      2          0 2 microseconds
+db file sequential read                      4          0 4 microseconds
+db file sequential read                      8          0 8 microseconds
+db file sequential read                     16          0 16 microseconds
+db file sequential read                     32          0 32 microseconds
+db file sequential read                     64          0 64 microseconds
+db file sequential read                    128          0 128 microseconds
+db file sequential read                    256        538 256 microseconds
+db file sequential read                    512       5461 512 microseconds
+db file sequential read                   1024       2383 1 millisecond
+db file sequential read                   2048        123 2 milliseconds
+db file sequential read                   4096        148 4 milliseconds
+db file sequential read                   8192        682 8 milliseconds
+db file sequential read                  16384       3777 16 milliseconds
+db file sequential read                  32768       1977 32 milliseconds
+db file sequential read                  65536        454 65 milliseconds
+db file sequential read                 131072         68 131 milliseconds
+db file sequential read                 262144          6 262 milliseconds
+</pre>
+It seems that half of the reads are served by the array cache and the other half are above disk latency time.</p>
+<p>Now I set the asm_preferred_read_failure_groups to the remote site, to measure reads coming from there.
+<pre>
+alter system set asm_preferred_read_failure_groups='DATA1_MIR.FAILGRP_SH' scope=memory;
+</pre></p>
+<p>and here is the result on similar workload:
+<pre>
+EVENT                          WAIT_TIME_MICRO WAIT_COUNT WAIT_TIME_FORMAT
+------------------------------ --------------- ---------- ------------------------------
+db file sequential read                      1          0 1 microsecond
+db file sequential read                      2          0 2 microseconds
+db file sequential read                      4          0 4 microseconds
+db file sequential read                      8          0 8 microseconds
+db file sequential read                     16          0 16 microseconds
+db file sequential read                     32          0 32 microseconds
+db file sequential read                     64          0 64 microseconds
+db file sequential read                    128          0 128 microseconds
+db file sequential read                    256          0 256 microseconds
+db file sequential read                    512       5425 512 microseconds
+db file sequential read                   1024       6165 1 millisecond
+db file sequential read                   2048        150 2 milliseconds
+db file sequential read                   4096         89 4 milliseconds
+db file sequential read                   8192        630 8 milliseconds
+db file sequential read                  16384       3598 16 milliseconds
+db file sequential read                  32768       1903 32 milliseconds
+db file sequential read                  65536        353 65 milliseconds
+db file sequential read                 131072         36 131 milliseconds
+db file sequential read                 262144          0 262 milliseconds
+db file sequential read                 524288          1 524 milliseconds
+</pre></p>
+<p>The pattern is similar except that I&#8217;ve nothing lower than 0.5 millisecond. I/Os served by the storage cache have there the additional latency of 0.3 milliseconds from the remote site. Of course, when we are above the millisecond, we don&#8217;t see the difference.</p>
+<p>Now let&#8217;s set the right setting where preference should go to local reads:
+<pre>
+alter system set asm_preferred_read_failure_groups='DATA1_MIR.FAILGRP_VE' scope=memory;
+</pre>
+and the result:
+<pre>
+EVENT                          WAIT_TIME_MICRO WAIT_COUNT WAIT_TIME_FORMAT
+------------------------------ --------------- ---------- ------------------------------
+db file sequential read                      1          0 1 microsecond
+db file sequential read                      2          0 2 microseconds
+db file sequential read                      4          0 4 microseconds
+db file sequential read                      8          0 8 microseconds
+db file sequential read                     16          0 16 microseconds
+db file sequential read                     32          0 32 microseconds
+db file sequential read                     64          0 64 microseconds
+db file sequential read                    128          0 128 microseconds
+db file sequential read                    256       1165 256 microseconds
+db file sequential read                    512       9465 512 microseconds
+db file sequential read                   1024        519 1 millisecond
+db file sequential read                   2048        184 2 milliseconds
+db file sequential read                   4096        227 4 milliseconds
+db file sequential read                   8192        705 8 milliseconds
+db file sequential read                  16384       3350 16 milliseconds
+db file sequential read                  32768       1743 32 milliseconds
+db file sequential read                  65536        402 65 milliseconds
+db file sequential read                 131072         42 131 milliseconds
+db file sequential read                 262144          1 262 milliseconds
+</pre>
+Here the fast reads are around 0.5 millisecond. And one thousand reads had a service time lower than 0.3 milliseconds, which was not possible when reading from the remote site.</p>
+<p>Here is the pattern in in an Excel chart where you see no big difference for latency above 4 milliseconds.</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/05/CapturePrefFailGrp.png" rel="lightbox[8855]"><img src="../wp-insides/uploads/sites/2/2016/05/CapturePrefFailGrp.png" alt="CapturePrefFailGrp" width="1151" height="837" class="alignnone size-full wp-image-8856" /></a></p>
+<p>With efficient storage array, extended cluster latency may penalize performance of writes. However, writes should be asynchronous (DBRW) so the latency is not part of the user response time. I&#8217;m not talking about redo logs here. For redo you have to choose to put it on a local only diskgroup or on a mirrored one. This depends on availability requirements and latency between the two sites. </p>
+<p>So, when you have non uniform latency among failure groups, don&#8217;t forget to set asm_preferred_read_failure_groups. And test it with SLOB as I did here. Wat you expect from theorical latencies should be visible in the wait event histogram.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-88560" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/05/CapturePrefFailGrp.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3627">
+				<div id="div-comment-3627" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/09af8a627caf85cb823686a5fcec4d8f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://bdrouvot.wordpress.com' rel='external nofollow' class='url'>Bertrand</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3627">
+			May 31, 2016 at 7 h 19 min</a>		</div>
+
+		<p>Hello Franck,</p>
+<p>you could also simulate the impact of the ASM preferred read vithout actually implementing it, for example that way: <a href="https://bdrouvot.wordpress.com/2014/08/11/simulate-and-visualize-the-impact-of-the-asm-preferred-feature-on-the-read-iops-and-throughput/" rel="nofollow">https://bdrouvot.wordpress.com/2014/08/11/simulate-and-visualize-the-impact-of-the-asm-preferred-feature-on-the-read-iops-and-throughput/</a></p>
+<p>Thx
+Bertrand
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-36281"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3627' onclick='return addComment.moveForm( "div-comment-3627", "3627", "respond", "8855" )' aria-label='Reply to Bertrand to Bertrand'>Reply to Bertrand</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

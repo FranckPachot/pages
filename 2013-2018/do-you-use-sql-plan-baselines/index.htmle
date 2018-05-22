@@ -1,0 +1,101 @@
+This was first published on <a href=https://blog.dbi-services.com/do-you-use-sql-plan-baselines>https://blog.dbi-services.com/do-you-use-sql-plan-baselines</a> (2015-09-25)
+								<h1 class="entry-title">Do you use SQL Plan Baselines?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I can hear a lot of complaints about the instability coming from the adaptive features introduced into the optimizer logic at each releases.
+Giving more intelligence to the optimizer is very good to improve the response time for generated queries, BI, ad-hoc reporting.
+But when you have an OLTP that works for years with its static set of queries, then you don&#8217;t appreciate the plan instability coming from (in reverse chronological order and not exhaustive): SPD, ADS, cardinality feedback, &#8216;size auto&#8217; histograms, bind variable peeking, CBO, etc.</p>
+<p>We can discuss about that, and I may agree, but my first question will be:
+ &#8211; do you use SQL Plan Baselines ?</p>
+<p><span id="more-4011"></span>
+It&#8217;s totally correct to care about plan stability. How many times I&#8217;ve been doing some tuning for a customer that tells me: <em>&#8220;I don&#8217;t care if the query is long. We can accept it or tune it. But when the response time goes from 1 second to 1 hour at random, I can&#8217;t even test if I can improve it or not.&#8221;</em></p>
+<p>Yes, plan in-stability is a problem. But the solution is <b>not</b>:</p>
+<ul>
+<li>/*+ RULE */</li>
+<li>optimizer_index_cost_adj=10</li>
+<li>_optim_peek_user_binds=false</li>
+<li>_optimizer_adaptive_cursor_sharing=false</li>
+<li>_optimizer_use_feedback=false</li>
+<li>optimizer_adaptive_features=false</li>
+<li>optimizer_features_enable=8.0.0</li>
+</ul>
+<p>(and no, this is not a copy/paste from a SAP note&#8230;)</p>
+<p>The solution <b>is</b>:</p>
+<ul>
+<li>SQL Plan Baselines if you are in Enterprise Edition (no option needed when you evolve them manually)</li>
+<li>Stored outlines (deprecated, but the only way in Standard Edition)</li>
+</ul>
+<h3>Static SQL</h3>
+<p>It&#8217;s not new. When I started to work on databases, I was using DB2 (the v1 on Unix) and Oracle 7. </p>
+<p>With DB2, when the application code was compiled, the queries were optimized at that time (with statistics from database &#8211; it&#8217;s cost based optimization) and the execution plan was stored into the database (similar to a stored procedure) at deploy time. It&#8217;s called the &#8216;bind process&#8217;.
+Yes, bind variables come at execution time but the application can be bound to the database at deployment time. This is plan stability for Static SQL.</p>
+<p>In Oracle, we were in RULE optimizer at that time, so the plan stability was there: the rules did not depend on data. Same query on same structure always give the same plan. Probably for this reason, Oracle has never implemented Static SQL. Even embedded SQL pre-processed at compilation are not optimized at compile time. Only syntax and semantic is checked. Oracle always process the Static SQL as Dynamic SQL: they are optimized at runtime. Not at each parse call, because it&#8217;s cached, but it&#8217;s cached only in memory (library cache). And at any point, because of invalidation, space pressure on shared pool, instance restart, etc. the SQL can be hard parsed again.</p>
+<p>No problem with RULE. But when Oracle introduced the CBO &#8211; Cost Based Optimizer &#8211; then things changed. All SQL are considered as Dynamic SQL, they can be optimized at any time, and because the cost depends on data (statistics) and lot of parameters, the plans can change.</p>
+<p>And people thought that Oracle didn&#8217;t care about plan instability because they introduced more and more parameters that can make the plan change: bind variable peeking, rolling invalidation, cardinality feedback, auto mechanisms and adaptive features. But no, the solution to store execution plans was there since Oracle 8: it&#8217;s the outlines. Outlines associate a set of hints that limit the choice of the optimizer in order to get always the same plan. Outlines fixed only one possible plan. Now SQL Plan Baselines goes further: all plans are stored and you can choose which ones are allowed to be used.</p>
+<h3>Capture</h3>
+<p>There are several ways to capture SQL Plan Baselines (capture automatically all statements that have more than 2 executions, capture from library cache with different criteria, or from SQL Tuning Set, or manually by sql_id). But be careful, because &#8211; depending on your application design &#8211; you may have a lot of statements captured.</p>
+<p>And don&#8217;t capture a lot of statements at a time because cursors will be invalidated and you risk to have a peak of hard parsing that follow the bulk capture.
+Here is an example to se the &#8216;reason&#8217; of invalidation:
+I have a statement that is executed very often:
+<pre>
+SQL&gt; select sql_id,child_number,executions,invalidations from v$sql where sql_id='2zgczymdyvgmq'
+SQL_ID        CHILD_NUMBER EXECUTIONS INVALIDATIONS
+------------- ------------ ---------- -------------
+2zgczymdyvgmq            0   98794435             0
+</pre>
+I capture the SQL Plan Baseline for it:
+<pre>
+SQL&gt; variable loaded number
+SQL&gt; exec :loaded:=dbms_spm.load_plans_from_cursor_cache('2zgczymdyvgmq')
+anonymous block completed
+SQL&gt; print loaded
+LOADED
+-
+1
+</pre>
+and after a few seconds, a new child cursor appears:
+<pre>
+SQL&gt; select sql_id,child_number,executions,invalidations,sql_plan_baseline from v$sql where sql_id='2zgczymdyvgmq'
+SQL_ID        CHILD_NUMBER EXECUTIONS INVALIDATIONS SQL_PLAN_BASELINE
+------------- ------------ ---------- ------------- ------------------------------
+2zgczymdyvgmq            0   98794462             0
+2zgczymdyvgmq            1        501             1 SQL_PLAN_56gpu0marthcwcc4c47e7
+</pre>
+the reason from V$SQL_SHARED_CURSOR is:
+<pre>
+&lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;4&lt;/ID&gt;&lt;reason&gt;SQL Tune Base Object Different(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;flags_kestbcci&gt;7&lt;/flags_kestbcci&gt;&lt;ehash_kestbcci&gt;3581723036&lt;/ehash_kestbcci&gt;&lt;/ChildNode&gt;
+</pre></p>
+<h3>control the capture</h3>
+<p>So my recommendation here is to control the capture. You will have to manage them (see why the plan change, evolve them, etc). They are stored in SYSAUX. The can be purged after retention, but if you captured a lot at the same time, then the purge will take a lot of time (and undo records).</p>
+<p>So you should control the capture. Here is an example to capture the Top-100 statements by execution count. You can review them, capture 100 more if you thing it makes sense, wait a while to see how many have been executed again in the following days, how many have new possible plans, etc.</p>
+<p><pre>
+set serveroutput on
+variable loaded number
+exec for i in (select * from (select * from (select sql_id,exact_matching_signature from v$sql where plan_hash_value&gt;0 and sql_plan_baseline is null and last_active_time&gt;sysdate-1/24 group by sql_id,exact_matching_signature order by count(executions) desc) where rownum&lt;=100) where exact_matching_signature not in (select signature from dba_sql_plan_baselines)) loop :loaded:=nvl(:loaded,0)+dbms_spm.load_plans_from_cursor_cache(i.sql_id); end loop;
+print loaded
+</pre></p>
+<p>It&#8217;s just an example. I choose to capture the statements that have the most executions since startup. You can add other criteria.</p>
+<p>But you should not capture only those that have a large elapsed time, or from a STS coming from AWR. The goal is different here. AWR is focused high resource consumption because the goal is to tune the &#8216;bad&#8217; statements. But here the goal is to keep the &#8216;good&#8217; statement so that they will never be &#8216;bad&#8217;.</p>
+<p>So it makes sense to capture only the good statements. Don&#8217;t run the capture at a time where users complain about response time.</p>
+<h3>So what?</h3>
+<p>The core message here is:</p>
+<ul>
+<li>Stop to complain about oracle Plan Instability if you didn&#8217;t give a try at SQL Plan Baselines (or outlines in SE)</li>
+<li>When the system is going well, don&#8217;t wait for the next performance issue. This is the time to fix the plans that are going well.</li>
+<li>Don&#8217;t fear migrations. Stabilize the most critical use-cases with SQL Plan Baselines and go on.</li>
+<li>If you&#8217;re an ERP vendor, stop to fake optimizer with old parameters. Deploy the execution plans with your application</li>
+</ul>
+<p>I know that SQL Plan Baselines are not widely used. Mostly because we don&#8217;t find time for this pro-active activity. And because it requires a good communication between dev and ops. But remember that Oracle has provided plan stability features for a long time, and they think we use it when they introduce all adaptive features.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-40120"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

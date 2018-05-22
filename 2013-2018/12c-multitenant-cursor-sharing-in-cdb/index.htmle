@@ -1,0 +1,136 @@
+This was first published on <a href=https://blog.dbi-services.com/12c-multitenant-cursor-sharing-in-cdb>https://blog.dbi-services.com/12c-multitenant-cursor-sharing-in-cdb</a> (2016-03-12)
+								<h1 class="entry-title">12c multitenant: Cursor sharing in CDB</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In multitenant, there are two goals: consolidation within the same container database and isolation of pluggable databases. I see multitenant consolidation as an extension of schema consolidation. What is not possible in schema consolidation, such as public objects name collision, is now possible with pluggable databases. 10 years ago I administrated on a database with high level of consolidation: 3000 schemas with same structure and different data. The big scalability issue there was library cache waits (it was 10g) because same SQL statements running on thousands of schemas means parent cursors with lot of child. When 12c came out, and I&#8217;ve seen that Multitenant shares the parent cursor, then I wanted to compare library cache contention between schema consolidation an pluggable database consolidation.
+<span id="more-7443"></span>
+I&#8217;ve created 50 pluggable databases PDB001 to PDB050 with 50 users in each USER001 to USER050.
+I prepared the following script:
+<pre>
+begin
+ for i in 1..1000 loop
+  execute immediate 'select * from dual';
+  execute immediate 'select '||i||' from dual';
+ end loop;
+end;
+/
+</pre>
+The idea is to run the same statement in a loop, with other different statements to avoid cursor caching. Actually my goal is to simulate what we find sometimes with connection pools that run a &#8216;select from dual&#8217; before grabbing a session, just to check it is still there.
+I&#8217;ve run 50 concurrent sessions with that script in the following connections:</p>
+<ol>
+<li>Same schema name on multiple pluggable databases</li>
+<li>Different schema names on the same pluggable database</li>
+<li>Same schema name on same pluggable database</li>
+<li>Different user names on different pluggable databases</li>
+</ol>
+<p>And here are the 4 runs displayed by Orachrome Lighty, my favorite tool to display database performance statistics.
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CaptureCDBCURSORS0011.png" rel="lightbox[7443]"><img src="../wp-insides/uploads/sites/2/2016/03/CaptureCDBCURSORS0011.png" alt="CaptureCDBCURSORS001" width="1279" height="718" class="alignnone size-full wp-image-7446" /></a></p>
+<p>Good reference for mutexes are Tanel Poder and Andrey Nikolaev. <a href="http://blog.tanelpoder.com/files/Oracle_Latch_And_Mutex_Contention_Troubleshooting.pdf">http://blog.tanelpoder.com/files/Oracle_Latch_And_Mutex_Contention_Troubleshooting.pdf</a></p>
+<p>Basically here, &#8220;library cache: mutex X&#8221; is the most important wait event and it&#8217;s contention on library cache because of the hard parses.</p>
+<p>Then, I changed the script to add more contention. I artificially multiply the number of child cursors. In addition to the 50 ones (not shared because of different user and/or container) I change an optimizer parameter to get 50 different versions:
+<pre>
+begin
+ for i in 1..50
+ loop
+ execute immediate 'alter session set optimizer_index_cost_adj='||i;
+ for j in 1..20
+ loop
+  execute immediate 'select * from dual';
+  execute immediate 'select '||i||'+'||j||' from dual';
+ end loop;
+ end loop;
+end;
+/
+</pre></p>
+<p>The time it takes is longer than when we had only one version, but it&#8217;s still the same time in container consolidation vs. schema consolidation:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CaptureCDBCURSORS002.png" rel="lightbox[7443]"><img src="../wp-insides/uploads/sites/2/2016/03/CaptureCDBCURSORS002.png" alt="CaptureCDBCURSORS002" width="1643" height="744" class="alignnone size-full wp-image-7449" /></a></p>
+<p>&#8220;cursor: mutex X&#8221; appears here. It&#8217;s the contention on the parent cursor because of the multiple versions to search.</p>
+<p>So, in current version (I tested on 12.1.0.2) multitenant consolidation is the same as schema consolidation: not worse and not better. This was designed on purpose: sharing the parent cursor saves memory by avoiding to store same information multiple times. It&#8217;s the goal of consolidation. The non-sharing is done at child cursor level.</p>
+<p>This means that bad application design that lead to library cache contention in schema consolidation will not be better when separating into multiple pluggable databases.
+When you want explicitly to avoid sharing, then you have either to set different optimizer parameter (I dream of a dummy one, just to avoid sharing without changing anything else) or to issue different statements. In following example, I add the connection info as comment in the statement:</p>
+<p><pre>
+begin
+ for i in 1..1000 loop
+  execute immediate 'select /*+ &amp;_USER.@&amp;_CONNECT_IDENTIFIER */ * from dual';
+  execute immediate 'select '||i||' from dual';
+ end loop;
+end;
+/
+</pre></p>
+<p>And here is the result. No contention except when I connect with same user and same service:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CaptureCDBCURSORS003.png" rel="lightbox[7443]"><img src="../wp-insides/uploads/sites/2/2016/03/CaptureCDBCURSORS003.png" alt="CaptureCDBCURSORS003" width="1671" height="705" class="alignnone size-full wp-image-7456" /></a></p>
+<p>Please, don&#8217;t hesitate to comment. Even if contention on library cache has improved at each release, high number of versions are always a problem. Especially with bad application design that parse too often. Reading a long chain of child cursors can take a long time and requires exclusive latch on parent cursor. PSU 11.2.0.2.2 introduced cursor obsolescence to limit the number of child cursor, but some bugs came with that. In 12.1 it&#8217;s limited to 1024 child cursors. With hundreds of pluggable databases we can reach that very quickly because of the many reasons for non-sharing (bind length, NLS settings, adaptive cursor sharing, etc).</p>
+<p>On additional note, if you look at V$SQL_SHARED_CURSOR you don&#8217;t see any reason for the non-sharing when it&#8217;s because of different container. A enhancement request has been opened for that.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-74440" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CaptureCDBCURSORS0011.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3004">
+				<div id="div-comment-3004" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/24fe3c8252e9710ff20d2caa9550ef6e?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">GregG</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3004">
+			March 13, 2016 at 13 h 34 min</a>		</div>
+
+		<p>Great blog post, as always Franck .
+I dont remember off the top of my head but we may consider reducing long child chains via something called
+cursor obsolete threshold (_cursor_obsolete_threshold) I believe . Not sure if this lifts the contention though .
+Regards
+GG
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-30051"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3004' onclick='return addComment.moveForm( "div-comment-3004", "3004", "respond", "7443" )' aria-label='Reply to GregG to GregG'>Reply to GregG</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-3010">
+				<div id="div-comment-3010" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3010">
+			March 14, 2016 at 8 h 49 min</a>		</div>
+
+		<p>Hi Greg G,
+Thanks. Yes, _cursor_obsolete_threshold  helps but also brings other problems. See Bugs 13364735 10264680 11699057 11069199 14585499. So maybe the default value can be raised for CDB that run lot of PDBs of same applications, given that they have a correct design (not parsing each execution, using bind variables, etc)
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-30111"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3010' onclick='return addComment.moveForm( "div-comment-3010", "3010", "respond", "7443" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

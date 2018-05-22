@@ -1,0 +1,199 @@
+This was first published on <a href=https://blog.dbi-services.com/exadata-express-cloud-service-max_pdb_storage>https://blog.dbi-services.com/exadata-express-cloud-service-max_pdb_storage</a> (2017-02-04)
+								<h1 class="entry-title">Exadata Express Cloud Service: MAX_PDB_STORAGE</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The separation of roles between system DBA and application DBA is the way to go for agile development and the PDBaaS managed service is an excellent way to play with this concept: You are PDB administrator but not the CDB administrator.
+Here is an example about tablespace creation/deletion, and the kind of problems that may arise with this architecture.
+<span id="more-14674"></span>
+The PDB administrator manages all the PDB objects. He must be able to create users and tablespaces in order to deploy an application.</p>
+<h3>Create tablespace</h3>
+<p>So yes, in Exadata Express Cloud Service we can create a tablespace and this is what I did:
+<pre>
+SQL&gt; create tablespace IOPS datafile size 10G;
+Tablespace created.
+</pre>
+and you don&#8217;t need to specify the datafile location because db_create_file_dest is defined:
+<pre>
+SQL&gt; show parameter db_create_file_dest
+
+NAME                TYPE   VALUE
+------------------- ------ -----
+db_create_file_dest string +DATA
+</pre>
+Actually, this is something that I cannot change because it is set by the CDB administrator when creating the PDB:
+<pre>
+SQL&gt; alter session set db_create_file_dest='/var/tmp'
+
+Error report -
+ORA-02097: parameter cannot be modified because specified value is invalid
+ORA-01031: insufficient privileges
+</pre>
+This is a 12.2 feature. Impossible to create a file outside:
+<pre>
+create tablespace IOPS datafile '/var/tmp/franck.dbf' size 10G
+Error report -
+ORA-65250: invalid path specified for file - /var/tmp/franck.dbf
+</pre>
+I&#8217;ve already written about that 12cR2 feature: <a href="http://blog.dbi-services.com/12cr2-create_file_dest-for-pdb-isolation/" target="_blank">http://blog.dbi-services.com/12cr2-create_file_dest-for-pdb-isolation/</a> and this is a rather nice feature.</p>
+<h3>MAX_PDB_STORAGE</h3>
+<p>There&#8217;s another limit in PDBaaS: you have a limit on the storage you can use. And in this X20 service, the limit is 20G.</p>
+<p>When you have reached the maximum, you get the following error:</p>
+<p><pre>SQL&gt; create tablespace ANOTHERONE datafile size 30G;
+
+create tablespace ANOTHERONE datafile size 30G
+Error report -
+ORA-65114: space usage in container is too high
+65114. 00000 -  "space usage in container is too high"
+*Cause:    Space usage in the current container exceeded the value of  MAX_PDB_STORAGE for the container.
+*Action:   Specify a higher value for MAX_PDB_STORAGE using the ALTER  PLUGGABLE DATABASE statement.
+</pre></p>
+<p>Ok. This limit is visible as a property of my PDB:
+<pre>SQL&gt; select property_name, property_value from database_properties where property_name ='MAX_PDB_STORAGE';
+
+PROPERTY_NAME    PROPERTY_VALUE
+-------------    --------------
+MAX_PDB_STORAGE  24771223880  </pre>   </p>
+<p>And the current size is visible from V$PDBS:
+<pre>SQL&gt; select con_id,total_size from v$pdbs;
+
+CON_ID  TOTAL_SIZE
+------  -----------
+47      24766742528
+</pre></p>
+<p>Nothing hidden here, this is the sum of my PDB files, datafiles and tempfiles:</p>
+<p><pre>SQL&gt; select sum(bytes) from dba_data_files;
+SUM(BYTES)
+----------
+21761523712
+
+SQL&gt; select sum(bytes) from dba_temp_files;
+SUM(BYTES)
+----------
+ 3005218816
+</pre></p>
+<p>Of course, I&#8217;m not authorized to increase my limit:
+<pre>
+SQL&gt; alter pluggable database storage(maxsize 40G);
+
+alter pluggable database storage(maxsize 40G)
+Error report -
+ORA-01031: insufficient privileges
+01031. 00000 -  "insufficient privileges"
+*Cause:    An attempt was made to perform a database operation without the necessary privileges.
+*Action:   Ask your database administrator or designated security administrator to grant you the necessary privileges
+</pre></p>
+<p>And this is once again a very nice feature coming in 12<em>c</em>R2 multitenant.</p>
+<p>So&#8230; I&#8217;ve filled my X20 service. There a need for some housekeeping. But&#8230;</p>
+<h3>Drop tablespace</h3>
+<p>I&#8217;m allowed to create and drop tablespaces. Let&#8217;s drop that IOPS tablespace:</p>
+<p><pre>
+SQL&gt; drop tablespace iops;
+
+drop tablespace iops
+Error report -
+ORA-01031: insufficient privileges
+01031. 00000 -  "insufficient privileges"
+*Cause:    An attempt was made to perform a database operation without the necessary privileges.
+*Action:   Ask your database administrator or designated security administrator to grant you the necessary privileges
+</pre></p>
+<p>With lockdown profiles, you have always the same message: no clue about what is not authorized. I know that there is a DROP_TABLESPACE_KEEP_DATAFILES feature that you can disable with lockdown profiles and this makes sense when the CDB administrator do not want that PDB administrators leave dead datafiles in the system. Here we are on ASM, with OMF, so the datafiles are automatically dropped. But the lockdown is working at statement syntax level, so we have to mention the clause:
+<pre>
+SQL&gt; drop tablespace iops including contents and datafiles;
+
+drop tablespace iops including contents and datafiles
+Error report -
+ORA-38881: Cannot drop tablespace IOPS on primary database due to guaranteed restore points.
+38881. 00000 -  "Cannot drop tablespace %s on primary database due to guaranteed restore points."
+*Cause:    An attempt was made to drop a tablespace on a primary database while there are guaranteed restore points. You cannot do this because Flashback database cannot undo dropping of a tablespace.
+*Action:   Drop all guaranteed restore points first and retry, or delay dropping the tablespace until all guaranteed restore points are removed.
+</pre></p>
+<p>So the syntax is accepted, but here I have another problem. I have a guaranteed restore point and this prevents the drop of tablespace.</p>
+<p>Let&#8217;s have a look at restore points because I didn&#8217;t create one (this is something were are not allowed to do on Exadata Express Cloud Service, which would be a nice feature as this servie is focused at developers).
+<pre>
+SQL&gt; select * from v$restore_point;
+
+SCN          DATABASE_INCARNATION#  GUARANTEE_FLASHBACK_DATABASE  STORAGE_SIZE  TIME                             RESTORE_POINT_TIME  PRESERVED  NAME        PDB_RESTORE_POINT  CLEAN_PDB_RESTORE_POINT  PDB_INCARNATION#  CON_ID
+---          ---------------------  ----------------------------  ------------  ----                             ------------------  ---------  ----        -----------------  -----------------------  ----------------  ------
+84602869122  2                      YES                           18253611008   28-JAN-17 03.23.08.000000000 AM                      YES        PRE_17_1_2  NO                 NO                       0                 0
+</pre></p>
+<p>The PDB has been created when I subscribed to the service, on 22-JAN-17 and we are now 03-Feb-17.</p>
+<p>So it seems that the CDB administrator (it is a managed service, CDB DBA is Oracle) has created a restore point last Saturday.
+The name, PRE_17_1_7, looks like something we do before a maintenance, in case something goes wrong. I had no notification about any maintenance. And anyway, we usually remove the restore point as soon as possible because this fills the FRA.</p>
+<p>I can see somme CDB structures, such as the FRA:</p>
+<p><pre>
+SQL&gt; select * from v$recovery_area_usage;
+
+FILE_TYPE                PERCENT_SPACE_USED  PERCENT_SPACE_RECLAIMABLE  NUMBER_OF_FILES  CON_ID
+---------                ------------------  -------------------------  ---------------  ------
+CONTROL FILE             0                   0                          1                0
+REDO LOG                 0                   0                          0                0
+ARCHIVED LOG             0.81                0.81                       193              0
+BACKUP PIECE             0.2                 0                          26               0
+IMAGE COPY               0.33                0                          10               0
+FLASHBACK LOG            1.3                 0.98                       41               0
+FOREIGN ARCHIVED LOG     0                   0                          0                0
+AUXILIARY DATAFILE COPY  0                   0                          0                0
+</pre>
+Ok, that&#8217;s not too much. There is not a lot of activity during one week here. And anyway, FRA is big:
+<pre>
+SQL&gt; show parameter recovery
+
+NAME                       TYPE        VALUE
+-------------------------- ----------- -----
+db_recovery_file_dest      string      +RECO
+db_recovery_file_dest_size big integer 6T
+</pre></p>
+<p>So far so good, but I&#8217;m stuck here. The restore point is at CDB level, so I cannot drop it:
+<pre>
+SQL&gt; drop restore point PRE_17_1_2;
+
+drop restore point PRE_17_1_2
+Error report -
+ORA-38780: Restore point 'PRE_17_1_2' does not exist.
+38780. 00000 -  "Restore point '%s' does not exist."
+*Cause:    The restore point name of the DROP RESTORE POINT command does not exist.
+*Action:   No action required.
+</pre></p>
+<p>This means that I cannot drop my tablespace. And I cannot even resize the datafiles to their minimum:
+<pre>
+SQL&gt; alter database datafile '+DATA/CFCDBA1/46AB9829A44EB2C1E0538846220A6F7D/DATAFILE/iops.1455.934053351' resize 10M;
+
+alter database datafile '+DATA/CFCDBA1/46AB9829A44EB2C1E0538846220A6F7D/DATAFILE/iops.1455.934053351' resize 10M
+Error report -
+ORA-38883: Cannot shrink data file +DATA/CFCDBA1/46AB9829A44EB2C1E0538846220A6F7D/DATAFILE/iops.1455.934053351 on primary database due to guaranteed restore points.
+38883. 00000 -  "Cannot shrink data file %s on primary database due to guaranteed restore points."
+*Cause:    An attempt was made to shrink a data file on a primary database while there are guaranteed restore points. You cannot do this because Flashback database cannot undo the shrinking of a data file.
+*Action:   Drop all guaranteed restore points first and retry, or delay the data file resize until all guaranteed restore points are removed.
+</pre></p>
+<p>I have an empty tablespace that takes all my allocated storage and I cannot remove it.</p>
+<p>So what to do? Try to contact support? Or fill the FRA until raises an alert?
+I would try the first one but I received a CSI with my order, but it&#8217;s not a valid one&#8230;</p>
+<h3>Update 04-FEB-17</h3>
+<p>After reaching an admin (not through the official support) the restore point has been dropped and we can now do what we are allowed to do: create and drop user tablespaces.
+<pre>
+SQL&gt; drop tablespace iops including contents and datafiles;
+Tablespace IOPS dropped.
+</pre>
+and I&#8217;m now below the MAX_PDB_STORAGE
+<pre>
+SQL&gt; select con_id,total_size/power(1024,3) from v$pdbs;
+
+CON_ID  TOTAL_SIZE/POWER(1024,3)
+------  ------------------------
+47            10.175201416015625
+</pre></p>
+<h3>So what?</h3>
+<p>Because I am a DBA, I prefer a DBaaS service where I have full administration rights. And this is something very nice which you can found only on Oracle Cloud: even in PaaS you have full system access (root) and database access (sysdba). However, managed services like this PDBaaS Exadata Express Cloud Service can be very nice for non-admins. They can provision a PDB easily and have most of admin rights on them. </p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-146750"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

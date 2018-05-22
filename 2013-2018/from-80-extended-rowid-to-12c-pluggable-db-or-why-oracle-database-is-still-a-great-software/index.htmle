@@ -1,0 +1,285 @@
+This was first published on <a href=https://blog.dbi-services.com/from-80-extended-rowid-to-12c-pluggable-db-or-why-oracle-database-is-still-a-great-software>https://blog.dbi-services.com/from-80-extended-rowid-to-12c-pluggable-db-or-why-oracle-database-is-still-a-great-software</a> (2014-10-24)
+								<h1 class="entry-title">From 8.0 extended rowid to 12c pluggable db: Why Oracle Database is still a great software</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Do you know why Oracle Database is a leader in the database market since 30 years? Do you know any other software that is still the leading solution after decades? I think that it is because Oracle has been a good software from the get-go. Many early decisions in the software architecture have revealed themselves later to be the right decision. Several decisions, such as the C language that made it portable to all platforms that were relevant during those 30 years, or the parallel server that has brought RAC when standalone servers were not able to scale anymore. Here, I will illustrate a decision made 15 years ago that has made the whole 12c pluggable databases stuff possible.</p>
+<h3>Oracle 7 rowid</h3>
+<p>The ROWID is the physical address of a row in the database. Physically, a database is just a set of files where data is stored as rows in blocks. So, at the time of Oracle 7, the ROWID was just:</p>
+<ul>
+<li>the file number</li>
+<li>the block number in that file</li>
+<li>the row number in that block</li>
+</ul>
+<div>That was printed in hexadecimal when we selected the ROWID pseudo-column:</div>
+<div></div>
+<p><a class="easyblog-thumb-preview" title="CaptureOracle7Rowid.PNG" href="http://blog.dbi-services.com/images/easyblog_images/139/CaptureOracle7Rowid.PNG" rel="lightbox[477]"><img title="CaptureOracle7Rowid.PNG" src="../images/easyblog_images/139/CaptureOracle7Rowid.PNG" alt="CaptureOracle7Rowid.PNG" /></a></p>
+<p>Here my rows are numeroted from 0 to 3 and are all in the file 2 at block offset 58 (0x3a)
+At that time, the maximum number of datafiles in a database was 1022. That was enough until the datawarehouse days brought the need for Very Large DataBases.</p>
+<h3>Relative file number</h3>
+<p>In Oracle 8 they wanted to increase the possible number of datafile without changing the rowid (which would have involved updating all blocks during an upgrade). And here is how they did:</p>
+<p>1. they introduced the &#8216;relative file number&#8217;. The file identification part is not unique for the database but only for the tablespace. That means that you can have 1022 datafiles per tablespace instead of 1022 datafiles per database.
+2. they kept the relative_fno equal to the absolute file_id for the first 1022 datafiles, so that an Oracle 7 datafile is still compatible: the number that was the absolute file_id being now the relative_fno.
+3. when going over the 1022 datafiles per database, the file_id can go beyond (it is not stored in the rowid) but the relative_fno just recycles to 1.</p>
+<p>The consequence is that a rowid is not unique anymore. When we have to look for a row by its rowid, we must know on which tablespace it is, because the rowid identification is related to the tablespace.</p>
+<p>No problem. Where are the rowid used? In chained rows, to get the other piece. A table cannot store parts of its row in different tablespace, so we know that if we are in tablespace USERS and have a pointer to a chained row, it has to be in the USER tablespace as well. They are used in indexes as well. And that&#8217;s the same: if we unique scan the index EMP_PK to get the rowid of the EMP row, we know that it is in the USERS tablespace because we know that EMP table is in the USERS tablespace.</p>
+<p>However, a new feature appeared at that time: a table can be partitioned. We cannot say anymore that EMP rows are in USERS tablespace because EMP may be partitioned over several tablespaces. That does not concern chained rows. That does not concern non-partitioned tables. And with partitioned tables, that does not concern local indexes because local index partitions always address rows in one table partition.</p>
+<p>This is where Oracle has introduced an extended rowid, for global indexes on partitioned tables, which is larger and is able to give the tablespace information in addition to the relative file number. It is called extended as opposite to &#8216;restricted&#8217; rowid which is restricted to cases where we know the tablespace.</p>
+<p>They could have choosen to store only the tablespace number. But they choose to store the object id instead, which &#8211; from the dictionary &#8211; can be used to know the tablespace. People were puzzled by that choice at that time, but it has been revealed later as a great software architecture decision because this is what allows us to have pluggable databases 15 years later.</p>
+<p>But before that, I have to introduce another 8.0 change, which is the data object id.</p>
+<h3>Data object id</h3>
+<p>In Oracle 7, there is only one object_id. Because there is a one-to-one relation between the logical object (table) and the physical object (segment). That has changed with the introduction of partitioning, where one table may have several partitions.</p>
+<p>Partitions are also logical objects, and each of them has a unique object_id. But once again, the software architects made a very good decision by separating the identification of the physical object: they introduced the data_object_id. When you create a table, the data_object_id of the segment is equal to the object_id of the table. But that can change.</p>
+<p>For example, what happens when you truncate a table? You just reset the high water mark without going to all the blocks. And you can insert new rows that may go into the same place. But how are you sure that concurrent users will not mix old blocks with new ones ? Remember that the reader do not lock anything, so they didn&#8217;t notice your truncate. The truncate changes the data object_id as if it were a new segment, but still related to the same logical table.</p>
+<p>And with partitioning you can exchange partition: the logical object_id changes but the physical data_object_id is still the same because it is still the same segment.</p>
+<p>It&#8217;s not always easy to know if we are dealing with an object_id or a data_object_id. Basically, things that are logical (for example lock table or lock partition) show the object_id and they are &#8211; depending on the place &#8211; called OBJECT_ID, OBJ# or OBJN. When it is related to the physical segment (blocks in buffer cache, block corruption) we see DATA_OBJECT_ID, DATAOBJ# or OBJD or even OBJ or OBJECT_NUMBER.</p>
+<p>When I&#8217;m not sure about what to use in my scripts, I test it on a table that has been truncated at least once, so that both values are different. I advise you to always test your scripts on a table that has been truncated and on a tablespace that has been transported.</p>
+<h3>Oracle 8 extended rowid</h3>
+<p>So I said that the extended rowid does not store the tablespace id. It stores the data_object_id, which is associated with one and only one tablespace. The format of the extended rowid is:</p>
+<ul>
+<li>the data object id (which gives the tablespace from the data dictionary)</li>
+<li>the relative file number (relative to the tablespace)</li>
+<li>the block number in that file</li>
+<li>the row number in that block</li>
+</ul>
+<p>and it is needed only when we don&#8217;t navigate from an object which can be used to define exactly which tablespace can contain the segment.</p>
+<p>Now let&#8217;s understand why the Oracle software architects have decided to store the data_object_id instead of the tablespace number. By doing that, they made the tablespaces physically independant of the database.</p>
+<h3>Pluggable tablespaces</h3>
+<p>Yes, I know it&#8217;s called transportable tablespaces. But it was the premise of pluggable database. Anyway, pluggable databases are just transportable tablespaces that include the system tablespace (which contain the metadata for the other tablespaces).</p>
+<p>You can transport a tablespace from another database and plug it in you database. Of course, the absolute file number will change as it is assigned by your database. The tablespace number will change. But the relative file numbers &#8211; relative to the tablespace &#8211; do not have to change.</p>
+<p>And of course the object_id will change: a new one will be used when importing the metadata. But the data_object_id do not have to change. The reason is that data_object_id is not expected to be unique in the database. It must be unique only whithin the object (two partitions of the same table cannot have the same data_object_id).</p>
+<h3>Oracle 8 extended rowid was designed for pluggable databases</h3>
+<p>And this is where those early decisions have all their meaning. You can plug a tablespace and the rowid of the rows in that tablespace do not have to be updated. This is what makes it a quick operation because only the dictionary and the file headers have to be updated. The time depends on the number of objects, but not on the volume of data. The agility brought by pluggable databases in 2013 were actually designed in 1997.</p>
+<h3>rowid is not unique</h3>
+<p>So I said that rowid is not unique? Let&#8217;s prove it. I create a table DEMO2 in tablespace DEMO1, export that tablespace, rename the table to DEMO2 to DEMO1, import that tablespace as DEMO2, so that I have now two tables DEMO1 and DEMO2 respectively in tablespaces DEMO1 and DEMO1.</p>
+<p>Here is my table:</p>
+<p>&nbsp;</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select dname,rowid
+  2   ,dbms_rowid.rowid_object(rowid) data_object_id
+  3   ,dbms_rowid.rowid_relative_fno(rowid) relative_fno
+  4   ,dbms_rowid.rowid_block_number(rowid) block_id
+  5   ,dbms_rowid.rowid_row_number(rowid) row_number
+  6   from DEMO2
+  7  /
+
+DNAME          ROWID              DATA_OBJECT_ID RELATIVE_FNO   BLOCK_ID ROW_NUMBER
+-------------- ------------------ -------------- ------------ ---------- ----------
+ACCOUNTING     AAAX7uAACAAAACEAAA          98030            2        132          0
+RESEARCH       AAAX7uAACAAAACEAAB          98030            2        132          1
+SALES          AAAX7uAACAAAACEAAC          98030            2        132          2
+OPERATIONS     AAAX7uAACAAAACEAAD          98030            2        132          3
+</pre>
+<p>I export the tablespace with transportable tablespaces:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; host expdp '"/ as sysdba"' transport_tablespaces=DEMO1
+Export: Release 12.1.0.2.0 - Production on Fri Oct 24 15:33:35 2014
+Copyright (c) 1982, 2014, Oracle and/or its affiliates.  All rights reserved.
+Connected to: Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+Starting "SYS"."SYS_EXPORT_TRANSPORTABLE_01":  "/******** AS SYSDBA" transport_tablespaces=DEMO1
+Processing object type TRANSPORTABLE_EXPORT/PLUGTS_BLK
+Processing object type TRANSPORTABLE_EXPORT/TABLE
+Processing object type TRANSPORTABLE_EXPORT/TABLE_STATISTICS
+Processing object type TRANSPORTABLE_EXPORT/STATISTICS/MARKER
+Processing object type TRANSPORTABLE_EXPORT/POST_INSTANCE/PLUGTS_BLK
+Master table "SYS"."SYS_EXPORT_TRANSPORTABLE_01" successfully loaded/unloaded
+******************************************************************************
+Dump file set for SYS.SYS_EXPORT_TRANSPORTABLE_01 is:
+  /u02/app/oracle/admin/DEMO/dpdump/expdat.dmp
+******************************************************************************
+Datafiles required for transportable tablespace DEMO1:
+  /tmp/demo1.dbf
+Job "SYS"."SYS_EXPORT_TRANSPORTABLE_01" successfully completed at Fri Oct 24 15:34:35 2014 elapsed 0 00:00:59
+SQL&gt; host cp '/tmp/demo1.dbf' '/tmp/demo2.dbf'
+SQL&gt; alter tablespace DEMO1 read write;
+Tablespace altered.
+</pre>
+<p>Then import it to DEMO2 tablespace (after renaming my previous table)</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; rename DEMO2 to DEMO1;
+SQL&gt; host impdp '"/ as sysdba"' transport_datafiles='/tmp/demo2.dbf ' remap_tablespace='DEMO1:DEMO2';
+Import: Release 12.1.0.2.0 - Production on Fri Oct 24 15:34:35 2014
+
+Copyright (c) 1982, 2014, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+Master table "SYS"."SYS_IMPORT_TRANSPORTABLE_01" successfully loaded/unloaded
+Starting "SYS"."SYS_IMPORT_TRANSPORTABLE_01":  "/******** AS SYSDBA" transport_datafiles=/tmp/demo2.dbf  remap_tablespace=DEMO1:DEMO2
+Processing object type TRANSPORTABLE_EXPORT/PLUGTS_BLK
+Processing object type TRANSPORTABLE_EXPORT/TABLE
+Processing object type TRANSPORTABLE_EXPORT/TABLE_STATISTICS
+Processing object type TRANSPORTABLE_EXPORT/STATISTICS/MARKER
+Processing object type TRANSPORTABLE_EXPORT/POST_INSTANCE/PLUGTS_BLK
+Job "SYS"."SYS_IMPORT_TRANSPORTABLE_01" successfully completed at Fri Oct 24 15:34:49 2014 elapsed 0 00:00:13
+SQL&gt; alter tablespace DEMO2 read write;
+Tablespace altered.
+</pre>
+<p>Now I have 2 tables with different object_id but same data_object_id:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select object_name,object_id,data_object_id from user_objects where object_name like 'DEMO_';
+
+OBJECT_NAM  OBJECT_ID DATA_OBJECT_ID
+---------- ---------- --------------
+DEMO2           98076          98030
+DEMO1           98029          98030
+</pre>
+<p>And 2 segments in different files (file_id) but same relative_fno:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select segment_name,tablespace_name,file_id,relative_fno,block_id from dba_extents where segment_name like 
+
+SEGMENT_NAME    TABLESPACE    FILE_ID RELATIVE_FNO   BLOCK_ID
+--------------- ---------- ---------- ------------ ----------
+DEMO1           DEMO1               2            2        128
+DEMO2           DEMO2               4            2        128
+</pre>
+<p>I update the rows so that I be sure to select on different tables</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; update DEMO1 set dname=upper(dname);
+4 rows updated.
+SQL&gt; update DEMO2 set dname=lower(dname);
+4 rows updated.
+</pre>
+<p>And now showing the ROWID from both tables:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select dname,rowid
+  2   ,dbms_rowid.rowid_object(rowid) data_object_id
+  3   ,dbms_rowid.rowid_relative_fno(rowid) relative_fno
+  4   ,dbms_rowid.rowid_block_number(rowid) block_id
+  5   ,dbms_rowid.rowid_row_number(rowid) row_number
+  6   from DEMO1
+  7  /
+
+DNAME          ROWID              DATA_OBJECT_ID RELATIVE_FNO   BLOCK_ID ROW_NUMBER
+-------------- ------------------ -------------- ------------ ---------- ----------
+ACCOUNTING     AAAX7uAACAAAACEAAA          98030            2        132          0
+RESEARCH       AAAX7uAACAAAACEAAB          98030            2        132          1
+SALES          AAAX7uAACAAAACEAAC          98030            2        132          2
+OPERATIONS     AAAX7uAACAAAACEAAD          98030            2        132          3
+
+SQL&gt; select dname,rowid
+  2   ,dbms_rowid.rowid_object(rowid) data_object_id
+  3   ,dbms_rowid.rowid_relative_fno(rowid) relative_fno
+  4   ,dbms_rowid.rowid_block_number(rowid) block_id
+  5   ,dbms_rowid.rowid_row_number(rowid) row_number
+  6   from DEMO2
+  7  /
+
+DNAME          ROWID              DATA_OBJECT_ID RELATIVE_FNO   BLOCK_ID ROW_NUMBER
+-------------- ------------------ -------------- ------------ ---------- ----------
+accounting     AAAX7uAACAAAACEAAA          98030            2        132          0
+research       AAAX7uAACAAAACEAAB          98030            2        132          1
+sales          AAAX7uAACAAAACEAAC          98030            2        132          2
+operations     AAAX7uAACAAAACEAAD          98030            2        132          3
+</pre>
+<p>Conclusion: I have in my database two different tables with sames rowid because it is a physical copy. Only the data dictionary makes the difference.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4780" data-img="http://blog.dbi-services.com/images/easyblog_images/139/CaptureOracle7Rowid.PNG"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1254">
+				<div id="div-comment-1254" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/7486447af0c535ecc0d283e9a22c04ca?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Olivier Berthommé</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1254">
+			October 29, 2014 at 14 h 13 min</a>		</div>
+
+		<p>Hi Frank,</p>
+<p>Very interesting post ! Congratulations for starting an Oracle 7 ; did you virtualize an HP 3000 <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":-)" class="wp-smiley" /> ?</p>
+<p>Why not name data_object_id : segment_id ? Is it not the same concept ?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12551"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1254' onclick='return addComment.moveForm( "div-comment-1254", "1254", "respond", "477" )' aria-label='Reply to Olivier to Olivier Berthommé'>Reply to Olivier</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1256">
+				<div id="div-comment-1256" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1256">
+			October 30, 2014 at 9 h 18 min</a>		</div>
+
+		<p>Hi Olivier,
+That&#8217;s a good question. I think the reason is that data_object_id cannot identify a segment without the tablespace. Another reason would be that a segment type can change without changing the data_object_id (as with exchange partitions).
+As far as I know, &#8216;segment id&#8217; is used only by dbv (to pass tsn.relfile.block parameter) and in statspack comments for STATS$SEG_STAT_OBJ (key: dataobj#, obj#, ts#, dbid)
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12571"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1256' onclick='return addComment.moveForm( "div-comment-1256", "1256", "respond", "477" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1257">
+				<div id="div-comment-1257" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/c10bb46429554ba6f3c6144ad8dbd555?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Hemant K Chitale</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1257">
+			November 3, 2014 at 8 h 34 min</a>		</div>
+
+		<p>Cool !  (that&#8217;s all I can say !)
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12581"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1257' onclick='return addComment.moveForm( "div-comment-1257", "1257", "respond", "477" )' aria-label='Reply to Hemant to Hemant K Chitale'>Reply to Hemant</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1302">
+				<div id="div-comment-1302" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/aad8e5c3b03a723bc53ddb807436f320?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Martin Preiss</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1302">
+			November 20, 2014 at 13 h 46 min</a>		</div>
+
+		<p>Hi Franck,
+almost missed that article&#8230; &#8211; thank you! Having studied history for a lot of years I like this kind of overviews.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13031"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1302' onclick='return addComment.moveForm( "div-comment-1302", "1302", "respond", "477" )' aria-label='Reply to Martin to Martin Preiss'>Reply to Martin</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,299 @@
+This was first published on <a href=https://blog.dbi-services.com/12c-extended-datatypes-better-than-clob>https://blog.dbi-services.com/12c-extended-datatypes-better-than-clob</a> (2014-05-23)
+								<h1 class="entry-title">Oracle 12c extended datatypes better than CLOB?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>12c has introduced character strings that can can go above 4000 bytes. In the previous versions, in PL/SQL only we were allowed to have VARCHAR2 up to 32k. In SQL the VARCHAR2 datatype was limited to 4000 and CHAR was limited to 2000. That became a bit small especially when lot of applications needed to store unicode characters.</p>
+<p>From 12c we can have SQL datatypes having up to 32k bytes for VARCHAR2, CHAR and RAW. It&#8217;s not allowed by default. We need to set max_string_size=extended and recompile views with utl32k. Nice improvement. But is it a good idea to use that new feature when we already have CLOB for large character strings ? The New Features documentation is clear about that: extended datatypes have been introduced to be compatible with other databases &#8211; not to replace existing features.</p>
+<p>I will not go into the details how they are stored. Information about that is available elsewhere. See for example <a href="http://twitter.com/ludodba">@ludodba</a> recent blog post <a href="http://www.ludovicocaldara.net/dba/extended-data-types-storage/trackback">Where are Extended Data Types stored?</a>. Extended datatypes are stored as chained rows if you just extend an existing table, or as a LOB if you defined them on a new table. Chained rows is clearly not a good option, so, given that you (re)create the tables, their storage is similar to CLOB.</p>
+<p>But there is something that I don&#8217;t like with LOBS: they are fetched row by row. When you select a row you get only the handle. And you get the CLOB later when you access to it through the handle. Did you ever try to datapump a table with LOBs through network_link? Huge amount of roundtrips and very bad performance. It&#8217;s one rare case where doing expdp/impdp with a dumpfile is better. For very large objects, you will do several roundtrips anyway, so this is not an issue. But with character strings that are just a few kilobytes having them as LOB introduces an ineffective overhead.</p>
+<p>Let&#8217;s compare the fetch behaviour with those new extended datatypes. For my demo, I&#8217;ll use a table with a clob column &#8220;C&#8221; and an extended varchar2 column &#8220;E&#8221;, and insert same data into both columns.</p>
+<p><pre>
+SQL&gt; create table TEST ( C clob , E varchar2(9000) );
+Table created.
+SQL&gt; insert into TEST select lpad(rownum,9000,'x'),lpad(rownum,9000,'x') from dual connect by level &lt;=10;
+10 rows created.</pre></p>
+<p>Here is the autotrace when reading the CLOB from 10 rows:</p>
+<p><pre>SQL&gt; set autotrace trace stat
+ SQL&gt; select C from TEST;
+ 
+  10 rows selected.
+  
+  Statistics
+  ----------------------------------------------------------
+            2  recursive calls
+            0  db block gets
+           27  consistent gets
+           20  physical reads
+            0  redo size
+        93936  bytes sent via SQL*Net to client
+         2722  bytes received via SQL*Net from client
+           22  SQL*Net roundtrips to/from client
+            0  sorts (memory)
+            0  sorts (disk)
+           10  rows processed</pre></p>
+<p>For only 10 rows I&#8217;ve made 22 roundtrips. This is the problem with LOBs. Too many roundtrips. Well there is another problem that I&#8217;ll not show here, which is the fact that you can fetch the lob a long time after, even when the cursor is closed. It does consistent read so you have to set your undo_retention accordingly.</p>
+<p>Now here is the same data from the extended varchar2 column:</p>
+<p><pre>SQL&gt; select E from TEST;
+  
+  10 rows selected.
+ 
+  Statistics
+  ----------------------------------------------------------
+            1  recursive calls
+            0  db block gets
+           56  consistent gets
+            0  physical reads
+            0  redo size
+        90501  bytes sent via SQL*Net to client
+          492  bytes received via SQL*Net from client
+            2  SQL*Net roundtrips to/from client
+            0  sorts (memory)
+            0  sorts (disk)
+           10  rows processed</pre></p>
+<p>Here I got the same volume (10 times 9000 characters) but this time I did only 2 roundtrips.
+Let&#8217;s go further and trace with sql_trace. LOB calls are instrumented since 11g so we can see them from the trace file:</p>
+<p><pre>PARSING IN CURSOR #139894737850360 len=18 dep=0 uid=103 oct=3 lid=103 tim=8952647276 hv=844696927 ad='77e1a518' sqlid='132sh6wt5k3az'
+ select C from TEST
+ END OF STMT
+ PARSE #139894737850360:c=0,e=82,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=895260
+ EXEC #139894737850360:c=0,e=69,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=897416
+ FETCH #139894737850360:c=0,e=97,p=0,cr=4,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=848200
+ LOBREAD: c=999,e=10893,p=2,cr=1,cu=0,tim=8952659696
+ FETCH #139894737850360:c=0,e=43,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=860372
+ LOBREAD: c=1000,e=1614,p=2,cr=1,cu=0,tim=8952662447
+ FETCH #139894737850360:c=0,e=47,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=863495
+ LOBREAD: c=2000,e=657,p=2,cr=1,cu=0,tim=8952664615
+ FETCH #139894737850360:c=0,e=40,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=865575
+ LOBREAD: c=0,e=706,p=2,cr=1,cu=0,tim=8952666808
+ FETCH #139894737850360:c=0,e=37,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=867552
+ LOBREAD: c=1000,e=949,p=2,cr=1,cu=0,tim=8952669193
+ FETCH #139894737850360:c=0,e=92,p=0,cr=4,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=869825
+ LOBREAD: c=0,e=844,p=2,cr=1,cu=0,tim=8952671276
+ FETCH #139894737850360:c=0,e=68,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=872168
+ LOBREAD: c=1000,e=756,p=2,cr=1,cu=0,tim=8952673521
+ FETCH #139894737850360:c=0,e=44,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=874712
+ LOBREAD: c=999,e=914,p=2,cr=1,cu=0,tim=8952676180
+ FETCH #139894737850360:c=0,e=64,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=877352
+ LOBREAD: c=0,e=931,p=2,cr=1,cu=0,tim=8952678875
+ FETCH #139894737850360:c=0,e=52,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=879774
+ LOBREAD: c=1000,e=795,p=2,cr=1,cu=0,tim=8952681136
+ FETCH #139894737850360:c=1000,e=7,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=891850
+ STAT #139894737850360 id=1 cnt=10 pid=0 pos=1 obj=100085 op='TABLE ACCESS FULL TEST (cr=16 pr=0 pw=0 time=60 us cost=5 size=20980 card=10)'
+ CLOSE #139894737850360:c=0,e=31,dep=0,type=0,tim=8952684289</pre></p>
+<p>And the sql_trace with the same data from the extended datatype.</p>
+<p><pre>PARSING IN CURSOR #139895028091224 len=18 dep=0 uid=103 oct=3 lid=103 tim=8954178349 hv=1829009117 ad='7b48ba08' sqlid='4kq232tqh8xqx'
+ select E from TEST
+ END OF STMT
+ PARSE #139895028091224:c=0,e=64,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=895345
+ EXEC #139895028091224:c=0,e=36,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=895435
+ FETCH #139895028091224:c=1000,e=896,p=0,cr=8,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=899458
+ FETCH #139895028091224:c=4000,e=3660,p=0,cr=48,cu=0,mis=0,r=9,dep=0,og=1,plh=1357081020,tim=89535
+ STAT #139895028091224 id=1 cnt=10 pid=0 pos=1 obj=100085 op='TABLE ACCESS FULL TEST (cr=56 pr=0 pw=0 time=670 us cost=5 size=20010 card=10)'
+ CLOSE #139895028091224:c=0,e=13,dep=0,type=0,tim=8954214996</pre></p>
+<p>So there is is one big advantage over CLOB: the column values are returned without additional roundtrips.</p>
+<p>That would mean that if you have character strings that may be between 4k and 32k then extended datatypes can be a good option. It&#8217;s a new feature however, and designed for another goal (easy migration from other databases). So it&#8217;s something to test carefully and the tests must integrate all you infrastructure components (backups, exports, replication, etc).</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4450"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 6 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1196">
+				<div id="div-comment-1196" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1f3f471596f97000d86f7851a596751a?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Sayan Malakshinov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1196">
+			May 24, 2014 at 22 h 31 min</a>		</div>
+
+		<p>Thanks! Intersting, that we already talked about it, but without public tests &#8211; <a href="http://orasql.org/2013/07/13/oracle-12c-extended-varchars/#comment-964086726" rel="nofollow">http://orasql.org/2013/07/13/oracle-12c-extended-varchars/#comment-964086726</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-11971"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1196' onclick='return addComment.moveForm( "div-comment-1196", "1196", "respond", "444" )' aria-label='Reply to Sayan to Sayan Malakshinov'>Reply to Sayan</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1197">
+				<div id="div-comment-1197" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1197">
+			May 25, 2014 at 15 h 29 min</a>		</div>
+
+		<p>Thanks Sayan for the link. Especially for _scalar_type_lob_storage_threshold. So we can choose between lob storage or chained rows&#8230;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-11981"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1197' onclick='return addComment.moveForm( "div-comment-1197", "1197", "respond", "444" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1490">
+				<div id="div-comment-1490" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e77066b8a1906237435988c65dfae1ac?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Shadab</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1490">
+			June 16, 2015 at 20 h 34 min</a>		</div>
+
+		<p>Hi,
+On oracle 12c compatible 12.0.0.0, changed to extended with sysdba privileges.
+I can create a table with varchar2(16000) as column now and insert a string > 4000 bytes; but only when connected as sysdba.
+When connected as a normal user rather than sysdba, I cannot play with varchar2 >4000 bytes, an error ORA-60019  is thrown. Can you explain why?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14911"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1490' onclick='return addComment.moveForm( "div-comment-1490", "1490", "respond", "444" )' aria-label='Reply to Shadab to Shadab'>Reply to Shadab</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1492">
+				<div id="div-comment-1492" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1492">
+			June 17, 2015 at 16 h 00 min</a>		</div>
+
+		<p>Hi Shadab,
+I think it&#8217;s not related with the user but with the default tablespace. SYS has SYSTEM as default tablespace, which is in MSSM. Securefiles can be stored only on ASSM tablespaces, and extended datatypes are stored as securefiles.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14931"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1492' onclick='return addComment.moveForm( "div-comment-1492", "1492", "respond", "444" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-2540">
+				<div id="div-comment-2540" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/b1cbe3edf67429f5d172e5f70f0c9ada?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Peter Gabriel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2540">
+			January 9, 2016 at 17 h 53 min</a>		</div>
+
+		<p>Did you try </p>
+<p>    select dbms_lob.substr(C, 9000, 1) from TEST;</p>
+<p>with Oracle 12?  At least in Oracle 11 with LOBs of 4000 characters (the oracle 11 limit <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":-)" class="wp-smiley" /> the round trips are avoided as well:
+<pre>
+SQL&gt; select C from TEST;
+
+Statistiken
+----------------------------------------------------------
+	  0  recursive calls
+	  0  db block gets
+	 34  consistent gets
+	 20  physical reads
+	  0  redo size
+       7491  bytes sent via SQL*Net to client
+       3664  bytes received via SQL*Net from client
+	 32  SQL*Net roundtrips to/from client
+	  0  sorts (memory)
+	  0  sorts (disk)
+	 10  rows processed
+
+SQL&gt; select dbms_lob.substr(C, 9000, 1) from TEST;
+
+Statistiken
+----------------------------------------------------------
+	  0  recursive calls
+	  0  db block gets
+	 24  consistent gets
+	 10  physical reads
+	  0  redo size
+       8455  bytes sent via SQL*Net to client
+	334  bytes received via SQL*Net from client
+	  2  SQL*Net roundtrips to/from client
+	  0  sorts (memory)
+	  0  sorts (disk)
+	 10  rows processed
+</pre>
+Regards,</p>
+<p>Peter
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25411"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2540' onclick='return addComment.moveForm( "div-comment-2540", "2540", "respond", "444" )' aria-label='Reply to Peter to Peter Gabriel'>Reply to Peter</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-2545">
+				<div id="div-comment-2545" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2545">
+			January 10, 2016 at 17 h 41 min</a>		</div>
+
+		<p>Hi Peter,
+Very good remark, thanks. It&#8217;s the same in 12c.
+Note that the way I&#8217;ve inserted the rows with lpad(rownum,9000,&#8217;x&#8217;) works only in 12c with extended datatypes. Without, the output of lpad is transparently truncated to 4000 as it is a varchar2.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25461"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2545' onclick='return addComment.moveForm( "div-comment-2545", "2545", "respond", "444" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,91 @@
+This was first published on <a href=https://blog.dbi-services.com/flashback-logging-overhead-db-file-sequential-read-on-undo-tablespace>https://blog.dbi-services.com/flashback-logging-overhead-db-file-sequential-read-on-undo-tablespace</a> (2015-01-09)
+								<h1 class="entry-title">Flashback logging overhead: &#8216;db file sequential read&#8217; on UNDO tablespace</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>in my <a href="http://www.dbi-services.com/index.php/blog/entry/insert-into-gtt-bulk-with-appendvalues">previous post</a> I&#8217;ve reproduced an issue where some bulk insert into a GTT was generating too much undo. But the real case I encountered was worse: the insert was <strong>reading</strong> lot of UNDO. And lot of this undo was read from disk.</p>
+<p>Jonathan Lewis has pointed me to a possible explanation he has given (<a href="https://community.oracle.com/thread/2228697#9611282">here</a>)</p>
+<p>I&#8217;ve reproduced the testcase from the previous post after setting the database to do flashback logging. Here are the results, comparing tkprof with and without flashback logging, for the 3 kinds of inserts I&#8217;ve tested:
+<pre>               count    cpu  elapsed  disk  query current   rows
+              ------  ----- -------- ----- ------ -------  -----
+</pre></p>
+<ul>
+<li>row-by-row insert:</li>
+</ul>
+<p><pre><b>FLASHBACK OFF</b> 100000   24.18    25.11     0   1918  314937 100000
+<b>FLASHBACK ON </b> 100000   21.50    21.51  <b>2924</b>   1930  317916 100000
+</pre></p>
+<ul>
+<li>bulk insert:</li>
+</ul>
+<p><pre><b>FLASHBACK OFF</b>    100    0.78     0.78     0   2009   68277 100000
+<b>FLASHBACK ON </b>    100    0.88     0.90  <b>1204</b>   2016   69532 100000
+</pre></p>
+<ul>
+<li>bull insert with APPEND_VALUES</li>
+</ul>
+<p><pre><b>FLASHBACK OFF</b>    100    0.85     1.08     0   6908    7421 100000
+<b>FLASHBACK ON </b>    100    1.02     1.68   <b>502</b>   6912    7945 100000
+</pre>
+So it&#8217;s clear. In FLASHBACK ON we read the same number of blocks, but some of them involve a physical read, where it&#8217;s not the case when we don&#8217;t do flashback logging.</p>
+<p>When Oracle creates new block that overwrite entirely what was stored before into it, then there is no need to read the previous values. The block is directly written in the buffer cache. They are counted as a buffer get, but there is nothing to read &#8211; so no disk read at all.</p>
+<p>But when database is in FLASHBACK ON, or has a guaranteed restore point, then all overwritten blocks must be logged into the flashback logs because a flashback database has to write them back. So it must be read before being overwritten.</p>
+<p>That concern blocks from dropped (or truncated) objects. And that concerns also the expired undo blocks that are reused. And in that case, because they expired after a while (undo_retention) there are good chance that they are not anymore in buffer cache. Consequence is disk reads from UNDO tablespace.</p>
+<h3>physical reads for flashback new</h3>
+<p>Here are the statistics of the 3 insert cases from previous blog, where I&#8217;ve added the &#8216;physical reads for flashback new&#8217; one:
+<pre>NAME                                   VALUE
+--------------------------------- ----------
+physical reads for flashback new        2924
+redo entries                          203086
+redo size                           36492404
+undo change vector size             20673192
+
+NAME                                   VALUE
+--------------------------------- ----------
+physical reads for flashback new        1204
+redo entries                           31769
+redo size                            9647772
+undo change vector size              6867248
+
+NAME                                   VALUE
+--------------------------------- ----------
+physical reads for flashback new         506
+redo entries                            6506
+redo size                            4105060
+undo change vector size              2997752
+</pre>
+When we generate 20673192 bytes into 8k blocks, we expect to write at least to 20673192/8192=2524 block. This matches the 2924 &#8216;physical reads for flashback new&#8217;. And it&#8217;s exactly the 2924 &#8216;disk&#8217; reads that we see in the tkprof above.</p>
+<h3>Measuring the impact</h3>
+<p>Now back to the initial issue where I had lot of &#8216;db file sequential read&#8217; on UNDO (file#=2)</p>
+<p>Here are some statistics from a 1 hour Statspack:
+<pre>Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+db file sequential read                      9,896,083      14,338      1   32.8
+
+Statistic                                      Total     per Second    per Trans
+--------------------------------- ------------------ -------------- ------------
+physical reads for flashback new           1,196,359          208.9         14.3
+undo change vector size                7,100,240,724    1,240,000.1     84,960.6
+flashback log write bytes             16,034,947,072    2,800,375.0    191,872.2
+flashback log writes                          45,350            7.9          0.5
+</pre>
+So from that we know that:</p>
+<ul>
+<li>1,196,359/9,896,083=12% of &#8216;db file sequential read&#8217; is for &#8216;physical reads for flashback new&#8217;</li>
+<li>and 16,034,947,072/7,100,240,724= half of flashback logging is for undo</li>
+</ul>
+<p>This is the overhead of flashback logging. Reducing the undo generated (see previous block) can be a good recommendation. And besides the flashback logging issue, it will reduce the generated redo as well.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5620"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

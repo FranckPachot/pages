@@ -1,0 +1,205 @@
+This was first published on <a href=https://blog.dbi-services.com/12cr2-no-cardinality-feedback-for-small-queries>https://blog.dbi-services.com/12cr2-no-cardinality-feedback-for-small-queries</a> (2017-01-05)
+								<h1 class="entry-title">12cR2: no cardinality feedback for small queries</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This follows the comments on Clemens Bleile post about SQL Plan Directives in Oracle 12.2 where he discovered a new behavior that is not documented. The feature is good: bypass the cardinality feedback overhead when the query is fast anyway.
+<span id="more-13898"></span></p>
+<h3>Feature</h3>
+<p>In Clemens Bleile post about <a href="http://blog.dbi-services.com/sql-plan-directives-in-12cr2-behavior-is-different-than-in-12cr1/">SQL Plan Directives changes in 12<em>c</em>R2</a> he determined than the new feature coming in bug 23596611 was responsible for the bypass of automatic reoptimization (the 12<em>c</em> cardinality feedback) in some cases.</p>
+<p>The description gives the idea that the reason for the bypass of cardinality feedback is &#8216;small queries':</p>
+<p><pre>SQL&gt; select BUGNO,SQL_FEATURE,DESCRIPTION,OPTIMIZER_FEATURE_ENABLE from v$system_fix_control where bugno=23596611;
+
+     BUGNO SQL_FEATURE                    DESCRIPTION                            OPTIMIZER_FEATURE_ENABLE
+---------- ------------------------------ -------------------------------------- -------------------------
+  23596611 QKSFM_STATS_FEEDBACK_23596611   No feedback for small queries         12.2.0.1</pre></p>
+<p>This is a new concept and in the traces we know there is nothing about &#8216;small queries&#8217;. Here is how to get more information.</p>
+<h3>Function</h3>
+<p>First, I&#8217;m looking for the &#8216;small queries&#8217; text in the oracle executable:</p>
+<p><pre>$ strings $ORACLE_HOME/bin/oracle | grep "small query"
+kkocfbCheckCardEst: No feedback for small query (BG %f, CPU %f (ms)
+kkocfbCompareExecStats: skipping cost comparision forsmall query (BG %f, CPU %f (ms)</pre></p>
+<p>Good. This looks like there is a way to trace some information about that bypass decision, and there&#8217;s a clue that &#8216;small queries&#8217; are evaluated on number of buffer gets (BG) and CPU time threshold. More than that, we have the name of the C function that traces this: kkocfbCheckCardEst</p>
+<p>kkocfb probably means:</p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr"><a href="https://twitter.com/OracleSK">@OracleSK</a> <a href="https://twitter.com/FranckPachot">@FranckPachot</a> <a href="https://twitter.com/johnnyq72">@johnnyq72</a> it’s kernel kompile costing cardinality feedback probably. and it seems there is a trace function&#8230;</p>
+<p>&mdash; Frits Hoogland (@fritshoogland) <a href="https://twitter.com/fritshoogland/status/816763076800380929">January 4, 2017</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>and then I&#8217;m looking for a way to get this trace. I didn&#8217;t know which event can trace that, but others know:</p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr"><a href="https://twitter.com/fritshoogland">@fritshoogland</a> <a href="https://twitter.com/OracleSK">@OracleSK</a> <a href="https://twitter.com/FranckPachot">@FranckPachot</a> <a href="https://twitter.com/johnnyq72">@johnnyq72</a> are you talking about event 10507 level 512?</p>
+<p>&mdash; Mauro Pagano (@Mautro) <a href="https://twitter.com/Mautro/status/816772241635627008">January 4, 2017</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>However there is another way to get an idea of the events that are checked by a function.
+The idea is described here: <a href="http://yong321.freeshell.org/computer/OracleFuncCalls.html">http://yong321.freeshell.org/computer/OracleFuncCalls.html</a></p>
+<h3>Event</h3>
+<p>We are not allowed to disassemble oracle code (this is in the licensing rules that you accept when you download oracle) so I&#8217;ll not do it here.
+If you think you have a special permission to do it, just run:
+<pre>gdb oracle &lt;&lt;&lt;&quot;disas kkocfbCheckCardEst&quot;</pre></p>
+<p>I can&#8217;t show the dissassembled code, so here is how to get the list of the events that are checked by the kkocfbCheckCardEst function:
+<pre>$ gdb oracle &lt;&lt;&lt;&quot;disas kkocfbCheckCardEst&quot; | awk --non-decimal-data &#039;/mov .*,%edi$/{gsub(/[$,]/,&quot; &quot;);a=$4}/EventRdbmsErr/{printf &quot;%d\n&quot;, a}&#039; | sort -u
+10507</pre></p>
+<p>The information we have about this event does not describe all what can be traced:</p>
+<p><pre>$ oerr ora 10507
+10507, 00000, "Trace bind equivalence logic"
+// *Cause:
+// *Action:</pre></p>
+<p>From that, I don&#8217;t know which level to set the event, but in case of doubt and because levels are often bit flags, you can set it to the maximum 0xFFFFFFFF:</p>
+<p><pre>
+alter session set events '10507 trace name context forever, level 4294967295';
+</pre></p>
+<h3>trace when cardinality feedback is bypassed</h3>
+<p>When I run the query where execution is doing less than 100 buffer gets I get the following trace with event 10507 level 512:</p>
+<p><pre>
+****** Begin CFB Hints (APA) [sql_id=a71qw8t17qpqq] xsc=0x7fca901f0e30 ctx=0x9415d4f8 ******
+Dumping Hints
+=============
+*********** End CFB Hints (APA) ***********
+kkocfbInitCardFdbkCompCtx [sql_id=a71qw8t17qpqq] monitor=y
+kkocfbCheckCardEst: No feedback for small query (BG 0.000000, CPU 0.000000 (ms)
+</pre></p>
+<p>The message is clear: no feedback for small query. The Buffer Get and CPU show 0 but on my test case, increasing the size of the table, I have seen that 100 buffer gets is the threshold:</p>
+<p><pre>
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          95 cpu_time:          0
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          95 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          96 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          96 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          97 cpu_time:          0
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          97 cpu_time:          0
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          98 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          98 cpu_time:          0
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          99 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: N                buffer_gets:          99 cpu_time:          0
+bq4fc1rdx97av is_reoptimizable: Y                buffer_gets:         100 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: Y                buffer_gets:         100 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: Y                buffer_gets:         101 cpu_time:       1000
+bq4fc1rdx97av is_reoptimizable: Y                buffer_gets:         101 cpu_time:          0
+bq4fc1rdx97av is_reoptimizable: Y                buffer_gets:         102 cpu_time:          0
+bq4fc1rdx97av is_reoptimizable: Y                buffer_gets:         102 cpu_time:       1000
+</pre></p>
+<h3>trace when query becomes reoptimizable</h3>
+<p>When the query reads more than 100 buffer gets, the cursor is marked as reoptimizable and here is the trace:</p>
+<p><pre>
+****** Begin CFB Hints (APA) [sql_id=a71qw8t17qpqq] xsc=0x7fed7dc2ca40 ctx=0x9418f4f8 ******
+Dumping Hints
+=============
+*********** End CFB Hints (APA) ***********
+kkocfbInitCardFdbkCompCtx [sql_id=a71qw8t17qpqq] monitor=y
+Reparsing due to card est...
+ @=0x95426550 type=1 nodeid=1 monitor=Y halias="DEMO_TABLE" loc="SEL$1" act=500 min=0 est=63 next=(nil)
+kkocfbCheckCardEst [sql_id=a71qw8t17qpqq] reparse=y ecs=n efb=n ost=n fbs=n
+ *********** Begin Dump Context (kkocfbCheckCardEst) [sql_id=a71qw8t17qpqq cpcnt=0] ***********
+ @=0x95426550 type=1 nodeid=1 monitor=Y halias="DEMO_TABLE" loc="SEL$1" act=500 min=0 est=63 next=(nil)
+ *********** End Dump Context ***********
+</pre></p>
+<p>act=500 is the actual number of rows (A-Rows) and est=63 is the estimated one (A-Rows) and this is how misestimate is detected.</p>
+<h3>trace when reoptimized query is run again</h3>
+<p>At that point we can see the feedback as OPT_ESTIMATE hints in v$sql_reoptimization_hints.</p>
+<p>When we run the same query another time, it is parsed again with those hits, fixing cardinality tho the A-Rows of previous execution.</p>
+<p>Here is the trace for this second execution.</p>
+<p><pre>
+kkoarCopyCtx: [sql_id=a71qw8t17qpqq] origin=CFB old=0x63904140 new=0x7fcda3716d40 copyCnt=1 copyClient=y
+**************************************************************
+kkocfbCopyBestEst: Best Stats
+  Exec count:         1
+  CR gets:            279
+  CU gets:            4
+  Disk Reads:         0
+  Disk Writes:        0
+  IO Read Requests:   0
+  IO Write Requests:  0
+  Bytes Read:         0
+  Bytes Written:      0
+  Bytes Exchanged with Storage:  0
+  Bytes Exchanged with Disk:  0
+  Bytes Simulated Read:  0
+  Bytes Simulated Returned:  0
+  Elapsed Time: 6998 (us)
+  CPU Time: 2000 (us)
+  User I/O Time: 0 (us)
+ *********** Begin Dump Context (kkocfbCopyBestEst) **********
+ *********** End Dump Context ***********
+kkocfbCopyCardCtx: oldCtx Dumping string mapping
+----------------------
+kkocfbCopyCardCtx: newCtx Dumping string mapping
+----------------------
+**************************************************************
+kkocfbCopyCardCtx: Best stats
+  Exec count:         1
+  CR gets:            279
+  CU gets:            4
+  Disk Reads:         0
+  Disk Writes:        0
+  IO Read Requests:   0
+  IO Write Requests:  0
+  Bytes Read:         0
+  Bytes Written:      0
+  Bytes Exchanged with Storage:  0
+  Bytes Exchanged with Disk:  0
+  Bytes Simulated Read:  0
+  Bytes Simulated Returned:  0
+  Elapsed Time: 6998 (us)
+  CPU Time: 2000 (us)
+  User I/O Time: 0 (us)
+ **** Begin Dump Context (kkocfbCopyCardCtx - best est) ****
+ ********************* End Dump Context ********************
+   *********** Begin Dump Context (Copy:old) [sql_id=a71qw8t17qpqq cpcnt=0] ***********
+   @=0x6446dc58 type=1 nodeid=1 monitor=Y halias="DEMO_TABLE" loc="SEL$1" act=500 min=0 est=63 next=(nil)
+   *********** End Dump Context ***********
+   *********** Begin Dump Context (Copy:new) [sql_id=a71qw8t17qpqq cpcnt=0] ***********
+   @=0x7fcda3716a78 type=1 nodeid=1 monitor=Y halias="DEMO_TABLE" loc="SEL$1" act=500 min=0 est=63 next=(nil)
+   *********** End Dump Context ***********
+kkoarReparse: xsc=0x7fcda3672b98 kxsAutoReoptCtx=0x7fcda3716d40
+kkocfbAddCardHints: Dumping string mapping
+----------------------
+******** Begin CFB Hints [sql_id=a71qw8t17qpqq]  xsc=0x7fcda3672b98 ********
+Dumping Hints
+=============
+  atom_hint=(@=0x7fcda37831e8 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" TABLE "DEMO_TABLE"@"SEL$1" ROWS=500.000000 ) )
+********** End CFB Hints **********
+</pre></p>
+<p>You can see the OPT_ESTIMATE hints here.</p>
+<p><pre>
+****** Begin CFB Hints (APA) [sql_id=a71qw8t17qpqq] xsc=0x7fcda3672b98 ctx=0x8a274118 ******
+Dumping Hints
+=============
+  atom_hint=(@=0x7fcda37831e8 err=0 resol=1 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" TABLE "DEMO_TABLE"@"SEL$1" ROWS=500.000000 ) )
+  atom_hint=(@=0x7fcda3782d10 err=0 resol=1 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" TABLE "DEMO_TABLE"@"SEL$1" ROWS=500.000000 ) )
+*********** End CFB Hints (APA) ***********
+kkocfbInitCardFdbkCompCtx [sql_id=a71qw8t17qpqq] monitor=y
+**************************************************************
+kkocfbCopyBestEst: Best Stats
+  Exec count:         1
+  CR gets:            279
+  CU gets:            4
+  Disk Reads:         0
+  Disk Writes:        0
+  IO Read Requests:   0
+  IO Write Requests:  0
+  Bytes Read:         0
+  Bytes Written:      0
+  Bytes Exchanged with Storage:  0
+  Bytes Exchanged with Disk:  0
+  Bytes Simulated Read:  0
+  Bytes Simulated Returned:  0
+  Elapsed Time: 6998 (us)
+  CPU Time: 2000 (us)
+  User I/O Time: 0 (us)
+ *********** Begin Dump Context (kkocfbCopyBestEst) **********
+ *********** End Dump Context ***********
+kkocfbCheckCardEst [sql_id=a71qw8t17qpqq] reparse=n ecs=n efb=y ost=n fbs=n
+</pre></p>
+<h3>So what?</h3>
+<p>With those adaptive feature it is good to be able to trace the decisions in order to understand and reproduce the problems we encounter. Event 10507 is very useful. It&#8217;s the execution time counterpart for the event 10053 which explains compile time decision. And in latest versions, the optimizer is more and more present at execution time.</p>
+<p>We have always seen problems coming from cardinality feedback. Most of them are coming from bad statistics or a data model where there is not one optimal access plan. Then the CBO is always trying to find better and sometimes the best is the enemy of the good.
+Now in 12.2 you have a very good way to avoid the cardinality feedback side effect: tune your queries and your data model so that the critical queries read less than 100 logical reads.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-138990"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

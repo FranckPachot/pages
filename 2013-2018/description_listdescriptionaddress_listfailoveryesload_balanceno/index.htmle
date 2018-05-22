@@ -1,0 +1,114 @@
+This was first published on <a href=https://blog.dbi-services.com/description_listdescriptionaddress_listfailoveryesload_balanceno>https://blog.dbi-services.com/description_listdescriptionaddress_listfailoveryesload_balanceno</a> (2018-02-15)
+								<h1 class="entry-title">(DESCRIPTION_LIST=(DESCRIPTION=(ADDRESS_LIST=(FAILOVER=YES)(LOAD_BALANCE=NO)</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Do you have complex connection strings with DESCRIPTION_LIST, DESCRIPTION, ADDRESS_LIST, ADDRESS and a nice combination of FAILOVER and LOAD_BALANCE? You probably checked the documentation, telling you that FAILOVER=YES is the default at all levels, but LOAD_BALANCE=YES is the default only for DESCRIPTION_LIST. But when disaster recovery and availability is concerned, the  documentation is not sufficient. I want to test it. And here is how I do it.
+<span id="more-21190"></span></p>
+<p>I don&#8217;t want to test it with the real configuration and stop the different instances. And I don&#8217;t need to. My way to test an address list is to define a tnsnames.ora with the connection string, such as the following:</p>
+<p><pre>NET_SERVICE_NAME=
+NET_SERVICE_NAME=
+ (DESCRIPTION_LIST=
+  (DESCRIPTION=
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=101))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=102))
+  )
+  (DESCRIPTION=
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+    (ADDRESS_LIST=
+      (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=201))
+      (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=202))
+    )
+  )
+ )
+</pre></p>
+<p>I used localhost because I know it&#8217;s there and I don&#8217;t want to wait for the TCP timeout. But I use fake ports, which do not exist. So finally, a connection will never be established but I will be able to see all that are tried. I check them with strace on the connect() system call, with the following script:</p>
+<p><pre>
+for i in {1..10}
+do
+TNS_ADMIN=/tmp strace -T -e trace=connect sqlplus -s -L sys/oracle@NET_SERVICE_NAME as sysdba &lt;&lt;&lt; "" 2&gt;&amp;1 | awk '
+/sa_family=AF_INET, sin_port=htons/{
+ gsub(/[()]/," ") ; printf "%s ",$5
+}
+END{
+ print ""
+}
+'
+done | sort | uniq</pre></p>
+<p>So, I used meaningful numbers for my fake ports: 101 and 102 for the addresses in the first description of the description list, and 201 and 202 for the address list in the second description. The awk script shows the sequence that was tried. And, because of the random round robin, I run them in a loop several times to see all patterns, aggregated by sort|uniq</p>
+<p>So here is the result from the connection string above using the defaults for load balancing and failover:
+<pre>
+101 102 201 202
+201 202 101 102
+</pre></p>
+<p>The sequence within the address list is always in order (101,102 and 201,202) because LOAD_BALANCE=NO is the default there. But I have two combinations for the descriptions because LOAD_BALANCE=YES is the default in DESCRIPTION_LIST. Finally, all adresses are tried because FAILOVER=YES is the default at all levels.</p>
+<h3>LOAD_BALANCE</h3>
+<p>If I define LOAD_BALANCE at all levels, such as:
+<pre>
+NET_SERVICE_NAME=
+ (DESCRIPTION_LIST=(FAILOVER=YES)(LOAD_BALANCE=YES)
+  (DESCRIPTION=(FAILOVER=YES)(LOAD_BALANCE=YES)
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=101))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=102))
+  )
+  (DESCRIPTION=(FAILOVER=YES)
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+    (ADDRESS_LIST=(FAILOVER=YES)(LOAD_BALANCE=YES)
+      (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=201))
+      (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=202))
+    )
+  )
+ )
+</pre></p>
+<p>The result shows that all combinations can be tried in any order:
+<pre>
+101 102 201 202
+101 102 202 201
+102 101 201 202
+102 101 202 201
+201 202 101 102
+201 202 102 101
+202 201 101 102
+202 201 102 101
+</pre></p>
+<p>By running it in a large loop you will confirm that any address will be tried at most once.</p>
+<h3>FAILOVER</h3>
+<p>Now, If I set FAILOVER=NO within the first description:
+<pre>
+NET_SERVICE_NAME=
+ (DESCRIPTION_LIST=(FAILOVER=YES)(LOAD_BALANCE= NO)
+  (DESCRIPTION=(FAILOVER= NO)(LOAD_BALANCE=YES)
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=101))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=102))
+  )
+  (DESCRIPTION=(LOAD_BALANCE=NO )
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+    (ADDRESS_LIST=(FAILOVER=YES)(LOAD_BALANCE=YES)
+      (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=201))
+      (ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=202))
+    )
+  )
+ )
+</pre></p>
+<p>the first attempt can be 101 or 102 (because of LOAD_BALANCING) but only one will be tried in this address list, because of no failover. Then, the second description is attempted (because FAILOVER=YES at description list level) and with all addresses there (because of LOAD_BALANCING=YES). The result of all possible combinations is:</p>
+<p><pre>
+101 201 202
+102 201 202
+102 202 201
+</pre></p>
+<p>So here it is. You can test any complex connection description to check what will be the possible connections and in which order they will be tried. From this, you can infer what will happen with a real configuration: the wait for TCP timeout for addresses tested on hosts that are not up, and the load balancing given be the different possible combinations.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-211910"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

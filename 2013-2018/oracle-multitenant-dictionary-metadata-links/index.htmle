@@ -1,0 +1,313 @@
+This was first published on <a href=https://blog.dbi-services.com/oracle-multitenant-dictionary-metadata-links>https://blog.dbi-services.com/oracle-multitenant-dictionary-metadata-links</a> (2015-01-05)
+								<h1 class="entry-title">Oracle multitenant dictionary: metadata links</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>As in previous posts (<a href="https://blog.dbi-services.com/oracle-12c-cdb-metadata-a-object-links-internals">1</a> and <a href="https://blog.dbi-services.com/oracle-multitenant-dictionary-object-links">2</a>) I&#8217;m still playing with multitenant dictionary. You may wonder why I&#8217;m spending time to do unsupported things that we will never be able to use in real life.</p>
+<p>Of course, playing with internals is fun <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /></p>
+<p>But it&#8217;s not only that. We will implement CDB databases (multi-tenant, and single-tenant as I think non-CDB will be deprecated in future versions). We will operate pluggable databases (clone, upgrade, downgrade,&#8230;), encounter issues, etc. Before doing that on critical environments, I need to be confident about the multitenant implementation. I&#8217;ts new, it&#8217;s undocumented, and &#8211; at the first sight &#8211; it looks like a &#8216;hack&#8217; in the way the dictionary is working for years.</p>
+<p>The first time I&#8217;ve seen the noncdb_to_pdb.sql I was scared. The first object link tables I&#8217;ve checked was not working as expected. And the first recovery scenario I tried had issues. And this is why I started investigating.</p>
+<p>Currently, I feel more confident about it. Those metadata links and object links works well and seems to be robust. And the implementation is not a weird black box anymore, but just something to learn and experiment.</p>
+<h3>Create shared function</h3>
+<p>I&#8217;ll create two functions with sharing=metadata, DEMO_FUNCTION0 which calls DEMO_FUNCTION1.
+In order to do that I set &#8220;_oracle_script&#8221; to true and run the same create statements in <strong>root</strong> and in the <strong>pdb</strong>.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set "_oracle_script"=true;
+Session altered.
+
+SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+SQL&gt; create function DEMO_FUNCTION1 sharing=metadata return varchar2 as begin return 'demo'; end;
+  2  /
+Function created.
+
+SQL&gt; create function DEMO_FUNCTION0 sharing=metadata return varchar2 as begin return DEMO_FUNCTION1; end;
+  2  /
+Function created.
+
+SQL&gt; grant execute on DEMO_FUNCTION0 to public;
+Grant succeeded.
+</pre>
+<p>now in the <strong>pdb</strong>:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; create function DEMO_FUNCTION1 sharing=metadata return varchar2 as begin return 'demo'; end;
+  2  /
+Function created.
+
+SQL&gt; create function DEMO_FUNCTION0 sharing=metadata return varchar2 as begin return DEMO_FUNCTION1; end;
+  2  /
+Function created.
+
+SQL&gt; grant execute on DEMO_FUNCTION0 to public;
+Grant succeeded.
+</pre>
+<h3>Check multitenant dictionary</h3>
+<p>Then I can check the dictionary tables (not the views, but the underlying tables).</p>
+<p>First in <strong>root</strong>:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS   FLAGS SHAR SIGNATURE
+----- -------------- ------ ------- ---- --------------------------------
+92370 DEMO_FUNCTION0      1 5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+92369 DEMO_FUNCTION1      1 5308416 MDL  0BCDC8C960AD833F95F0595EEBB70745
+</pre>
+<p>I see the two functions in OBJ$ (the table behind DBA_OBJECTS) which are flagged as metadata links and in 12c all objects have a signature.
+The major storage of the function metadata is the pl/sql code in SOURCE$:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+ OBJ# LINE SOURCE
+----- ---- --------------------------------------------------
+92370    1 function DEMO_FUNCTION0                  return va
+           rchar2 as begin return DEMO_FUNCTION1; end;
+
+92369    1 function DEMO_FUNCTION1                  return va
+                      rchar2 as begin return 'demo'; end;
+</pre>
+<p>And because I&#8217;ve granted execution to public I have an entry in OBJAUTH$:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select obj#,grantor#,grantee# from objauth$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+      OBJ#   GRANTOR#   GRANTEE#
+---------- ---------- ----------
+     92370          0          1
+</pre>
+<p>Finally, I have a dependency between those functions as DEMO_FUNCTION0 is calling DEMO_FUNCTION1:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select d_obj#,p_obj# from dependency$ where p_obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+    D_OBJ#     P_OBJ#
+---------- ----------
+     92370      92369
+</pre>
+<p>I&#8217;ll now look at the same information in the <strong>pdb</strong>. I don&#8217;t expect to have all of those information being redundantly stored because this is the main goal of multitenant: avoid to store the metadata link objects in all containers.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS   FLAGS SHAR SIGNATURE
+----- -------------- ------ ------- ---- --------------------------------
+91829 DEMO_FUNCTION0      1 5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+91828 DEMO_FUNCTION1      1 5308416 MDL  0BCDC8C960AD833F95F0595EEBB70745
+</pre>
+<p>It&#8217;s the same information as in the <strong>root</strong> because the create statements are exactly the same.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+no rows selected
+</pre>
+<p>This is the important point. The most important part of metadata that we don&#8217;t want to duplicate among all containers is the pl/sql code (wrapped or not) of all those dbms_ packages. When you have a metadata link function, then the code is not stored in the<strong> pdb</strong> SOURCE$. When a session has to access to it, it sees that it is a metadata link (from OBJ$) and then switch temporarily to the <strong>root</strong> in order to get it and populate the <strong>pdb</strong>dictionary cache.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select obj#,grantor#,grantee# from objauth$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+      OBJ#   GRANTOR#   GRANTEE#
+---------- ---------- ----------
+     91829          0          1
+</pre>
+<p>The objects privileges are stored at <strong>pdb</strong>level because they can be different than in root (commonality of users and privileges).</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select d_obj#,p_obj# from dependency$ where p_obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+    D_OBJ#     P_OBJ#
+---------- ----------
+     91829      91828
+</pre>
+<p>The dependency is stored at pdblevel for two reasons:</p>
+<ul>
+<li>the objects id are different.</li>
+<li>dependency can be different among PDBs</li>
+</ul>
+<p>Remember that you can plug a PDB from another CDB and from another version of Oracle. Then the dependency used to invalidate to force recompilation makes sense.</p>
+<h3>Run the function from both containers</h3>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; select DEMO_FUNCTION0 from dual;
+
+DEMO_FUNCTION0
+--------------------------------------------
+demo
+
+SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select DEMO_FUNCTION0 from dual;
+
+DEMO_FUNCTION0
+--------------------------------------------
+demo
+</pre>
+<p>We have same result.</p>
+<p>And we can check that each container has filled its own buffer cache:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select con_id,name,type,sharable_mem from gv$db_object_cache where name like 'DEMO_FUNCTION_';
+
+    CON_ID NAME                TYPE       SHARABLE_MEM
+---------- ------------------- ---------- ------------
+         3 DEMO_FUNCTION0      FUNCTION          24552
+         3 DEMO_FUNCTION1      FUNCTION           8168
+         1 DEMO_FUNCTION0      FUNCTION          24552
+         1 DEMO_FUNCTION1      FUNCTION           8168
+</pre>
+<h3>PDB in a different version than CDB</h3>
+<p>Now let&#8217;s imagine that we plug a PDB which has different version. We can also &#8216;patch&#8217; our pdb by changing the function &#8211; however I don&#8217;t think it is supported to patch a PDB to a version different than the CDB.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create or replace function DEMO_FUNCTION1 sharing=metadata return varchar2 as begin return 'demo from pdb'; end;
+  2  /
+Function created.
+</pre>
+<p>I&#8217;ve changed the function in the<strong> pdb</strong> which is now different than the<strong> root</strong> one.
+Let&#8217;s check what we have now on both containers:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+      OBJ# NAME                   STATUS      FLAGS SHAR SIGNATURE
+---------- ------------------ ---------- ---------- ---- --------------------------------
+     92370 DEMO_FUNCTION0              1    5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+     92369 DEMO_FUNCTION1              1    5308416 MDL  0BCDC8C960AD833F95F0595EEBB70745
+
+SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+ OBJ# LINE SOURCE
+----- ---- --------------------------------------------------
+92370    1 function DEMO_FUNCTION0                  return va
+           rchar2 as begin return DEMO_FUNCTION1; end;
+
+92369    1 function DEMO_FUNCTION1                  return va
+                      rchar2 as begin return 'demo'; end;
+</pre>
+<p>Nothing changed in the <strong>root</strong></p>
+<pre>SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS      FLAGS SHAR SIGNATURE
+----- -------------- ------ ---------- ---- --------------------------------
+91829 DEMO_FUNCTION0      5    5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+91828 DEMO_FUNCTION1      1   22020096 NONE FC39D079D5CD8B8743EDE6F7FCBFE33B
+</pre>
+<pre class="brush: sql; gutter: true; first-line: 1">The signature is different and the sharing flag is not set to metadata link anymore. Note that the status of the calling function is now INVALID thanks to the dependency tracking at container level.</pre>
+<pre>SQL&gt; select * from source$ where obj# in (select obj# from obj$ where name like 'DEMO_FUNCTION_');
+
+      OBJ#       LINE SOURCE
+---------- ---------- --------------------------------------------------
+     91828          1 function DEMO_FUNCTION1                  return va
+                      rchar2 as begin return 'demo from pdb'; end;</pre>
+<p>we have now the pl/sql code in the pdbas it is not a metadata link anymore.</p>
+<p>Let&#8217;s run it:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=cdb$root;
+Session altered.
+
+SQL&gt; select DEMO_FUNCTION0 from dual;
+
+DEMO_FUNCTION0
+--------------------------------------------
+demo
+
+SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select DEMO_FUNCTION0 from dual;
+
+DEMO_FUNCTION0
+--------------------------------------------
+demo from pdb
+</pre>
+<p>This proves that the function is not shared anymore. Anything has been managed properly (dependency tracking, status invalidation, dictionary cache invalidation, etc.
+As it has been executed, the invalid function has been recompiled automatically and is now valid:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=pdb1;
+Session altered.
+
+SQL&gt; select obj#,name,status,flags,decode(bitand(flags,196608),65536,'MDL',131072,'OBL','NONE') sharing,signature from obj$ where name like 'DEMO_FUNCTION_';
+
+ OBJ# NAME           STATUS      FLAGS SHAR SIGNATURE
+----- -------------- ------ ---------- ---- --------------------------------
+91829 DEMO_FUNCTION0      1    5308416 MDL  ECE1890DECB2F100A2F755CC0B76166D
+91828 DEMO_FUNCTION1      1   22020096 NONE FC39D079D5CD8B8743EDE6F7FCBFE33B
+</pre>
+<h3>Conclusion</h3>
+<p>The main points here are:</p>
+<ul>
+<li>metadata link stored procedure code is stored only in root</li>
+<li>dependency and grants are stored in each container to be managed locally</li>
+<li>&#8216;sharing=metadata&#8217; and same signature are two mandatory conditions to have a metadata link</li>
+</ul>
+<p>This implementation seems to be very robust: sharing is done only when the DDL is the same. Invalidation is properly managed. We have seen how it behaves when a function is changed in a PDB. Next blog post will show how it behaves when we change the function in the root.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5540"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3712">
+				<div id="div-comment-3712" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/841449f6dd5c3049201c1d5f7662be89?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Mani Megalai S</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3712">
+			June 8, 2016 at 10 h 09 min</a>		</div>
+
+		<p>Hi,</p>
+<p>I am currently doing Proof of concept for Multitenant Architecture with 12cR1 Metadata sharing concepts. Could you please explain how is the metadata link created in the internal. How is this metadata link referred by the PDBs. ?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37131"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3712' onclick='return addComment.moveForm( "div-comment-3712", "3712", "respond", "553" )' aria-label='Reply to Mani to Mani Megalai S'>Reply to Mani</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-3728">
+				<div id="div-comment-3728" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3728">
+			June 8, 2016 at 18 h 54 min</a>		</div>
+
+		<p>Hi Mani,
+Internally, the object definition (OBJ$) is stored in CDB$ROOT and in PDB. They have different OBJECT_ID.
+The association is done on the name (owner,object_name) and a &#8216;signature&#8217; which is probably a hash of related metadata.
+And there&#8217;s just a flag that instructs the session to switch to the root container when retrieving data and/or metadata.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37291"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3728' onclick='return addComment.moveForm( "div-comment-3728", "3728", "respond", "553" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

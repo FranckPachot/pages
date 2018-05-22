@@ -1,0 +1,158 @@
+This was first published on <a href=https://blog.dbi-services.com/oracle-12c-how-to-prevent-license-violation-with-active-data-guard>https://blog.dbi-services.com/oracle-12c-how-to-prevent-license-violation-with-active-data-guard</a> (2017-01-28)
+								<h1 class="entry-title">Oracle 12c &#8211; How to Prevent License Violation with Active Data Guard</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>There are some articles floating around how to prevent a license violation with Active Data Guard. Some of them related to an underscore parameter &#8220;_query_on_physical&#8221; and some of them related to a startup trigger. Both of them have advantages and disadvantages. E.g. regarding the &#8220;_query_on_physical&#8221; I can&#8217;t find any MOS Note about it, and I don&#8217;t know the side effects.</p>
+<p>Oracle gives us a hard time to disable features that we don&#8217;t want to be enabled by accident. It gets much better with 12.2 where you can use lockdown profiles. My colleague Franck explained it very well at the DOAG 2016 how this new feature works.</p>
+<p><a href="http://www.doag.org/formes/pubfiles/8586609/docs/Konferenz/2016/vortraege/Datenbank/2016-DB-Franck_Pachot-Multitenant_New_Security_Features_Clarify_DevOps_DBA_roles-Praesentation.pdf" target="_blank">http://www.doag.org/formes/pubfiles/8586609/docs/Konferenz/2016/vortraege/Datenbank/2016-DB-Franck_Pachot-Multitenant_New_Security_Features_Clarify_DevOps_DBA_roles-Praesentation.pdf</a></p>
+<p>But for now, I am on 12cR1 and I need a solution for that version. Especially with Active Data Guard it is very easy to activate it. Just type in &#8220;startup&#8221; on the Standby, and then you have it already. Nothing more is needed.</p>
+<p>Nevertheless, I have 12cR1 here, and my favorite way to prevent a license violation with Active Data Guard is related to cluster resources, in combination with the DataGuard Broker and an Observer. If all of them are in place and when you are on the right patch level, then it works. Especially the patch level is quite important. We will see later. What is also important, is that you should work only with the Broker command or with the srvctl utility.</p>
+<p>In my case I have a primary single instance called DBIT121_SITE1 and a standby single instance called DBIT121_SITE2. After the Data Guard has been setup, it is time to configure the Cluster Resources.</p>
+<p>In this particular case, the most important parameters when you add the database cluster resources are &#8220;role&#8221; and &#8220;startoption&#8221;</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ srvctl add database -h | egrep '(&lt;role&gt;|&lt;start_options&gt;)' | tail -2
+    -role &lt;role&gt;                   Role of the database (PRIMARY, PHYSICAL_STANDBY, LOGICAL_STANDBY, SNAPSHOT_STANDBY, FAR_SYNC)
+    -startoption &lt;start_options&gt;   Startup options for the database. Examples of startup options are OPEN, MOUNT, or "READ ONLY".</pre>
+<p>With the parameter &#8220;role&#8221; you specify the role that your database has at the moment (not the future role). The role adjustments are done later by the Broker whenever you do a switchover or failover.</p>
+<p>The role option is not only available with the &#8220;srvctl add database&#8221; command, it is also available with the &#8220;srvctl add service&#8221; command. Now it becomes really interesting. You tell Oracle to start the service only, if the role is PRIMARY.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ srvctl add service -h | grep '&lt;role&gt;'
+    -role &lt;role&gt;                   Role of the service (primary, physical_standby, logical_standby, snapshot_standby)</pre>
+<p>Ok. Let&#8217;s create the cluster resources now.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">-- Primary
+$ srvctl add database -db DBIT121_SITE1 -oraclehome /u01/app/oracle/product/12.1.0.2/dbhome_1 \
+-dbtype SINGLE -instance DBIT121 -node dbidg01 \
+-spfile /u01/app/oracle/admin/DBIT121/pfile/spfileDBIT121.ora \
+-pwfile /u01/app/oracle/admin/DBIT121/pfile/orapwDBIT121 \
+-role PRIMARY -startoption OPEN \
+-dbname DBIT121
+
+$ srvctl add service -db DBIT121_SITE1 -service DBIT121_SERVICE -role primary \
+-failovertype SELECT -notification TRUE -tafpolicy BASIC
+
+-- Standby
+$ srvctl add database -db DBIT121_SITE2 -oraclehome /u01/app/oracle/product/12.1.0.2/dbhome_1 \
+-dbtype SINGLE -instance DBIT121 -node dbidg02 \ 
+-spfile /u01/app/oracle/admin/DBIT121/pfile/spfileDBIT121.ora \
+-pwfile /u01/app/oracle/admin/DBIT121/pfile/orapwDBIT121 \
+-role PHYSICAL_STANDBY -startoption MOUNT \
+-dbname DBIT121
+
+$ srvctl add service -db DBIT121_SITE2 -service DBIT121_SERVICE -role primary \
+-failovertype SELECT -notification TRUE -tafpolicy BASIC</pre>
+<p>To test if everything works, simply do a &#8220;SWITCHOVER&#8221; with the Data Guard Broker and check the Cluster Resources afterwards. After a role change, you should see the following Cluster resource entries on the Primary</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ crsctl stat res ora.dbit121_site1.db -p | egrep '(USR_ORA_OPEN_MODE|ROLE)'
+ROLE=PRIMARY
+USR_ORA_OPEN_MODE=open</pre>
+<p>and these ones on the Standby</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ crsctl stat res ora.dbit121_site2.db -p | egrep '(USR_ORA_OPEN_MODE|ROLE)'
+ROLE=PHYSICAL_STANDBY
+USR_ORA_OPEN_MODE=mount</pre>
+<p>Oracle preserves the Open modes and also some other stuff like Block Change Tracking. If Active Data Guard was not enabled beforehand, it will also not be enabled afterwards (this is at least how it should be), and besides that, Oracle also disables the &#8220;Block Change Tracking&#8221; feature on the new Standby, because this would need the Active Data Guard license as well.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">alert.log
+...
+Completed: ALTER DATABASE SWITCHOVER TO 'DBIT121_SITE2'
+Target standby DBIT121_SITE2 did not have Active Data Guard enabled at the time of switchover.
+To maintain Active Data Guard license compliance Block Change Tracking will be disabled.
+Fri Jan 27 08:49:23 2017
+..</pre>
+<p>But the final and most important test is killing the PMON on the Standby. In GI version below 12.1.0.2 with 2016 Oct PSU, you might end up with Active Data Guard enabled. Opsssssss &#8230;
+Everything was setup up correctly, but still not working like expected. I just have simulated that a background process dies. This could happen in reality for example due to a bug with &#8220;_use_single_log_writer=false&#8221; which is the default with 12c, or simply by someone accidently killing the wrong process.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ ps -ef | grep ora_pmon_DBIT121 | grep -v grep 
+oracle 639 1 0 13:31 ? 00:00:00 ora_pmon_DBIT121
+
+$ kill -9 639 
+
+alert.log 
+... 
+... 
+Physical Standby Database mounted. 
+Lost write protection mode set to "typical" 
+Completed: ALTER DATABASE MOUNT /* db agent *//* {0:33:25} */ 
+ALTER DATABASE OPEN /* db agent *//* {0:33:25} */ 
+Data Guard Broker initializing... 
+... 
+
+Physical standby database opened for read only access. 
+Completed: ALTER DATABASE OPEN /* db agent *//* {0:33:25} */ 
+
+... 
+
+SQL&gt; select open_mode from v$database; 
+
+OPEN_MODE 
+-------------------- 
+READ ONLY WITH APPLY</pre>
+<p>After killing the PMON, the instance dies and the Cluster takes over which is very good. However, the cluster is ignoring my startup options which I have configured beforehand. After upgrading GI and the Database to 12.1.0.2 with 2016 Oct PSU, I could not reproduce this issue anymore and I have a good solution for preventing Active Data Guard to be activated.</p>
+<p>But what happens if my Primary host dies and a Failover is initiated by the observer. Then I do have two cluster resources with Primary and startup option OPEN. Let&#8217;s simulate this scenario by doing a shutdown abort with srvctl.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">DGMGRL&gt; show configuration;
+
+Configuration - DBIT121
+
+  Protection Mode: MaxAvailability
+  Members:
+  DBIT121_SITE1 - Primary database
+    DBIT121_SITE2 - (*) Physical standby database
+
+Fast-Start Failover: ENABLED
+
+Configuration Status:
+SUCCESS   (status updated 5 seconds ago)
+
+
+$ srvctl stop database -db DBIT121_SITE1 -stopoption ABORT</pre>
+<p>&nbsp;</p>
+<p>After 30 seconds, the observer initiated a fast start failover, and the new primary is now on SITE2.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">Initiating Fast-Start Failover to database "DBIT121_SITE2"...
+Performing failover NOW, please wait...
+Failover succeeded, new primary is "DBIT121_SITE2"</pre>
+<p>On SITE1 I still have the old Primary with Startup option OPEN. Not an issue at the moment, because it is a Primary and on a Primary there is no Active Data Guard. After I start up SITE1, a few moments later the reinstate takes place. Therefore, the database has to be brought again into the MOUNT state to do a &#8220;FLASHBACK DATABASE&#8221;.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ srvctl start database -db DBIT121_SITE1
+
+observer.log
+...
+Initiating reinstatement for database "DBIT121_SITE1"...
+Reinstating database "DBIT121_SITE1", please wait...
+Reinstatement of database "DBIT121_SITE1" succeeded
+
+broker.log on old Primary
+...
+Data Guard notifying Oracle Clusterware to prepare database for role change
+Database Reinstate needs instance count to be reduced to 1
+Flashback SCN is 22408550; DB checkpoint SCN is 22405622. Flashback to SCN 22408550.
+01/28/2017 10:59:25
+Physical Standby Reinstatement: Converting old primary to a physical standby
+01/28/2017 10:59:34
+Conversion to physical standby database succeeded
+Instance restart not required
+Purging diverged redos on resetlogs branch 933516912, starting SCN 22408551
+Purged 0 archived logs
+Target standby DBIT121_SITE2 did not have Active Data Guard enabled at the time of failover.
+To maintain Active Data Guard license compliance Block Change Tracking will be disabled.
+01/28/2017 10:59:42
+Notifying Oracle Clusterware to buildup after database reinstatement</pre>
+<p>The broker knows that Active DataGuard was not enabled beforehand, an so it does not enable it now.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ crsctl stat res ora.DBIT121_SITE1.db -p | egrep '(USR_ORA_OPEN_MODE|ROLE)'
+ROLE=PHYSICAL_STANDBY
+USR_ORA_OPEN_MODE=mount
+
+
+SQL&gt; select open_mode from v$database;
+
+OPEN_MODE
+--------------------
+MOUNTED</pre>
+<p>That&#8217;s it. This is my way to prevent Active Data Guard from being activated. <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":-)" class="wp-smiley" /></p>
+<h3>Conclusion</h3>
+<p>Using cluster resources to prevent Active Data Guard from being activated is a fully supported way. You only need to take care that you are on GI/DB and Observer version 12.1.0.2 2016 Oct PSU or higher. Before that patchlevel, it never worked for me correctly with cluster resources. Besides that, use only Broker and the cluster srvctl commands to manage your Data Guard environment.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-145490"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
