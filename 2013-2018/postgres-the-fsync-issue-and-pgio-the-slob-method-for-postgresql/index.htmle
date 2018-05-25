@@ -1,0 +1,177 @@
+This was first published on <a href=https://blog.dbi-services.com/postgres-the-fsync-issue-and-pgio-the-slob-method-for-postgresql>https://blog.dbi-services.com/postgres-the-fsync-issue-and-pgio-the-slob-method-for-postgresql</a> (2018-05-24)
+								<h1 class="entry-title">Postgres, the fsync() issue, and &#8216;pgio&#8217; (the SLOB method for PostgreSQL)</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>That&#8217;s a long blog post title, which is actually just a good pretext to play with Kevin Closson SLOB method for PostgreSQL: pgio
+I use the beta version of pgio here. If you want to read more about it, you can start on <a href="https://kevinclosson.net/2018/05/22/sneak-preview-of-pgio-the-slob-method-for-postgressql-part-i-the-beta-pgio-readme-file/" target="_blank">https://kevinclosson.net/2018/05/22/sneak-preview-of-pgio-the-slob-method-for-postgressql-part-i-the-beta-pgio-readme-file/</a>. If you are used to the SLOB for Oracle (<a href="https://kevinclosson.net/slob/" target="_blank">https://kevinclosson.net/slob/</a>) you will quickly understand the &#8216;why&#8217; and &#8216;how&#8217; of pgio.
+<span id="more-23601"></span></p>
+<h3>PostgreSQL&#8217;s fsync() surprise</h3>
+<p>You may have read about the fsync() issue. Postgres, from the beginning, relies a lot on the filesystem buffering to optimize I/O. So they write() to the data files but fsync() only at checkpoints. This is ok when everything goes well because the writes since the last checkpoints are protected by the Write Ahead Logging, where fsync() occurs for each writes at commit (if you didn&#8217;t change the default parameters for WAL). But when a problem occurs, such as power outage, some writes may be lost, or partially lost, and that&#8217;s not easy to detect at checkpoint time with fsync(). </p>
+<p>So, basically, there&#8217;s a risk of corruption and there are no easy ways to detect it.</p>
+<p>You can read the details from <a href="https://blog.dbi-services.com/postgres-the-fsync-issue-and-pgio-the-slob-method-for-postgresql/PostgreSQL's&#32;fsync()&#32;surprise" target="_blank">https://lwn.net/Articles/752063/</a> and that&#8217;s not the subject of this post.</p>
+<p>Most of the other databases are opening files with O_DSYNC, which means that the write() call will detect the error immediately. And the major ones are doing direct I/O anyway because they have their own buffer cache and do not need the performance overhead and corruption risk of double buffering.</p>
+<h3>Why is this so hard to fix?</h3>
+<p>So why is it so hard to do the same with Postgres? Just because it was not initially designed to optimize I/O and postgres relied heavily on the OS filesystem for that. The database systems which sync at each write, and which can do direct I/O, have implemented many optimizations to reduce the overhead of a disk latency at each write. They have their own buffer cache, with a background database writer which re-orders the writes in the optimal way. And they have multiblock writes for large contiguous writes which bypass the buffer cache.</p>
+<p>However, you may have a storage system where write latency is minimal, and you may have an application where the overhead here is not a big problem. This means that you should measure it in order to balance between performance and prevention of corruption. And this is where the SLOB method is awesome: reliable and predictable metrics to measure IOPS.</p>
+<h3>pgio to the rescue</h3>
+<p>This is my first trial of pgio, in beta version. It cannot be easier. I&#8217;ve just un-tar-ed it:
+<pre>
+tar -xvf pgio-0.9.tar
+cd pgio
+</pre></p>
+<p>I&#8217;ve setup the pgio.conf with 4 schemas and 2 threads per schema:
+<pre>
+UPDATE_PCT=10
+RUN_TIME=300
+NUM_SCHEMAS=4
+NUM_THREADS=2
+WORK_UNIT=255
+UPDATE_WORK_UNIT=8
+SCALE=200M
+DBNAME=pgio
+CONNECT_STRING="pgio"
+CREATE_BASE_TABLE=TRUE
+</pre>
+Because I want to test writes, I&#8217;ve set the UPDATE_PCT so that 10% of calls will do an UPDATE. And I kept the default work unit to read 255 blocks and, for those 10% updates, update 8 blocks only. I&#8217;ll run that with 2 threads per schemas, which means 8 concurrent sessions. And they will run for 300 seconds.</p>
+<p>In this test I didn&#8217;t want to set different values. I just want to see what happens in IOPS for a common workload of lot of reads and small changes. the scale is 200M here. My workload sessions will find their buffers in memory.</p>
+<p>On each test, I&#8217;ve created the pgio database:
+<pre>
+create tablespace pgio location '/u01/pgdata';
+CREATE TABLESPACE
+create database pgio tablespace pgio;
+CREATE DATABASE
+</pre></p>
+<p>Then run the setup.sh to load data in those schemas:
+<pre>
+Job info:      Loading 200M scale into 4 schemas as per pgio.conf-&gt;NUM_SCHEMAS.
+Batching info: Loading 2 schemas per batch as per pgio.conf-&gt;NUM_THREADS.
+Base table loading time: 15 seconds.
+Waiting for batch. Global schema count: 2. Elapsed: 0 seconds.
+Waiting for batch. Global schema count: 3. Elapsed: 103 seconds.
+Waiting for batch. Global schema count: 4. Elapsed: 177 seconds.
+Waiting for batch. Global schema count: 4. Elapsed: 249 seconds.
+
+Group data loading phase complete.         Elapsed: 249 seconds.
+                      List of relations
+ Schema |   Name    | Type  |  Owner   |  Size  | Description
+--------+-----------+-------+----------+--------+-------------
+ public | pgio1     | table | postgres | 200 MB |
+ public | pgio2     | table | postgres | 200 MB |
+ public | pgio3     | table | postgres | 200 MB |
+ public | pgio4     | table | postgres | 200 MB |
+ public | pgio_base | table | postgres | 29 MB  |
+(5 rows)
+</pre></p>
+<p>And then I&#8217;m ready to run the runit.sh</p>
+<h3>ext4 mount option</h3>
+<p>My tablespace is on an ext4 filesystem:
+<pre>
+-bash-4.2$ df -HT /u01/pgdata
+Filesystem     Type  Size  Used Avail Use% Mounted on
+/dev/sdb       ext4   32G  1.2G   29G   4% /u01
+</pre></p>
+<p>I&#8217;ll run the same workload, several times, with changing only one mount option:
+<pre>
+       async  All I/O to the filesystem should be done asynchronously. (See also the sync option.)
+       sync   All I/O to the filesystem should be done synchronously. In case of media with limited number of write cycles (e.g. some flash drives) "sync" may cause life-cycle shortening.
+</pre></p>
+<p>Which means that some runs will run with /u01 mounted as:
+<pre>
+/dev/sdb on /u01 type ext4 (rw,nosuid,nodev,relatime,sync,seclabel,data=ordered)
+</pre>
+and some others will run with the default (async):
+<pre>
+/dev/sdb on /u01 type ext4 (rw,nosuid,nodev,relatime,seclabel,data=ordered)
+</pre></p>
+<p>I did multiple runs and checked that the result is consistent among them. I&#8217;ll show only one result for each configuration.</p>
+<h3>Run it with async</h3>
+<p>Here is the output of one &#8216;runit.sh&#8217; when /u01 was in async:
+<pre>
+Date: Thu May 24 10:56:57 CEST 2018
+Database connect string: "pgio".
+Shared buffers: 128MB.
+Testing 4 schemas with 2 thread(s) accessing 200M (25600 blocks) of each schema.
+Running iostat, vmstat and mpstat on current host--in background.
+Launching sessions. 4 schema(s) will be accessed by 2 thread(s) each.
+pg_stat_database stats:
+          datname| blks_hit| blks_read|tup_returned|tup_fetched|tup_updated
+BEFORE:  pgio    |   252209 |    118112 |       110420 |        6788 |          18
+AFTER:   pgio    | 25189171 | 136972696 |    159128092 |   147250205 |      573216
+DBNAME:  pgio. 4 schemas, 2 threads(each). Run time: 300 seconds. RIOPS &gt;456181&lt; CACHE_HITS/s &gt;83123&lt;
+</pre></p>
+<p>This shows that, within those 5 minutes, I&#8217;ve fetched 147243417 tuples and updated 573198 ones.</p>
+<p>pgio takes snapshots of iostat, vmstat and mpstat. Here is a sample after 1 minute of run where we show that all CPU are busy in user or kernel, but not waiting on I/O latency:
+<pre>
+10:57:51 AM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+10:57:54 AM  all   52.82    0.00   42.22    0.09    0.00    1.11    0.00    0.00    0.00    3.76
+10:57:54 AM    0   54.11    0.00   40.75    0.00    0.00    1.37    0.00    0.00    0.00    3.77
+10:57:54 AM    1   54.42    0.00   40.14    0.34    0.00    1.02    0.00    0.00    0.00    4.08
+10:57:54 AM    2   51.19    0.00   43.34    0.34    0.00    0.68    0.00    0.00    0.00    4.44
+10:57:54 AM    3   51.02    0.00   44.22    0.34    0.00    1.36    0.00    0.00    0.00    3.06
+10:57:54 AM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+10:57:57 AM  all   53.33    0.00   42.15    0.00    0.00    1.02    0.00    0.00    0.00    3.50
+10:57:57 AM    0   53.95    0.00   42.27    0.00    0.00    0.69    0.00    0.00    0.00    3.09
+10:57:57 AM    1   52.56    0.00   42.66    0.00    0.00    0.68    0.00    0.00    0.00    4.10
+10:57:57 AM    2   54.27    0.00   40.27    0.00    0.00    1.37    0.00    0.00    0.00    4.10
+10:57:57 AM    3   52.72    0.00   43.54    0.00    0.00    1.36    0.00    0.00    0.00    2.38
+10:57:57 AM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+10:58:00 AM  all   54.10    0.00   41.54    0.09    0.00    0.77    0.00    0.00    0.00    3.50
+10:58:00 AM    0   55.14    0.00   39.38    0.34    0.00    1.03    0.00    0.00    0.00    4.11
+10:58:00 AM    1   54.95    0.00   40.96    0.00    0.00    0.68    0.00    0.00    0.00    3.41
+10:58:00 AM    2   54.11    0.00   41.10    0.00    0.00    0.68    0.00    0.00    0.00    4.11
+10:58:00 AM    3   52.05    0.00   44.86    0.00    0.00    0.68    0.00    0.00    0.00    2.40
+10:58:00 AM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+</pre></p>
+<h3>Run it with sync</h3>
+<p>Here is the output of one &#8216;runit.sh&#8217; when /u01 was in sync:
+<pre>
+Date: Thu May 24 12:18:54 CEST 2018
+Database connect string: "pgio".
+Shared buffers: 128MB.
+Testing 4 schemas with 2 thread(s) accessing 200M (25600 blocks) of each schema.
+Running iostat, vmstat and mpstat on current host--in background.
+Launching sessions. 4 schema(s) will be accessed by 2 thread(s) each.
+pg_stat_database stats:
+          datname| blks_hit| blks_read|tup_returned|tup_fetched|tup_updated
+BEFORE:  pgio    |   255169 |    119163 |       112734 |        6945 |          18
+AFTER:   pgio    | 15040938 |  74598977 |     87775490 |    86742056 |      337889
+DBNAME:  pgio. 4 schemas, 2 threads(each). Run time: 300 seconds. RIOPS &gt;248266&lt; CACHE_HITS/s &gt;49285&lt;
+</pre></p>
+<p>This shows that, within those 5 minutes, I&#8217;ve fetched 86735111 tuples and updated 337871 ones. So, basically the IOPS have been divided by two here in this example when waiting on each writes to be synced to disk.</p>
+<p>pgio takes snapshots of iostat, vmstat and mpstat. Here is a sample after 1 minute of run where we show that all CPU are 30% idle waiting on I/O completion:
+<pre>
+12:19:51 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+12:19:54 PM  all   29.95    0.00   27.79   10.88    0.00    1.26    0.00    0.00    0.00   30.13
+12:19:54 PM    0   30.63    0.00   27.46   11.27    0.00    0.70    0.00    0.00    0.00   29.93
+12:19:54 PM    1   30.07    0.00   27.62   12.24    0.00    0.70    0.00    0.00    0.00   29.37
+12:19:54 PM    2   30.28    0.00   27.82   10.92    0.00    0.35    0.00    0.00    0.00   30.63
+12:19:54 PM    3   28.02    0.00   28.02    8.56    0.39    3.89    0.00    0.00    0.00   31.13
+12:19:54 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+12:19:57 PM  all   30.10    0.00   27.92   11.24    0.00    1.00    0.00    0.00    0.00   29.74
+12:19:57 PM    0   29.29    0.00   28.57   10.71    0.00    0.36    0.00    0.00    0.00   31.07
+12:19:57 PM    1   30.88    0.00   28.07   11.93    0.00    0.35    0.00    0.00    0.00   28.77
+12:19:57 PM    2   30.31    0.00   27.18   12.54    0.00    0.70    0.00    0.00    0.00   29.27
+12:19:57 PM    3   30.43    0.00   27.67    9.88    0.00    2.77    0.00    0.00    0.00   29.25
+12:19:57 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+12:20:00 PM  all   29.51    0.00   27.00   10.76    0.00    1.08    0.00    0.00    0.00   31.66
+12:20:00 PM    0   29.58    0.00   28.17   10.56    0.00    0.35    0.00    0.00    0.00   31.34
+12:20:00 PM    1   29.72    0.00   26.22   12.24    0.00    0.70    0.00    0.00    0.00   31.12
+12:20:00 PM    2   29.12    0.00   26.32   10.88    0.00    0.35    0.00    0.00    0.00   33.33
+12:20:00 PM    3   29.34    0.00   27.80    8.88    0.00    3.09    0.00    0.00    0.00   30.89
+12:20:00 PM  CPU    %usr   %nice    %sys %iowait    %irq   %soft  %steal  %guest  %gnice   %idle
+</pre></p>
+<h3>So what?</h3>
+<p>Currently, Postgres relies on the filesystem to optimize the I/O, but there&#8217;s a risk of corruption in case of failure. We can force to wait for I/O completion with the &#8216;sync&#8217; mount options of the filesystems, or even with some file attributes (chattr -R +S) for ext4 or xfs, but there&#8217;s a performance penalty. The important thing is to measure this penalty, and this is where pgio is great: measure the performance penalty with a workload that is customizable (amount of changes, amount of data,&#8230;) but also predictable (does not depend on other parameters like an application benchmark). When you know how being in &#8216;sync&#8217; impacts your system, you can choose. And we can bet that future versions of Postgres will improve and offer ways to stay efficient without compromising the data at first power outage.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-236020"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
