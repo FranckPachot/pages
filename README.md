@@ -1,1 +1,1 @@
-https://franckpachot.github.io/blog/2013-2018/
+https://franckpachot.github.io/pages/2013-2018/
