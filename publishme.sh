@@ -14,7 +14,7 @@ mm=  gensub(/This was first published on .*>(.*)<.* [(](....)-(..)-(..)[)].*/,"\
 dd=  gensub(/This was first published on .*>(.*)<.* [(](....)-(..)-(..)[)].*/,"\\4",1)
 dir=yyyy"/"mm"/"dd
 if ( dir ~ "^201" ) system( "mkdir -p " dir)
-$0="<p class=firstpub>"$0"<br>Republishing for new followers. The content is related to the the versions available at the publication date</p>"
+$0="<p class=firstpub>"$0"<br>Republishing here for new followers. The content is related to the the versions available at the publication date</p>"
 }
 dir =="" { exit }
 /.*<h1 class="entry-title">(.*)<[/]h1>.*/{
