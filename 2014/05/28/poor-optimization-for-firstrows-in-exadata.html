@@ -1,0 +1,250 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/poor-optimization-for-firstrows-in-exadata />
+<meta name=description content='A blog post from 2014 about Oracle Exadata &#8211; poor optimization for FIRST_ROWS'>
+<title>Oracle Exadata &#8211; poor optimization for FIRST_ROWS</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/poor-optimization-for-firstrows-in-exadata>https://blog.dbi-services.com/poor-optimization-for-firstrows-in-exadata</a> (2014-05-28), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle Exadata &#8211; poor optimization for FIRST_ROWS</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a <a href="https://blog.dbi-services.com/oracle-rownum-vs-rownumber-and-12c-fetch-first">previous blog</a>, I discussed the difference between rownum and row_number(), in particular their behaviour in implicitely adding a first_rows(n) to the optimizer. That reminded me that I forgot to blog about an issue I encountered and which concerns both approaches. It was on an Exadata: a nice full table scan with smartscan was taking a long time. And forcing to an index access &#8211; with a very bad index &#8211; was better. The query had a very selective predicate (and that&#8217;s why SmartScan should be very good here) but where the predicate cannot be used by the index access.</p>
+<p>In order to explain this, I&#8217;ll do the same query but without any predicates. It&#8217;s on a simple TEST table with 1 million rows.
+<pre>select /*+ gather_plan_statistics */ * from (
+   select * from TEST order by n 
+ ) where rownum &lt; 10</pre>
+And here is the execution plan with execution statistics
+<pre>---------------------------------------------------------------------------------------------
+ | Id  | Operation                               | Name | E-Rows | A-Rows | Buffers | Reads  |
+ ---------------------------------------------------------------------------------------------
+ |   0 | SELECT STATEMENT                        |      |        |     10 |    2137 |   2135 |
+ |*  1 |  COUNT STOPKEY                          |      |        |     10 |    2137 |   2135 |
+ |   2 |   VIEW                                  |      |   1000K|     10 |    2137 |   2135 |
+ |*  3 |    SORT ORDER BY STOPKEY                |      |   1000K|     10 |    2137 |   2135 |
+ |*  4 |     TABLE ACCESS STORAGE FULL FIRST ROWS| TEST |   1000K|   1000K|    2137 |   2135 |
+ ---------------------------------------------------------------------------------------------</pre>
+It sounds good. SmartScan is used (TABLE ACCESS STORAGE). We read 1 million rows, then sort them and keep only the top-10. But it takes longer than our expectation. Let&#8217;s have a look at some SmartScan statistics:
+<pre>NAME                                                                   VALUE
+ ---------------------------------------------------------------- -----------
+ cell IO uncompressed bytes                                        17,596,416
+ cell blocks processed by cache layer                                   3,329
+ cell blocks processed by data layer                                    2,148
+ cell blocks processed by txn layer                                     3,329
+ cell num fast response sessions                                            1
+ cell num fast response sessions continuing to smart scan                   1
+ cell physical IO bytes eligible for predicate offload             17,498,112
+ cell physical IO interconnect bytes                               31,273,680
+ cell physical IO interconnect bytes returned by smart scan        15,848,144
+ cell scans                                                                 2
+ physical read bytes                                               17,506,304
+ physical read total bytes                                         32,923,648</pre>
+Something is wrong here. We have 17MB eligible to SmartScan, which is the 2135 blocks reads we see in the execution plan (I have the default 8k blocks).
+But I&#8217;ve exchanged 31MB through interconnect. What are those additional 16MB ? I&#8217;m doing only SmartScan here, according to the execution plan.</p>
+<p>Well. Easy to check. The full table scan must read all blocks up the the high water mark.
+<pre>select blocks,blocks*8192 MBYTES from user_tables where table_name='TEST';
+ SQL&gt;
+     BLOCKS     MBYTES
+ ---------- ----------
+       4013   32882245</pre>
+So my table has 4013 blocks and is 32MB. Not only my execution plan above is not optimal. But it is false. It is just impossible to full scan my table with only 2137 block reads. I have to read 4013 blocks, which is more than 30MB.
+So in the statistics above, the right values are &#8216;physical read total bytes&#8217; and &#8216;cell physical IO interconnect bytes&#8217;. But it seems that only 17MB of data has been read through smart scan.</p>
+<p>There we have to know a little bit more about an exadata optimization that is not very well documented. The clue was &#8216;FIRST ROWS&#8217; in the execution plan, just after &#8216;STORAGE&#8217;. If it&#8217;s a special feature, we can check how to enable/disable it with an underscore parameter. Names and descriptions are in sys.x$ksppi:
+<pre>SQL&gt; select KSPPINM,KSPPDESC from sys.x$ksppi where KSPPDESC like '%first%rows%';
+KSPPINM
+ --------------------------------------------------------------------------------
+ KSPPDESC
+ --------------------------------------------------------------------------------
+ _kcfis_fast_response_enabled
+ Enable smart scan optimization for fast response (first rows)
+_sort_elimination_cost_ratio
+ cost ratio for sort eimination under first_rows mode
+_optimizer_rownum_pred_based_fkr
+ enable the use of first K rows due to rownum predicate
+_optimizer_fkr_index_cost_bias
+ Optimizer index bias over FTS/IFFS under first K rows mode
+</pre>
+From its description, _kcfis_fast_response_enabled is related with SmartScan and with &#8216;first rows&#8217; (which we have in the execution plan and which is coming from the rownum &lt; 10.
+ So let&#8217;s disable it:
+<pre>
+alter session set "_kcfis_fast_response_enabled"=false;</pre>
+and execute again, with execution plan and statistics.
+<pre>---------------------------------------------------------------------------------------------
+ | Id  | Operation                               | Name | E-Rows | A-Rows | Buffers | Reads  |
+ ---------------------------------------------------------------------------------------------
+ |   0 | SELECT STATEMENT                        |      |        |     10 |    4019 |   4017 |
+ |*  1 |  COUNT STOPKEY                          |      |        |     10 |    4019 |   4017 |
+ |   2 |   VIEW                                  |      |   1000K|     10 |    4019 |   4017 |
+ |*  3 |    SORT ORDER BY STOPKEY                |      |   1000K|     10 |    4019 |   4017 |
+ |*  4 |     TABLE ACCESS STORAGE FULL FIRST ROWS| TEST |   1000K|   1000K|    4019 |   4017 |
+ ---------------------------------------------------------------------------------------------</pre>
+The first observation was that the execution time was much faster. And here we see the 4000 blocks of my table that we have to read.
+<pre>NAME                                                                                VALUE
+ ---------------------------------------------------------------- ------------------------
+ cell IO uncompressed bytes                                                     33,120,256
+ cell blocks processed by cache layer                                                5,913
+ cell blocks processed by data layer                                                 4,043
+ cell blocks processed by txn layer                                                  5,913
+ cell physical IO bytes eligible for predicate offload                          32,915,456
+ cell physical IO interconnect bytes                                            29,833,624
+ cell physical IO interconnect bytes returned by smart scan                     29,825,432
+ cell scans                                                                              2
+ physical read bytes                                                            32,923,648
+ physical read total bytes                                                      32,923,648</pre>
+All statistics are right now. 32MB eligible to SmartScan. 32MB returned by SmartScan.</p>
+<h3>So what happened?</h3>
+<p>When we use first_rows(10), either explicitely or coming from rownum &lt; 10, Oracle knows that we need only 10 rows. And Exadata has an optimization to avoid SmartScan for only few rows because it has an overhead to start. This is the &#8216;Enable smart scan optimization for fast response (first rows)&#8217; feature and you can see it in the &#8216;cell num fast response sessions&#8217; statistic above. No SmartScan occurs when the result is expected to come quickly. However, if it is longer than expected, it can switch so SmartScan later (&#8216;cell num fast response sessions continuing to smart scan&#8217;). But there are two problems with that.
+First, the statistics are wrong. The statistics from the first phase (the non-SmartScan one) are just lost. We see it in the execution plan where about 2000 reads are missing. And we see it also in &#8216;physical read bytes&#8217; where 16MB are missing.
+Second, and worse, this optimization is not good at all in our case. No matter we need only 10 rows. We have to read 1 million rows because we have to sort them before filtering them. And 1 million is not a good candidate for &#8216;fast response (first rows)&#8217; optimization. Here, 16MB has been read without SmartScan, and when I checked the wait events, they were all single block reads. The fastest machine has chosen to use the slowest way to get data&#8230;</p>
+<p>This is just one example of first rows issues. There are many others (<a href="http://jonathanlewis.wordpress.com/2010/01/10/first_rows_n-again/trackback/">see Jonathan Lewis blog</a>). In general, first_rows_n optimization is good when it avoids to sort all the rows, using the index which is maintained ordered. And by the way, if you see &#8216;first rows&#8217; without an order by, then it&#8217;s suspicous: who wants the top-n of a random row set ?
+In order to have a better control on first rows optimizations, I prefer to avoid rownum and use the row_number() function or the 12c FETCH FIRST ROWS syntax. See the <a href="https://blog.dbi-services.com/oracle-rownum-vs-rownumber-and-12c-fetch-first">previous blog</a> about that.</p>
+<h3>update</h3>
+<p>Thanks to Hemant K Chitale comment, I&#8217;ve fixed the unit (this testcase was in MB)</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4470"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1401">
+				<div id="div-comment-1401" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/c10bb46429554ba6f3c6144ad8dbd555?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Hemant K Chitale</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1401">
+			March 16, 2015 at 8 h 58 min</a>		</div>
+
+		<p>Is it GBs or MBs ?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14021"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1401' onclick='return addComment.moveForm( "div-comment-1401", "1401", "respond", "446" )' aria-label='Reply to Hemant to Hemant K Chitale'>Reply to Hemant</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1402">
+				<div id="div-comment-1402" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1402">
+			March 16, 2015 at 9 h 55 min</a>		</div>
+
+		<p>Hi, yes it&#8217;s MB. Thanks Hemant. I&#8217;m correcting the post.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14031"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1402' onclick='return addComment.moveForm( "div-comment-1402", "1402", "respond", "446" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-4114">
+				<div id="div-comment-4114" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4114">
+			July 28, 2016 at 21 h 06 min</a>		</div>
+
+		<p>It seems that this bug is not there in 12.1
+<pre>
+SQL&gt; set linesize 140 pagesize 130 echo on
+SQL&gt; select /*+ gather_plan_statistics */ * from (
+  2     select
+  3      * from TEST
+  4     order by h
+  5   ) where rownum  save query.sql replace
+Wrote file query.sql
+SQL&gt; select * from table(dbms_xplan.display_cursor(null,null,'iostats last'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  60w1rr0ymfppn, child number 0
+-------------------------------------
+select /*+ gather_plan_statistics */ * from (    select     * from TEST
+   order by h  ) where rownum &lt;=10
+
+Plan hash value: 1607412806
+
+-------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                               | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                        |      |      1 |        |     10 |00:00:01.63 |   24692 |  24676 |
+|*  1 |  COUNT STOPKEY                          |      |      1 |        |     10 |00:00:01.63 |   24692 |  24676 |
+|   2 |   VIEW                                  |      |      1 |     10M|     10 |00:00:01.63 |   24692 |  24676 |
+|*  3 |    SORT ORDER BY STOPKEY                |      |      1 |     10M|     10 |00:00:01.63 |   24692 |  24676 |
+|   4 |     TABLE ACCESS STORAGE FULL FIRST ROWS| TEST |      1 |     10M|     10M|00:00:03.95 |   24692 |  24676 |
+-------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(ROWNUM&lt;=10)
+   3 - filter(ROWNUM select name,value,case when name like '%bytes%' then round(value/8192) end blocks from v$mystat join v$statname using(statistic#) where value&gt;0 and (name like 'cell%' or name like 'physical read% bytes') order by 1;
+
+NAME                                                                  VALUE     BLOCKS
+---------------------------------------------------------------- ---------- ----------
+cell flash cache read hits                                                7
+cell physical IO interconnect bytes                               202334208      24699
+physical read bytes                                               202219520      24685
+physical read total bytes                                         202334208      24699
+
+</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41151"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4114' onclick='return addComment.moveForm( "div-comment-4114", "4114", "respond", "446" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

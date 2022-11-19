@@ -1,0 +1,222 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-12cr2-is_rolling_invalid-in-vsql />
+<meta name=description content='A blog post from 2016 about Oracle 12cR2: IS_ROLLING_INVALID in V$SQL'>
+<title>Oracle 12cR2: IS_ROLLING_INVALID in V$SQL</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-12cr2-is_rolling_invalid-in-vsql>https://blog.dbi-services.com/oracle-12cr2-is_rolling_invalid-in-vsql</a> (2016-09-25), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle 12cR2: IS_ROLLING_INVALID in V$SQL</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a <a href="http://blog.dbi-services.com/rolling-invalidate-window-exceeded/" target="_blank">previous post</a> I published a test case to show when a cursor is not shared anymore after a rolling invalidation. Basically the dbms_stats marks the cursor as &#8216;rolling invalid&#8217; and the next execution marks it as &#8216;rolling invalid executed&#8217;. Looking at 12<em>c</em>R2 there is a little enhancement in V$SQL with an additional column displays those states.
+<span id="more-10426"></span>
+Note that 12<em>c</em>R2 full documentation is not yet available, but you can test this on the Exadata Express Cloud Service.</p>
+<p>I set the invalidation period to 5 seconds instead of 5 hours to show the behavior without waiting
+<pre>
+17:43:52 SQL&gt; alter system set "_optimizer_invalidation_period"=5;
+System altered.
+</pre>
+I&#8217;ll run a statement with dbms_sql in order to separate parse and execute phases
+<pre>
+17:43:53 SQL&gt; variable c number
+17:43:53 SQL&gt; exec :c := dbms_sql.open_cursor;
+PL/SQL procedure successfully completed.
+17:43:53 SQL&gt; exec dbms_sql.parse(:c, 'select (cast(sys_extract_utc(current_timestamp) as date)-date''1970-01-01'')*24*3600 from DEMO' , dbms_sql.native );
+PL/SQL procedure successfully completed.
+</pre>
+Here is the cursor from V$SQL including the new IS_ROLLING_INVALID column:
+<pre>
+17:43:53 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME   IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------ ------------------
+            0          1           1          0 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 17:43:52 N
+</pre>
+Statement is parsed (one parse call + load) but IS_ROLLING_INVALID is N</p>
+<p>Now I execute it:
+<pre>
+17:43:53 SQL&gt; exec dbms_output.put_line( dbms_sql.execute(:c) );
+0
+PL/SQL procedure successfully completed.
+
+17:43:53 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME   IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------ ------------------
+            0          1           1          1 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 17:43:52 N
+</pre>
+Statement has one execution.</p>
+<p>I&#8217;m now gathering statistics with default rolling invalidation:
+<pre>
+17:43:53 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+PL/SQL procedure successfully completed.
+
+17:43:53 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME   IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------ ------------------
+            0          1           1          1 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 17:43:52 Y
+</pre>
+The cursor is now marked as rolling invalid (IS_ROLLING_INVALID=&#8221;Y&#8221;) but wait, this is not a &#8220;Y&#8221;/&#8221;N&#8221; boolean, there&#8217;s another possible value.</p>
+<p>I execute the statement again (no parse call, only execution):
+<pre>
+17:43:53 SQL&gt; exec dbms_output.put_line( dbms_sql.execute(:c) );
+0
+PL/SQL procedure successfully completed.
+
+17:43:53 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME   IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------ ------------------
+            0          1           1          2 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 17:43:52 X
+</pre>
+Cursor is now marked as rolling invalid executed (&#8220;X&#8221;) and this is where the rolling window starts (which I&#8217;ve set to 5 seconds instead of 5 hours)</p>
+<p>I wait 5 seconds and the cursor has not changed:
+<pre>
+17:43:58 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME   IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------ ------------------
+            0          1           1          2 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 17:43:52 X
+
+</pre>
+I execute it again (no parse call, only re-execute the cursor):
+<pre>
+17:43:58 SQL&gt; exec dbms_output.put_line( dbms_sql.execute(:c) );
+0
+PL/SQL procedure successfully completed.
+</pre>
+For this execution, a new child has been created:
+<pre>
+17:43:58 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME   IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------ ------------------
+            0          1           1          2 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 17:43:52 X
+            0          1           0          1 2016-09-25/17:43:53 2016-09-25/17:43:57 25-SEP-16 17:43:57 N
+</pre></p>
+<p>So rolling invalidation do not require a parse call. Execution can start the rolling window and set the invalidation timestamp, and first execution after this timestamp creates a new child cursor.</p>
+<p>I&#8217;ll now test what happens with parse calls only.</p>
+<p>I set a longer rolling window (2 minutes) here:
+<pre>
+17:43:58 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+PL/SQL procedure successfully completed.
+
+17:43:58 SQL&gt; alter system set "_optimizer_invalidation_period"=120;
+System altered.
+</pre>
+The last child has been marked as rolling invalid but not yet executed in this state:
+<pre>
+17:43:58 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME   IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------ ------------------
+            0          1           1          2 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 17:43:52 X
+            0          1           0          1 2016-09-25/17:43:53 2016-09-25/17:43:57 25-SEP-16 17:43:57 Y
+</pre></p>
+<p>From a new session I open another cursor:
+<pre>
+17:43:58 SQL&gt; connect &amp;_user./demo@&amp;_connect_identifier
+Connected.
+17:43:58 SQL&gt; exec :c := dbms_sql.open_cursor;
+PL/SQL procedure successfully completed.
+</pre>
+And run several parse calls without execute, one every 10 seconds:
+<pre>
+17:43:58 SQL&gt; exec for i in 1..12 loop dbms_sql.parse(:c, 'select (cast(sys_extract_utc(current_timestamp) as date)-date''1970-01-01'')*24*3600 from DEMO' , dbms_sql.native ); dbms_lock.sleep(10); end loop;
+PL/SQL procedure successfully completed.
+</pre>
+So two minutes later I see that I have a new child created during the rolling window:
+<pre>
+17:45:58 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTI IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- --------- ------------------
+            0          1           1          2 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 X
+            0          1           3          1 2016-09-25/17:43:53 2016-09-25/17:43:57 25-SEP-16 Y
+            0          1           9          0 2016-09-25/17:43:53 2016-09-25/17:44:27 25-SEP-16 N
+</pre>
+Here, at the third parse call (17:44:27) during the invalidation window, a new child cursor has been created. The old one is still marked as rolling invalid (&#8220;Y&#8221;), but not &#8216;rolling invalid executed&#8217; (&#8220;X&#8221;) because it has not been executed.</p>
+<p>So it seems that both parse or execute are triggering the rolling invalidation, and the IS_ROLLING_INVALID displays which one.</p>
+<p>An execute will now execute the new cursor:
+<pre>
+17:45:58 SQL&gt; exec dbms_output.put_line( dbms_sql.execute(:c) );
+
+PL/SQL procedure successfully completed.
+
+17:45:58 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_id='61x2h0y9zv0r6';
+
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTI IS_ROLLING_INVALID
+------------- ---------- ----------- ---------- ------------------- ------------------- --------- ------------------
+            0          1           1          2 2016-09-25/17:43:53 2016-09-25/17:43:53 25-SEP-16 X
+            0          1           3          1 2016-09-25/17:43:53 2016-09-25/17:43:57 25-SEP-16 Y
+            0          1           9          1 2016-09-25/17:43:53 2016-09-25/17:44:27 25-SEP-16 N
+</pre>
+Of course, when new cursors have been created we can see the reason in V$SQL_SHARED_CURSOR:
+<pre>
+17:45:58 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='61x2h0y9zv0r6';
+
+CHILD_NUMBER REASON
+------------ --------------------------------------------------------------------------------
+           0 &lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Win
+             dow Exceeded(2)&lt;/reason&gt;&lt;size&gt;0x0&lt;/size&gt;&lt;details&gt;already_processed&lt;/details&gt;&lt;/Ch
+             ildNode&gt;&lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invali
+             date Window Exceeded(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;invalidation_window&gt;1472658232&lt;
+             /invalidation_window&gt;&lt;ksugctm&gt;1472658237&lt;/ksugctm&gt;&lt;/ChildNode&gt;
+
+           1 &lt;ChildNode&gt;&lt;ChildNumber&gt;1&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Win
+             dow Exceeded(2)&lt;/reason&gt;&lt;size&gt;0x0&lt;/size&gt;&lt;details&gt;already_processed&lt;/details&gt;&lt;/Ch
+             ildNode&gt;&lt;ChildNode&gt;&lt;ChildNumber&gt;1&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invali
+             date Window Exceeded(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;invalidation_window&gt;1472658266&lt;
+             /invalidation_window&gt;&lt;ksugctm&gt;1472658268&lt;/ksugctm&gt;&lt;/ChildNode&gt;
+
+           2
+</pre></p>
+<p>The last child cursor has been created at 5:44:28 (invalidation_window=1472658268) because invalidation timestamp (ksugctm=1472658266)</p>
+<h3>So what?</h3>
+<p>We love Oracle because it&#8217;s not a black box. And it&#8217;s good to see that they continue in this way by exposing in V$ views information that can be helpful for troubleshooting. </p>
+<p>Rolling invalidation has been introduced for dbms_stats because we have to gather statistics and we don&#8217;t want hard parse storms after that.
+But remember that invalidation can also occur with DDL such as create, alter, drop, comment, grant, revoke.</p>
+<p>You should avoid running DDL when application is running. However, we may have to do some of those operations online. It would be nice to have the same rolling invalidation mechanisms and it seems that it will be possible: </p>
+<p><pre>
+SQL&gt; show parameter invalid
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+cursor_invalidation                  string      IMMEDIATE
+
+SQL&gt; alter session set cursor_invalidation=XXX;
+ERROR:
+ORA-00096: invalid value XXX for parameter cursor_invalidation, must be from among IMMEDIATE, DEFERRED
+</pre>
+That&#8217;s interesting. I&#8217;ll explain which DDL can use that in a future blog post.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-104270"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

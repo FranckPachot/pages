@@ -1,0 +1,215 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-v />
+<meta name=description content='A blog post from 2017 about Postgres vs. Oracle access paths V &#8211; FIRST ROWS and MIN/MAX'>
+<title>Postgres vs. Oracle access paths V &#8211; FIRST ROWS and MIN/MAX</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-v>https://blog.dbi-services.com/postgres-vs-oracle-access-paths-v</a> (2017-08-08), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Postgres vs. Oracle access paths V &#8211; FIRST ROWS and MIN/MAX</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>We have seen how an index can help to avoid a sorting operation in the <a href="../postgres-vs-oracle-access-paths-iv/index.html" target="_blank">previous post</a>. This avoids a blocking operation: the startup cost is minimal and the first rows can be immediately returned. This is often desired when displaying rows to the user screen. Here is more about Postgres startup cost, Oracle first_rows costing, and fetching first rows only.
+<span id="more-17774"></span>
+Here is the execution plan we had in Oracle to get the values of N sorted. The cost for Oracle is the cost to read the index leaves: estimated to 46 random reads:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dbck3rgnqbakg, child number 0
+-------------------------------------
+select /*+  */  n from demo1  where n is not null order by n
+---------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |         |      1 |        |    46 (100)|  10000 |00:00:00.01 |      48 |
+|   1 |  INDEX FULL SCAN | DEMO1_N |      1 |  10000 |    46   (0)|  10000 |00:00:00.01 |      48 |
+---------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<p>In PostreSQL, we have two costs (cost=0.29..295.29):
+<pre>
+explain (analyze,verbose,costs,buffers) select  n from demo1  where n is not null order by n ;
+                                                             QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_n on public.demo1  (cost=0.29..295.29 rows=10000 width=4) (actual time=0.194..2.026 rows=10000 loops=1)
+   Output: n
+   Index Cond: (demo1.n IS NOT NULL)
+   Heap Fetches: 0
+   Buffers: shared hit=30
+ Planning time: 1.190 ms
+ Execution time: 2.966 ms
+</pre></p>
+<p>I explained where the total cost (295.29) comes from:</p>
+<ul>
+<li>The index on the column X has 30 blocks witch is estimated at cost=120 (random_page_cost=4)</li>
+<li>We have 10000 index entries to process, estimated at cost=50 (cpu_index_tuple_cost=0.005)</li>
+<li>We have 10000 result rows to process, estimated at cost=100 (cpu_tuple_cost=0.01)</li>
+<li>We have evaluated 10000 &#8216;is not null&#8217; conditions, estimated at cost=25 (cpu_operator_cost=0.0025)</li>
+</ul>
+<p>But the Postgres EXPLAIN also show the startup cost (0.29) which is the cost before returning the first rows (only few cpu_operator_cost here).</p>
+<p>From that, I can guess that fetching 1 row will have the following cost:</p>
+<ul>
+<li>The startup cost of 0.29</li>
+<li>Read the first index page, cost=4 (random_page_cost=4)</li>
+<li>1 index entry to process at cpu_index_tuple_cost=0.005</li>
+<li>1 result row to process, estimated at cpu_tuple_cost=0.01</li>
+<li>1 &#8216;is not null&#8217; conditions, estimated at cpu_operator_cost=0.0025</li>
+</ul>
+<p>This should be approximately cost=4.3075 for one row. Roughly the cost to read one index page. We will see later that the query planner do not count this first index page.</p>
+<h3>Oracle First Rows</h3>
+<p>In Oracle, we have only the total cost in the execution plan, but we can estimate the cost to retrieve 1 row with the FIRST_ROWS(1) hint:</p>
+<p><pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0fjk9vv4g1q1w, child number 0
+-------------------------------------
+select /*+ first_rows(1) */  n from demo1  where n is not null order by
+n
+---------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |         |      1 |        |     2 (100)|  10000 |00:00:00.01 |      48 |
+|   1 |  INDEX FULL SCAN | DEMO1_N |      1 |  10000 |     2   (0)|  10000 |00:00:00.01 |      48 |
+---------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<p>The cost here is small, estimated to 2 random reads (1 B*Tree branch and 1 leaf) which is sufficient to get the first row. Of course, I&#8217;ve estimated it for 1 row but I finally retrieved all rows (A-Rows=10000), reading all blocks (Buffers=48). However, my execution plan is optimized for fetching one row.</p>
+<h3>Fetch first rows</h3>
+<p>I can run the previous query and finally fetch only one row, but I can also explicitly filter the result to get one row only. If you use older versions of Oracle, you may have used the &#8216;rownum&#8217; way of limiting rows, and this implicitly adds the first_rows hint. Here I&#8217;m using the FETCH FIRST syntax and I need to explicitely add the FIRST_ROWS() hint to get the plan optimized for that.
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  9bcm542sk64az, child number 0
+-------------------------------------
+select /*+ first_rows(1) */  n from demo1  where n is not null order by n fetch first 1 row only
+---------------------------------------------------------------------------------------------------------
+| Id  | Operation              | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT       |         |      1 |        |     2 (100)|      1 |00:00:00.01 |       3 |
+|*  1 |  VIEW                  |         |      1 |      1 |     2   (0)|      1 |00:00:00.01 |       3 |
+|*  2 |   WINDOW NOSORT STOPKEY|         |      1 |      1 |     2   (0)|      1 |00:00:00.01 |       3 |
+|   3 |    INDEX FULL SCAN     | DEMO1_N |      1 |  10000 |     2   (0)|      2 |00:00:00.01 |       3 |
+---------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter("from$_subquery$_002"."rowlimit_$$_rownumber"&lt;=1)
+   2 - filter(ROW_NUMBER() OVER ( ORDER BY &quot;N&quot;)&lt;=1)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - &quot;from$_subquery$_002&quot;.&quot;N&quot;[NUMBER,22], &quot;from$_subquery$_002&quot;.&quot;rowlimit_$$_rownumber&quot;[NUMBER,22]
+   2 - (#keys=1) &quot;N&quot;[NUMBER,22], &quot;DEMO1&quot;.ROWID[ROWID,10], ROW_NUMBER() OVER ( ORDER BY &quot;N&quot;)[22]
+   3 - &quot;DEMO1&quot;.ROWID[ROWID,10], &quot;N&quot;[NUMBER,22]
+</pre></p>
+<p>The cost is the same, estimated to 2 random reads, but we see how Oracle implements the FETCH FIRST: with window functions. And only one row has been fetched (A-Rows) reading 3 blocks (buffers). Note that because the index is sorted, the window function is a NOSORT operation.</p>
+<h3>Postgres</h3>
+<p>I can run the same query on PostgreSQL and get the execution plan:
+<pre>
+explain (analyze,verbose,costs,buffers) select  n from demo1  where n is not null order by n fetch first 1 row only;
+                                                              QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.29..0.31 rows=1 width=4) (actual time=0.124..0.124 rows=1 loops=1)
+   Output: n
+   Buffers: shared hit=3
+   -&gt;  Index Only Scan using demo1_n on public.demo1  (cost=0.29..295.29 rows=10000 width=4) (actual time=0.124..0.124 rows=1 loops=1)
+         Output: n
+         Index Cond: (demo1.n IS NOT NULL)
+         Heap Fetches: 0
+         Buffers: shared hit=3
+ Planning time: 0.576 ms
+ Execution time: 0.143 ms
+</pre></p>
+<p>Here, the total cost of the query is lower than the total cost of the Index Only Scan, because we know we will not read all index entries. Then the total cost of the query (0.31) is based on the startup cost (0.29) of the index access. I suppose there is 0.01 for the cpu_tuple_cost but I expected to see the cost to get the first page because we cannot get a row without reading the whole page. My guess is that Postgres divides the total cost (295) by the number of rows (10000) and uses that as a per-row estimation. This makes sense for a lot of rows but underestimates the cost to get the first page.</p>
+<p>In order to validate my guess, I force a Seq Scan to have a higher cost and fetch first 5 rows:
+<pre>
+explain (analyze,verbose,costs,buffers) select  n from demo1  where n is not null fetch first 5 row only ;
+                                                    QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------
+ Limit  (cost=0.00..0.76 rows=5 width=4) (actual time=0.026..0.029 rows=5 loops=1)
+   Output: n
+   Buffers: shared hit=1
+   -&gt;  Seq Scan on public.demo1  (cost=0.00..1529.00 rows=10000 width=4) (actual time=0.022..0.024 rows=5 loops=1)
+         Output: n
+         Filter: (demo1.n IS NOT NULL)
+         Buffers: shared hit=1
+ Planning time: 1.958 ms
+ Execution time: 0.057 ms
+</pre>
+My guess is: ( 1529.00 / 10000 ) * 5 = 0.7645 which is exactly the cost estimated for the Limit operation. This approximation does not take the page granularity into account.</p>
+<h3>MIN/MAX</h3>
+<p>The &#8220;order by n fetch first 1 row only&#8221; finally reads only one index entry, the first one, and returns the indexed value. We can get the same value with a &#8220;select max(N)&#8221; and Oracle has a special operation for that:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  29bsqfg69nudp, child number 0
+-------------------------------------
+select /*+  */  min(n) from demo1
+-------------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |         |      1 |        |     2 (100)|      1 |00:00:00.01 |       2 |
+|   1 |  SORT AGGREGATE            |         |      1 |      1 |            |      1 |00:00:00.01 |       2 |
+|   2 |   INDEX FULL SCAN (MIN/MAX)| DEMO1_N |      1 |      1 |     2   (0)|      1 |00:00:00.01 |       2 |
+-------------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - (#keys=0) MIN("N")[22]
+   2 - "N"[NUMBER,22]
+</pre></p>
+<p>This goes through the index branches (blevel=1 here in this small index so root is the first and only one branch) to the first leaf in order to get the value in the first entry. This has read 2 blocks here. The same can be done to get the last index entry in case we &#8220;select max(N)&#8221;.</p>
+<p>Postgres do not show a special operation for it, but a plan which is very similar to the one we have seen above when fetching the first row: Index Only Scan, with a Limit:</p>
+<p><pre>
+explain (analyze,verbose,costs,buffers) select  min(n) from demo1 ;
+                                                                  QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ Result  (cost=0.31..0.32 rows=1 width=4) (actual time=0.123..0.124 rows=1 loops=1)
+   Output: $0
+   Buffers: shared hit=3
+   InitPlan 1 (returns $0)
+     -&gt;  Limit  (cost=0.29..0.31 rows=1 width=4) (actual time=0.121..0.121 rows=1 loops=1)
+           Output: demo1.n
+           Buffers: shared hit=3
+           -&gt;  Index Only Scan using demo1_n on public.demo1  (cost=0.29..295.29 rows=10000 width=4) (actual time=0.119..0.119 rows=1 loops=1)
+                 Output: demo1.n
+                 Index Cond: (demo1.n IS NOT NULL)
+                 Heap Fetches: 0
+                 Buffers: shared hit=3
+ Planning time: 0.415 ms
+ Execution time: 0.140 ms
+</pre></p>
+<p>If we look at the &#8216;Index Only Scan&#8217; we see exactly what I had at the top of this post with &#8220;select n from demo1  where n is not null order by n&#8221;.</p>
+<p>Above it, there&#8217;s the Limit clause which is exactly the same as the one with the &#8220;fetch 1 row only&#8221; because the query planner understands that getting the MIN(N) is the same as getting the first value from the ordered index on N.</p>
+<p>This is processed as a non-correlated subquery (query block), also called InitPlan. The result of it ($0) is used by the result with an additional cost of 0.01 for the cpu_tuple_cost in this additional step. I don&#8217;t really know the reason for this additional step here, but anyway, the cost is minimal. Basically, both Oracle and Postgres take advantage of the index structure to get the minimum &#8211; or first value &#8211; from the sorted index entries.</p>
+<p>In this series, I&#8217;m running very simple queries in order to show how it works. In this post, we reached the minimum: one column and one row. The <a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-vi" target="_blank">next post</a> will finally select one additional column, which is not in the index.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-177750"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

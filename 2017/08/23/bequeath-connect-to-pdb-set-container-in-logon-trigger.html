@@ -1,0 +1,160 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/bequeath-connect-to-pdb-set-container-in-logon-trigger />
+<meta name=description content='A blog post from 2017 about Bequeath connect to PDB: set container in logon trigger?'>
+<title>Bequeath connect to PDB: set container in logon trigger?</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/bequeath-connect-to-pdb-set-container-in-logon-trigger>https://blog.dbi-services.com/bequeath-connect-to-pdb-set-container-in-logon-trigger</a> (2017-08-23), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Bequeath connect to PDB: set container in logon trigger?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>There are little changes when you go to multitenant architecture and one of them is that you must connect with a service name. You cannot connect directly to a PDB with a beaqueath (aka local) connection. This post is about a workaround you may have in mind: create a common user and set a logon trigger to &#8216;set container&#8217;. I <u>do not</u> recommend it and you should really connect with a service. Here is an example.
+<span id="more-18407"></span>
+Imagine that I have a user connecting with bequeath connection to a non-CDB, using user/password without a connection string, the database being determined by the ORACLE_SID. And I want to migrate to CDB without changing anything on the client connection configuration side. The best idea would be to use a service, explicitly or implicitly with TWO_TASK or LOCAL. But let&#8217;s imagine that you don&#8217;t want to change anything on the client side.</p>
+<p>As we can connect only the the CDB$ROOT with a bequeath connection, we have to create a common user. Because the idea is not to change anything on client configuration, and there&#8217;s a very little chance that the user starts with C## I&#8217;ll start to remove the mandatory prefix for common users.</p>
+<p><pre>
+SQL&gt; show parameter common_user_prefix
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+common_user_prefix                   string
+
+SQL&gt; alter system set common_user_prefix='' scope=spfile;
+System altered.
+
+SQL&gt; shutdown immediate
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+SQL&gt; startup
+ORACLE instance started.
+...
+</pre></p>
+<p>Then I create my common user:
+<pre>
+SQL&gt; create user MYOLDUSER identified by covfefe container=all;
+User created.
+</pre></p>
+<p>This user must be able to connect to the CDB:
+<pre>
+SQL&gt; grant create session to MYOLDUSER container=current;
+Grant succeeded.
+</pre></p>
+<p>And then I want it to switch immediately to PDB1 using a logon trigger:
+<pre>
+SQL&gt; create or replace trigger SET_CONTAINER_AT_LOGON after logon on database
+  2  when (user in ('MYOLDUSER'))
+  3  begin
+  4   execute immediate 'alter session set container=PDB1';
+  5  end;
+  6  /
+Trigger created.
+</pre></p>
+<p>Once on PDB1 this user will have some privileges, and for the example I will grant him a default role:
+<pre>
+SQL&gt; alter session set container=PDB1;
+Session altered.
+
+SQL&gt; create role MYROLE;
+Role created.
+
+SQL&gt; grant MYROLE to MYOLDUSER container=current;
+Grant succeeded.
+</pre></p>
+<p>The documentation says that <em>When you grant a role to a user, the role is granted as a default role for that user and is therefore enabled immediately upon logon</em> so I don&#8217;t need to:
+<pre>
+SQL&gt; alter user MYOLDUSER default role MYROLE;
+User altered.
+</pre></p>
+<p>But the doc say &#8216;logon&#8217; and technically I do not logon to PDB1. I just set container. However, if you test it you will see that default roles are set also on &#8216;set container&#8217;. And anyway, we cannot set a role in a procedure, neither with &#8216;set role&#8217; nor with dbms_session.set_role:
+<pre>
+ORA-06565: cannot execute SET ROLE from within stored procedure
+</pre></p>
+<p>Then, I can now connect locally to the CDB$ROOT with this user:
+<pre>
+SQL&gt; connect MYOLDUSER/covfefe
+Connected.
+</pre>
+And I&#8217;m automatically switched to the PDB1:
+<pre>
+SQL&gt; show con_name
+
+CON_NAME
+------------------------------
+PDB1
+</pre></p>
+<h3>Issue #1: default roles</h3>
+<p>However the default roles are not set:
+<pre>
+SQL&gt; select * from session_roles;
+
+no rows selected
+</pre>
+I have to set the role once connected:
+<pre>
+SQL&gt; set role all;
+Role set.
+
+SQL&gt; select * from session_roles;
+
+ROLE
+--------------------------------------------------------------------------------
+MYROLE
+</pre></p>
+<p>This is probably not what we want when we cannot change anything on the application side. This is considered as a bug (Bug 25081564 : ALTER SESSION SET CONTAINER IN &#8220;ON LOGON TRIGGER&#8221; IS NOT WORKING) fixed in 18.1 (expected in Q1 2018) and there&#8217;s a patch for 12.1 and 12.2 <a href="https://updates.oracle.com/download/25081564.html" target="_blank">https://updates.oracle.com/download/25081564.html</a></p>
+<h3>Issue #2: core dump</h3>
+<p>There&#8217;s another issue. If you run the same with SQLcl you have a core dump in the client library libclntsh.so on kpuSetContainerNfy
+<pre>
+SQLcl: Release 17.2.0 Production on Tue Aug 22 22:00:52 2017
+
+Copyright (c) 1982, 2017, Oracle.  All rights reserved.
+
+SQL&gt; connect MYOLDUSER/covfefe
+#
+# A fatal error has been detected by the Java Runtime Environment:
+#
+#  SIGSEGV (0xb) at pc=0x00007fcaa172faf6, pid=31242, tid=140510230116096
+#
+# JRE version: Java(TM) SE Runtime Environment (8.0_91-b14) (build 1.8.0_91-b14)
+# Java VM: Java HotSpot(TM) 64-Bit Server VM (25.91-b14 mixed mode linux-amd64 compressed oops)
+# Problematic frame:
+# C  [libclntsh.so.12.1+0x11d8af6]  kpuSetContainerNfy+0x66
+#
+# Core dump written. Default location: /media/sf_share/122/blogs/core or core.31242
+</pre></p>
+<p>There&#8217;s a SR opened for that. This is not a no-go because the context being no change to the client part, then sqlplus will probably be used. However, that&#8217;s another point which shows that &#8216;set container&#8217; in a logon trigger may have some implementation problems.</p>
+<h3>Issue #3: security</h3>
+<p>In my opinion, there is a bigger problem here. With sqlplus (or with sqlcl not using local connection) I can connect to the CDB$ROOT and switch to PDB1. But look at all the commands above&#8230; where did I grant the &#8216;set container&#8217; privilege for MYOLDUSER on the PDB1 container? Nowhere. MYOLDUSER has no create session and no set container privileges, but is able to connect to PDB1 thanks to the logon trigger. Of course , the logon trigger is defined by a DBA who knows what he does. But in my opinion, it is not a good idea to bypass the privilege checking.</p>
+<h3>So what?</h3>
+<p>With no default role, connecting without the right privilege, the security model is biased here. And disabling the common user prefix will raise other issues one day with plugging operations. Then, in my opinion, this is not a solution to workaround the need to connect with a service. Especially in the context where we run legacy application with no possibility to change the way it connects: you just postpone the problems to bigger ones later.</p>
+<p>The real solution is to connect to a service (and that&#8217;s not difficult even when you can&#8217;t change the code, with TWO_TASK environment variable).</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-184080"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

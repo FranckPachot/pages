@@ -1,0 +1,473 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-partitioned-sequences-a-future-new-feature-in-12c />
+<meta name=description content='A blog post from 2014 about Oracle Partitioned Sequences &#8211; a future new feature in 12c?'>
+<title>Oracle Partitioned Sequences &#8211; a future new feature in 12c?</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-partitioned-sequences-a-future-new-feature-in-12c>https://blog.dbi-services.com/oracle-partitioned-sequences-a-future-new-feature-in-12c</a> (2014-02-21), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle Partitioned Sequences &#8211; a future new feature in 12c?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p><strong>Disclaimer</strong>: I&#8217;ll talk about an undocumented feature that appeared in Oracle 12c &#8211; undocumented except if you consider that being exposed in DBA_SEQUENCES as the PARTITION_COUNT is a kind of documentation. So, as the syntax is not documented (I got it only by guessing), you should not use it in production: there are probably some reasons why Oracle did not expose an interresting feature like that.
+<span id="more-413"></span>
+<strong>Remark</strong>: Sorry for the formatting of this post. I tried to use nice tables instead of monospace code, but that was not a success.</p>
+<p>In these days, you probably have most of primary keys coming from a sequence: a generated number that is always increasing in order to be sure to have no duplicates. And of course you have a (unique) index on it. But what do you see when you have a high activity inserting rows concurrently to that table ?</p>
+<p>Here is what you can see:</p>
+<p><img title="partitioned-sequence-capture-1_20140220-150723_1.PNG" src="../images/easyblog_images/139/partitioned-sequence-capture-1_20140220-150723_1.PNG" alt="partitioned-sequence-capture-1_20140220-150723_1.PNG" />
+That came from a retail database where we did a load test simulating the order entry rate that was expected for production.
+The AWR report shows the segments concerned:</p>
+<p><img title="partitioned-sequence-capture-1.PNG" src="../images/easyblog_images/139/partitioned-sequence-capture-2.PNG" alt="partitioned-sequence-capture-2.PNG" /></p>
+<p>No doubt: index hot block contention on primary key.</p>
+<p>It is a well know issue. Because the index is sorted, the value coming from the sequence is always going to the last block. All sessions have to access to the same block and there is a &#8216;buffer busy wait&#8217; contention on it. And when you are in RAC that block has to be updated by the different nodes and it&#8217;s worse, showing all those &#8216;gc&#8217; wait events.</p>
+<p>In order to illustrate the different solution, I have created a DEMO table with 1 million rows. And then I insert 100000 additional rows and check how many blocks where touched:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">create table DEMO_TABLE (id,n , constraint DEMO_PK primary key(id) ) 
+ as select rownum,rownum from 
+  (select * from dual connect by level</pre>
+<p>And here is the number of index blocks touched:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">select object_name,data_object_id,sum(tch) from sys.x$bh 
+ join user_objects on user_objects.data_object_id=x$bh.obj 
+ where object_name like 'DEMO%' 
+ group by object_name,data_object_id order by 1 desc;
+</pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">OBJECT_NAME</th>
+<th scope="col">DATA_OBJECT_ID</th>
+<th scope="col">SUM(TCH)</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_TABLE</td>
+<td align="right">97346</td>
+<td align="right">243</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97347</td>
+<td align="right">243</td>
+</tr>
+</tbody>
+</table>
+<p>And I&#8217;m interrested about index block split as well:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">select name,value from v$mystat 
+ join v$statname using(statistic#) 
+ where name like 'leaf node%splits';
+</pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">NAME</th>
+<th scope="col">VALUE</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node splits</td>
+<td align="right">200</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node 90-10 splits</td>
+<td align="right">200</td>
+</tr>
+</tbody>
+</table>
+<p>I touched 200 blocks only (the size of the index entry is approximatively the same as the table row size). The highest block is filled with an increasing value and only when it is full the insert allocates a new block and goes to it. This is optimal for one session, but it is the cause of contention on multi-threaded inserts because all sessions are touching the same block at the same time.</p>
+<p>So what&#8217;s the solution ? Of course, you want to have your primary key value distributed.
+Reverse index ? Let&#8217;s see:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">alter index DEMO_PK rebuild reverse;
+Index altered.
+</pre>
+<p>Then I run the same inserts and here are the statistics about index blocks:</p>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">OBJECT_NAME</th>
+<th scope="col">DATA_OBJECT_ID</th>
+<th scope="col">SUM(TCH)</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_TABLE</td>
+<td align="right">97349</td>
+<td align="right">247</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97352</td>
+<td align="right">4392</td>
+</tr>
+</tbody>
+</table>
+<pre></pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">NAME</th>
+<th scope="col">VALUE</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node splits</td>
+<td align="right">182</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node 90-10 splits</td>
+<td align="right">0</td>
+</tr>
+</tbody>
+</table>
+<p>Now I touched 4000 blocks (without any block split because each new value fit in the 5% pctfree after my index rebuild). Great: no contention. I mean&#8230; no buffer contention.</p>
+<p>But think about it. Because of my reverse distribution, I touch now all the index blocks. Do they fit in my buffer cache anymore ? Probably not. And one day, when I have more data, I encounter i/o issues.</p>
+<p>If you want to see an illustration of the contentions I am talking about here, you can check the slides 14 to 19 from the <a href="http://asktom.oracle.com/pls/apex/z?p_url=ASKTOM%2Edownload_file%3Fp_file%3D39730289013958128829&amp;p_cat=RWP_DAY_2014.zip&amp;p_company=82292509702187">Oracle Real Performance Tour</a> where Tom Kyte, Andrew Holdsworth &amp; Graham Wood have shown a nice demo of that.
+ So we want to spread the values on several index blocks, but not on all index blocks. Hash partitioning can be used for that. Let&#8217;s have 4 partitions:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">alter table DEMO_TABLE disable constraint DEMO_PK;
+create index DEMO_PK on DEMO_TABLE(id) global partition by hash(id) partitions 4;
+alter table DEMO_TABLE enable constraint DEMO_PK;
+</pre>
+<p>and the result is quite good:</p>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">OBJECT_NAME</th>
+<th scope="col">DATA_OBJECT_ID</th>
+<th scope="col">SUM(TCH)</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_TABLE</td>
+<td align="right">97353</td>
+<td align="right">245</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97357</td>
+<td align="right">76</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97358</td>
+<td align="right">76</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97359</td>
+<td align="right">76</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97360</td>
+<td align="right">76</td>
+</tr>
+</tbody>
+</table>
+<pre></pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">NAME</th>
+<th scope="col">VALUE</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node splits</td>
+<td align="right">213</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node 90-10 splits</td>
+<td align="right">213</td>
+</tr>
+</tbody>
+</table>
+<p>I&#8217;ve distributed my inserts over 4 partitions, having 4 hot blocks instead of one. This is a way to prevent buffer busy waits when having a few concurrent sessions inserting new values.</p>
+<p>&nbsp;</p>
+<p>But the distribution is done on the value coming from the sequence. So each session will touch sequentially each of the 4 hot blocks. Even if this reduces the probablility of contention, it is not optimal. And if you&#8217;re going in RAC you will see those &#8216;gc&#8217; wait events again, with the hot blocks being accessed by all nodes.</p>
+<p>The actual solution to the problem is not to distribute the insert based on the value, but having the distribution key based on the session identification. If each session has its own index block to insert into, then all contention is gone.</p>
+<p>This is exactly what will be addressed by the &#8216;partitioned sequence&#8217; feature that is not (yet) documented.</p>
+<pre> It generates sequence values in different ranges of value. And that range depends on the session (probably a hash function on the instance number and the session id).
+I come back to my non-partitioned no-reverse index, and alter the sequence as:</pre>
+<pre>alter sequence DEMO_SEQUENCE partition 4;
+</pre>
+<pre>And here is the stats about index blocks:</pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">OBJECT_NAME</th>
+<th scope="col">DATA_OBJECT_ID</th>
+<th scope="col">SUM(TCH)</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_TABLE</td>
+<td align="right">97361</td>
+<td align="right">397</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97364</td>
+<td align="right">404</td>
+</tr>
+</tbody>
+</table>
+<pre></pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">NAME</th>
+<th scope="col">VALUE</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node splits</td>
+<td align="right">351</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node 90-10 splits</td>
+<td align="right">351</td>
+</tr>
+</tbody>
+</table>
+<p>First, you see that my table is larger. This is because the sequence number from the partitioned sequence is larger. It is build by prefixing the sequence number with a partition value, and that makes the binary representation larger. The table here have only two columns, but on a real table, the difference will not be so important. The index is bigger, that&#8217;s a fact. However if you compare it with the reverse index (that has a lot of free space in the blocks) it is much better here. And you can reduce the sequence max value if you want a smaller id. But the very good thing is that the instances and sessions will work on different ranges, avoiding block contention, while keeping the index maintenance optimal in buffer cache.</p>
+<p>Here is my sequence:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">select sequence_name,min_value,max_value,last_number,partition_count from user_sequences;</pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">SEQUENCE_NAME</th>
+<th scope="col">MIN_VALUE</th>
+<th scope="col">MAX_VALUE</th>
+<th scope="col">LAST_NUMBER</th>
+<th scope="col">PARTITION_COUNT</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_SEQUENCE</td>
+<td align="right">1</td>
+<td align="right">9999999999999999999999999999</td>
+<td align="right">10100000</td>
+<td align="right">4</td>
+</tr>
+</tbody>
+</table>
+<p>&nbsp;</p>
+<p>Ok, that feature is really nice, but you can&#8217;t use it until it is documented in a future release. So you have to do it yourself: concatenate a value hased from the instance/session in front of the number coming from the sequence. Of course, at the Real Performance Tour the undocumented solution was not raised, and the solution presented was prefixing the sequence. Here is just as an example:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">insert into DEMO_TABLE 
+ select 1e30*mod(to_number(sys_context('userenv','sid')),4)+DEMO_SEQUENCE.nextval,...
+</pre>
+<pre>and here are the index statistics:</pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">OBJECT_NAME</th>
+<th scope="col">DATA_OBJECT_ID</th>
+<th scope="col">SUM(TCH)</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_TABLE</td>
+<td align="right">97365</td>
+<td align="right">351</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>DEMO_PK</td>
+<td align="right">97366</td>
+<td align="right">351</td>
+</tr>
+</tbody>
+</table>
+<pre></pre>
+<table bgcolor="#EEEEEE">
+<tbody>
+<tr bgcolor="#ffffff">
+<th scope="col">NAME</th>
+<th scope="col">VALUE</th>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node splits</td>
+<td align="right">433</td>
+</tr>
+<tr bgcolor="#ffffff">
+<td>leaf node 90-10 splits</td>
+<td align="right">371</td>
+</tr>
+</tbody>
+</table>
+<pre></pre>
+<p>So while dreaming about a feature that you may be able to use in the future, you can acheive the same goal if you&#8217;re ready to change your code. Anyway, achieving scalability, and good performance on high load often requires to touch the code a bit.</p>
+<h2>update:</h2>
+<p>If you want to see that feature documented, maybe voting up <a href="https://community.oracle.com/ideas/2548">here</a> can help.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4140" data-img="http://blog.dbi-services.com/images/easyblog_images/139/partitioned-sequence-capture-1_20140220-150723_1.PNG"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-7947">
+				<div id="div-comment-7947" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/08b4eccce68cd521b54671abb0442ae1?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://jonathanlewis.wordpress.com' rel='external nofollow' class='url'>Jonathan Lewis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7947">
+			July 26, 2017 at 18 h 49 min</a>		</div>
+
+		<p>Franck,</p>
+<p>Looks like things have changed in 12.2 &#8211; part_count is still there in seq$ but the hidden parameters have changed, the &#8220;partition N&#8221; syntax doesn&#8217;t work at present, and the columns in dba_sequences have changed &#8211; preliminary note in a comment from a reader: <a href="http://jonathanlewis.wordpress.com/2015/06/17/reverse-key-2/#comment-9804" rel="nofollow">http://jonathanlewis.wordpress.com/2015/06/17/reverse-key-2/#comment-9804</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-79481"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7947' onclick='return addComment.moveForm( "div-comment-7947", "7947", "respond", "413" )' aria-label='Reply to Jonathan to Jonathan Lewis'>Reply to Jonathan</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2 parent" id="comment-7959">
+				<div id="div-comment-7959" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7959">
+			July 28, 2017 at 16 h 25 min</a>		</div>
+
+		<p>Hi Jonathan,
+thanks for the heads up. Yes it seems that syntax is simpler:
+<pre>
+SQL&gt; create sequence DEMO_SEQ minvalue 1 maxvalue 1000 scale;
+Sequence DEMO_SEQ created.
+
+SQL&gt; select * from user_sequences where sequence_name='DEMO_SEQ';
+SEQUENCE_NAME  MIN_VALUE  MAX_VALUE  INCREMENT_BY  CYCLE_FLAG  ORDER_FLAG  CACHE_SIZE  LAST_NUMBER  SCALE_FLAG  EXTEND_FLAG  SESSION_FLAG  KEEP_VALUE
+-------------  ---------  ---------  ------------  ----------  ----------  ----------  -----------  ----------  -----------  ------------  ----------
+DEMO_SEQ       1          1000       1             N           N           20          1            Y           N            N             N
+
+SQL&gt; select DEMO_SEQ.NEXTVAL from DUAL;
+
+Error starting at line : 7 File @ /media/sf_share/122/blogs/scalable-sequences.sql
+In command -
+select DEMO_SEQ.NEXTVAL from DUAL
+Error report -
+ORA-64603: NEXTVAL cannot be instantiated for DEMO_SEQ. Widen the sequence by 3 digits or alter sequence with SCALE EXTEND.
+
+SQL&gt; select ksppinm,ksppdesc,ksppstvl from x$ksppi join x$ksppcv using(indx) where ksppinm like '%_kqdsn%';
+
+KSPPINM                 KSPPDESC                                        KSPPSTVL
+-------                 --------                                        --------
+_kqdsn_instance_digits  number of instance digits in scalable sequence  2
+_kqdsn_cpu_digits       number of cpu digits in scalable sequence       3
+
+SQL&gt; alter sequence DEMO_SEQ scale extend;
+Sequence DEMO_SEQ altered.
+
+SQL&gt; select DEMO_SEQ.NEXTVAL from DUAL;
+NEXTVAL
+-------
+1010170001
+
+SQL&gt; select DEMO_SEQ.NEXTVAL from DUAL;
+NEXTVAL
+-------
+1010170002
+
+SQL&gt; connect / as sysdba
+Connected.
+SQL&gt; select DEMO_SEQ.NEXTVAL from DUAL;
+NEXTVAL
+-------
+1013920003
+</pre>
+Good to see that the idea was not abandoned.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-79601"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7959' onclick='return addComment.moveForm( "div-comment-7959", "7959", "respond", "413" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment even depth-3 parent" id="comment-8022">
+				<div id="div-comment-8022" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/22c59a0ce6d44d7d2d26540b807d91c3?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://anbob.com' rel='external nofollow' class='url'>anbob</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-8022">
+			August 4, 2017 at 8 h 53 min</a>		</div>
+
+		<p>hi Franck,</p>
+<p>101     017   0001
+0001 was sequence value
+017 was current sid
+what&#8217;s 101 mean?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-80231"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-8022' onclick='return addComment.moveForm( "div-comment-8022", "8022", "respond", "413" )' aria-label='Reply to anbob to anbob'>Reply to anbob</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-4" id="comment-8023">
+				<div id="div-comment-8023" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-8023">
+			August 4, 2017 at 10 h 00 min</a>		</div>
+
+		<p>Hi Anbob, I&#8217;m not sure but it is supposed to have 2 digits for instance number (01) and 3 digits for &#8216;CPU&#8217; &#8211; probably hashed from process id. However, it seems that there is an additional digit.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-80241"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-8023' onclick='return addComment.moveForm( "div-comment-8023", "8023", "respond", "413" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

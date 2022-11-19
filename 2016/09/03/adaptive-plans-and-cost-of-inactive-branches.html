@@ -1,0 +1,112 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/adaptive-plans-and-cost-of-inactive-branches />
+<meta name=description content='A blog post from 2016 about Adaptive Plans and cost of inactive branches'>
+<title>Adaptive Plans and cost of inactive branches</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/adaptive-plans-and-cost-of-inactive-branches>https://blog.dbi-services.com/adaptive-plans-and-cost-of-inactive-branches</a> (2016-09-03), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Adaptive Plans and cost of inactive branches</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Here are the details about an execution plan screenshot I&#8217;ve tweeted recently because the numbers looked odd. It&#8217;s not a big problem, or maybe not a problem at all. Just something surprising. I don&#8217;t like when the numbers don&#8217;t match and then I try to reproduce and get an explanation, just to be sure there is not something hidden that I misunderstood.
+<span id="more-10554"></span>
+Here is a similar test case joining two small tables DEMO1 and DEMO2 with specific stale statistics.</p>
+<h3>Hash Join</h3>
+<p>I start by forcing a full table scan to get a hash join:</p>
+<p><pre>select /*+ full(DEMO2) */ * from DEMO1 natural join DEMO2
+Plan hash value: 3212315601
+------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation          | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |       |      1 |        |   130 (100)|      0 |00:00:00.01 |       3 |       |       |          |
+|*  1 |  HASH JOIN         |       |      1 |    200 |   130   (1)|      0 |00:00:00.01 |       3 |  1696K|  1696K|  520K (0)|
+|   2 |   TABLE ACCESS FULL| DEMO1 |      1 |    200 |     3   (0)|      0 |00:00:00.01 |       3 |       |       |          |
+|   3 |   TABLE ACCESS FULL| DEMO2 |      0 |    100K|   127   (1)|      0 |00:00:00.01 |       0 |       |       |          |
+------------------------------------------------------------------------------------------------------------------------------</pre></p>
+<p>The cost of DEMO1 full table scan is 3. The cost of DEMO2 full table scan is 127. That&#8217;s a total of 130 (the cost of the hash join itself is negligible here)</p>
+<h3>Nested Loop</h3>
+<p>When forcing an index access, a nested loop will be used:</p>
+<p><pre>select /*+ index(DEMO2) */ * from DEMO1 natural join DEMO2
+Plan hash value: 995663177
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                    | Name   | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT             |        |      1 |        |   203 (100)|      0 |00:00:00.01 |       3 |
+|   1 |  NESTED LOOPS                |        |      1 |    200 |   203   (0)|      0 |00:00:00.01 |       3 |
+|   2 |   NESTED LOOPS               |        |      1 |    200 |   203   (0)|      0 |00:00:00.01 |       3 |
+|   3 |    TABLE ACCESS FULL         | DEMO1  |      1 |    200 |     3   (0)|      0 |00:00:00.01 |       3 |
+|*  4 |    INDEX UNIQUE SCAN         | DEMOPK |      0 |      1 |     0   (0)|      0 |00:00:00.01 |       0 |
+|   5 |   TABLE ACCESS BY INDEX ROWID| DEMO2  |      0 |      1 |     1   (0)|      0 |00:00:00.01 |       0 |
+--------------------------------------------------------------------------------------------------------------
+</pre></p>
+<p>The cost of the index access is 1 and as it expected to run 200 loops the total cost is 200. With the full table scan of DEMO1 the total is 203.</p>
+<h3>Adaptive plan</h3>
+<p>Here is an explain plan to see the initial plan with active and inactive branches:</p>
+<p><pre>SQL&gt; explain plan for
+  2  select /*+              */ * from DEMO1 natural join DEMO2;
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'adaptive'));
+Plan hash value: 3212315601
+------------------------------------------------------------------------------------------
+|   Id  | Operation                     | Name   | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|     0 | SELECT STATEMENT              |        |   200 |  6400 |   130   (1)| 00:00:01 |
+|  *  1 |  HASH JOIN                    |        |   200 |  6400 |   130   (1)| 00:00:01 |
+|-    2 |   NESTED LOOPS                |        |   200 |  6400 |   130   (1)| 00:00:01 |
+|-    3 |    NESTED LOOPS               |        |       |       |            |          |
+|-    4 |     STATISTICS COLLECTOR      |        |       |       |            |          |
+|     5 |      TABLE ACCESS FULL        | DEMO1  |   200 |  1000 |     3   (0)| 00:00:01 |
+|- *  6 |     INDEX UNIQUE SCAN         | DEMOPK |       |       |            |          |
+|-    7 |    TABLE ACCESS BY INDEX ROWID| DEMO2  |     1 |    27 |   127   (1)| 00:00:01 |
+|     8 |   TABLE ACCESS FULL           | DEMO2  |   100K|  2636K|   127   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------</pre></p>
+<p>The active branches (full table scan) have the correct cost: 127 + 3 = 130</p>
+<p>However, it&#8217;s not the case with inactive ones: no estimations for &#8216;INDEX UNIQUE SCAN&#8217; and it seems that the &#8216;TABLE ACCESS BY INDEX ROWID&#8217; get the cost from the full table scan (here 127).</p>
+<p>It&#8217;s just an observation here. I&#8217;ve no explanation about it and I&#8217;ve no idea about the consequences except the big surprise when you see the numbers. I guess that the cost of the inactive branches is meaningless. What is important is that the right cost has been used to determine the inflection point.</p>
+<p>The index access having a cost of 1, the cost of the nested loop will be higher than full table scan (estimated to 127) when there are more than 127 loops. This is what we see from the 10053 trace:
+<pre>SQL&gt; host grep ^DP DEMO14_ora_19470_OPTIMIZER.trc
+DP: Found point of inflection for NLJ vs. HJ: card = 127.34</pre></p>
+<p>Now, as I have no rows in the tables, the nested loop branch will be activated in place of the hash join. So if we display the plan once it is resolved, we will see the lines with an unexpected cost:</p>
+<p><pre>Plan hash value: 995663177
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                    | Name   | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT             |        |      1 |        |   130 (100)|      0 |00:00:00.01 |       3 |
+|   1 |  NESTED LOOPS                |        |      1 |    200 |   130   (1)|      0 |00:00:00.01 |       3 |
+|   2 |   NESTED LOOPS               |        |      1 |        |            |      0 |00:00:00.01 |       3 |
+|   3 |    TABLE ACCESS FULL         | DEMO1  |      1 |    200 |     3   (0)|      0 |00:00:00.01 |       3 |
+|*  4 |    INDEX UNIQUE SCAN         | DEMOPK |      0 |        |            |      0 |00:00:00.01 |       0 |
+|   5 |   TABLE ACCESS BY INDEX ROWID| DEMO2  |      0 |      1 |   127   (1)|      0 |00:00:00.01 |       0 |
+--------------------------------------------------------------------------------------------------------------
+</pre></p>
+<p>I think it&#8217;s harmless, just a bit misleading. 127 is not the cost of the index access. It&#8217;s the cost of the full table scan.
+I had this surprise when trying to understand why the optimizer choose a full scan instead of index access. This is probably the only reason why I look at the cost: use hints to force the plan that I think is better, in order to understand where the optimizer thinks it is more expensive.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-105550"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

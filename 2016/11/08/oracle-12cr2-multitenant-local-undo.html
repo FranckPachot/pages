@@ -1,0 +1,438 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-12cr2-multitenant-local-undo />
+<meta name=description content='A blog post from 2016 about Oracle 12cR2 multitenant: Local UNDO'>
+<title>Oracle 12cR2 multitenant: Local UNDO</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-12cr2-multitenant-local-undo>https://blog.dbi-services.com/oracle-12cr2-multitenant-local-undo</a> (2016-11-08), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle 12cR2 multitenant: Local UNDO</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Pluggable Databases are supposed to be isolated, containing the whole of user data and metadata. This is the definition of dictionary separation coming with multitenant architecture: only system data and metadata are at CDB level. User data and metadata are in separate tablespaces belonging to the PDB.  And this is what makes the unplug/plug available: because PDB tablespaces contain everything, you can transport their datafiles from one CDB to another.
+However, if they are so isolated, can you explain why
+<ul>
+<li>You cannot flashback a PDB?</li>
+<li>You need an auxiliary instance for PDB Point-In-Time recovery?</li>
+<li>You need to put the PDB read-only before cloning it?</li>
+</ul>
+<p><span id="more-10682"></span>
+There is something that is not contained in your PDB but is at CDB level, and which contains user data. The UNDO tablespace is shared:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/09/CaptureLocalUndo001.png" rel="lightbox[10682]"><img src="../wp-insides/uploads/sites/2/2016/09/CaptureLocalUndo001.png" alt="CaptureLocalUndo001" width="888" height="476" class="alignnone size-full wp-image-10686" /></a></p>
+<p>You cannot flashback a PDB because doing so requires to rollback the ongoing transactions at the time you flashback. Information was in UNDO tablespace at that time, but is not there anymore.</p>
+<p>It&#8217;s the same idea with Point-In-Time recovery of PDB. You need to restore the UNDO tablespace to get those UNDO records from the Point-In-Time. But you cannot restore it in place because it&#8217;s shared with other PDBs that need current information. This is why you need an auxiliary instance for PDBPITR in 12.1</p>
+<p>To clone a PDB cannot be done with ongoing transactions because their UNDO is not in the PDB. This is why it can be done only when the PDB is read-only.</p>
+<h3>12.2 Local UNDO</h2>
+<p>In 12.2 you can choose to have one UNDO tablespace per PDB, in local undo mode, which is the default in DBCA:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/09/CaptureLocalUndo000.png" rel="lightbox[10682]"><img src="../wp-insides/uploads/sites/2/2016/09/CaptureLocalUndo000.png" alt="CaptureLocalUndo000" width="753" height="244" class="alignnone size-full wp-image-10687" /></a></p>
+<p>With local undo PDBs are truly isolated even when opened with ongoing transactions:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/09/CaptureLocalUndo002.png" rel="lightbox[10682]"><img src="../wp-insides/uploads/sites/2/2016/09/CaptureLocalUndo002.png" alt="CaptureLocalUndo002" width="876" height="476" class="alignnone size-full wp-image-10685" /></a></p>
+<p>Look at the &#8216;RB segs&#8217; column from RMAN report schema:
+<pre>
+[oracle@OPC122 ~]$ rman target /
+
+Recovery Manager: Release 12.2.0.1.0 - Production on Tue Nov 8 18:53:46 2016
+
+Copyright (c) 1982, 2016, Oracle and/or its affiliates.  All rights reserved.
+
+connected to target database: CDB1 (DBID=901060295)
+
+RMAN&gt; report schema;
+
+using target database control file instead of recovery catalog
+Report of database schema for database with db_unique_name CDB1
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------
+1    880      SYSTEM               YES     /u02/app/oracle/oradata/CDB1/system01.dbf
+3    710      SYSAUX               NO      /u02/app/oracle/oradata/CDB1/sysaux01.dbf
+4    215      UNDOTBS1             YES     /u02/app/oracle/oradata/CDB1/undotbs01.dbf
+5    270      PDB$SEED:SYSTEM      NO      /u02/app/oracle/oradata/CDB1/pdbseed/system01.dbf
+6    560      PDB$SEED:SYSAUX      NO      /u02/app/oracle/oradata/CDB1/pdbseed/sysaux01.dbf
+7    5        USERS                NO      /u02/app/oracle/oradata/CDB1/users01.dbf
+8    180      PDB$SEED:UNDOTBS1    NO      /u02/app/oracle/oradata/CDB1/pdbseed/undotbs01.dbf
+9    270      PDB1:SYSTEM          YES     /u02/app/oracle/oradata/CDB1/PDB1/system01.dbf
+10   590      PDB1:SYSAUX          NO      /u02/app/oracle/oradata/CDB1/PDB1/sysaux01.dbf
+11   180      PDB1:UNDOTBS1        YES     /u02/app/oracle/oradata/CDB1/PDB1/undotbs01.dbf
+12   5        PDB1:USERS           NO      /u02/app/oracle/oradata/CDB1/PDB1/users01.dbf
+
+List of Temporary Files
+=======================
+File Size(MB) Tablespace           Maxsize(MB) Tempfile Name
+---- -------- -------------------- ----------- --------------------
+1    33       TEMP                 32767       /u04/app/oracle/oradata/temp/temp01.dbf
+2    64       PDB$SEED:TEMP        32767       /u04/app/oracle/oradata/temp/temp012016-10-04_11-34-07-330-AM.dbf
+3    100      PDB1:TEMP            100         /u04/app/oracle/oradata/CDB1/PDB1/temp012016-10-04_11-34-07-330-AM.dbf
+</pre></p>
+<p>You have an UNDO tablespace in ROOT, in PDB$SEED and in each user PDB.</p>
+<p>If you have a database in shared undo mode, you can move to local undo mode while in &#8216;startup migrate&#8217;. PDBs when opened will have an UNDO tablespace created. You can also create an UNDO tablespace in PDB$SEED. </p>
+<p>Yes, in 12.2, you can open the PDB$SEED read/write for this purpose:</p>
+<p><pre>
+18:55:59 SQL&gt; alter pluggable database PDB$SEED open read write force;
+
+Pluggable database altered.
+
+18:56:18 SQL&gt; show pdbs;
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ WRITE NO
+         3 PDB1                           READ WRITE NO
+18:56:23 SQL&gt; alter pluggable database PDB$SEED open read only force;
+
+Pluggable database altered.
+</pre>
+But remember this is only allowed for local undo migration.</p>
+<p>The recommandation is to run in local undo mode, even in Single-Tenant.</p>
+<p>More about it in the <a href="http://12cr2multitenant.pachot.net">12cR2 Multitenant book</a>:
+<a href="http://12cr2multitenant.pachot.net"><img src="https://images-na.ssl-images-amazon.com/images/I/51UkZp1tqGL._SX397_BO1,204,203,200_.jpg" alt="" /></a></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-106830" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/09/CaptureLocalUndo001.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 8 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-7324">
+				<div id="div-comment-7324" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ee5173abf04af61add74c56524a0dcc7?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Harish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7324">
+			April 17, 2017 at 14 h 43 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>I have a doubt. I have created a lockdown profile in CDB. I have assigned the lockdown profile to PDB ORCLPDB1. When i query the output from cdb_lockdown_profiles i am getting the CON_ID column as 1.
+<pre>
+SQL&gt; conn / as sysdba
+Connected.
+SQL&gt; select con_id,PROFILE_NAME,RULE_TYPE,RULE,CLAUSE,CLAUSE_OPTION,OPTION_VALUE,status from cdb_lockdown_profiles where profile_name='TEST_LOCK';
+
+    CON_ID PROFILE_NAME         RULE_TYPE            RULE                 CLAUSE          CLAUSE_OPTION
+---------- -------------------- -------------------- -------------------- -------------------- --------------------
+OPTION_VALUE         STATUS
+-------------------- ----------
+         1 TEST_LOCK            STATEMENT            ALTER SESSION        SET
+                     DISABLE
+
+         1 TEST_LOCK            STATEMENT            ALTER SESSION        SET             OPTIMIZER_MODE
+                     ENABLE
+
+         1 TEST_LOCK            STATEMENT            ALTER SESSION        SET             CURSOR_SHARING
+                     ENABLE
+
+         1 TEST_LOCK            STATEMENT            ALTER SYSTEM
+                     DISABLE
+
+
+SQL&gt; show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         3 ORCLPDB1                       READ WRITE NO
+         4 ORCLPDB2                       READ WRITE NO
+</pre>
+As per the con_id it should display as 3 right? why is it showing as 1? Have you tested this.</p>
+<p>Regards,</p>
+<p>Harish
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73251"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7324' onclick='return addComment.moveForm( "div-comment-7324", "7324", "respond", "10682" )' aria-label='Reply to Harish to Harish'>Reply to Harish</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2 parent" id="comment-7331">
+				<div id="div-comment-7331" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7331">
+			April 17, 2017 at 21 h 49 min</a>		</div>
+
+		<p>Hi Harish,
+This is expected. The lockdown profile rules are defined &#8211; and stored &#8211; in CDB$ROOT only. The parameter that you set for the PDB references a lockdown profile name which is stored in CDB$ROOT. So CON_ID is 1 and you can see the enabled and disabled option/feature/statements only when you are in CDB$ROOT. A PDB user will see &#8216;insufficient privileges&#8217; but cannot see the reason.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73321"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7331' onclick='return addComment.moveForm( "div-comment-7331", "7331", "respond", "10682" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment even depth-3" id="comment-7338">
+				<div id="div-comment-7338" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ee5173abf04af61add74c56524a0dcc7?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Harish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7338">
+			April 18, 2017 at 18 h 21 min</a>		</div>
+
+		<p>Thanks a lot for your explanation.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73391"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7338' onclick='return addComment.moveForm( "div-comment-7338", "7338", "respond", "10682" )' aria-label='Reply to Harish to Harish'>Reply to Harish</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-7325">
+				<div id="div-comment-7325" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ee5173abf04af61add74c56524a0dcc7?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Harish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7325">
+			April 17, 2017 at 14 h 49 min</a>		</div>
+
+		<p>Another scenario which i tested is below.</p>
+<p>I created a lock down profile in CDB and set the pdb_lockdown parameter. I dropped a old lockdown profile from the CDB and set the value of pdb_lockdown to the new name. When i logged in back to the PDB it contains the old value?
+Why is it so?
+<pre>
+SQL&gt; conn /as sysdba
+Connected.
+SQL&gt; drop lockdown profile LOCK_TEST;
+
+Lockdown Profile dropped.
+
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         3 ORCLPDB1                       READ WRITE NO
+         4 ORCLPDB2                       READ WRITE NO
+
+SQL&gt; show con_name
+
+CON_NAME
+------------------------------
+CDB$ROOT
+
+SQL&gt; alter system set pdb_lockdown='TEST_LOCK';
+
+System altered.
+
+SQL&gt;  alter session set container=ORCLPDB1;
+
+Session altered.
+
+SQL&gt;  alter system checkpoint;
+
+System altered.
+
+SQL&gt; show parameter pdb_lockdown
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+pdb_lockdown                         string      LOCK_TEST
+SQL&gt; alter system checkpoint;
+
+System altered.
+</pre>
+Oracle docs say the below. </p>
+<p>If you set PDB_LOCKDOWN while connected to a CDB root, then the lockdown profile applies to all PDBs in the CDB. It does not apply to the CDB root.</p>
+<p>If you set PDB_LOCKDOWN while connected to an application root, then the lockdown profile applies to the application root and all PDBs in the application container.</p>
+<p>If you set PDB_LOCKDOWN while connected to a particular PDB, then the lockdown profile applies to that PDB and overrides the lockdown profile for the CDB or application container, if one exists.</p>
+<p>Just wanted to Know if you have faced this scenario</p>
+<p>Thanks,</p>
+<p>Harish
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73261"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7325' onclick='return addComment.moveForm( "div-comment-7325", "7325", "respond", "10682" )' aria-label='Reply to Harish to Harish'>Reply to Harish</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2 parent" id="comment-7332">
+				<div id="div-comment-7332" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7332">
+			April 17, 2017 at 21 h 55 min</a>		</div>
+
+		<p>Hi,
+The parameter that you set in the CDB applies to all PDBs as a default. But if the parameter is set at PDB level, then this one is used. This is not only for lockdown profiles but for all parameters.
+You have the parameter set to LOCK_TEST in the PDB and set to TEST_LOCK at CDB level. The LOCK_TEST  will be used in the PDB, unless you remove it (alter system reset) at PDB level.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73331"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7332' onclick='return addComment.moveForm( "div-comment-7332", "7332", "respond", "10682" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment odd alt depth-3" id="comment-7339">
+				<div id="div-comment-7339" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ee5173abf04af61add74c56524a0dcc7?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Harish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7339">
+			April 18, 2017 at 18 h 23 min</a>		</div>
+
+		<p>Thanks Franck got it. I got little confused when reading these docs hence wanted to get clarified. As always you are there to help me out.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73401"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7339' onclick='return addComment.moveForm( "div-comment-7339", "7339", "respond", "10682" )' aria-label='Reply to Harish to Harish'>Reply to Harish</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-7857">
+				<div id="div-comment-7857" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/532b7da7b61b543339f605877c94c891?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Peter</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7857">
+			July 12, 2017 at 17 h 23 min</a>		</div>
+
+		<p>Hi Franck,
+I have tested it and can confirm :
+There is no need to have an auxiliary instance while performing PITR of a PDB in 12.2 &#8211; pretty cool!
+I&#8217;m installing new 12.2 RACs and up to know, I did not found any issues <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":)" class="wp-smiley" />
+Best regards and thank you
+Peter
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-78581"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7857' onclick='return addComment.moveForm( "div-comment-7857", "7857", "respond", "10682" )' aria-label='Reply to Peter to Peter'>Reply to Peter</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-10028">
+				<div id="div-comment-10028" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9b04d0e72ce3e4950ad1739db7a5a119?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Satish</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10028">
+			January 7, 2018 at 11 h 15 min</a>		</div>
+
+		<p>Hi Franck,
+In my setup, PDB PIT recovery works in &#8220;Shared UNDO Mode&#8221; but fails in &#8220;Local UNDO Mode&#8221;</p>
+<p>Details are as follow:
+Oracle 12cR2 on Linux, PDB PIT recovery fails in &#8220;Local UNDO Mode&#8221; if I drop tablespace from pdb.
+Steps performed are as follow:
+ &#8211; Create PDB [A]- Create tablespace [B] in PDB [A] &#8211; Create table &#8220;emp&#8221; in tablespace[B] &#8211; Added few rows in table
+ &#8211; backup PDB [A]
+ &#8211; Drop tablespace [B] from PDB [A]
+ &#8211; Run PDB [A] PIT Restore recovery
+ &#8211; Now i get below output, when i try to get table data in PDB [A]
+	SQL&gt; select * from emp;
+	select * from emp
+              *
+	ERROR at line 1:
+	ORA-00376: file 18 cannot be read at this time
+	ORA-01111: name for data file 18 is unknown &#8211; rename to correct file
+	ORA-01110: data file 18:
+	&#8216;/u01/app/oracle/product/12.2.0/dbhome_1/dbs/MISSING00018&#8242;	</p>
+<p>However same recovery works if i just make changes in table inside tablespace( instead of dropping tablespace)
+Also, PDB PIT recovery works fine in &#8220;Shared UNDO Mode&#8221; with same above steps (dropping tablespace).</p>
+<p>Any idea what could be wrong?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-100291"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10028' onclick='return addComment.moveForm( "div-comment-10028", "10028", "respond", "10682" )' aria-label='Reply to Satish to Satish'>Reply to Satish</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

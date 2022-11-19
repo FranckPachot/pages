@@ -1,0 +1,201 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/compare-source-and-target-in-a-dbvisit-replication />
+<meta name=description content='A blog post from 2016 about Compare source and target in a Dbvisit replication'>
+<title>Compare source and target in a Dbvisit replication</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/compare-source-and-target-in-a-dbvisit-replication>https://blog.dbi-services.com/compare-source-and-target-in-a-dbvisit-replication</a> (2016-07-05), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Compare source and target in a Dbvisit replication</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>You&#8217;ve setup a logical replication, and you trust it. But before the target goes into production, it will be safer to compare source and target. At least count the number of rows.
+But tables are continuously changing, so how can you compare? Not so difficult thanks to Dbvisit replicate heartbeat table and Oracle flashback query.
+<span id="more-9615"></span>
+Here is the state of the replication, with activity on the source and real-time replication to the target:
+<pre>| Dbvisit Replicate 2.7.06.4485(MAX edition) - Evaluation License expires in 29 days
+MINE IS running. Currently at plog 368 and SCN 6119128 (07/06/2016 04:15:21).
+APPLY IS running. Currently at plog 368 and SCN 6119114 (07/06/2016 04:15:19).
+Progress of replication dbvrep_XE:MINE-&gt;APPLY: total/this execution
+--------------------------------------------------------------------------------------------------------------------------------------------
+REPOE.CUSTOMERS:              100%  Mine:961/961         Unrecov:0/0         Applied:961/961     Conflicts:0/0       Last:06/07/2016 04:12:12/OK
+REPOE.ADDRESSES:              100%  Mine:961/961         Unrecov:0/0         Applied:961/961     Conflicts:0/0       Last:06/07/2016 04:12:12/OK
+REPOE.CARD_DETAILS:           100%  Mine:894/894         Unrecov:0/0         Applied:894/894     Conflicts:0/0       Last:06/07/2016 04:12:12/OK
+REPOE.ORDER_ITEMS:            100%  Mine:5955/5955       Unrecov:0/0         Applied:5955/5955   Conflicts:0/0       Last:06/07/2016 04:12:12/OK
+REPOE.ORDERS:                  99%  Mine:4781/4781       Unrecov:0/0         Applied:4780/4780   Conflicts:0/0       Last:06/07/2016 04:12:12/OK
+REPOE.INVENTORIES:            100%  Mine:5825/5825       Unrecov:0/0         Applied:5825/5825   Conflicts:0/0       Last:06/07/2016 04:12:12/OK
+REPOE.LOGON:                   99%  Mine:6175/6175       Unrecov:0/0         Applied:6173/6173   Conflicts:0/0       Last:06/07/2016 04:12:12/OK
+--------------------------------------------------------------------------------------------------------------------------------------------
+7 tables listed.   </pre>      </p>
+<p>If you wand to compare the rows from source and target, you will always see a difference because modifications on source arrive on target a few seconds later.</p>
+<h3>Source and target SCN</h3>
+<p>The first thing to do is to determine a consistent point in time where source and target are the same. This point in time exists because the redo log is sequential by nature, and the commits are done in the same order on target than source. And this order is visible with the SCN. The only problem is that on a logical replication the SCN on source and target are completely different and have their own life.</p>
+<p>The first step is determine an SCN from the target and an SCN on the source that show the same state of transactions.</p>
+<p>But before that, let&#8217;s connect to the target and set the environment:</p>
+<p><pre>$ sqlplus /nolog @ compare.sql
+
+SQL*Plus: Release 11.2.0.2.0 Production on Tue Jul 5 18:15:34 2016
+Copyright (c) 1982, 2014, Oracle.  All rights reserved.
+Connected to:
+Oracle Database 11g Express Edition Release 11.2.0.2.0 - 64bit Production
+
+SQL&gt; define table_owner=REPOE
+SQL&gt; define table_name=ORDERS
+SQL&gt;
+SQL&gt; connect system/manager@//192.168.56.67/XE
+Connected.
+SQL&gt; alter session set nls_date_format='DD-MON-YYYY HH24:mi:ss';
+Session altered.
+SQL&gt; alter session set nls_timestamp_format='DD-MON-YYYY HH24:mi:ss';
+Session altered.</pre></p>
+<p>My example is on the #repattack environment, with Swingbench running on the source, and I&#8217;ll compare the ORDER table.</p>
+<h3>Heartbeat table</h3>
+<p>Each Dbvisit replicate configuration comes with an heartbeat table created in the Dbvisit schema on the source and replicated to the target. This table is updated every 10 seconds on the source with timestamp and SCN. This is a great way to check how the replication is working. Here it will be the way to get the SCN information from the source.</p>
+<h3>Flashback query</h3>
+<p>Oracle flashback query offers a nice way to get the commit SCN for the rows updated in the heartbeat table. From the target database, this is the commit SCN for the replication transaction (the APPLY process) and it can be displayed along with the SCN from the source transaction that is recorded in the heartbeat table and replicated to the target.</p>
+<p><pre>SQL&gt; column versions_startscn new_value scn_target
+SQL&gt; column source_scn new_value scn_source
+SQL&gt; column mine_process_name format a12
+SQL&gt; column versions_starttime format a21
+
+SQL&gt; select mine_process_name,wallclock_date,mine_date,source_scn,mine_scn,versions_startscn,versions_starttime,versions_endscn
+        from DBVREP.DBRSCOMMON_HEARTBEAT versions between timestamp(sysdate-1/24/60) and sysdate
+        order by versions_endscn nulls last ;
+
+MINE_PROCESS WALLCLOCK_DATE       MINE_DATE                      SOURCE_SCN             MINE_SCN    VERSIONS_STARTSCN VERSIONS_STARTTIME         VERSIONS_ENDSCN
+------------ -------------------- -------------------- -------------------- -------------------- -------------------- --------------------- --------------------
+MINE         06-JUL-2016 04:14:27 06-JUL-2016 04:14:22              6118717              6118661                                                         4791342
+MINE         06-JUL-2016 04:14:37 06-JUL-2016 04:14:31              6118786              6118748              4791342 06-JUL-2016 04:11:29               4791376
+MINE         06-JUL-2016 04:14:47 06-JUL-2016 04:14:41              6118855              6118821              4791376 06-JUL-2016 04:11:39               4791410
+MINE         06-JUL-2016 04:14:57 06-JUL-2016 04:14:51              6118925              6118888              4791410 06-JUL-2016 04:11:49               4791443
+MINE         06-JUL-2016 04:15:07 06-JUL-2016 04:15:01              6119011              6118977              4791443 06-JUL-2016 04:11:59               4791479
+MINE         06-JUL-2016 04:15:17 06-JUL-2016 04:15:11              6119091              6119059              4791479 06-JUL-2016 04:12:09               4791515
+MINE         06-JUL-2016 04:15:27 06-JUL-2016 04:15:21              6119162              6119128              4791515 06-JUL-2016 04:12:19
+</pre></p>
+<p>This shows that the current version of the heartbeat table on target was commited at SCN 4791515 and we know that this state matches approximately the SCN 6119162 on the source. You can choose any pair you want but the latest will probably be the fastest to query.</p>
+<p>Note that this is approximative because the SCN recorded in the HEARTBEAT table is the SCN of the update and not the commit, which is done just after. You can get the commit SCN by creating your own HEARTBEAT table update a column with userenv(&#8216;commitscn&#8217;).</p>
+<h3>Counting rows on source</h3>
+<p>I&#8217;ll use flashback query to count the rows from the source at SCN 6119162. I&#8217;m doing it in parallel query, but be careful when the table has high modification activity there will be lot of undo blocks to read.</p>
+<p><pre>SQL&gt; connect system/manager@//192.168.56.66/XE
+Connected.
+SQL&gt; alter session force parallel query parallel 8;
+Session altered.
+
+SQL&gt; select count(*) from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_source;
+old   1: select count(*) from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_source
+new   1: select count(*) from "REPOE"."ORDERS" as of scn              6119162
+
+            COUNT(*)
+--------------------
+              775433</pre></p>
+<h3>Counting rows on target</h3>
+<p>I&#8217;m doing the same fron the target, but with the SCN 4791515
+<pre>SQL&gt; connect system/manager@//192.168.56.67/XE
+Connected.
+SQL&gt; alter session force parallel query parallel 8;
+Session altered.
+
+SQL&gt; select count(*) from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_target;
+old   1: select count(*) from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_target
+new   1: select count(*) from "REPOE"."ORDERS" as of scn              4791515
+
+            COUNT(*)
+--------------------
+              775433</pre></p>
+<p>Good. Same number of rows. This proves that even with constantly inserted tables we can find a point of comparison, thanks to Dbvisit heartbeat table and thanks to Oracle flashback query. If you are replicating with another logical replication product, you can simulate the heartbeat table with a job that updates the current SCN to a single row table, and replicate it. If your target is not Oracle, then there are good chances that you cannot do that kind of &#8216;as of&#8217; query which means that you need to lock the table on source for the time you compare.</p>
+<h3>ORA_HASH</h3>
+<p>If you think that counting the rows is not sufficient, you can compare a hash value from the columns. Here is an example.
+I get the list of columns, with ORA_HASH() function on it, and sum() between them:</p>
+<p><pre>SQL&gt; column columns new_value columns
+SQL&gt; select listagg('ORA_HASH('||column_name||')','+') within group (order by column_name) columns
+      2  from dba_tab_columns where owner='&amp;table_owner.' and table_name='&amp;table_name';
+old   2: from dba_tab_columns where owner='&amp;table_owner.' and table_name='&amp;table_name'
+new   2: from dba_tab_columns where owner='REPOE' and table_name='ORDERS'
+
+COLUMNS
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ORA_HASH(CARD_ID)+ORA_HASH(COST_OF_DELIVERY)+ORA_HASH(CUSTOMER_CLASS)+ORA_HASH(CUSTOMER_ID)+ORA_HASH(DELIVERY_ADDRESS_ID)+ORA_HASH(DELIVERY_TYPE)+ORA_HASH(INVOICE_ADDRESS_ID)+ORA_HASH(ORDER_DATE)+ORA_
+HASH(ORDER_ID)+ORA_HASH(ORDER_MODE)+ORA_HASH(ORDER_STATUS)+ORA_HASH(ORDER_TOTAL)+ORA_HASH(PROMOTION_ID)+ORA_HASH(SALES_REP_ID)+ORA_HASH(WAIT_TILL_ALL_AVAILABLE)+ORA_HASH(WAREHOUSE_ID)</pre></p>
+<p>With this list defined in a substitution variable, I can compare the sum of hash values:</p>
+<p><pre>SQL&gt; select count(*),avg(&amp;columns.) hash from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_target;
+old   1: select count(*),sum(&amp;columns.) hash from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_target
+new   1: select count(*),sum(ORA_HASH(CARD_ID)+ORA_HASH(COST_OF_DELIVERY)+ORA_HASH(CUSTOMER_CLASS)+ORA_HASH(CUSTOMER_ID)+ORA_HASH(DELIVERY_ADDRESS_ID)+ORA_HASH(DELIVERY_TYPE)+ORA_HASH(INVOICE_ADDRESS_ID)+ORA_HASH(ORDER_DATE)+ORA_HASH(ORDER_ID)+ORA_HASH(ORDER_MODE)+ORA_HASH(ORDER_STATUS)+ORA_HASH(ORDER_TOTAL)+ORA_HASH(PROMOTION_ID)+ORA_HASH(SALES_REP_ID)+ORA_HASH(WAIT_TILL_ALL_AVAILABLE)+ORA_HASH(WAREHOUSE_ID)) hash from "REPOE"."ORDERS" as of scn          4791515
+
+            COUNT(*)                 HASH
+-------------------- --------------------
+              775433   317531150805040439
+
+SQL&gt; connect system/manager@//192.168.56.66/XE
+Connected.
+SQL&gt; alter session force parallel query parallel 8;
+Session altered.
+
+SQL&gt; select count(*),avg(&amp;columns.) hash from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_source;
+old   1: select count(*),sum(&amp;columns.) hash from "&amp;table_owner."."&amp;table_name." as of scn &amp;scn_source
+new   1: select count(*),sum(ORA_HASH(CARD_ID)+ORA_HASH(COST_OF_DELIVERY)+ORA_HASH(CUSTOMER_CLASS)+ORA_HASH(CUSTOMER_ID)+ORA_HASH(DELIVERY_ADDRESS_ID)+ORA_HASH(DELIVERY_TYPE)+ORA_HASH(INVOICE_ADDRESS_ID)+ORA_HASH(ORDER_DATE)+ORA_HASH(ORDER_ID)+ORA_HASH(ORDER_MODE)+ORA_HASH(ORDER_STATUS)+ORA_HASH(ORDER_TOTAL)+ORA_HASH(PROMOTION_ID)+ORA_HASH(SALES_REP_ID)+ORA_HASH(WAIT_TILL_ALL_AVAILABLE)+ORA_HASH(WAREHOUSE_ID)) hash from "REPOE"."ORDERS" as of scn          6119162
+
+            COUNT(*)                 HASH
+-------------------- --------------------
+              775433    17531150805040439</pre></p>
+<p> Note that this is only an example. You must adapt for your needs: precision of the comparison and performance.                                                                                                                         </p>
+<h3>So what?</h3>
+<p>Comparing source and target is not a bad idea. With Dbvisit replicate, if you defined the replication properly and did the initial import with the SCN provided by the setup wizard, you should not miss transactions, even when there is lot of activity on source, and even without locking the source for the initialisation. But it&#8217;s always good to compare, especially before the &#8216;Go&#8217; decision of a migration done with Dbvisit replicate to lower the downtime (and the stress). Thanks to heartbeat table and flashback query, a checksum is not too hard to implement.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-96160"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-10645">
+				<div id="div-comment-10645" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/5edb4f52909d0717b4d56fcc4957589e?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Swapnil Agawane</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10645">
+			February 23, 2018 at 0 h 14 min</a>		</div>
+
+		<p>It would be very helpful. Thank you so much!!
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-106461"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10645' onclick='return addComment.moveForm( "div-comment-10645", "10645", "respond", "9615" )' aria-label='Reply to Swapnil to Swapnil Agawane'>Reply to Swapnil</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

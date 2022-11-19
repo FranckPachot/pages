@@ -1,0 +1,122 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/variations-on-1m-rows-insert-3-timesten />
+<meta name=description content='A blog post from 2015 about Variations on 1M rows insert (3): TimesTen'>
+<title>Variations on 1M rows insert (3): TimesTen</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/variations-on-1m-rows-insert-3-timesten>https://blog.dbi-services.com/variations-on-1m-rows-insert-3-timesten</a> (2015-05-18), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Variations on 1M rows insert (3): TimesTen</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the previous <a href="http://blog.dbi-services.com/variations-on-1m-rows-insert-1-bulk-insert/">blog post</a> I measured how inserting 1 million rows takes 5 minutes instead of 45 seconds when we commit at each row inserted. In Oracle we can improve that down to 2 minutes if we can accept (and manage) the loss of transactions following an instance crash.
+Let&#8217;s go further. For OLTP that need to face a high rate of transactions, Oracle has TimesTen which is a Database In-Memory &#8211; meaning that it is optimized for in-memory structures. My testcase has a 1 million rows table that can fit in memory, so let&#8217;s try it.</p>
+<h3>Test case</h3>
+<p>I am still using the <a href="http://www.oracle.com/technetwork/community/developer-vm/index.html">Oracle Developer Day 11g VM</a> which has TimesTen installed.
+I&#8217;ve configured my database in /home/oracle/app/oracle/product/TimesTen/tt1122/info/sys.odbc.ini</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[sampledb_1122]
+Driver=/home/oracle/app/oracle/product/TimesTen/tt1122/lib/libtten.so
+DataStore=/home/oracle/app/oracle/product/TimesTen/tt1122/info/DemoDataStore/sampledb_1122
+PermSize=400
+TempSize=320
+PLSQL=1
+DatabaseCharacterSet=US7ASCII
+</pre>
+<p>I used the sample one but I have increased the size of memory to 400MB and 320MB for PERM_ALLOCATED_SIZE and TEMP_ALLOCATED_SIZE.</p>
+<h3>ttIsql</h3>
+<p>So I run the TimesTen command line interpreter:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[oracle@localhost ~]$ ttisql
+
+Copyright (c) 1996-2011, Oracle.  All rights reserved.
+Type ? or "help" for help, type "exit" to quit ttIsql.
+</pre>
+<p>check the version</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">Command&gt; version
+TimesTen Release 11.2.2.2.0
+</pre>
+<p>connect to my database</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">Command&gt; connect "dsn=sampledb_1122";
+Connection successful: DSN=sampledb_1122;UID=oracle;DataStore=/home/oracle/app/oracle/product/TimesTen/tt1122/info/DemoDataStore/sampledb_1122;DatabaseCharacterSet=US7ASCII;ConnectionCharacterSet=US7ASCII;DRIVER=/home/oracle/app/oracle/product/TimesTen/tt1122/lib/libtten.so;PermSize=40;TempSize=32;TypeMode=0;
+(Default setting AutoCommit=1)
+</pre>
+<p>and I want to manage commits myself</p>
+<pre>Command&gt; set autocommit 0;
+</pre>
+<p>and then I&#8217;m doing the same as in previous posts:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">Command&gt; set echo on;
+
+Command&gt; create table DEMO ("id" number primary key, "text" varchar2(15), "number" number);
+
+Command&gt; set timing on;
+</pre>
+<p>There is something that is very nice about TimesTen: it supports PL/SQL. I&#8217;m running exactly the same as I did in Oracle:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">Command&gt; declare
+ type people_array is varray(12) of varchar(15);
+ people people_array := people_array( 'Marc', 'Bill', 'George', 'Eliot', 'Matt', 'Trey', 'Tracy','Greg', 'Steve', 'Kristina', 'Katie', 'Jeff' );
+ people_count number :=people.COUNT;
+ n number;
+begin
+ for i in 0..1e6 loop
+  n:=trunc(dbms_random.value(0,10000));
+  insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+  commit;
+ end loop;
+ commit;
+end;
+/
+
+PL/SQL procedure successfully completed.
+
+Execution time (SQLExecute) = 21.010554 seconds.
+</pre>
+<p>21 second. Yes that&#8217;s fast&#8230;</p>
+<h3>Durable commits</h3>
+<p>Do you remember how we improved the commits in the last post? When accepting the risk to have non durable commits the response time was faster on Oracle database because we don&#8217;t have to wait for persistence of commits.</p>
+<p>Here in TimesTen, it&#8217;s an In-Memory database and by default transactions are not durable. Transactions are logged for rollback, but not for recovery. Which means that nothing goes to disk. If the instance crashes, data is lost. If I want to have the durability of ACID properties then we have to write transaction logging to disk.
+This is activated by the following property in the sys.odbc.ini:</p>
+<pre>DurableCommits=1;
+</pre>
+<p>I connect:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">Command&gt; connect "dsn=sampledb_1122";
+Connection successful: DSN=sampledb_1122;UID=oracle;DataStore=/home/oracle/app/oracle/product/TimesTen/tt1122/info/DemoDataStore/sampledb_1122;DatabaseCharacterSet=US7ASCII;ConnectionCharacterSet=US7ASCII;DurableCommits=1;DRIVER=/home/oracle/app/oracle/product/TimesTen/tt1122/lib/libtten.so;PermSize=40;TempSize=32;TypeMode=0;
+(Default setting AutoCommit=1)</pre>
+<p>and run exactly the same as before:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+
+Execution time (SQLExecute) = 31.316902 seconds.
+</pre>
+<p>It&#8217;s longer but still faster than the Oracle database. TimesTen is optimized for that.</p>
+<h3>Conclusion</h3>
+<p>Note that we have the durability here, thanks to the persistence of transaction log, as long as we set DurableCommits=1. However, in case of instance crash, the recovery may be long because lot of transaction must be re-done. It&#8217;s an In-Memory database, it&#8217;s fast when it&#8217;s up but you don&#8217;t have the same availability than a database that is optimized to store data on disk. You have to tune the checkpoints in order to balance between the performance and the availability.</p>
+<p>TimesTen In-Memory database can be a good solution to accelerate some use-cases. Its compatibility with Oracle SQL and PL/SQL is very good. You can install it standalone or as a cache for Oracle Database. Licencing is 50% of Oracle Enterprise Edition.</p>
+<p>TimesTen is also called &#8216;Database In-Memory&#8217;. Which is a bit misleading because Oracle has also the 12c In-memory option which is very different. With competitors, TimesTen can be compared to SQL Server In-Memory OLTP. Because it&#8217;s a unique event &#8211; a cross technology one (MSSQL, ORA, HANA) &#8211; I don&#8217;t hesitate to link again to our free <a href="http://www.dbi-services.com/newsroom/events/">Event about In-Memory: boost your IT performance!</a> In Switzerland (Lausanne, Basel and Zürich).</p>
+<p>Talking about cross technology expertise, don&#8217;t miss Daniel&#8217;s variation on <a href="http://www.dbi-services.com/index.php/blog/entry/variations-on-1m-rows-insert-1-bulk-insert-postgresql">1M rows insert into PostgreSQL</a> and <a href="http://www.dbi-services.com/index.php/blog/entry/variations-on-1m-rows-insert2-commit-write-postgresql">with synchronous commit</a> .</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-19570"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

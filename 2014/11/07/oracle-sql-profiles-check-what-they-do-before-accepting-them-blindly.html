@@ -1,0 +1,511 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-sql-profiles-check-what-they-do-before-accepting-them-blindly />
+<meta name=description content='A blog post from 2014 about Oracle SQL Profiles: Check what they do before accepting them blindly'>
+<title>Oracle SQL Profiles: Check what they do before accepting them blindly</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-sql-profiles-check-what-they-do-before-accepting-them-blindly>https://blog.dbi-services.com/oracle-sql-profiles-check-what-they-do-before-accepting-them-blindly</a> (2014-11-07), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle SQL Profiles: Check what they do before accepting them blindly</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>People often ask me if I use the SQL Tuning Advisor. The answer is no, at least not through the end of it. But don&#8217;t take me wrong. SQL Tuning Advisor is a really nice feature. If you like the CBO then you must love the Tuning Advisor, because it is just the CBO with more time to optimize, and more ways to optimize. The fact is that when a customer calls me, they expect a bit more than running an advisor and implement the result. I&#8217;m there to fix the root cause, not just workaround some missing stats. And this is why I use it very rarely.</p>
+<p>However when I have a big query, with a plan that covers several pages, it takes a lot of time to find what is wrong. The method is often based on comparing the estimated cardinalities with the actual ones. But If I have access to the Tuning Pack, then the SQL Tuning Advisor can help to find very quickly where the estimations are going wrong.</p>
+<p>The SQL Tuning Advisor proposes a SQL Profile to adjust the estimations. Then I just have to check the biggest adjustment and I can focus where the estimations are wrong. However, that information is not exposed. The SQL Tuning Advisor report shows the new plan, but not the ways it gets to it.</p>
+<p>The goal of this post is to give you the query I use to show exactly what the profile will implement when you accept it.</p>
+<p>Even if you&#8217;re going to accept the profile, It&#8217;s a good idea to check it before. It will help to choose if you need to enable &#8216;force matching&#8217; or not. And if it is a good fix or if there are more sustainable ways to achieve the same.</p>
+<p>You probably know that a profile implements the estimation adjustment with the OPT_ESTIMATE hints which adjust it with a &#8216;scale_rows&#8217; factor that can apply to tables, index selectivity or joins. They is very well explained on the <a href="http://www.pythian.com/blog/oracles-opt_estimate-hint-usage-guide/trackback/">Pythian blog</a></p>
+<p>So, let&#8217;s take an exemple. My favorite query to show bad estimations on the HR schema is:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">alter session set current_schema=HR;
+select distinct DEPARTMENT_NAME
+ from DEPARTMENTS join EMPLOYEES using(DEPARTMENT_ID)
+ where DEPARTMENT_NAME like '%ing' and SALARY&gt;20000;
+</pre>
+<p>For the simple reason that I know that lot of the department names are ending with &#8216;ing&#8217; (Marketing, Purchasing,&#8230;) but the CBO doesn&#8217;t know that. And I can&#8217;t give that information through column statistics or histograms:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from table( dbms_xplan.display_cursor(format=&gt;'rowstats last ') );
+
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------------------------------------
+SQL_ID  4fz1vtn0w8aak, child number 0
+-------------------------------------
+select distinct DEPARTMENT_NAME  from DEPARTMENTS join EMPLOYEES
+using(DEPARTMENT_ID)  where DEPARTMENT_NAME like '%ing' and SALARY&gt;20000
+
+Plan hash value: 3041748347
+
+----------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name              | Starts | E-Rows | A-Rows |
+----------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |                   |      1 |        |      0 |
+|   1 |  HASH UNIQUE                          |                   |      1 |      1 |      0 |
+|   2 |   NESTED LOOPS SEMI                   |                   |      1 |      1 |      0 |
+|*  3 |    TABLE ACCESS FULL                  | DEPARTMENTS       |      1 |      1 |      7 |
+|*  4 |    TABLE ACCESS BY INDEX ROWID BATCHED| EMPLOYEES         |      7 |      1 |      0 |
+|*  5 |     INDEX RANGE SCAN                  | EMP_DEPARTMENT_IX |      7 |     10 |     55 |
+----------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("DEPARTMENTS"."DEPARTMENT_NAME" LIKE '%ing')
+   4 - filter("EMPLOYEES"."SALARY"&gt;20000)
+   5 - access("DEPARTMENTS"."DEPARTMENT_ID"="EMPLOYEES"."DEPARTMENT_ID")
+
+Note
+-----
+   - this is an adaptive plan
+
+</pre>
+<p>Look at E-Rows and A-Rows: I have 7 departments ending with &#8216;ing&#8217; but the optimizer thinks that there is only one. In 11g you need a profile to help the optimizer or you&#8217;re going into an expensive nested loop. This example has few rows, but imagine the consequence when a nested loop is choosen but must execute on millon of rows. In 12c &#8211; and if you are in Enterprise Edition &#8211; the adaptive plan will help to avoid that situation. As soon as a threshold is reached another plan will be executed.</p>
+<p>But even with adaptive plan, there may be a better plan that is possible only with accurate estimations. Let&#8217;s see what the SQL Tuning Advisor will find.</p>
+<h3>Running SQL Tuning Advisor</h3>
+<p>I create and execute the tuning task:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">begin
+ dbms_output.put_line('task id: '||
+ dbms_sqltune.create_tuning_task(
+  task_name=&gt;'dbiInSite',
+  description=&gt;'dbi InSite workshop Oracle Tuning',
+  scope=&gt;dbms_sqltune.scope_comprehensive,
+  time_limit=&gt;30,
+  sql_id=&gt;'4fz1vtn0w8aak'
+  )
+ );
+ dbms_sqltune.execute_tuning_task('dbiInSite');
+end;
+/
+</pre>
+<p>And show the report:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; set long 1000000 longc 1000000
+SQL&gt; select dbms_sqltune.report_tuning_task('dbiInSite') FROM dual;
+
+DBMS_SQLTUNE.REPORT_TUNING_TASK('DBIINSITE')
+-------------------------------------------------------------------------------
+GENERAL INFORMATION SECTION
+-------------------------------------------------------------------------------
+Tuning Task Name   : dbiInSite
+Tuning Task Owner  : SYS
+Workload Type      : Single SQL Statement
+Scope              : COMPREHENSIVE
+Time Limit(seconds): 30
+Completion Status  : COMPLETED
+Started at         : 11/08/2014 00:03:22
+Completed at       : 11/08/2014 00:03:23
+
+-------------------------------------------------------------------------------
+Schema Name: HR
+SQL ID     : 4fz1vtn0w8aak
+SQL Text   : select distinct DEPARTMENT_NAME
+              from DEPARTMENTS join EMPLOYEES using(DEPARTMENT_ID)
+              where DEPARTMENT_NAME like '%ing' and SALARY&gt;20000
+
+-------------------------------------------------------------------------------
+FINDINGS SECTION (1 finding)
+-------------------------------------------------------------------------------
+
+1- SQL Profile Finding (see explain plans section below)
+--------------------------------------------------------
+  A potentially better execution plan was found for this statement.
+
+  Recommendation (estimated benefit: 33.67%)
+  ------------------------------------------
+  - Consider accepting the recommended SQL profile.
+    execute dbms_sqltune.accept_sql_profile(task_name =&gt; 'dbiInSite',
+            task_owner =&gt; 'SYS', replace =&gt; TRUE);
+
+  Validation results
+  ------------------
+  The SQL profile was tested by executing both its plan and the original plan
+  and measuring their respective execution statistics. A plan may have been
+  only partially executed if the other could be run to completion in less time.
+
+                           Original Plan  With SQL Profile  % Improved
+                           -------------  ----------------  ----------
+  Completion Status:            COMPLETE          COMPLETE
+  Elapsed Time (s):             .005964           .000177      97.03 %
+  CPU Time (s):                 .005999             .0002      96.66 %
+  User I/O Time (s):                  0                 0
+  Buffer Gets:                       13                 9      30.76 %
+  Physical Read Requests:             0                 0
+  Physical Write Requests:            0                 0
+  Physical Read Bytes:                0                 0
+  Physical Write Bytes:               0                 0
+  Rows Processed:                     0                 0
+  Fetches:                            0                 0
+  Executions:                         1                 1
+
+  Notes
+  -----
+  1. Statistics for the original plan were averaged over 10 executions.
+  2. Statistics for the SQL profile plan were averaged over 10 executions.
+
+-------------------------------------------------------------------------------
+EXPLAIN PLANS SECTION
+-------------------------------------------------------------------------------
+
+1- Original With Adjusted Cost
+------------------------------
+Plan hash value: 3041748347
+
+-------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name              | Rows  | Bytes | Cost (%CPU)| 
+-------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |                   |     1 |    23 |     7  (15)| 
+|   1 |  HASH UNIQUE                          |                   |     1 |    23 |     7  (15)| 
+|   2 |   NESTED LOOPS SEMI                   |                   |     1 |    23 |     6   (0)| 
+|*  3 |    TABLE ACCESS FULL                  | DEPARTMENTS       |     7 |   112 |     3   (0)| 
+|*  4 |    TABLE ACCESS BY INDEX ROWID BATCHED| EMPLOYEES         |     1 |     7 |     1   (0)| 
+|*  5 |     INDEX RANGE SCAN                  | EMP_DEPARTMENT_IX |    10 |       |     0   (0)| 
+-------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - filter("DEPARTMENTS"."DEPARTMENT_NAME" LIKE '%ing')
+   4 - filter("EMPLOYEES"."SALARY"&gt;20000)
+   5 - access("DEPARTMENTS"."DEPARTMENT_ID"="EMPLOYEES"."DEPARTMENT_ID")
+
+2- Using SQL Profile
+--------------------
+Plan hash value: 2473492969
+
+---------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name        | Rows  | Bytes | Cost (%CPU)| Time     |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |             |     1 |    23 |     5  (20)| 00:00:01 |
+|   1 |  HASH UNIQUE                  |             |     1 |    23 |     5  (20)| 00:00:01 |
+|   2 |   NESTED LOOPS                |             |     1 |    23 |     4   (0)| 00:00:01 |
+|   3 |    NESTED LOOPS               |             |     1 |    23 |     4   (0)| 00:00:01 |
+|*  4 |     TABLE ACCESS FULL         | EMPLOYEES   |     1 |     7 |     3   (0)| 00:00:01 |
+|*  5 |     INDEX UNIQUE SCAN         | DEPT_ID_PK  |     1 |       |     0   (0)| 00:00:01 |
+|*  6 |    TABLE ACCESS BY INDEX ROWID| DEPARTMENTS |     1 |    16 |     1   (0)| 00:00:01 |
+---------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - filter("EMPLOYEES"."SALARY"&gt;20000)
+   5 - access("DEPARTMENTS"."DEPARTMENT_ID"="EMPLOYEES"."DEPARTMENT_ID")
+   6 - filter("DEPARTMENTS"."DEPARTMENT_NAME" LIKE '%ing')
+
+-------------------------------------------------------------------------------
+
+</pre>
+<p>So even if I have adaptive plan, a better plan is possible. When the optimizer know that there are more rows from DEPARTMENTS than EMPLOYEES, it&#8217;s better to start with EMPLOYEES, for nested loop as well as for hash join.</p>
+<h3>Showing the OPT_ESTIMATE hints</h3>
+<p>Then I don&#8217;t want to accept the profile yet, but want to see all those OPT_ESTIMATE hints that has been determined by the SQL Tuning Advisor and that will be added to the query when the profile is accepted. Here my script. Note that this script is for 11g and 12c. In 10g the information was stored elsewhere. You can go to <a href="http://jonathanlewis.wordpress.com/2007/02/12/sql-profiles-2/trackback/">Jonathan Levis post</a> for the 10g query.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">set serveroutput on echo off
+declare
+  -- input variables
+  input_task_owner dba_advisor_tasks.owner%type:='SYS';
+  input_task_name dba_advisor_tasks.task_name%type:='dbiInSite';
+  input_show_outline boolean:=false;
+  -- local variables
+  task_id  dba_advisor_tasks.task_id%type;
+  outline_data xmltype;
+  benefit number;
+begin
+  for o in ( select * from dba_advisor_objects where owner=input_task_owner and task_name=input_task_name and type='SQL')
+  loop
+          -- get the profile hints (opt_estimate)
+          dbms_output.put_line('--- PROFILE HINTS from '||o.task_name||' ('||o.object_id||') statement '||o.attr1||':');
+          dbms_output.put_line('/*+');
+          for r in (
+            select hint,benefit from (
+             select case when attr5 like 'OPT_ESTIMATE%' then cast(attr5 as varchar2(4000)) when attr1 like 'OPT_ESTIMATE%' then attr1 end hint,benefit
+             from dba_advisor_recommendations t join dba_advisor_rationale r using (task_id,rec_id)
+             where t.owner=o.owner and t.task_name = o.task_name and r.object_id=o.object_id and t.type='SQL PROFILE'
+             --and r.message='This attribute adjusts optimizer estimates.'
+            ) order by to_number(regexp_replace(hint,'^.*=([0-9.]+)[^0-9].*$','1'))
+          ) loop
+           dbms_output.put_line('   '||r.hint); benefit:=to_number(r.benefit)/100;
+          end loop;
+          dbms_output.put_line('*/');
+          -- get the outline hints
+          begin
+          select outline_data into outline_data from (
+              select case when other_xml is not null then extract(xmltype(other_xml),'/*/outline_data/hint') end outline_data
+              from dba_advisor_tasks t join dba_sqltune_plans p using (task_id)
+              where t.owner=o.owner and t.task_name = o.task_name and p.object_id=o.object_id  and t.advisor_name='SQL Tuning Advisor' --11gonly-- and execution_type='TUNE SQL'
+              and p.attribute='Using SQL profile'
+          ) where outline_data is not null;
+          exception when no_data_found then null;
+          end;
+          exit when not input_show_outline;
+          dbms_output.put_line('--- OUTLINE HINTS from '||o.task_name||' ('||o.object_id||') statement '||o.attr1||':');
+          dbms_output.put_line('/*+');
+          for r in (
+              select (extractvalue(value(d), '/hint')) hint from table(xmlsequence(extract( outline_data , '/'))) d
+          ) loop
+           dbms_output.put_line('   '||r.hint);
+          end loop;
+          dbms_output.put_line('*/');
+          dbms_output.put_line('--- Benefit: '||to_char(to_number(benefit),'FM99.99')||'%');
+  end loop;
+  dbms_output.put_line('');
+end;
+/
+
+
+</pre>
+<p>And here is the output:</p>
+<pre>--- PROFILE HINTS from dbiInSite (1) statement 4fz1vtn0w8aak:
+/*+
+OPT_ESTIMATE(@"SEL$2CBA5DDD", TABLE, "EMPLOYEES"@"SEL$1", SCALE_ROWS=2)
+OPT_ESTIMATE(@"SEL$58A6D7F6", TABLE, "EMPLOYEES"@"SEL$1", SCALE_ROWS=2)
+OPT_ESTIMATE(@"SEL$6AE97DF7", TABLE, "DEPARTMENTS"@"SEL$1", SCALE_ROWS=5.185185185)
+OPT_ESTIMATE(@"SEL$58A6D7F6", TABLE, "DEPARTMENTS"@"SEL$1", SCALE_ROWS=5.185185185)
+*/
+
+PL/SQL procedure successfully completed.
+</pre>
+<p>This is very interesting information. It says that the actual number of employees in this query (with that specific where clause) is 2 times what is estimated from statistics. And that the estimated number of departments is 5 times what is estimated.</p>
+<h3>So what it is used for?</h3>
+<p>That gives me several ways to improve, even without implementing the profile.</p>
+<p>First, the number of employees for a &#8216;SALARY&gt;2000&#8242; predicate can be improved with histograms. That is better than a profile because it will improve all queries that filter on employee salary.</p>
+<p>Then, for DEPARTMENTS, histograms will not help because the bad estimation comes from the LIKE &#8216;%ing&#8217; predicate and I&#8217;ve no way to give that information with statistics. Ok, let&#8217;s go for the profile. If you want to implement the profile, will you choose &#8216;force matching&#8217; or not? Of course not. The estimation adjustment makes sense only with our &#8216;%ing&#8217; values. This is were looking at the OPT_ESTIMATE is very important, or you can&#8217;t do the right choice.</p>
+<p>And you may choose something else than profile. Dynamic sampling makes sense in this case. Another solution may be to add OPT_ESTIMATE or CARDINALITY hints in the query.</p>
+<h3>Conclusion</h3>
+<p>SQL Tuning Advisor is powerful, when used intelligently. It gives ideas about what is wrong and proposes a way to fix it. But you can have more when retrieving the internal hints that the profile generate. Better choice to implement the profile, or alternative solutions. As usual, if you see something wrong or to improve in my query, please comment.</p>
+<h3>Quizz</h3>
+<p>The answer is left for another post, but if you have an idea, please don&#8217;t hesitate to comment.
+Question is: In the above output, I&#8217;ve two OPT_ESTIMATE rows for each table. what is the reason for that?</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5190"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 8 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1262">
+				<div id="div-comment-1262" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/aad8e5c3b03a723bc53ddb807436f320?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Martin Preiss</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1262">
+			November 10, 2014 at 11 h 55 min</a>		</div>
+
+		<p>Hi Franck,
+regarding the quiz question: maybe the duplication of the hints is a result of the two plan branches for the adaptive plan?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12631"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1262' onclick='return addComment.moveForm( "div-comment-1262", "1262", "respond", "518" )' aria-label='Reply to Martin to Martin Preiss'>Reply to Martin</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1264">
+				<div id="div-comment-1264" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1264">
+			November 10, 2014 at 12 h 50 min</a>		</div>
+
+		<p>Hi Martin,</p>
+<p>Good guess, but all branches are related to the same query block name.
+Here is the &#8216;+alias&#8217; section from dbms_xplan</p>
+<p>Query Block Name / Object Alias (identified by operation id):
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;-</p>
+<p>   1 &#8211; SEL$58A6D7F6
+   3 &#8211; SEL$58A6D7F6 / DEPARTMENTS@SEL$1
+   4 &#8211; SEL$58A6D7F6 / EMPLOYEES@SEL$1
+   5 &#8211; SEL$58A6D7F6 / EMPLOYEES@SEL$1</p>
+<p>Hint: At first I suspected a bug in my script. But it became obvious when I&#8217;ve seen all those query block names in the 10053 trace.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12651"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1264' onclick='return addComment.moveForm( "div-comment-1264", "1264", "respond", "518" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1266">
+				<div id="div-comment-1266" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1266">
+			November 10, 2014 at 14 h 57 min</a>		</div>
+
+		<p>The goal of the quiz being only to give me some time to write the seconds blog, I&#8217;ll not delay the answer for the pleasure of it, So you can check my latest post about it.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12671"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1266' onclick='return addComment.moveForm( "div-comment-1266", "1266", "respond", "518" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="pingback odd alt thread-odd thread-alt depth-1" id="comment-3938">
+				<div id="div-comment-3938" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://jhdba.wordpress.com/2016/07/05/excellent-blog-post-on-sql-profiles/' rel='external nofollow' class='url'>EXcellent blog post on SQL Profiles &laquo; Oracle DBA &#8211; A lifelong learning experience</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3938">
+			July 5, 2016 at 19 h 20 min</a>		</div>
+
+		<p>[&#8230;] Well I did come across just such an article today. It was written by Franck Pachot and was on the subject of SQL Profiles [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39391"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3938' onclick='return addComment.moveForm( "div-comment-3938", "3938", "respond", "518" )' aria-label='Reply to EXcellent to EXcellent blog post on SQL Profiles &laquo; Oracle DBA &#8211; A lifelong learning experience'>Reply to EXcellent</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-3939">
+				<div id="div-comment-3939" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e0282692ebe7c396b1132c50be61f517?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.jhdba.wordpress.com' rel='external nofollow' class='url'>John Hallas</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3939">
+			July 5, 2016 at 19 h 26 min</a>		</div>
+
+		<p>Excellent article. I have mentioned it in my own blog I though it was so well written. Hopefully you get a few hits</p>
+<p><a href="https://jhdba.wordpress.com/2016/07/05/excellent-blog-post-on-sql-profiles/" rel="nofollow">https://jhdba.wordpress.com/2016/07/05/excellent-blog-post-on-sql-profiles/</a></p>
+<p>PS the comment above re the next article needs a link adding to it to the article really</p>
+<p>John
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39401"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3939' onclick='return addComment.moveForm( "div-comment-3939", "3939", "respond", "518" )' aria-label='Reply to John to John Hallas'>Reply to John</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-3941">
+				<div id="div-comment-3941" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3941">
+			July 5, 2016 at 20 h 55 min</a>		</div>
+
+		<p>Hi John,
+Thanks a lot for your feedback.
+The link to why multiple OPT_ESTIMATE?: <a href="http://blog.dbi-services.com/oracle-sql-profile-why-multiple-optestimate/" rel="nofollow">http://blog.dbi-services.com/oracle-sql-profile-why-multiple-optestimate/</a>
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39421"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3941' onclick='return addComment.moveForm( "div-comment-3941", "3941", "respond", "518" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="pingback even thread-odd thread-alt depth-1" id="comment-3942">
+				<div id="div-comment-3942" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://oracleinaction.com/sql-profile-i/' rel='external nofollow' class='url'>SQL PROFILE DEMYSTIFIED : PART - I - ORACLE IN ACTION</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3942">
+			July 6, 2016 at 6 h 49 min</a>		</div>
+
+		<p>[&#8230;] SQL Profiles: Check what they do before accepting Oracle SQL Profile: Why Multiple [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39431"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3942' onclick='return addComment.moveForm( "div-comment-3942", "3942", "respond", "518" )' aria-label='Reply to SQL to SQL PROFILE DEMYSTIFIED : PART - I - ORACLE IN ACTION'>Reply to SQL</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-3944">
+				<div id="div-comment-3944" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/f103ca08a2540d6bb3fec7769b93a5ef?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://chandlerdba.wordpress.com/' rel='external nofollow' class='url'>Neil Chandler</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3944">
+			July 6, 2016 at 9 h 22 min</a>		</div>
+
+		<p>Great article Franck.</p>
+<p>It should be mentioned that SQL_Profiles using OPT_ESTIMATE are basically a form of extended satistics that will decay and end up out of date. If your data distributions change, the SQL Profile will become a problem and you can get unexpected results. You need to revisit SQL Profiles on a periodic basis to ensure you are still getting optimal plans because, as you say, it&#8217;s treating the symptoms and not the root cause.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39451"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3944' onclick='return addComment.moveForm( "div-comment-3944", "3944", "respond", "518" )' aria-label='Reply to Neil to Neil Chandler'>Reply to Neil</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

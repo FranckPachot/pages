@@ -1,0 +1,369 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/12cr2-dbca-automatic-memory-management-and-databasetype />
+<meta name=description content='A blog post from 2017 about 12cR2 DBCA, Automatic Memory Management, and  -databaseType'>
+<title>12cR2 DBCA, Automatic Memory Management, and  -databaseType</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/12cr2-dbca-automatic-memory-management-and-databasetype>https://blog.dbi-services.com/12cr2-dbca-automatic-memory-management-and-databasetype</a> (2017-04-03), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">12cR2 DBCA, Automatic Memory Management, and  -databaseType</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This post explains the following error encountered when creating a 12.2 database with DBCA:
+<pre>[DBT-11211] The Automatic Memory Management option is not allowed when the total physical memory is greater than 4GB.</pre>
+or when creating the database directly with the installer:
+<pre>[INS-35178]The Automatic Memory Management option is not allowed when the total physical memory is greater than 4GB.</pre>
+If you used Automatic Memory Management (AMM) you will have to think differently and size the SGA and PGA separately.
+<span id="more-15418"></span></p>
+<h3>ASMM</h3>
+<p>Automatic Shared Memory Management, or ASMM is what you do when setting SGA_TARGET and not setting MEMORY_TARGET. Basically, you define the size of the SGA you want to allocate at startup and that will be available for the instance, most of it being buffer cache and shared pool. I&#8217;ll not go into the detail of SGA_TARGET and SGA_MAX_SIZE because on the most common platforms, all is allocated at instance startup. Then, in addition to this shared area used by all instance processes, each processes can allocate private memory, and you control this with PGA_AGGREGATE_TARGET.
+The total size of SGA and PGA for all instances in a system must reside in physical memory for the simple reason that they are mostly used to avoid I/O (a large buffer cache avoids physical reads and optimizes physical writes, a large PGA avoids reads and writes to tempfiles).</p>
+<h3>AMM</h3>
+<p>Because you don&#8217;t always know how much to allocate to each (SGA and PGA) Oracle came with a feature where you define the whole MEMORY_TARGET, part of this will be dynamically allocated to SGA or PGA. This is called Automatic Memory Management (AMM). It&#8217;s a good idea on the paper: it is automatic, which means that you don&#8217;t have to think about it, and it is dynamic, which means that you don&#8217;t waste physical memory because of bad sizing.</p>
+<p>But it is actually a bad idea when going to implementation, at least on the most common platforms.
+SGA and PGA are different beasts that should not be put in the same cage:</p>
+<ul>
+<li>SGA is big, static, shared, allocated once at startup</li>
+<li>PGA is small chunks constantly allocated and deallocated, private to processes</li>
+</ul>
+<p>First, it is not so easy because you have to size the /dev/shm correctly or you will get the following at startup:
+<pre>ORA-00845: MEMORY_TARGET not supported on this system</pre>
+In addition to that, because the whole memory is prepared to contain the whole SGA you see misleading numbers in &#8216;show sga&#8217;.</p>
+<p>Second there are lot of bugs, resizing overhead, etc.</p>
+<p>And finally, you cannot use large pages when you are in AMM, and in modern system (lot of RAM, lot of processes) having all processes mapping the SGA with small pages of 4k is a big overhead.</p>
+<p>So, as long as you have more than few GB on a system, you should avoid AMM and set SGA_TARGET and PGA_AGGREGATE_TARGET independently. Forget MEMORY_TARGET. Forget /dev/shm. Forget also the following documentation at <a href="http://docs.oracle.com/database/122/ADMIN/managing-memory.htm#ADMIN00207" target="_blank">http://docs.oracle.com/database/122/ADMIN/managing-memory.htm#ADMIN00207</a> which mentions that <em>Oracle recommends that you enable the method known as automatic memory management.</em>
+Actually, AMM is not recommended for systems with more than a few GB of physical memory, and most system have more than few GB of physical memory. If you try to use AMM on a system with more than 4GB you get a warning in 12<em>c</em>R1 and it is an error in 12<em>c</em>R2:
+<a href="../wp-insides/uploads/sites/2/2017/04/CaptureAMM002.png" rel="lightbox[15418]"><img src="../wp-insides/uploads/sites/2/2017/04/CaptureAMM002.png" alt="CaptureAMM002" width="512" height="304" class="alignnone size-full wp-image-15608" /></a>
+I got this when trying to create a database with AMM on a system with more than 4GB of physical memory.</p>
+<p><a href="../wp-insides/uploads/sites/2/2017/04/CaptureAMM001.png" rel="lightbox[15418]"><img src="../wp-insides/uploads/sites/2/2017/04/CaptureAMM001.png" alt="CaptureAMM001" width="804" height="632" class="alignnone size-full wp-image-15611" /></a>
+This does not depend on the size of MEMORY_TARGET you choose, or the size of /dev/shm, but only the size of available physical memory:
+<pre>[oracle@VM104 ~]$ df -h /dev/shm
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           3.9G     0  3.9G   0% /dev/shm
+
+[oracle@VM104 ~]$ free -h
+              total        used        free      shared  buff/cache   available
+Mem:           7.8G        755M        5.0G        776M        2.1G        6.2G
+Swap:          411M          0B        411M
+</pre></p>
+<h3>No choice: it is  a hard stop</h3>
+<p>If you are not convinced, then please have a look at <a href="https://support.oracle.com/epmos/faces/DocContentDisplay?id=2244817.1" target="_blank">MOS Doc ID 2244817.1</a> which explains this decision:</p>
+<ul>
+<li>It is not something new: DBCA used to give similar warning message but in 12.2.0.1 it is an error message</li>
+<li>Reason behind: Because database creation fails some times and in some cases database wont be functional after some times </li>
+</ul>
+<p>So, do you want to create a database which may not be functional after some times?</p>
+<h3>So, what size for SGA and PGA?</h3>
+<p>Then, if you were thinking that AMM was cool, your next question not is: what size to allocate to SGA and PGA?</p>
+<p>Don&#8217;t panic.</p>
+<p>You are in this situation because you have several GB of RAM. Current servers have lot of memory. You don&#8217;t have to size it to the near 100MB. Start with some values, run with it. Look at the performance and the memory advisors. Are you doing too much physical I/O on tables where you expect data to be in cache? Then increase the SGA, and maybe set a minimum for the buffer cache. Do you see lot of hard parse because your application runs lot of statements and procedures? Then increase the SGA and maybe set a minimum for the shared pool. Do you run lot of analytic queries that full scan tables and have to hash and sort huge amount of data? Then decrease the SGA and increase the PGA_AGGREGATE_TARGET. </p>
+<p>Where to start?</p>
+<p>If you don&#8217;t know where to start, look at the DBCA database types:</p>
+<p><pre>#-----------------------------------------------------------------------------
+# Name          : databaseType
+# Datatype      : String
+# Description   : used for memory distribution when memoryPercentage specified
+# Valid values  : MULTIPURPOSE|DATA_WAREHOUSING|OLTP
+# Default value : MULTIPURPOSE
+# Mandatory     : NO
+#-----------------------------------------------------------------------------</pre></p>
+<p>Those types define the ratio between SGA and PGA. Then why not start with what is recommended by Oracle?</p>
+<p>I&#8217;ve created the 3 types of instances with the following:
+<pre>dbca -silent -totalMemory 10000 -databaseType MULTIPURPOSE -generateScripts -scriptDest /tmp/MULT  ...
+dbca -silent -totalMemory 10000 -databaseType DATA_WAREHOUSING -generateScripts -scriptDest /tmp/DWHG  ...
+dbca -silent -totalMemory 10000 -databaseType OLTP -generateScripts -scriptDest /tmp/OLTP ...</pre></p>
+<p>And here are the settings generated by DBCA
+<pre>$ grep target /tmp/*/init.ora
+DWHG/init.ora:sga_target=6000m
+DWHG/init.ora:pga_aggregate_target=4000m
+MULT/init.ora:sga_target=7500m
+MMULT/init.ora:pga_aggregate_target=2500m
+OLTP/init.ora:sga_target=8000m
+OLTP/init.ora:pga_aggregate_target=2000m</pre></p>
+<p>Here is the summary:</p>
+<table width="100%">
+<tr>
+<th>
+</th>
+<th>
+SGA
+</th>
+<th>
+PGA
+</th>
+</tr>
+<tr>
+<th>
+OLTP
+</th>
+<td>
+80%
+</td>
+<td>
+20%
+</td>
+</tr>
+<tr>
+<th>
+Multi-Purpose
+</th>
+<td>
+75%
+</td>
+<td>
+25%
+</td>
+</tr>
+<tr>
+<th>
+Data Warehousing
+</th>
+<td>
+60%
+</td>
+<td>
+40%
+</td>
+</tr>
+</table>
+<p>(percentages are relative to eachother, here. Donc&#8217; use 100% of physical memory for the Oracle instances because the system needs some memory as well)</p>
+<p>This gives an idea where to start. Servers have lot of memory but you don&#8217;t have to use all of it. If you have a doubt, leave some free memory to be available for the filesystem cache. Usually, we recommend to used direct i/o (filesystemio_options=setall) to avoid the filesystem overhead. But when you start and want to lower the risks sub-sizing SGA or PGA, then you may prefer to keep that second level of cache (filesystemio_options=async) which uses all the physical memory available. This may improve the reads from tempfiles in case your PGA is too small. This is just an idea, not a recommendation.</p>
+<h3>So what?</h3>
+<p>If you have a server with more than few GB, then set SGA and PGA separately. Start with the ratios above, and then monitor performance and advisors. Physical servers today have at least 32GB. Even with a small VM with 1GB for my labs, I prefer to set them separately, because in that case I want to be sure to have a minimum size for buffer cache and shared pool. You may have lot of small VMs with 3GB and think about setting MEMORY_TARGET. But using large pages is a recommendation here because the hypervisor will have lot of memory to map, so ASMM is still the recommandation.</p>
+<p>Once you know the size of all SGA, look at Hugepagesize in /proc/meminfo, set the number of hugepages in /etc/sysctl.conf, run sysctl -p and your instances will use available large pages for the SGA.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-154190" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/04/CaptureAMM002.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 8 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7348">
+				<div id="div-comment-7348" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a2a19e1fb1fdd173d1a39b0e73390c09?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Foued</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7348">
+			April 20, 2017 at 13 h 39 min</a>		</div>
+
+		<p>Thanks Franck for this nice post, It changed the way I thought about the recommended &#8216; Go AMM &#8216; .
+Kind regards,
+Foued
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73491"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7348' onclick='return addComment.moveForm( "div-comment-7348", "7348", "respond", "15418" )' aria-label='Reply to Foued to Foued'>Reply to Foued</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-10497">
+				<div id="div-comment-10497" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75234dd34f80230790f957f674492496?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://Dba24.pl' rel='external nofollow' class='url'>Maciej Tokar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10497">
+			February 11, 2018 at 15 h 26 min</a>		</div>
+
+		<p>Thanks for this post. As I have never been a fan of AMM and never really used I didn&#8217;t know about this AMM de-recommendation in 12.1 onwards. Anyway good to know that</p>
+<p>Best Regards
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-104981"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10497' onclick='return addComment.moveForm( "div-comment-10497", "10497", "respond", "15418" )' aria-label='Reply to Maciej to Maciej Tokar'>Reply to Maciej</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-10506">
+				<div id="div-comment-10506" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10506">
+			February 11, 2018 at 21 h 46 min</a>		</div>
+
+		<p>Yes, same here. This had been reported to me by a customer. Anyway, good to have an official document.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-105071"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10506' onclick='return addComment.moveForm( "div-comment-10506", "10506", "respond", "15418" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-10509">
+				<div id="div-comment-10509" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/eb357b339a3c4c901d1e09d19ccdbf3b?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://twitter.com/LucasBednarek' rel='external nofollow' class='url'>Łukasz B.</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10509">
+			February 12, 2018 at 1 h 24 min</a>		</div>
+
+		<p>Thanks for forcing me to read part of 12.2 documentation about AMM again. It is even mentioned there now in About Memory Management chapter .
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-105101"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10509' onclick='return addComment.moveForm( "div-comment-10509", "10509", "respond", "15418" )' aria-label='Reply to Łukasz to Łukasz B.'>Reply to Łukasz</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-10714">
+				<div id="div-comment-10714" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/c10bb46429554ba6f3c6144ad8dbd555?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://hemantoracledba.blogspot.com' rel='external nofollow' class='url'>Hemant K Chitale</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10714">
+			March 13, 2018 at 6 h 00 min</a>		</div>
+
+		<p>Franck,
+When you say :
+&#8220;If you try to use AMM on a system with less than 4GB you get a warning in 12cR1 and it is an error in 12cR2&#8243;</p>
+<p>do you mean &#8220;less than 4GB&#8221; or &#8220;more than 4GB&#8221; ?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107151"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10714' onclick='return addComment.moveForm( "div-comment-10714", "10714", "respond", "15418" )' aria-label='Reply to Hemant to Hemant K Chitale'>Reply to Hemant</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-10715">
+				<div id="div-comment-10715" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10715">
+			March 13, 2018 at 10 h 55 min</a>		</div>
+
+		<p>Hi Hemant. Thanks, I fixed the typo.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107161"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10715' onclick='return addComment.moveForm( "div-comment-10715", "10715", "respond", "15418" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-10721">
+				<div id="div-comment-10721" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/0b93e5378d1dc0fd42dabc01d70f4f10?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Kenneth Nwanze</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10721">
+			March 16, 2018 at 10 h 02 min</a>		</div>
+
+		<p>Hi Franck</p>
+<p>I have been AMM for some time now. Easy to set up and I don’t have to worry about sizing.
+Now I’m setting up 12cR2 and came across that error. U could imagine my shock.</p>
+<p>Now I have to size my database of 32gb for both SGA and PGA. </p>
+<p>One question I have is what happens to the memory defined if I use dbua to upgrade my system from 11g to 12c? And my 11g has AMM enabled.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107221"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10721' onclick='return addComment.moveForm( "div-comment-10721", "10721", "respond", "15418" )' aria-label='Reply to Kenneth to Kenneth Nwanze'>Reply to Kenneth</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-10723">
+				<div id="div-comment-10723" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10723">
+			March 19, 2018 at 23 h 04 min</a>		</div>
+
+		<p>Hi Kenneth, I&#8217;ve not tested this. My guess is that dbua doesn&#8217;t care. If you test it, please let us know.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107241"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10723' onclick='return addComment.moveForm( "div-comment-10723", "10723", "respond", "15418" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

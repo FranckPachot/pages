@@ -1,0 +1,198 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/mapping-in-memory-cu-to-values-imcu-pruning />
+<meta name=description content='A blog post from 2015 about Mapping In-memory CU to values: IMCU pruning'>
+<title>Mapping In-memory CU to values: IMCU pruning</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/mapping-in-memory-cu-to-values-imcu-pruning>https://blog.dbi-services.com/mapping-in-memory-cu-to-values-imcu-pruning</a> (2015-10-13), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Mapping In-memory CU to values: IMCU pruning</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="http://blog.dbi-services.com/mapping-in-memory-column-store-to-datafile-row-store-extents/" title="Mapping In-memory Column Store to datafile Row Store extents">previous post</a> we have seen how In-Memory Compression Unit map to the physical persistent storage &#8211; table extents. Let&#8217;s see now how they are mapped to column values, allowing to optimize the scan in a similar way as Exadata Storage Indexes.
+<span id="more-4416"></span>
+The examples below will illustrate IMCU pruning and IMCU skip filtering. Here are the slides I use for another example:</p>
+<table>
+<tr>
+<td><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/10/CaptureIM02.jpg" rel="lightbox[4416]"><img src="../wp-insides/uploads/sites/2/2015/10/CaptureIM02-300x226.jpg" alt="CaptureIM02" width="300" height="226" class="alignnone size-medium wp-image-4435" /></a></td>
+<td><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/10/CaptureIM03.jpg" rel="lightbox[4416]"><img src="../wp-insides/uploads/sites/2/2015/10/CaptureIM03-300x223.jpg" alt="CaptureIM03" width="300" height="223" class="alignnone size-medium wp-image-4436" /></a></tr>
+</table>
+<h3>V$IM_SMU_HEAD</h3>
+<p>Here are the 4 IMCUs I have from the <a href="http://blog.dbi-services.com/mapping-in-memory-column-store-to-datafile-row-store-extents/" target="_blank">previous post</a>.
+<pre>
+SQL&gt; select objd,tsn,startdba,extent_cnt,block_cnt,load_scn,itl_cnt,total_rows,invalid_rows from V$IM_SMU_HEAD;
+
+      OBJD        TSN   STARTDBA EXTENT_CNT  BLOCK_CNT LOAD_SCN            ITL_CNT TOTAL_ROWS INVALID_ROWS
+---------- ---------- ---------- ---------- ---------- ---------------- ---------- ---------- ------------
+    107958          6    1572875         22          5 941292582               255     491079            0
+    107958          6    1573890          8        126 941292582               255     561354            0
+    107958          6    1574914          8        126 941292582               255     524160            0
+    107958          6    1575938          7        126 941292582               255     423407            0
+</pre>
+The important values to remember are the number of rows in each IMCUs.
+In total I have 2 million rows.</p>
+<h3>V$IM_COL_CU</h3>
+<p>The table was created with:
+<pre>
+create table DEMO inmemory tablespace USERS as select rownum num,mod(rownum,10) ten from xmltable('1 to 2000000');
+</pre>
+I have two columns in my table:</p>
+<ul>
+<li>NUM: is a number from 1 to 2 millions</li>
+<li>TEN: have values from 0 to 9, equally distributed on all the table</li>
+</ul>
+<p>Each IMCU stores the minimum and maximum value for each column in each IMCU and we can see them from V$IM_COL_CU.</p>
+<p>The min and max are stored in row format in the same way as in the column statistics. When we know the datatype, we can use the dbms_stats.convert_raw_value to display them. It&#8217;s a procedure, not a function, and in 12c I like to create an inline function to use it easily:
+<pre>
+SQL&gt; break on head_piece_address skip 1 duplicates
+SQL&gt; with function row2num(x raw) return number as n number; begin dbms_stats.convert_raw_value(x,n); return n; end;
+  2  select head_piece_address,column_number,length/1024/1024,dictionary_entries,row2num(minimum_value),row2num(maximum_value) from V$IM_COL_CU order by 1,2,3,4
+  3  /
+
+HEAD_PIECE_ADDRE COLUMN_NUMBER LENGTH/1024/1024 DICTIONARY_ENTRIES ROW2NUM(MINIMUM_VALUE) ROW2NUM(MAXIMUM_VALUE)
+---------------- ------------- ---------------- ------------------ ---------------------- ----------------------
+
+0000000067FFFDD8             1       4.84460545             491079                      1                 491079
+0000000067FFFDD8             2       .234272003                 10                      0                      9
+
+00000000686FFDD8             1       5.66581059             561354                 491080                1052433
+00000000686FFDD8             2       .267781258                 10                      0                      9
+
+00000000626FFDA8             1        5.6811142             524160                1052434                1576593
+00000000626FFDA8             2       .250045776                 10                      0                      9
+
+00000000620FFDA8             1        4.5891037             423407                1576594                2000000
+00000000620FFDA8             2       .202003479                 10                      0                      9
+</pre></p>
+<p>For the first column NUM:</p>
+<ul>
+<li>1st IMCU: 491079 values from 1 to 491079</li>
+<li>2nd IMCU: 561354 values from 491080 to 1052433</li>
+<li>3rd IMCU: 524160 values from 1052434 to 1576593</li>
+<li>4th IMCU: 423407 values from 1576594 to 2000000</li>
+</ul>
+<p>And the second column TEN:</p>
+<ul>
+<li>1st IMCU: 10 distinct values from 0 to 9</li>
+<li>2nd IMCU: 10 distinct values from 0 to 9</li>
+<li>3rd IMCU: 10 distinct values from 0 to 9</li>
+<li>4th IMCU: 10 distinct values from 0 to 9</li>
+</ul>
+<h3>IM Full Scan</h3>
+<p>First, I check the IM statistics for my session:
+<pre>SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where ( name like 'IM%row%' or name like 'IM%block%' ) and value&gt;0;
+
+NAME                       VALUE
+---------------------- ---------
+IM scan rows             2000000
+IM scan rows valid       2000000
+IM scan rows projected   2000000     </pre>
+This what I&#8217;ve read previously when populating the IMCS: 2 million rows.
+The following will be done in the same session, so statistics cumulates, but I&#8217;ll add the delta values in front.</p>
+<p>Now I&#8217;m running a query that has to scan all rows
+<pre>SQL&gt; select distinct ten from DEMO ;
+
+...
+10 rows selected.</pre></p>
+<p>I&#8217;ve read all 2 million rows and have find 10 distinct values from the TEN column.</p>
+<p>Now checking my session statistics again:
+<pre>SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where ( name like 'IM%row%' or name like 'IM%block%' ) and value&gt;0;
+
+NAME                        VALUE
+---------------------- ----------
+IM scan rows              4000000     +2000000
+IM scan rows valid        4000000     +2000000
+IM scan rows projected    2000040          +40</pre>
+Among the 2 million rows I had to actually read the 2 million rows because I&#8217;ve no filter here.
+The result of the projection is 10 rows (my &#8216;distinct&#8217; results) but the projection has been made for each IMCU and this is why we see 40 here.</p>
+<h3>IMCU Pruning</h3>
+<p>Let&#8217;s run a query that filters only 100000 rows that are within the second IMCU &#8211; the one having values from 491080 to 1052433 for column 1 (see above).</p>
+<p><pre>SQL&gt; select distinct ten from DEMO where num between 500000 and 600000;
+
+...
+10 rows selected.</pre>
+I get different figures now:
+<pre>SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where ( name like 'IM%row%' or name like 'IM%block%' ) and value&gt;0;
+
+NAME                        VALUE
+---------------------- ----------
+IM scan rows              6000000     +2000000
+IM scan rows valid        4561354      +561354
+IM scan rows optimized    1438646     +1438646
+IM scan rows projected    2000050          +10
+IM scan CUs pruned              3           +3
+IM scan segments minmax         4           +4
+</pre>
+The 2 millions rows are split among &#8216;valid&#8217; and &#8216;optimized&#8217;. Thanks to the minimum and maximum values stored for each IMCU, pruning has occurred. Only the second IMCU has been scanned and filtered because it&#8217;s the only one that can contain values from 500000 to 600000.
+It contains 561354 rows and this is what is counted as &#8216;valid&#8217; rows where filtering has to be done. Pruning has saved the processing of the 1438646 rows that are in the other IMCU because we are sure they do not verify the predicate.
+If you look at the projected rows, there are only 10 because it&#8217;s the number of distinct values coming from the only one IMCU processed.</p>
+<p>The &#8216;minmax&#8217; optimization has been used on the 4 IMCUs and 3 of them have been &#8216;pruned&#8217;. This is the &#8216;no mail&#8217; flag on the mailbox icon in my slides: you know that there is no mail without having to open the mail box.</p>
+<h3>IMCU Skipping</h3>
+<p>Now running the query with a larger range that spans three IMCUs.
+<pre>SQL&gt; select distinct ten from DEMO where num between 500000 and 2000000;
+
+...
+10 rows selected.</pre>
+From what we have seen above, only the 1st IMCUs can be pruned now:
+<pre>SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where ( name like 'IM%row%' or name like 'IM%block%' ) and value&gt;0;
+
+NAME                        VALUE
+---------------------- ----------
+IM scan rows              8000000     +2000000
+IM scan rows valid        6070275     +1508921
+IM scan rows optimized    1929725      +491079
+IM scan rows projected    2000080          +30
+IM scan CUs optimized read      2           +2
+IM scan CUs pruned              4           +1
+IM scan segments minmax         8           +4
+</pre>
+We have scanned 3 IMCU here, totalizing 561354+524160+423407=1508921 rows and we saved the scan of the 1st IMCU (491079 rows). We did projection on the 3 IMCUs which return 10 rows each. The 4 IMCUs have been considered for &#8216;minmax&#8217; and only one has been pruned.</p>
+<p>But there is more here. &#8216;IM scan CUs optimized read&#8217; appeared here. The filter scan is done to get the vector of rows that match the predicate. But from min/max we know that the 3rd and 4th IMCUs have all rows matching because both their min and max are between 500000 and 2000000. This is filter skipping, accounted with &#8216;IM scan CUs optimized read&#8217;</p>
+<h3>Dictionary entries</h3>
+<p>If you look above at the V$IM_COL_CU view we have not only the minimum and maximum value. We have the number of dictionary entries which looks like the number of distinct values. Why is it called like that? Because the distinct values are stored in a dictionary. A guess is that it can be used for dictionary encryption (each value is replaced by a number which is the position of that data item in a dictionary).</p>
+<p>But for sure, if that dictionary covers all possible values, then some equality filtering can be done from there. Let&#8217;s look if we can do IMCU pruning for a query that select no rows:</p>
+<p><pre>SQL&gt; select distinct ten from DEMO where where ten=10;
+
+...
+no rows selected.</pre></p>
+<p><pre>SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where ( name like 'IM%row%' or name like 'IM%block%' ) and value&gt;0;
+
+NAME                        VALUE
+---------------------- ----------
+IM scan rows             10000000     +2000000
+IM scan rows valid        8070275     +2000000
+IM scan rows optimized    1929725
+IM scan rows projected    2000080
+IM scan CUs pruned              8           +4
+IM scan segments minmax        12           +4
+</pre></p>
+<p>The 4 IMCUs were candidate for &#8216;minmax&#8217; but no pruning occured. From those statistics, it seems that the dictionary entries are not used for pruning.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-44170" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/10/CaptureIM03-300x223.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

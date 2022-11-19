@@ -1,0 +1,142 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/rman-12c-push-and-pull-duplicate-explained />
+<meta name=description content='A blog post from 2016 about RMAN 12c Push and Pull duplicate explained'>
+<title>RMAN 12c Push and Pull duplicate explained</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/rman-12c-push-and-pull-duplicate-explained>https://blog.dbi-services.com/rman-12c-push-and-pull-duplicate-explained</a> (2016-03-17), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">RMAN 12c Push and Pull duplicate explained</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Oracle Database 12<em>c</em> introduced the &#8216;restore from service&#8217; where you can restore and recover by requesting backupsets from the source. With that feature, the duplicate from active can work in the opposite way: instead of asking the source (target) to send the files to the destination (auxiliary) now the destination can do all the job. Let&#8217;s see how it works by comparing the RMAN log of the two methods.
+<span id="more-7588"></span></p>
+<h3>Pull Based Duplicate</h3>
+<p>In 12c the pull method is the default. Here there are two additional reasons for it: I allocate more channels in auxiliary than in target, and I specify &#8216;from backupset&#8217;</p>
+<p><pre>
+RMAN&gt;
+echo set on
+ run {
+  allocate channel c1 device type disk;
+  allocate auxiliary channel a1 device type disk;
+  allocate auxiliary channel a2 device type disk;
+  duplicate database for standby from active database using backupset nofilenamecheck;
+}
+</pre></p>
+<p>In pull based duplicate, the auxiliary channels will connect to the target. This means that the credentials and connection string you used to connect target must be available (tnsnames, etc.) from the auxiliary.</p>
+<p>I allocated 2 channels a1 and a2 in auxiliary and only one c1 in target.</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CapturePull.png" rel="lightbox[7588]"><img src="../wp-insides/uploads/sites/2/2016/03/CapturePull.png" alt="CapturePull" width="954" height="652" class="alignnone size-full wp-image-7592" /></a></p>
+<h3>Push Based Duplicate</h3>
+<p>In order to force a push based duplicate, I can mention &#8216;using copy&#8217; instead of &#8216;using backupset&#8217;. Here I do not mention anything but  I allocate more channels in target than in auxiliary and push-based is then used:</p>
+<p><pre>
+RMAN&gt;
+echo set on
+ run {
+  allocate channel c1 device type disk;
+  allocate channel c2 device type disk;
+  allocate auxiliary channel a1 device type disk;
+  duplicate database for standby from active database nofilenamecheck;
+}
+</pre></p>
+<p>I allocated 2 channels c1 and c2 in target and only one a1 in auxiliary.</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CapturePush.png" rel="lightbox[7588]"><img src="../wp-insides/uploads/sites/2/2016/03/CapturePush.png" alt="CapturePush" width="951" height="626" class="alignnone size-full wp-image-7593" /></a></p>
+<p>In push based duplicate the target will connect to the auxiliary. So SQL*Net connection must be ok for that. You probably need to define a static entry for the auxiliary in its listener so that the target can connect to the nomount instance.</p>
+<p>In order to compare, I&#8217;ve diff&#8217;ed the rman logs so the pull based are prefixed by &#8216;&lt;&#8216; and the push based by &#8216;&gt;&#8217; in the following.</p>
+<h3>Control File</h3>
+<p>The first step is to restore the control file. Here is the difference:</p>
+<p>Pull based duplicate do a restore from service (VM117 is the target)</p>
+<p><pre>&lt;    restore clone from service  &#039;//VM117/CDB&#039; standby controlfile;
+</pre></p>
+<p>Whereas push based do a backup as copy to the auxiliary. Why as copy? Because all the intelligence here is on the target. The auxiliary will not read a backupset.</p>
+<p><pre>&gt;    backup as copy current controlfile for standby auxiliary format  '/u02/fast_recovery_area/CDB_SBY/controlfile/crontrol.ctl';
+</pre></p>
+<p>In pull based, the auxiliary channels are doing all the job:</p>
+<p><pre>
+&lt; channel a1: starting datafile backup set restore
+&lt; channel a1: using network backup set from service //VM117/CDB
+&lt; channel a1: restoring control file
+&lt; channel a1: restore complete, elapsed time: 00:00:02
+&lt; output file name=/u02/fast_recovery_area/CDB_SBY/controlfile/crontrol.ctl</pre></p>
+<p>Whereas in push based, it&#8217;s the target that do the work:</p>
+<p><pre>&gt; channel c1: starting datafile copy
+&gt; copying standby control file
+&gt; output file name=/u01/app/oracle/product/12R2EE/dbs/snapcf_CDB.f tag=TAG20160317T152842
+&gt; channel c1: datafile copy complete, elapsed time: 00:00:03
+</pre></p>
+<h3>Datafiles</h3>
+<p>Now the datafiles. The pull based is the auxiliary restoring from service:</p>
+<p><pre>
+&lt;    restore
+&lt;    from  nonsparse   from service
+&lt;  &#039;//VM117/CDB&#039;   clone database
+&lt;    ;
+</pre></p>
+<p>On the opposite, the push based is the target sending copies to the auxiliary:</p>
+<p><pre>
+&gt;    backup as copy reuse
+&gt;    datafile  1 auxiliary format
+&gt;  "/u02/oradata/CDB/system01.dbf"   datafile
+&gt;  3 auxiliary format
+&gt;  "/u02/oradata/CDB/sysaux01.dbf"   datafile
+&gt;  4 auxiliary format
+&gt;  "/u02/oradata/CDB/undotbs01.dbf"   datafile
+...
+</pre></p>
+<p>Channels are working. For the pull based, I&#8217;ve two auxiliary channels:</p>
+<p><pre>
+&lt; channel a1: starting datafile backup set restore
+&lt; channel a1: using network backup set from service //VM117/CDB
+&lt; channel a1: specifying datafile(s) to restore from backup set
+&lt; channel a1: restoring datafile 00001 to /u02/oradata/CDB/system01.dbf
+&lt; channel a2: starting datafile backup set restore
+&lt; channel a2: using network backup set from service //VM117/CDB
+&lt; channel a2: specifying datafile(s) to restore from backup set
+&lt; channel a2: restoring datafile 00003 to /u02/oradata/CDB/sysaux01.dbf
+</pre></p>
+<p>for the push based it&#8217;s the two channels in target:</p>
+<p><pre>
+&gt; channel c1: starting datafile copy
+&gt; input datafile file number=00001 name=/u02/oradata/CDB/system01.dbf
+&gt; channel c2: starting datafile copy
+&gt; input datafile file number=00003 name=/u02/oradata/CDB/sysaux01.dbf
+&gt; output file name=/u02/oradata/CDB/system01.dbf tag=TAG20160317T152850
+&gt; channel c1: datafile copy complete, elapsed time: 00:00:46
+&gt; channel c1: starting datafile copy
+&gt; input datafile file number=00009 name=/u02/oradata/CDB/pdb/sysaux01.dbf
+&gt; output file name=/u02/oradata/CDB/sysaux01.dbf tag=TAG20160317T152850
+</pre></p>
+<h3>Conclusion</h3>
+<p>Hope it helps to remember how it works:</p>
+<ul>
+<li>Pull: The auxiliary restores from target. All &#8216;backup as backupset&#8217; optimizations are available: compression, section size,&#8230; Non formatted blocks and unnecessary undo is not transfered.</li>
+<li>Push: Use it if you want the target to do all the job. More data will be transferred because it&#8217;s full datafiles. Target must be able to connect to auxiliary.</li>
+</ul>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-75890" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CapturePull.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

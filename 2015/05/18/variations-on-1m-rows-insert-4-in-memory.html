@@ -1,0 +1,171 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/variations-on-1m-rows-insert-4-in-memory />
+<meta name=description content='A blog post from 2015 about Variations on 1M rows insert (4): IN MEMORY'>
+<title>Variations on 1M rows insert (4): IN MEMORY</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/variations-on-1m-rows-insert-4-in-memory>https://blog.dbi-services.com/variations-on-1m-rows-insert-4-in-memory</a> (2015-05-18), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Variations on 1M rows insert (4): IN MEMORY</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Oracle In-Memory option is for reporting. Oracle has chosen an hybrid approach: maintain the In-Memory Column Store in addition of the buffer cache. Dont&#8217; forget our <a href="http://www.dbi-services.com/index.php/newsroom-e/events/event-l-in-memory-r-boost-your-it-performance">In-Memory event</a>, but for the moment, let&#8217;s try the 1M row insert when the target table is IN MEMORY.</p>
+<h3>12c</h3>
+<p>I&#8217;ve done the previous variations on 11g because I wanted to use the Developer Days VM that has also TimesTen installed. But now I want to test some 12c features. So I run the same as <a href="http://www.dbi-services.com/index.php/blog/entry/insert1m-bulk">the 1st variation</a>. The one on a table with one index (primary key), conventional inserts committed only at the end. The one that takes 35 seconds on 11.2.0.2.</p>
+<p>Here is the same on an equivallent VM with 12.1.0.2:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; set timing on
+SQL&gt; declare
+  2   type people_array is varray(12) of varchar(15);
+  3   people people_array := people_array( 'Marc', 'Bill', 'George', 'Eliot', 'Matt', 'Trey', 'Tracy','Greg', 'Steve', 'Kristina', 'Katie', 'Jeff' );
+  4   people_count number :=people.COUNT;
+  5   n number;
+  6  begin
+  7   for i in 0..1e6 loop
+  8    n:=trunc(dbms_random.value(0,10000));
+  9    insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+ 10    -- 
+ 11   end loop;
+ 12   commit;
+ 13  end;
+ 14  /
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:01:17.03
+</pre>
+<p>Yes it&#8217;s 2 times longer and I don&#8217;t know why. I tried with different versions and for the moment it seems that the CPU consumption in 11.2.0.4 or 12c is x2 when compared to 11.2.0.3. I didn&#8217;t investigate further and I&#8217;ll probably come back to that after attending Luca Canali session next week about <a href="http://www.soug.ch/fr/evenements/sig-150521-agenda.html">modern linux tools for Oracle troubleshooting.</a></p>
+<p>Please don&#8217;t take any conclusion about it now. In real life, 12c is not slower than 11g. This is just one testcase on one specific context and there is nothing to say about it before understanding what happens. This test is just there to set the baseline as 01:17:00 on that 12c database.</p>
+<h3>In-Memory</h3>
+<p>The question of the day is: How this 1 million rows insert behave on an IN MEMORY table? We know that there is an overhead to maintain both the buffer cache and the In-Memory Column Store. And we know that this is probably not on problem because In-Memory often let us to get rid of a few indexes and the gain in index maintenance compensates the overhead.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create table DEMO ("id" number primary key, "text" varchar2(15), "number" number) 
+INMEMORY PRIORITY CRITICAL;
+Table created.
+</pre>
+<p>I&#8217;ve created the table in-memory with on-demand population. The load duration is not higher than without in-memory:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:01:23.35	
+</pre>
+<p>However in-memory journal has been updated:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+IM space private journal bytes allocated                           25100288
+IM space private journal bytes freed                               25100288
+IM transactions rows journaled                                       394895
+</pre>
+<p>The 25MB is the size of my 1M rows but not all rows have been populated in memory:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select segment_name,inmemory_size,bytes,bytes_not_populated from v$im_segments;
+
+SEGMENT_NA    INMEMORY_SIZE            BYTES      BYTES_NOT_POPULATED
+---------- ---------------- ---------------- ------------------------
+DEMO              1,179,648       23,068,672               11,354,112
+</pre>
+<p>If I query the table we still read some blocks from buffer cache:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; set autotrace on 
+SQL&gt; select count(*) from demo;
+
+  COUNT(*)
+----------
+   1000002
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+----------------------------------------------------------------------------
+| Id  | Operation                   | Name | Rows  | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |      |     1 |    28   (0)| 00:00:01 |
+|   1 |  SORT AGGREGATE             |      |     1 |            |          |
+|   2 |   TABLE ACCESS INMEMORY FULL| DEMO |  1025K|    28   (0)| 00:00:01 |
+----------------------------------------------------------------------------
+
+Statistics
+----------------------------------------------------------
+         13  recursive calls
+          1  db block gets
+       4681  consistent gets
+       1795  physical reads
+     145188  redo size
+        545  bytes sent via SQL*Net to client
+        551  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+
+</pre>
+<p>And then the whole table is now populated in memory:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select segment_name,inmemory_size,bytes,bytes_not_populated from v$im_segments;
+
+SEGMENT_NA    INMEMORY_SIZE            BYTES      BYTES_NOT_POPULATED
+---------- ---------------- ---------------- ------------------------
+DEMO              8,585,216       23,068,672                        0
+
+</pre>
+<p>But even then, we need to read some blocks from buffer cache:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; set autotrace on
+SQL&gt; select count(*) from demo;
+
+  COUNT(*)
+----------
+   1000002
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+----------------------------------------------------------------------------
+| Id  | Operation                   | Name | Rows  | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |      |     1 |    28   (0)| 00:00:01 |
+|   1 |  SORT AGGREGATE             |      |     1 |            |          |
+|   2 |   TABLE ACCESS INMEMORY FULL| DEMO |  1025K|    28   (0)| 00:00:01 |
+----------------------------------------------------------------------------
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+       1381  consistent gets
+          0  physical reads
+          0  redo size
+        545  bytes sent via SQL*Net to client
+        551  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+
+</pre>
+<h3>Conclusion</h3>
+<p>The update if In-Memory is not very well documented. From this simple test, it seems that updating the in-memory column store has very limited overhead when storing the modifications into the in-memory transactional log. However, reading the rows just after the insert seems to be not very optimal. Not all rows have been updated into the transaction log. And even when all is populated, buffer cache is still read. If you want to know a bit more, with deep tracing, you can check Mahmoud Hatem investigations about that, with deep tracing.</p>
+<p>In this post there are more questions than answers, but the fact is that maintaining the In-Memory Column Store is not a big overhead, which make it possible on our OLTP databases.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-20790"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

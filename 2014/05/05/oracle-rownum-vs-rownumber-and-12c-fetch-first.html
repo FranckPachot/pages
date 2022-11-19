@@ -1,0 +1,303 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-rownum-vs-rownumber-and-12c-fetch-first />
+<meta name=description content='A blog post from 2014 about Oracle:  ROWNUM vs ROW_NUMBER() and 12c fetch first'>
+<title>Oracle:  ROWNUM vs ROW_NUMBER() and 12c fetch first</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-rownum-vs-rownumber-and-12c-fetch-first>https://blog.dbi-services.com/oracle-rownum-vs-rownumber-and-12c-fetch-first</a> (2014-05-05), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle:  ROWNUM vs ROW_NUMBER() and 12c fetch first</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Prior to Oracle 12c, there were two ways to do &#8216;top-n&#8217; queries:</p>
+<ul>
+<li>use rownum after sorting rows with &#8220;order by&#8221;</li>
+<li>use row_number() over (order by)</li>
+</ul>
+<p>Top-n queries are usually required for result pagination. The application shows the first 10 rows, then the next 10 on the following page, etc. In these queries, user interactions are often stateless, so we cannot just open a cursor and fetch 10 rows on each user request.</p>
+<p>In both case you will need a subquery. In the former case you need it because otherwise the order by will be applied after the rownum filter. In the latter case you need it because you cannot use analytic functions in the where clause.</p>
+<p>But there is a big difference, which is very important to get the optimal plan, and this is what I will expose here before showing the new 12c syntax.</p>
+<h3>Query with rownum</h3>
+<p><pre>PLAN_TABLE_OUTPUT
+ SQL_ID 7x2wat0fhwdn9, child number 0
+  -------------------------------------
+  select * from (
+     select * from test where contract_id=500
+     order by start_validity
+  ) where rownum &lt;=10
+  order by start_validity
+  Plan hash value: 2207676858
+  --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      14 |
+  |*  1 |  COUNT STOPKEY                |         |      1 |        |     10 |      14 |
+  |   2 |   VIEW                        |         |      1 |     10 |     10 |      14 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |     10 |     10 |      14 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |        |     16 |       4 |
+  --------------------------------------------------------------------------------------
+  Predicate Information (identified by operation id):
+  ---------------------------------------------------
+  1 - filter(ROWNUM&lt;=10)
+  4 - access("CONTRACT_ID"=500)</pre>
+This is good. The optimizer knows that we retrieve only 10 rows and the index access was chosen for that because it returns rows in the right order without the need to sort them.</p>
+<h3>Query with row_number()</h3>
+<p><pre> PLAN_TABLE_OUTPUT
+  SQL_ID gmmz59f64zftf, child number 0
+  -------------------------------------
+  select * from (
+    select test.*,row_number()over(order by start_validity) rn 
+    from test where contract_id=500
+  ) where rn &lt;=10
+ order by start_validity
+ Plan hash value: 1795822849
+ ------------------------------------------------------------------------------
+  | Id  | Operation                | Name | Starts | E-Rows | A-Rows | Buffers |
+  ------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT         |      |      1 |        |     10 |    4397 |
+  |*  1 |  VIEW                    |      |      1 |     10 |     10 |    4397 |
+  |*  2 |   WINDOW SORT PUSHED RANK|      |      1 |   2000 |     10 |    4397 |
+  |*  3 |    TABLE ACCESS FULL     | TEST |      1 |   2000 |   2000 |    4397 |
+  ------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("RN"&lt;=10) 
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "START_VALIDITY")&lt;=10) 
+ 3 - filter("CONTRACT_ID"=500)</pre>
+This is not good. A full table scan reads all rows, whereas an index can give those 10 rows quickly. Reading and sorting thousands of rows instead of just reading a dozen. So why the index scan was not chosen? In that case I usually force the plan to the one that I expect, so that I can see which bad estimation has driven the CBO choice. Let&#8217;s see the execution plan when forcing range scan :
+<pre> PLAN_TABLE_OUTPUT
+  SQL_ID axxrwar6s9275, child number 0
+  -------------------------------------
+  select * from (
+    select /*+ index(TEST) */ test.*,row_number()over(order by start_validity) rn 
+    from test where contract_id=500
+ ) where rn&lt;=10
+ order by start_validity
+  Plan hash value: 1912639229
+ --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      15 |
+  |*  1 |  VIEW                         |         |      1 |     10 |     10 |      15 |
+  |*  2 |   WINDOW NOSORT STOPKEY       |         |      1 |   2000 |     10 |      15 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |   2000 |     11 |      15 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |   2000 |     11 |       4 |
+  --------------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("RN"&lt;=10)
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "START_VALIDITY")&lt;=10)
+  4 - access("CONTRACT_ID"=500)</pre>
+I didn&#8217;t show the cost here. The estimated number of rows is sufficient to understand. The optimizer has estimated the cost of the index access without knowing that we retreive at most 10 rows. When using rownum &lt; 10, the optimizer implicitly add a first_rows(10). But not with row_number().</p>
+<p>With the row_number() we have to do it ourselves:</p>
+<p><pre>PLAN_TABLE_OUTPUT
+  SQL_ID 32m4yadk1ypsn, child number 0
+  -------------------------------------
+  select /*+ FIRST_ROWS(10) */ * from (
+    select test.*,row_number()over(order by start_validity) rn 
+    from test where contract_id=500
+  ) where rn&lt;=10
+ order by start_validity 
+  Plan hash value: 1912639229
+ --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      15 |
+  |*  1 |  VIEW                         |         |      1 |     10 |     10 |      15 |
+  |*  2 |   WINDOW NOSORT STOPKEY       |         |      1 |     10 |     10 |      15 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |     10 |     11 |      15 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |        |     11 |       4 |
+  --------------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("RN"&lt;=10) 
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "START_VALIDITY")&lt;=10) 
+ 4 - access("CONTRACT_ID"=500)</pre>
+Now the index range scan is chosen, with the right cardinality estimation.</p>
+<p>So which solution it the best one? I prefer row_number() for several reasons:</p>
+<ul>
+<li>I like analytic functions. They have larger possibilities, such as setting the limit as a percentage of total number of rows for example.</li>
+<li>11g documentation for rownum says:
+The ROW_NUMBER built-in SQL function provides superior support for ordering the results of a query</li>
+<li>12c allows the ANSI syntax ORDER BY&#8230;FETCH FIRST&#8230;ROWS ONLY which is translated to row_number() predicate</li>
+<li>12c documentation for rownum adds:
+The row_limiting_clause of the SELECT statement provides superior support</li>
+<li>rownum has <a href="http://jonathanlewis.wordpress.com/2008/11/11/first_rows_n/trackback">first_rows_n issues</a> as well</li>
+</ul>
+<p>As you can see, Oracle does not say that rownum is de-supported. Just that there is another function with &#8216;superior support&#8217;. Which is the same I presume.</p>
+<p>So, I use row_number() in 11g or the ANSI syntax in 12c but in both cases I have to add the FIRST_ROWS(n) hint in orde rto get the right plan. Warning: don&#8217;t use the old FIRST_ROWS hint anymore which was rule based and is deprecated. The right way to tell Oracle that you will fetch only n rows is the FIRST_ROWS(n) hint.</p>
+<p>Now here is the same query with the 12c syntax.</p>
+<h3>Query with 12c syntax</h3>
+<p><pre>PLAN_TABLE_OUTPUT
+  SQL_ID 49m5a3f33cmd0, child number 0
+  -------------------------------------
+  select /*+ FIRST_ROWS(10) */ * from test where contract_id=500 
+  order by start_validity fetch first 10 rows only
+ Plan hash value: 1912639229
+ --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      15 |
+  |*  1 |  VIEW                         |         |      1 |     10 |     10 |      15 |
+  |*  2 |   WINDOW NOSORT STOPKEY       |         |      1 |     10 |     10 |      15 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |     10 |     11 |      15 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |        |     11 |       4 |
+  --------------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("from$_subquery$_002"."rowlimit_$$_rownumber" &lt;=10)
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "TEST"."START_VALIDITY") &lt;=10 )  
+ 4 - access("CONTRACT_ID"=500)</pre>
+The 12c syntax has been translated with row_number() predicates and I added the FIRST_ROWS(10) hint in order to have the right estimations.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4300"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1493">
+				<div id="div-comment-1493" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/48b960a4ac2f85c16b4791d2fdad3089?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Sven W.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1493">
+			June 18, 2015 at 17 h 03 min</a>		</div>
+
+		<p>Well written and nicely condensed overview!</p>
+<p>Would you recommend to set the hint also when you use row_number with a partioned by object? The problem there is that you can&#8217;t reasonbly say how many rows will be returned. Only that it will be a specific number per partioning group.</p>
+<p>example</p>
+<p>select * from (
+   select test.*,row_number()over(partition by contract_id order by start_validity) rn
+   from test
+ ) where rn =1
+ order by start_validity
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14941"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1493' onclick='return addComment.moveForm( "div-comment-1493", "1493", "respond", "429" )' aria-label='Reply to Sven to Sven W.'>Reply to Sven</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1494">
+				<div id="div-comment-1494" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1494">
+			June 18, 2015 at 19 h 07 min</a>		</div>
+
+		<p>Hi Sven,
+Thanks for your feedback.
+Good question. Here, the rownum is there to filter rows but not to stop after n rows (no STOPKEY in the plan). So you should not use FIRST_ROWS hint.
+I&#8217;ve quickly check the execution plan with a first_rows(10) and it&#8217;s very bad. Some operations cost for 10 rows, some others for all rows. Big inconsistencies. I put that in my blog todo list <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" />
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14951"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1494' onclick='return addComment.moveForm( "div-comment-1494", "1494", "respond", "429" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-3753">
+				<div id="div-comment-3753" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/68ae8864524f244c24060f55e22470af?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Tarquinius Superbus</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3753">
+			June 13, 2016 at 16 h 46 min</a>		</div>
+
+		<p>Hi, thanks for your post.
+I&#8217;m just not sure, what is the purpose of 2nd ORDER BY expression in your 1st example query:</p>
+<p>select * from (
+     select * from test where contract_id=500
+     order by start_validity
+  ) where rownum &lt;=10
+  order by start_validity
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37541"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3753' onclick='return addComment.moveForm( "div-comment-3753", "3753", "respond", "429" )' aria-label='Reply to Tarquinius to Tarquinius Superbus'>Reply to Tarquinius</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-3754">
+				<div id="div-comment-3754" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3754">
+			June 13, 2016 at 17 h 14 min</a>		</div>
+
+		<p>Hi Tarquinius,
+Yes you&#8217;re right, there is no reason for it.
+I think it&#8217;s there because it was there in the customer query for the problem I reproduced here.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-37551"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3754' onclick='return addComment.moveForm( "div-comment-3754", "3754", "respond", "429" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

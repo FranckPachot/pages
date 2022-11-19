@@ -1,0 +1,245 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/documentum-using-da-with-self-signed-ssl-certificate />
+<meta name=description content='A blog post from 2017 about Documentum &#8211; Using DA with Self-Signed SSL Certificate'>
+<title>Documentum &#8211; Using DA with Self-Signed SSL Certificate</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/documentum-using-da-with-self-signed-ssl-certificate>https://blog.dbi-services.com/documentum-using-da-with-self-signed-ssl-certificate</a> (2017-08-05), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Documentum &#8211; Using DA with Self-Signed SSL Certificate</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>A few years ago, I was working on a Documentum project and one of the tasks was to setup all components in SSL. I already published a lot of blogs on this subject but there is one I wanted to do but never really took the time to publish it. In this blog, I will therefore talk about Documentum Administrator in SSL using a Self-Sign SSL Certificate. Recently, a colleague of mine had the same issue at another customer so I provided him the full procedure that I will describe below. However, since the process below requires the signature of a jar file and since this isn’t available for all companies, you might want to check out my colleague&#8217;s <a title="DA 7.2 UCF Transfer failing with SSL" href="https://blog.dbi-services.com/da-7-2-ucf-transfer-failing-with-ssl/" target="_blank">blog</a> too.</p>
+<p>A lot of companies are working with their own SSL Trust Chain, meaning that they provide/create their own SSL Certificate (Self-Signed) including their Root and Intermediate SSL Certificate for the trust. End-users will not really notice the difference but they are actually using Self-Sign SSL Certificate. This has some repercussions when working with Documentum since you need to import the SSL Trust Chain on the various Application Servers (JMS, WebLogic, Dsearch, aso&#8230;). This is pretty simple but there is one thing that is a little bit trickier and this is related to Documentum Administrator.</p>
+<p>Below, I will use a DA 7.2 P16 (that is therefore pretty recent) but the same applies to all patches of DA 7.2 and 7.3. For information, we didn&#8217;t face this issue with DA 7.1 so something most probably changed between DA 7.1 and 7.2. If you are seeing the same thing with a DA 7.1, feel free to put a comment below, I would love to know! When you are accessing DA for the first time, you will actually download a JRE which will be put under C:\Users\&lt;user_name&gt;\Documentum\ucf\&lt;machine_name&gt;, by default. This JRE is used for various stuff including the transfer of files (UCF), display of DA preferences, aso&#8230; DA isn&#8217;t taking the JRE from the website of Oracle, it is, in fact, taking it from the da.war file. The DA war file always contains two or three different JREs versions. Now if you want to use DA in HTTPS, these JREs will also need to contain your custom SSL Trust Chain. So how can you do that?</p>
+<p>Well a simple answer would be: just like for the JMS or WebLogic, just import the custom SSL Trust Chain in the &#8220;cacerts&#8221; of these JREs. That will actually not work for a very vicious reason: EMC is now signing all the files provided and that also include the JREs inside da.war (well actually they are signing the checksums of the JREs, not the JREs themselves). Because of this signature, if you edit the cacerts file of the JREs, DA will say something like that: &#8220;Invalid checksum for the file &#8216;win-jre1.8.0_91.zip'&#8221;. This checksum ensures that the JREs and all the files you are using on your local workstation that have been downloaded from the da.war are the one provided by EMC. This is good from a security point of view since it prevents intruders to exchanges the files during transfer or directly on your workstation but that also prevents you from updating the JREs with your custom SSL Trust Chain.</p>
+<p>&nbsp;</p>
+<p>So what I will do below to update the Java cacerts AND still keep a valid signature is:</p>
+<ol>
+<li>Extract the JREs and ucfinit.jar file from da.war</li>
+<li>Update the cacerts of each JREs with a custom SSL Trust Chain (Root + Intermediate)</li>
+<li>Repackage the JREs</li>
+<li>Calculate the checksum of the JREs using the ComputeChecksum java class</li>
+<li>Extract the old checksum files from ucfinit.jar</li>
+<li>Replace the old checksum files for the JREs with the new one generated on step 4</li>
+<li>Remove .RSA and .SF files from the META-INF folder and clean the MANIFEST to remove Documentum&#8217;s digital signature</li>
+<li>Recreate the file ucfinit.jar with the clean manifest and all other files</li>
+<li>Ask the company&#8217;s dedicated team to sign the new jar file</li>
+<li>Repackage da.war with the updated JREs and the updated/signed ucfinit.jar</li>
+</ol>
+<p>&nbsp;</p>
+<p>I will use below generic commands that do not specify any version of the JREs or DA because there will be two or three different JREs and the versions will change depending on your DA Patch level, so better stay generic. I will also use my custom SSL Trust Chain which I put under /tmp.</p>
+<p>In this first part, I will create a working folder to avoid messing with the deployed applications. Then I will extract the needed files and finally remove all files and folders that I don&#8217;t need. That&#8217;s the step 1:</p>
+<pre class="brush: bash; gutter: true; first-line: 1; highlight: [12,13,14,15]">[weblogic@weblogic_server_01 ~]$ mkdir /tmp/workspace; cd /tmp/workspace
+[weblogic@weblogic_server_01 workspace]$
+[weblogic@weblogic_server_01 workspace]$ cp $WLS_APPLICATIONS/da.war .
+[weblogic@weblogic_server_01 workspace]$ ls
+da.war
+[weblogic@weblogic_server_01 workspace]$
+[weblogic@weblogic_server_01 workspace]$ jar -xvf da.war wdk/system/ucfinit.jar wdk/contentXfer/
+  created: wdk/contentXfer/
+ inflated: wdk/contentXfer/All-MB.jar
+ ...
+ inflated: wdk/contentXfer/Web/Emc.Documentum.Ucf.Client.Impl.application
+ inflated: wdk/contentXfer/win-jre1.7.0_71.zip
+ inflated: wdk/contentXfer/win-jre1.7.0_72.zip
+ inflated: wdk/contentXfer/win-jre1.8.0_91.zip
+ inflated: wdk/system/ucfinit.jar
+[weblogic@weblogic_server_01 workspace]$
+[weblogic@weblogic_server_01 workspace]$ cd ./wdk/contentXfer/
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ ls
+All-MB.jar                                    jacob.dll                 libUCFSolarisGNOME.so   ucf-client-installer.zip  win-jre1.8.0_91.zip
+Application Files                             jacob.jar                 libUCFSolarisJNI.so     ucf.installer.config.xml
+Emc.Documentum.Ucf.Client.Impl.application    libMacOSXForkerIO.jnilib  licenses                UCFWin32JNI.dll
+ES1_MRE.msi                                   libUCFLinuxGNOME.so       MacOSXForker.jar        Web
+ExJNIAPI.dll                                  libUCFLinuxJNI.so         mac_utilities.jar       win-jre1.7.0_71.zip
+ExJNIAPIGateway.jar                           libUCFLinuxKDE.so         ucf-ca-office-auto.jar  win-jre1.7.0_72.zip
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ for i in `ls | grep -v 'win-jre'`; do rm -rf "./${i}"; done
+[weblogic@weblogic_server_01 contentXfer]$ rm -rf ./*/
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ ls
+win-jre1.7.0_71.zip  win-jre1.7.0_72.zip  win-jre1.8.0_91.zip
+[weblogic@weblogic_server_01 contentXfer]$</pre>
+<p>&nbsp;</p>
+<p>At this point, only the JREs are present in the current folder (wdk/contentXfer) and I also have another file in another folder (wdk/system/ucfinit.jar). Once that is done, I&#8217;m creating a list of the JREs available that I will use for the whole blog and I&#8217;m also performing the steps 2 and 3, to extract the cacerts from the JREs, update them and finally repackage them (this is where I use the custom SSL Trust Chain):</p>
+<pre class="brush: bash; gutter: true; first-line: 1; highlight: [3,4,5,9,11,13,16,17,18,21,22,23,26,27,28]">[weblogic@weblogic_server_01 contentXfer]$ ls win-jre* | sed -e 's/.*win-//' -e 's/.zip//' &gt; /tmp/list_jre.txt
+[weblogic@weblogic_server_01 contentXfer]$ cat /tmp/list_jre.txt
+jre1.7.0_71
+jre1.7.0_72
+jre1.8.0_91
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ while read line; do unzip -x win-${line}.zip ${line}/lib/security/cacerts; done &lt; /tmp/list_jre.txt
+Archive:  win-jre1.7.0_71.zip
+  inflating: jre1.7.0_71/lib/security/cacerts
+Archive:  win-jre1.7.0_72.zip
+  inflating: jre1.7.0_72/lib/security/cacerts
+Archive:  win-jre1.8.0_91.zip
+  inflating: jre1.8.0_91/lib/security/cacerts
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ while read line; do keytool -import -noprompt -trustcacerts -alias custom_root_ca -keystore ${line}/lib/security/cacerts -file /tmp/Company_Root_CA.cer -storepass changeit; done &lt; /tmp/list_jre.txt
+Certificate was added to keystore
+Certificate was added to keystore
+Certificate was added to keystore
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ while read line; do keytool -import -noprompt -trustcacerts -alias custom_int_ca -keystore ${line}/lib/security/cacerts -file /tmp/Company_Intermediate_CA.cer -storepass changeit; done &lt; /tmp/list_jre.txt
+Certificate was added to keystore
+Certificate was added to keystore
+Certificate was added to keystore
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ while read line; do zip -u win-${line}.zip ${line}/lib/security/cacerts; done &lt; /tmp/list_jre.txt
+updating: jre1.7.0_71/lib/security/cacerts (deflated 35%)
+updating: jre1.7.0_72/lib/security/cacerts (deflated 35%)
+updating: jre1.8.0_91/lib/security/cacerts (deflated 33%)
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ while read line; do rm -rf ./${line}; done &lt; /tmp/list_jre.txt
+[weblogic@weblogic_server_01 contentXfer]$</pre>
+<p>&nbsp;</p>
+<p>At this point, the JREs have been updated with a new &#8220;cacerts&#8221; and therefore its checksum changed. It doesn&#8217;t match the signed checksum anymore so if you try to deploy DA at this point, you will get the error message I put above. So, let&#8217;s perform the steps 4, 5 and 6. For that purpose, I will use the file /tmp/ComputeChecksum.class that was provided by EMC. This class is needed in order to recalculate the new checksum of the JREs:</p>
+<pre class="brush: bash; gutter: true; first-line: 1; highlight: [9,13,26,27,28,35,36,37]">[weblogic@weblogic_server_01 contentXfer]$ pwd
+/tmp/workspace/wdk/contentXfer
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ cp /tmp/ComputeChecksum.class .
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ ls
+ComputeChecksum.class  win-jre1.7.0_71.zip  win-jre1.7.0_72.zip  win-jre1.8.0_91.zip
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ java ComputeChecksum .
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ ls
+ComputeChecksum.class           win-jre1.7.0_71.zip           win-jre1.7.0_72.zip           win-jre1.8.0_91.zip
+ComputeChecksum.class.checksum  win-jre1.7.0_71.zip.checksum  win-jre1.7.0_72.zip.checksum  win-jre1.8.0_91.zip.checksum
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ rm ComputeChecksum.class*
+[weblogic@weblogic_server_01 contentXfer]$
+[weblogic@weblogic_server_01 contentXfer]$ cd /tmp/workspace/wdk/system/
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ pwd
+/tmp/workspace/wdk/system
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ ls
+ucfinit.jar
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ jar -xvf ucfinit.jar
+ inflated: META-INF/MANIFEST.MF
+ inflated: META-INF/COMPANY.SF
+ inflated: META-INF/COMPANY.RSA
+  created: META-INF/
+ inflated: All-MB.jar.checksum
+  created: com/
+  created: com/documentum/
+  ...
+ inflated: UCFWin32JNI.dll.checksum
+ inflated: win-jre1.7.0_71.zip.checksum
+ inflated: win-jre1.7.0_72.zip.checksum
+ inflated: win-jre1.8.0_91.zip.checksum
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ mv /tmp/workspace/wdk/contentXfer/win-jre*.checksum .
+[weblogic@weblogic_server_01 system]$</pre>
+<p>&nbsp;</p>
+<p>With this last command, the new checksum have replaced the old ones. The next step is now to remove the old signatures (.RSA and .SF files + content of the manifest) and the repack the ucfinit.jar file (step 7 and 8):</p>
+<pre class="brush: bash; gutter: true; first-line: 1; highlight: [21,22]">[weblogic@weblogic_server_01 system]$ rm ucfinit.jar META-INF/*.SF META-INF/*.RSA
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ sed -i -e '/^Name:/d' -e '/^SHA/d' -e '/^ /d' -e '/^[[:space:]]*$/d' META-INF/MANIFEST.MF
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ cat META-INF/MANIFEST.MF
+Manifest-Version: 1.0
+Ant-Version: Apache Ant 1.8.4
+Title: Documentum Client File Selector Applet
+Bundle-Version: 7.2.0160.0058
+Application-Name: Documentum
+Built-By: dmadmin
+Build-Version: 7.2.0160.0058
+Permissions: all-permissions
+Created-By: 1.6.0_30-b12 (Sun Microsystems Inc.)
+Copyright: Documentum Inc. 2001, 2004
+Caller-Allowable-Codebase: *
+Build-Date: August 16 2016 06:35 AM
+Codebase: *
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ vi META-INF/MANIFEST.MF
+    =&gt; Add a new empty line at the end of this file with vi, vim, nano or whatever... The file must always end with an empty line.
+    =&gt; Do NOT use the command "echo '' &gt;&gt; META-INF/MANIFEST.MF" because it will change the fileformat of the file which complicate the signature (usually the FF is DOS...)
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ jar -cmvf META-INF/MANIFEST.MF ucfinit.jar *
+added manifest
+adding: All-MB.jar.checksum(in = 28) (out= 30)(deflated -7%)
+adding: com/(in = 0) (out= 0)(stored 0%)
+adding: com/documentum/(in = 0) (out= 0)(stored 0%)
+adding: com/documentum/ucf/(in = 0) (out= 0)(stored 0%)
+...
+adding: UCFWin32JNI.dll.checksum(in = 28) (out= 30)(deflated -7%)
+adding: win-jre1.7.0_71.zip.checksum(in = 28) (out= 30)(deflated -7%)
+adding: win-jre1.7.0_72.zip.checksum(in = 28) (out= 30)(deflated -7%)
+adding: win-jre1.8.0_91.zip.checksum(in = 28) (out= 30)(deflated -7%)
+[weblogic@weblogic_server_01 system]$</pre>
+<p>&nbsp;</p>
+<p>At this point, the file ucfinit.jar has been recreated with an &#8220;empty&#8221; manifest, without signature but with all the new checksum files. Therefore, it is now time to send this file (ucfinit.jar) to your code signing team (step 9). This is out of scope for this blog but basically what will be done by your signature team is the creation of the .RSA and .SF files inside the folder META-INF as well as the repopulation of the manifest. The .SF and the manifest will contain more or less the same thing: the different files of the ucfinit.jar files will have their entries in these files with a pair filename/signature. At this point, we therefore have re-signed the checksum of the JREs.</p>
+<p>&nbsp;</p>
+<p>The last step is now to repack the da.war with the new ucfinit.jar file which has been signed. I put the new signed file under /tmp:</p>
+<pre class="brush: bash; gutter: true; first-line: 1; highlight: [23,24,25,27]">[weblogic@weblogic_server_01 system]$ pwd
+/tmp/workspace/wdk/system
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ rm -rf *
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ ll
+total 0
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ cp /tmp/ucfinit.jar .
+[weblogic@weblogic_server_01 system]$
+[weblogic@weblogic_server_01 system]$ cd /tmp/workspace/
+[weblogic@weblogic_server_01 workspace]$
+[weblogic@weblogic_server_01 workspace]$ ls wdk/*
+wdk/contentXfer:
+win-jre1.7.0_71.zip  win-jre1.7.0_72.zip  win-jre1.8.0_91.zip
+
+wdk/system:
+ucfinit.jar
+[weblogic@weblogic_server_01 workspace]$
+[weblogic@weblogic_server_01 workspace]$ jar -uvf da.war wdk
+adding: wdk/(in = 0) (out= 0)(stored 0%)
+adding: wdk/contentXfer/(in = 0) (out= 0)(stored 0%)
+adding: wdk/contentXfer/win-jre1.7.0_71.zip(in = 41373620) (out= 41205241)(deflated 0%)
+adding: wdk/contentXfer/win-jre1.7.0_72.zip(in = 41318962) (out= 41137924)(deflated 0%)
+adding: wdk/contentXfer/win-jre1.8.0_91.zip(in = 62424686) (out= 62229724)(deflated 0%)
+adding: wdk/system/(in = 0) (out= 0)(stored 0%)
+adding: wdk/system/ucfinit.jar(in = 317133) (out= 273564)(deflated 13%)
+[weblogic@weblogic_server_01 workspace]$
+[weblogic@weblogic_server_01 workspace]$ mv $WLS_APPLICATIONS/da.war $WLS_APPLICATIONS/da.war_bck_beforeSignature
+[weblogic@weblogic_server_01 workspace]$
+[weblogic@weblogic_server_01 workspace]$ mv da.war $WLS_APPLICATIONS/
+[weblogic@weblogic_server_01 workspace]$</pre>
+<p>&nbsp;</p>
+<p>Once this has been done, simply redeploy the Documentum Administrator and the next time you will access it in HTTPS, you will be able to transfer files, view the DA preferences, aso&#8230; The JREs are now trusted automatically because the checksum of the JRE is now signed properly.</p>
+<p>&nbsp;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-181510"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

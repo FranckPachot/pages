@@ -1,0 +1,239 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/awr-dont-store-explain-plan-predicates />
+<meta name=description content='A blog post from 2014 about AWR does not store explain plan predicates'>
+<title>AWR does not store explain plan predicates</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/awr-dont-store-explain-plan-predicates>https://blog.dbi-services.com/awr-dont-store-explain-plan-predicates</a> (2014-11-11), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">AWR does not store explain plan predicates</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>What is the most important part in an execution plan? It&#8217;s probably the predicate section. It helps to see implicit conversions. It helps to understand why an index is used or not. Or to see additional predicates coming from constraints. When you get an execution plan from shared pool, the dbms_xplan.display_cursor() shows the predicates. But when you retrieve a plan from the past, dbms_xplan.display_awr() does not show them.</p>
+<h3>Statspack</h3>
+<p>With Statspack, you can store execution plans when you take level 7 snapshot (which I often set as default). But you don&#8217;t have the predicate section, for the simple reason that they are not collected.</p>
+<p>Here is what you can find in spcpkg.sql, look at the lines commented out and replaced by 0</p>
+<p><pre>
+            insert into stats$sql_plan
+...
+                 , access_predicates
+                 , filter_predicates
+...
+                 , 0 -- should be max(sp.access_predicates) (2254299)
+                 , 0 -- should be max(sp.filter_predicates)
+</pre></p>
+<h3>AWR</h3>
+<p>AWR is not better. Finding the code is a bit more difficult. It&#8217;s optimized, run from the binaries. Let&#8217;s find it:
+<pre>$ strings $ORACLE_HOME/bin/oracle | grep -i "v[$]sql_plan"
+
+SELECT /*+ leading(S) use_nl(P) PARAM('_cursor_plan_unparse_enabled','FALSE') */ remarks, operation, options, object_node, object_owner, object_name, object_alias, object_type, optimizer, id, parent_id, depth, position, cost, cardinality, bytes, other_tag, partition_start, partition_stop, partition_id, distribution, cpu_cost, io_cost, temp_space, access_predicates, filter_predicates,projection, time, qblock_name FROM v$sql_plan_statistics_all P, v$sqlarea_plan_hash S WHERE P.sql_id = :1 AND P.plan_hash_value = :2 AND P.con_dbid = :3 AND S.sql_id = :4 AND S.plan_hash_value = :5 AND S.con_dbid = :6 AND P.child_address = s.last_active_child_address</pre></p>
+<p>The parameter description for _cursor_plan_unparse_enabled is &#8216;enables/disables using unparse to build projection/predicates&#8217; which is true by default but is set to false for this query. This, access_predicates ant filter_predicates are null as in Statspack.</p>
+<h3>Why?</h3>
+<p>It you tried to use those access_predicate and filter_predicates in the days of 9i you probably remember that it finished in ORA-7445 most of the times. Those columns are a bit special. The predicates are not stored as-is. They are &#8216;unparsed&#8217; from the execution plan code. And because of a few bugs, Oracle has probably chosen to avoid automatic collection on them.</p>
+<p>I think there are still some bugs still until 11.1 But I query those columns very frequently (directly or through dbms_xplan.display_cursor) and I don&#8217;t think I&#8217;ve seen any problem in current versions. I hope that one day that limitation will be released.</p>
+<h3>Workaround</h3>
+<p>When I&#8217;ve a plan coming from AWR, the first thing I do is to try to find it in the shared pool with dbms_xplan.display_cursor &#8211; with same sql_id and same plan_hash_value. Then I&#8217;ll have the predicate section.</p>
+<p>If it is not present anymore, then I&#8217;ll try to reproduce it with an EXPLAIN PLAN. In order to get the same plan, I retrieve the outlines (&#8216;+OUTLINE&#8217; format) and the bind variable values may help as well (&#8216;+PEEKED_BINDS&#8217; format) and then I reproduce it and check that I&#8217;ve the same plan_hash_value.</p>
+<p>Let&#8217;s see on an example</p>
+<p>I have the following plan from AWR
+<pre>SQL&gt; select * from table(dbms_xplan.display_awr('7ws837zynp1zv',3722429161,format=&gt;'basic +predicate'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+SQL_ID 7ws837zynp1zv
+--------------------
+SELECT CARD_ID, CUSTOMER_ID, CARD_TYPE, CARD_NUMBER, EXPIRY_DATE,
+IS_VALID, SECURITY_CODE FROM CARD_DETAILS WHERE CUSTOMER_ID = :B2 AND
+ROWNUM &lt; :B1
+
+Plan hash value: 3722429161
+
+--------------------------------------------------------------------
+| Id  | Operation                            | Name                |
+--------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                     |
+|   1 |  COUNT STOPKEY                       |                     |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| CARD_DETAILS        |
+|   3 |    INDEX RANGE SCAN                  | CARDDETAILS_CUST_IX |
+--------------------------------------------------------------------
+
+17 rows selected.
+</pre>
+There is no predicates here.</p>
+<p>Then I try to get the plan with explain plan:
+<pre>SQL&gt; alter session set current_schema=SOE;
+
+Session altered.
+
+SQL&gt; explain plan for
+  2  SELECT CARD_ID, CUSTOMER_ID, CARD_TYPE, CARD_NUMBER, EXPIRY_DATE,
+  3  IS_VALID, SECURITY_CODE FROM CARD_DETAILS WHERE CUSTOMER_ID = :B2 AND
+  4  ROWNUM  select * from table(dbms_xplan.display(format=&gt;'basic +predicate'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+Plan hash value: 2597291669
+
+-------------------------------------------
+| Id  | Operation          | Name         |
+-------------------------------------------
+|   0 | SELECT STATEMENT   |              |
+|*  1 |  COUNT STOPKEY     |              |
+|*  2 |   TABLE ACCESS FULL| CARD_DETAILS |
+-------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(ROWNUM &lt; TO_NUMBER(:B1))
+   2 - filter("CUSTOMER_ID"=TO_NUMBER(:B2))
+
+15 rows selected.
+</pre>
+The problem is that I&#8217;ve not the same plan. I want the predicates for the index access (plan hash value 3722429161).</p>
+<p>So I get the maximum information from the AWR plan, with +OUTLINE and +PEEKED_BINDS:
+<pre>SQL&gt; select * from table(dbms_xplan.display_awr('7ws837zynp1zv',3722429161,format=&gt;'basic +outline +peeked_binds'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+SQL_ID 7ws837zynp1zv
+--------------------
+SELECT CARD_ID, CUSTOMER_ID, CARD_TYPE, CARD_NUMBER, EXPIRY_DATE,
+IS_VALID, SECURITY_CODE FROM CARD_DETAILS WHERE CUSTOMER_ID = :B2 AND
+ROWNUM &lt; :B1
+
+Plan hash value: 3722429161
+
+--------------------------------------------------------------------
+| Id  | Operation                            | Name                |
+--------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                     |
+|   1 |  COUNT STOPKEY                       |                     |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| CARD_DETAILS        |
+|   3 |    INDEX RANGE SCAN                  | CARDDETAILS_CUST_IX |
+--------------------------------------------------------------------
+
+Outline Data
+-------------
+
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$1")
+      INDEX_RS_ASC(@"SEL$1" "CARD_DETAILS"@"SEL$1"
+              ("CARD_DETAILS"."CUSTOMER_ID"))
+      BATCH_TABLE_ACCESS_BY_ROWID(@"SEL$1" "CARD_DETAILS"@"SEL$1")
+      END_OUTLINE_DATA
+  */
+
+Peeked Binds (identified by position):
+--------------------------------------
+
+   1 - :B2 (NUMBER): 315821
+   2 - :B1 (NUMBER): 15
+
+39 rows selected.
+</pre>
+And I can now do the explain plan with the hints coming from the outlines (I can also replace the variables with the binds if I want to, as they are those that were peeked to optimize the statement):
+<pre>SQL&gt; explain plan for
+  2  SELECT
+  3    /*+
+  4        OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+  5        DB_VERSION('12.1.0.2')
+  6        ALL_ROWS
+  7        OUTLINE_LEAF(@"SEL$1")
+  8        INDEX_RS_ASC(@"SEL$1" "CARD_DETAILS"@"SEL$1"
+  9                ("CARD_DETAILS"."CUSTOMER_ID"))
+ 10        BATCH_TABLE_ACCESS_BY_ROWID(@"SEL$1" "CARD_DETAILS"@"SEL$1")
+ 11    */
+ 12  CARD_ID, CUSTOMER_ID, CARD_TYPE, CARD_NUMBER, EXPIRY_DATE,
+ 13  IS_VALID, SECURITY_CODE FROM CARD_DETAILS WHERE CUSTOMER_ID = :B2 AND
+ 14  ROWNUM  select * from table(dbms_xplan.display(format=&gt;'basic +predicate'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+Plan hash value: 3722429161
+
+--------------------------------------------------------------------
+| Id  | Operation                            | Name                |
+--------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                     |
+|*  1 |  COUNT STOPKEY                       |                     |
+|   2 |   TABLE ACCESS BY INDEX ROWID BATCHED| CARD_DETAILS        |
+|*  3 |    INDEX RANGE SCAN                  | CARDDETAILS_CUST_IX |
+--------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(ROWNUM &lt; TO_NUMBER(:B1))
+   3 - access("CUSTOMER_ID"=TO_NUMBER(:B2))
+
+16 rows selected.
+</pre>
+Bingo, I&#8217;ve now the predicates.</p>
+<h3>Time for a Wish</h3>
+<p>I wish that one day Oracle will release that limitation so that we can get predicate information from AWR (when in EE + Diagnostic Pack) and Statspack (SE and EE without option).</p>
+<p>I&#8217;ve posted the idea on OTN. Please vote for the idea <a href="https://community.oracle.com/ideas/2494">here</a></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4360"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="pingback even thread-even depth-1" id="comment-2965">
+				<div id="div-comment-2965" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://tusharghotikar.wordpress.com/2015/02/11/useful-links/' rel='external nofollow' class='url'>Useful links &#8211; Something new in a developers life</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2965">
+			March 7, 2016 at 14 h 47 min</a>		</div>
+
+		<p>[&#8230;] dbms_xplan to display explain predicates http://blog.dbi-services.com/awr-dont-store-explain-plan-predicates/ [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-29661"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2965' onclick='return addComment.moveForm( "div-comment-2965", "2965", "respond", "435" )' aria-label='Reply to Useful to Useful links &#8211; Something new in a developers life'>Reply to Useful</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

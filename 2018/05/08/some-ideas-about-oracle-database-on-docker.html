@@ -1,0 +1,206 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/some-ideas-about-oracle-database-on-docker />
+<meta name=description content='A blog post from 2018 about Some ideas about Oracle Database on Docker'>
+<title>Some ideas about Oracle Database on Docker</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/some-ideas-about-oracle-database-on-docker>https://blog.dbi-services.com/some-ideas-about-oracle-database-on-docker</a> (2018-05-08), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Some ideas about Oracle Database on Docker</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This is not a &#8216;best practice&#8217; but just some ideas about building Docker images to provide an Oracle Database. I started with the images provided by Oracle: <a href="https://github.com/oracle/docker-images/tree/master/OracleDatabase/SingleInstance" target="_blank">https://github.com/oracle/docker-images/tree/master/OracleDatabase/SingleInstance</a> and this is great to validate the docker environment. Then I customized for my needs and here are the different points about this customization.
+<span id="more-23169"></span></p>
+<h3>Do not send a huge context at each build attempt</h3>
+<p>I work by iteration. Sending a 3GB context each time I try a build is a no-go for me. Then I quickly stopped to put the Oracle installation .zip in the context of my build. I already <a href="../docker-efficiently-building-images-for-large-software/index.html" target="_blank">blogged</a> about this.</p>
+<p>There are several ways to avoid to send a big context, such as having the .zip in an NFS or HTTP server and ADD it or RUN wget from there. I prefer to build one small container with this .zip that I&#8217;ll use later</p>
+<p>In my current directory I have the linuxx64_12201_database.zip which I explicitly send to the context with this .dockerignore:
+<pre>
+ *
+ !linuxx64_12201_database.zip
+</pre></p>
+<p>And I build a franck/oracle122/zip image with it:
+<pre>
+ FROM oraclelinux:7-slim
+ ADD linuxx64_12201_database.zip /var/tmp
+</pre></p>
+<p>When done, I&#8217;ll not have to send the context again and I will build my container from this one with another Dockerfile:
+<pre>
+ FROM franck/oracle122/zip
+ RUN yum -y install oracle-database-server-12cR2-preinstall unzip tar wget openssl vi &amp;&amp; rm -rf /var/cache/yum
+</pre></p>
+<h3>Do not yum install at each build attempt</h3>
+<p>In the same idea, I build another intermediate image with the yum install above. The reason is that once I have it, I don&#8217;t need internet access anymore. I did that before boarding for an 8 hours flight. I build the above Dockerfile as franck/oracle122/prereq while on airport wifi and will use it later as the base for the final Dockerfile:</p>
+<p>.dockerignore:
+<pre>
+ *
+</pre>
+Dockerfile:
+<pre>
+ FROM franck/oracle122/prereq
+ # then follow all the work which do not need large context or internet connection
+ ...
+</pre></p>
+<p>Even if you are not on a plane, it is always good to avoid internet access. You probably had to get some doors opened in the firewall in order to pull the base image. Now that you have it, you should keep it. Or one day, the security team will close the door again and you will waste a few hours. That also means that you do not start with a :latest image but with a specific version.</p>
+<h3>Do the long steps first</h3>
+<p>The Dockerfile provided by Oracle starts with all ENV and a COPY to add all scripts into the container. The problem is that each time you want to change a script, the build has to start from this step. And then the long operations have to be done again: unzip, install,&#8230;</p>
+<p>I have a small context here (only the scripts and configuration files) but I ADD or COPY them only when needed. For example, here, a modification in install.rsp will re-do the runInstaller step, but the unzip one will not have to be done again because the cache is re-used:
+<pre>
+ WORKDIR /var/tmp
+ RUN unzip linuxx64_12201_database.zip
+ COPY install.rsp /var/tmp
+ RUN ./database/runInstaller -silent -force -waitforcompletion -responsefile /var/tmp/install.rsp -ignoresysprereqs -ignoreprereq ; true
+</pre></p>
+<p>The script that will run the container is added only at the end so that I can modify and re-build quickly without re-doing the previous steps.
+<pre>
+ VOLUME ["/opt/oracle/pdbs"]
+ EXPOSE 1521 5500
+ COPY docker_cmd.sh /opt/oracle
+ CMD exec /opt/oracle/docker_cmd.sh ${CDB} ${PDB
+</pre></p>
+<p>Another step that I do at the end is removing the files I do not need in the container. Because that&#8217;s a guess and try approach and I want to build quickly. Of course, this may not be optimized for the size of all those layers, but I can reduce the final image later. The main feature of Docker build are the layers and I use them to develop the Dockerfile without wasting my time. For the waste of storage, I use ZFS with block level Cow, dedup and compression. For the final image, I&#8217;ll &#8211;squash it.</p>
+<h3>Remove all unnecessary files</h3>
+<p>The detail will probably go into a future blog post. But, as soon as runInstaller is done, and latest bundle patch applied, you can remove a lot of directories that I do not need anymore:
+<pre>
+rm -rf $ORACLE_HOME/inventory $ORACLE_HOME/.patch_storage
+</pre></p>
+<p>As soon as the database has been created with DBCA, I do not need the DBCA templates anymore:
+<pre>
+rm -rf $ORACLE_HOME/assistants
+</pre></p>
+<p>As this container will run only the instance, I can remove:
+<pre>
+rm -rf $ORACLE_HOME/sqldeveloper $ORACLE_HOME/suptools $ORACLE_HOME/jdk
+</pre></p>
+<p>And depending on the options I will provide in the database, I remove the big ones:
+<pre>
+rm -rf $ORACLE_HOME/apex $ORACLE_HOME/javavm $ORACLE_HOME/md
+</pre></p>
+<p>There is also a lot to remove from $ORACLE_HOME/lib (I need only a few *.so* that I can determine with strace, perf, lsof, ldd) and from $ORACLE_HOME/bin (basically, I need oracle, tnslsnr, lsnrctl, and sqlplus). Those are executables and you can strip them to reduce the size further. Definitely remove the last relink ones renamed as oracleO, &#8230;</p>
+<p>Those are just examples, your list will depend on your version and usage, but this may reduce the image to 1GB or less. Of course, this is not supported. But the goal is to provide a small development database. Not an reliable and efficient one for production.</p>
+<h3>Use ZFS for the storage driver</h3>
+<p>An Oracle Database is full of large files that are updated sparsely. Just forget about OVERLAY and OVERLAY2 which copies the whole file to the new layer when you update a single byte of a file. I do not consider BTRFS seriously. In my opinion, ZFS is the only filesystem to consider for storing Docker images with large files. Enforce deduplication and compression to overcome the inflation of layering and the ignorance of sparse files. I think that recordsize=32k is a good idea from what I&#8217;ve seen about how docker applies writes to layers. More detail in a future blog post.</p>
+<p>Note that layering issues are not only for build efficiency but also for container run. You will see that I put some datafiles in the image. Then, at database open, some blocks are changed (at least the headers) and I do not want a full file copy to the runnable layer. Block level CoW is required for that.</p>
+<h3>Create the CDB in the container</h3>
+<p>The container is the place to store all the software, and most of CDB$ROOT and PDB$SEED is part of the software distribution. This is what takes time when creating a database (catalog, catproc,&#8230;) and I definitely refuse to give a container to a developer where he will have to wait 10 minutes at run because the database has to be created on the external volume. A &#8216;docker run&#8217; must be fast. And the external volume must contain only the data that has to be persisted, not 500MB of dbms_% package code, which will be all the same for all containers from the same image.</p>
+<p>This means that I create the CDB during the build:
+<pre>
+ RUN /opt/oracle/product/12.2.0.1/dbhome_1/bin/dbca -silent -createDatabase -templateName General_Purpose.dbc -gdbName ${CDB} -sid ${CDB} -initParams db_unique_name=${CDB},service_names=${CDB},shared_pool_size=600M,local_listener='(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=0.0.0.0)(PORT=1521)))' -createAsContainerDatabase true -numberOfPdbs 0 -sysPassword oracle -systemPassword oracle -emConfiguration NONE -datafileDestination /opt/oracle/oradata -recoveryAreaDestination /opt/oracle/fast_recovery_area -recoveryAreaSize 1024 -storageType FS -sampleSchema false -automaticMemoryManagement false -totalMemory 1024 -databaseType OLTP -enableArchive false -redoLogFileSize 10 -useLocalUndoForPDBs true -createListener LISTENER:1521 -useOMF true -dbOptions OMS:false,JSERVER:false,SPATIAL:false,IMEDIA:false,ORACLE_TEXT:false,SAMPLE_SCHEMA:false,CWMLITE:false,DV:false,APEX:false
+ RUN rm -rf /opt/oracle/product/12.2.0.1/dbhome_1/assistants/dbca/*
+</pre></p>
+<p>No PDB here, as the PDB will be created at &#8216;docker run&#8217; time into the external volume. I use a template with datafiles here, but I may prefer to run the whole creation to control the creation. I may even hack some .bsq and .sql files in RDBMS admin to reduce the size. I&#8217;m in archivelog mode here because I want to allow to flashback the PDB. The container is ephemeral. If it becomes too large (archive logs, audit, &#8230;) just remove it and start another one. Or add a script to remove the old ones (those not required by guarantee restore points).</p>
+<h3>Create the PDB in the external volume</h3>
+<p>The PDB is the only thing that must be persistent, and controlled by the developer. I create it with the following in my docker_cmd.sh (which is called from the Dockerfile CMD line providing CDB name and PDB name as arguments) script:
+<pre>
+     create pluggable database $2 admin user admin identified by oracle create_file_dest='/opt/oracle/pdbs';
+     alter pluggable database  $2 open;
+     show pdbs
+</pre>
+The PDB is bound to the external volume ( VOLUME [&#8220;/opt/oracle/pdbs&#8221;] ) thanks to 12.2 CREATE_FILE_DEST clause so that the developer can create datafiles only there. Then the &#8216;docker run&#8217; is fast as a clone of PDB$SEED.</p>
+<p>The developer will connect only to the PDB. He has nothing to do in CDB$ROOT. If there is a need to change something in CDB$ROOT, I&#8217;ll provide a new image. I may even define lockdown profiles rules to limit the PDB and define a listener where only the PDB registers.</p>
+<h3>Unplug the PDB at container stop</h3>
+<p>When the developer stops the container, I want to leave something consistent in the external volume. The way to do that quickly is a PDB unplug. An unplug to a PDB archive (a .pdb zip with all datafiles) would be nicer, but that takes too much time to create. I unplug to a .xml file. This is what I do on stop (SIGTERM and SIGSTOP):
+<pre>
+alter pluggable database all close;
+ column pdb_name format a30
+ select pdb_id,pdb_name,status from dba_pdbs;
+ begin
+  for c in (select pdb_name from dba_pdbs where pdb_id&gt;2) loop
+   dbms_output.put_line('-- Unpluging '||c.pdb_name);
+   execute immediate 'alter pluggable database "'||c.pdb_name||'" unplug into ''/opt/oracle/pdbs/'||c.pdb_name||'.xml''';
+  end loop;
+  for c in (select pdb_name from dba_pdbs where pdb_id&gt;2 and status='UNPLUGGED') loop
+   dbms_output.put_line('-- Dropping  '||c.pdb_name);
+   execute immediate 'drop pluggable database "'||c.pdb_name||'" keep datafiles';
+  end loop;
+ end;
+ /
+ -- All pluggable databases have been unplugged:
+ host ls /opt/oracle/pdbs/*.xml
+ -- Shutdown the CDB:
+ shutdown immediate;
+ -- You can plug those PDBs by passing the volume to a new container
+</pre>
+The script iterates on all PDBs but I see no reason to create more than one. I unplug the PDB and drop it, and then shutdown the instance. We need the unplug to be completed before the stop timeout. The container may be killed before the drop or shutdown, but as long as we have the .xml we can plug the PDB into a new container.</p>
+<h3>Plug the PDB at container re-start</h3>
+<p>I mentioned earlier that at start I create the pluggable database mentioned by ${PDB}. But this is only when there is no /opt/oracle/pdbs/${PDB}.xml
+If this file is found, this means that we provide a PDB that was unplugged by a previous container stop.
+Actually, when the start detects this file, the following will be run:
+<pre>
+     whenever sqlerror exit failure;
+     create pluggable database "${PDB}" using '/opt/oracle/pdbs/${PDB}.xml';
+     host rm /opt/oracle/pdbs/${PDB}.xml
+     alter pluggable database "${PDB}" open;
+     select message from pdb_plug_in_violations;
+</pre></p>
+<p>Finally, because I may start a container which has a newer Release Update than the one which unplugged my PDB, I run:
+<pre>
+$ORACLE_HOME/OPatch/datapatch
+</pre></p>
+<h3>One PDB per container</h3>
+<p>My scripts process all PDBs but I think that in most cases we need to have a one-to-one relationship between the container and the PDB. The idea is to provide a database that is ready to use and where no administration/troubleshooting is required. The key here is to keep it simple. If you need to provide a large CDB with several PDBs, then Docker is not the solution to your problem. A virtual machine is a better answer for that.</p>
+<h3>SPfile? Password file?</h3>
+<p>The image build provided by Oracle stores the persistent configuration files with the database, in the external volume, through symbolic links from ?/dbs. But with my design, I don&#8217;t need to. The configuration of the instance, running in the container, is within the container. The passwords for SYS is in the container. Then SPfile and password files stay in the container. The runnable image is not read-only. It is writeable. We can write here as long as the changes do not have to persist beyond the container end of life. </p>
+<p>The &#8216;scope=spfile&#8217; parameters that can be modified by the developer will be PDB parameters. They are persisted because they go to the .xml file at unplug. Only in case of crash, without a clean unplug, those parameters may be stored only in the container. That&#8217;s a special case. A crashed container is not dead and jsut waits to be re-started.</p>
+<h3>Crash recovery needs the same container</h3>
+<p>There&#8217;s one big flaw with my CDB-in-container/PDB-in-volume design. The whole database datafiles must be consistent, are checkpointed together, and are all protected by the same redo stream, which is located in the container. But what&#8217;s the real problem about that? If the container is cleanly stopped, the PDB is unplugged and there is a clear separation between my external volume and the container. And both are consistent. </p>
+<p>However, if the container crashes, the datafiles in my external volume are fuzzy and need recovery. This cannot be done without the CDB files which are on the container. This has only one consequence: the user must know that if the container was not cleanly stopped, she will need to start the PDB with the same container. I don&#8217;t think this is a real problem. I just ensure that the user gets the warning (a big README file in the external volume for example, created at start and removed at clean stop) and that the container will always be able to recover (no 100% full filesystem at start &#8211; anyway I have some log cleanups at start).</p>
+<h3>Handle all errors and signals</h3>
+<p>My startup script handle 3 situations.
+The first one is the first start after creation of the container. This creates the pluggable database.
+The second one is the re-start after a clean stop. This plugs the existing pluggable database.
+The third one is crash-recovery after a kill. This just runs the automatic instance recovery.</p>
+<p>Then the startup script will run in a loop, either tailing the alert.log or displaying some status info every minutes.</p>
+<p>But before all of that, the startup script must handle the termination signals.</p>
+<p>The clean stop is handled by the following signals:
+<pre>
+ trap 'shutdown SIGINT'  SIGINT
+ trap 'shutdown SIGTERM' SIGTERM
+ trap 'shutdown EXIT' 0
+</pre>
+SIGINT is for ^C when running the container, SIGTERM is when &#8216;docker stop&#8217;, and the signal 0 is when the container exits by itself. This can happen when my &#8216;tail -f&#8217; on alert log is killed for example. All of them call my shutdown() procedure which is trying a clean stop (unplug the PDBs).</p>
+<p>When the stop timout is expired or when we do a &#8216;docker kill&#8217;, there&#8217;s no time for that. The only thing I do here before a shutdown abort is an &#8216;alter system checkpoint&#8217; to try to reduce the recovery needed. And display a WARNING message saying that the container that was killed must not be removed but be re-started asap to recover the PDB in the external volume. Maybe explicitly name the container and the command to re-start.</p>
+<p>I do that with an abort() function called by the following:
+<pre>
+ trap 'abort    SIGKILL' SIGKILL
+</pre></p>
+<p>The kill -9 of the instance, or container crash, cannot be handled. Recovery is needed as for the SIGKILL one. Here is the reason for keeping a permanent README file near the PDB to explain that the container which crashed should be restarted as soon as possible to recover this.</p>
+<h3>Conclusion</h3>
+<p>This is not a recipe of how to build an Oracle Database Docker image, but just some ideas. The most important is to know the requirement. If you provide Oracle on Docker just because the developers want that, the solution will probably be wrong: too large, too long, inefficient, and too complex,&#8230; They will not use it and they will tell everybody that Oracle is not cool because it cannot be dockerized.
+<a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2018/05/CaptureDockerCDBPDB.png" rel="lightbox[23169]"><img src="../wp-insides/uploads/sites/2/2018/05/CaptureDockerCDBPDB-287x300.png" alt="CaptureDockerCDBPDB" width="287" height="300" class="alignright size-medium wp-image-23196" /></a>
+With my PDB-in-volume / CDB-in-container design, I have :</p>
+<ul>
+<li>Docker Images with the ephemeral software, one per version (down to patches), and with different set of component installed</li>
+<li>External volume (personal directory in a NFS share, or a local one) with the persistent data and settings</li>
+<li>Containers running the software on the data, linking them together for the whole lifecycle of the container</li>
+</ul>
+<p>Think of them as 2 USB sticks, one with the software (binaries and packages), and one with the data (user metadata and data). When plugged together on the same container, it runs one version of software with one state of data. If the container crashes, you just run it again without unplugging any of the sticks. When you are done with your test or development iteration, you stop the container and remove it. Then you have unplugged the sticks to run another combination of data and software.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-231700" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2018/05/CaptureDockerCDBPDB-287x300.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

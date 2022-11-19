@@ -1,0 +1,149 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/cbo-first_rows-and-view-misestimate />
+<meta name=description content='A blog post from 2017 about CBO, FIRST_ROWS and VIEW misestimate'>
+<title>CBO, FIRST_ROWS and VIEW misestimate</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/cbo-first_rows-and-view-misestimate>https://blog.dbi-services.com/cbo-first_rows-and-view-misestimate</a> (2017-11-17), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">CBO, FIRST_ROWS and VIEW misestimate</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>There are several bugs with the optimizer in FIRST_ROWS mode. Here is one I encountered during a 10.2.0.4 to 12.2.0.1 migration when a view had an &#8216;order by&#8217; in its definition.
+<span id="more-19618"></span></p>
+<p>Here is the test case that reproduces the problem.</p>
+<p>A big table:
+<pre>
+SQL&gt; create table DEMO1 (n constraint DEMO1_N primary key,x,y) as select 1/rownum,'x','y' from xmltable('1 to 1000000');
+Table DEMO1 created.
+</pre></p>
+<p>with a view on it, and that view has an order by:
+<pre>
+SQL&gt; create view DEMOV as select * from DEMO1 order by n desc;
+View DEMOV created.
+</pre></p>
+<p>and another table to join to:
+<pre>
+SQL&gt; create table DEMO2 (x constraint DEMO2_X primary key) as select dummy from dual;
+Table DEMO2 created.
+</pre></p>
+<p>My query reads the view in a subquery, adds a call to a PL/SQL function, and joins the result with the other table:</p>
+<p><pre>
+SQL&gt; explain plan for
+    select /*+ first_rows(10) */ *
+    from
+    ( select v.*,dbms_random.value from DEMOV v)
+    where x in (select x from DEMO2)
+    order by n desc;
+
+Explained.
+</pre></p>
+<p>You can see that I run it with FIRST_ROWS(10) because I actually want to fetch the top-10 rows when ordered by N. As N is a number and I have an index on it and there are no nulls (it is the primary key) I expect to read the first 10 entries from the index, call the function for each of them, then nested loop to the other tables.</p>
+<p>In the situation I encountered it, this is what was done in 10<i>g</i> but when migrated to 12<i>c</i> the query was very long because it called the PL/SQL function for million of rows. Here is the plan in my example:</p>
+<p><pre>
+SQL&gt; select * from dbms_xplan.display(format=&gt;'+projection');
+
+PLAN_TABLE_OUTPUT
+-----------------
+Plan hash value: 2046425878
+
+--------------------------------------------------------------------------------------------
+| Id  | Operation               | Name     | Rows  | Bytes |TempSpc| Cost (%CPU)| Time     |
+--------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |          |     1 |    21 |       |     7   (0)| 00:00:01 |
+|   1 |  NESTED LOOPS SEMI      |          |     1 |    21 |       |     7   (0)| 00:00:01 |
+|   2 |   VIEW                  | DEMOV    |   902 | 17138 |       |     7   (0)| 00:00:01 |
+|   3 |    SORT ORDER BY        |          |   968K|    17M|    29M|  6863   (1)| 00:00:01 |
+|   4 |     TABLE ACCESS FULL   | DEMO1    |   968K|    17M|       |  1170   (1)| 00:00:01 |
+|   5 |   VIEW PUSHED PREDICATE | VW_NSO_1 |     1 |     2 |       |     0   (0)| 00:00:01 |
+|*  6 |    INDEX UNIQUE SCAN    | DEMO2_X  |     1 |     2 |       |     0   (0)| 00:00:01 |
+--------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   6 - access("X"="V"."X")
+
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+
+   1 - (#keys=0) "V"."N"[NUMBER,22], "V"."X"[CHARACTER,1], "V"."Y"[CHARACTER,1]
+   2 - "V"."N"[NUMBER,22], "V"."X"[CHARACTER,1], "V"."Y"[CHARACTER,1]
+   3 - (#keys=1) INTERNAL_FUNCTION("N")[22], "X"[CHARACTER,1], "Y"[CHARACTER,1]
+   4 - "N"[NUMBER,22], "X"[CHARACTER,1], "Y"[CHARACTER,1]
+</pre></p>
+<p>A full table scan of the big table, with a call to the PL/SQL function for each row and the sort operation on all rows. Then the Top-10 rows are filtered and the nested loop operates on that. But you see the problem here. The cost of the &#8216;full table scan&#8217; and the &#8216;order by&#8217; has been evaluated correctly, but the cost after the VIEW operation is minimized.</p>
+<p>My interpretation (but it is just a quick guess) is that the the rowset is marked as &#8216;sorted&#8217; and then the optimizer considers that the cost to get first rows is minimal (as if it were coming from an index). However, this just ignores the initial cost of getting this rowset.</p>
+<p>I can force with a hint the plan that I want &#8211; index full scan to avoid a sort and get the top-10 rows quickly:
+<pre>
+SQL&gt; explain plan for
+    select /*+ first_rows(10)       INDEX_DESC(@"SEL$3" "DEMO1"@"SEL$3" ("DEMO1"."N")) */ *
+    from
+    ( select v.*,dbms_random.value from DEMOV v)
+    where x in (select x from DEMO2)
+    order by n desc;
+
+Explained.
+</pre></p>
+<p>This plan is estimated with an higher cost than the previous one and this is why it was not chosen:
+<pre>
+SQL&gt; select * from dbms_xplan.display(format=&gt;'+projection');
+PLAN_TABLE_OUTPUT
+Plan hash value: 2921908728
+
+------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name     | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |          |     1 |    21 |     9   (0)| 00:00:01 |
+|   1 |  NESTED LOOPS SEMI            |          |     1 |    21 |     9   (0)| 00:00:01 |
+|   2 |   VIEW                        | DEMOV    |   902 | 17138 |     9   (0)| 00:00:01 |
+|   3 |    TABLE ACCESS BY INDEX ROWID| DEMO1    |   968K|    17M|  8779   (1)| 00:00:01 |
+|   4 |     INDEX FULL SCAN DESCENDING| DEMO1_N  |   968K|       |  4481   (1)| 00:00:01 |
+|   5 |   VIEW PUSHED PREDICATE       | VW_NSO_1 |     1 |     2 |     0   (0)| 00:00:01 |
+|*  6 |    INDEX UNIQUE SCAN          | DEMO2_X  |     1 |     2 |     0   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   6 - access("X"="V"."X")
+
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+
+   1 - (#keys=0) "V"."N"[NUMBER,22], "V"."X"[CHARACTER,1], "V"."Y"[CHARACTER,1]
+   2 - "V"."N"[NUMBER,22], "V"."X"[CHARACTER,1], "V"."Y"[CHARACTER,1]
+   3 - "N"[NUMBER,22], "X"[CHARACTER,1], "Y"[CHARACTER,1]
+   4 - "DEMO1".ROWID[ROWID,10], "N"[NUMBER,22]
+</pre></p>
+<p>This cost estimation is fine. The cost of getting all rows by index access is higher than with a full table scan, but the optimizer knows that the actual cost is proportional to the number of rows fetched and then it adjusts the cost accordingly. This is fine here because the VIEW has only non-blocking operations. The problem in the first plan without the hint, was because the same arithmetic was done, without realizing that the SORT ORDER BY is a blocking operation and not a permanent sorted structure, and must be completed before being able to return the first row.</p>
+<p>In this example, as in the real case I&#8217;ve encountered, the difference in cost is very small (7 versus 9 here) which means that the plan can be ok and switch to the bad one (full scan, call function for all rows, sort them) with a small change in statistics. Note that I mentioned that the plan was ok in 10<i>g</i> but that may simply be related to the PGA settings and different estimation for the cost of sorting.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-196190"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

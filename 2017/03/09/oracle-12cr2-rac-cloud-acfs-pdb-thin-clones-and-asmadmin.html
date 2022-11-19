@@ -1,0 +1,134 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-12cr2-rac-cloud-acfs-pdb-thin-clones-and-asmadmin />
+<meta name=description content='A blog post from 2017 about Oracle 12cR2, RAC, Cloud, ACFS, PDB thin clones and asmadmin'>
+<title>Oracle 12cR2, RAC, Cloud, ACFS, PDB thin clones and asmadmin</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-12cr2-rac-cloud-acfs-pdb-thin-clones-and-asmadmin>https://blog.dbi-services.com/oracle-12cr2-rac-cloud-acfs-pdb-thin-clones-and-asmadmin</a> (2017-03-09), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle 12cR2, RAC, Cloud, ACFS, PDB thin clones and asmadmin</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the Oracle Public Cloud, fast provisioning gets all its meaning when creating a RAC database service: in one hour you can get an operational highly available multitenant database. You can even create it in Data Guard for Disaster Recovery. Now, Oracle is pushing ACFS to store the datafiles rather than direct ASM. Especially in multitenant because a great feature is thin cloning: CREATE PLUGGABLE DATABASE AS SNAPSHOT COPY. However, I encountered an error when I tried it for the first time.
+<span id="more-15109"></span></p>
+<h3>TDE keystore</h3>
+<p><pre>SQL&gt; create pluggable database pdb2 from pdb1 snapshot copy;
+create pluggable database pdb2 from pdb1 snapshot copy
+*
+ERROR at line 1:
+ORA-28357: password required to open the wallet</pre></p>
+<p>Oh yes, in the cloud all tablespaces are encrypted. In 12.2 we can put the keystore password in the command:</p>
+<h3>ORA-17517</h3>
+<p><pre>SQL&gt; create pluggable database pdb2 from pdb1 snapshot copy keystore identified by "Ach1z0#d" ;
+
+create pluggable database pdb2 from pdb1 snapshot copy keystore identified by "Ach1z0#d"
+*
+ERROR at line 1:
+ORA-65169: error encountered while attempting to copy file
+/u02/app/oracle/oradata/CDB1/49FC0C40FCF62C05E053BAF6C40A9DD6/datafile/o1_mf_users_dcr220sd_.dbf
+ORA-17517: Database cloning using storage snapshot failed on file
+8:/u02/app/oracle/oradata/CDB1/49FC0C40FCF62C05E053BAF6C40A9DD6/datafile/o1_mf_users_dcr220sd_.dbf</pre></p>
+<p>Here we are. The call to the storage snapshot feature has failed. Usually the errors coming from OS calls are accompanied with additional information but not here.</p>
+<h3>alert.log and trace</h3>
+<p>In alert.log, the error is displayed with reference to some other trace files:</p>
+<p><pre>2017-03-05 16:24:38.935000 +00:00
+create pluggable database pdb2 from pdb1 snapshot copy keystore identified by *
+ AUDSYS.AUD$UNIFIED (SQL_TEXT) - CLOB populated
+WARNING: Detected that PDB needs to import keys from source. PDB can only open in restricted mode until import.
+2017-03-05 16:24:40.447000 +00:00
+Errors in file /u01/app/oracle/diag/rdbms/cdb1/cdb11/trace/cdb11_p000_8910.trc:
+Errors in file /u01/app/oracle/diag/rdbms/cdb1/cdb11/trace/cdb11_p002_8918.trc:
+Errors in file /u01/app/oracle/diag/rdbms/cdb1/cdb11/trace/cdb11_p001_8914.trc:
+Errors in file /u01/app/oracle/diag/rdbms/cdb1/cdb11/trace/cdb11_p003_8922.trc:
+**************************************************************
+Undo Create of Pluggable Database PDB2 with pdb id - 4.
+**************************************************************
+ORA-65169 signalled during: create pluggable database pdb2 from pdb1 snapshot copy keystore identified by * ...</pre></p>
+<p>And those trace files have the following information:
+<pre>ksfdsscre_clone: create snapshot failed error(-1) errmsg(OS dependent failure) voltag(49FF372094256196E053BAF6C40AEB9D) parent_voltag() mntbuf(/u02)
+</pre></p>
+<p>This is not very helpful by itself. We see the snapshot name (voltag) and the parent name (parent_voltag). You may know that error (-1) is EPERM  which is &#8216;operation not permitted&#8217;. What I did to be sure was to try to create the snapshot myself:</p>
+<p><pre>[oracle@rac1 cdb11]$ acfsutil snap create -w 49FFA9651D1D58D5E053BAF6C40AF81C /u02
+acfsutil snap create: CLSU-00100: operating system function: ioctl failed with error data: 1
+acfsutil snap create: CLSU-00101: operating system error message: Operation not permitted
+acfsutil snap create: CLSU-00103: error location: OI_0
+acfsutil snap create: ACFS-03046: unable to perform snapshot operation on /u02</pre></p>
+<h3>EPERM</h3>
+<p>This is more clear and I also strace&#8217;d it to see where the error comes from:</p>
+<p><pre>open("/u02", O_RDONLY)                  = 41
+ioctl(41, RTC_UIE_ON, 0x7fff17ae17a0)   = 0
+ioctl(41, 0xffffffffc1287021, 0x7fff17ae0e90) = -1 EPERM (Operation not permitted)</pre></p>
+<p>I&#8217;m running that with the oracle user, as the instance does when creating a PDB:
+<pre>uid=1001(oracle) gid=1001(oinstall) groups=1001(oinstall),1002(dba),1003(racoper),1004(asmdba)</pre></p>
+<h3>grid</h3>
+<p>When connecting as grid, I am able to create the snapshot</p>
+<p><pre>[grid@rac1 ~]$ acfsutil snap create -w 49FFA9651D1D58D5E053BAF6C40AF81C /u02
+acfsutil snap create: Snapshot operation is complete.
+[grid@rac1 ~]$ acfsutil snap delete 49FFA9651D1D58D5E053BAF6C40AF81C /u02
+acfsutil snap delete: Snapshot operation is complete.
+</pre></p>
+<p>Grid has the following permissions:
+<pre>uid=1000(grid) gid=1001(oinstall) groups=1001(oinstall),1003(racoper),1004(asmdba),1005(asmoper),1006(asmadmin)</pre></p>
+<h3>asmadmin</h3>
+<p>This is what /etc/group looks like:</p>
+<p><pre>opc:x:54323:
+oinstall:x:1001:
+dba:x:1002:oracle
+racoper:x:1003:oracle,grid
+asmdba:x:1004:oracle,grid
+asmoper:x:1005:grid
+asmadmin:x:1006:grid</pre></p>
+<p>This is what the Oracle Public Cloud defines at RAC DBaaS service creation, and asmadmin is not mentioned in <a href="https://docs.oracle.com/database/122/LADBI/creating-an-oracle-software-owner-user.htm#LADBI-GUID-C1E5CEA8-741A-4500-B03E-B4A6BC1E87BB" target="_blank">documentation</a>.</p>
+<p>So, to solve (or workaround) the issue, I&#8217;ve added oracle to the asmadmin group:</p>
+<p><pre>asmadmin:x:1006:grid,oracle</pre></p>
+<p>and now, I&#8217;m able to create a snapshot when logging as oracle:</p>
+<p><pre>[oracle@rac1 ~]$ acfsutil snap create -w 49FFA9651D1D58D5E053BAF6C40AF81C /u02
+acfsutil snap create: Snapshot operation is complete.
+[oracle@rac1 ~]$ acfsutil snap delete 49FFA9651D1D58D5E053BAF6C40AF81C /u02
+acfsutil snap delete: Snapshot operation is complete.
+</pre></p>
+<h3>restart</h3>
+<p>I thought that restarting the instance would be sufficient, but it is not. I had to restart the cluster. And this is also something easy in the Oracle Public Cloud:</p>
+<p><a href="../wp-insides/uploads/sites/2/2017/03/CaptureRestartOPCRAC.png" rel="lightbox[15109]"><img src="../wp-insides/uploads/sites/2/2017/03/CaptureRestartOPCRAC.png" alt="CaptureRestartOPCRAC" width="986" height="139" class="alignnone size-full wp-image-15113" /></a></p>
+<p>A simple click restarts the first node, and then, once it is up again, restarts the second node.Rolling reboot ensures that the service is always up.</p>
+<h3>Thin clone</h3>
+<p>Here it is. The instance is now able to create a snapshot.</p>
+<p><pre>Connected to:
+Oracle Database 12c EE Extreme Perf Release 12.2.0.1.0 - 64bit Production
+
+SQL&gt; set echo on
+SQL&gt; create pluggable database pdb2 from pdb1 snapshot copy keystore identified by "Ach1z0#d" ;
+Pluggable database created.
+
+Elapsed: 00:00:30.36</pre></p>
+<h3>So what?</h3>
+<p>In my opinion, the configurations that stores a CDB datafiles on ACFS should give the rights to create snapshots to the user running the database. The cloud interface is very simple, but the technology behind is complex. The consequence of this gap is that using the cloud is easy when everything goes as expected, but any exception can bring us into troubleshooting.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-151100" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/03/CaptureRestartOPCRAC.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

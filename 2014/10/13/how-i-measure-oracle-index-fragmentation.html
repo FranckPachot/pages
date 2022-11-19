@@ -1,0 +1,301 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/how-i-measure-oracle-index-fragmentation />
+<meta name=description content='A blog post from 2014 about How to measure Oracle index fragmentation'>
+<title>How to measure Oracle index fragmentation</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/how-i-measure-oracle-index-fragmentation>https://blog.dbi-services.com/how-i-measure-oracle-index-fragmentation</a> (2014-10-13), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">How to measure Oracle index fragmentation</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>At Oracle Open World 2014, or rather the <a href="http://blog.dbi-services.com/oow14-day-5-not-only-oracle-open-world/"> Oaktable World</a>, Chris Antognini has presented &#8216;Indexes: Structure, Splits and Free Space Management Internals&#8217;. It&#8217;s not something new, but it&#8217;s still something that is not always well understood: how index space is managed, block splits, fragmentation, coalesce and rebuilds. Kyle Hailey has made a video of it available <a href="https://www.youtube.com/watch?v=kztG9voZtMw&amp;feature=youtu.be">here</a>.
+For me, it is the occasion to share the script I use to see if an index is fragmented or not.</p>
+<p>First, forget about those &#8216;analyze index validate structure&#8217; which locks the table, and the DEL_LEAF_ROWS that counts only the deletion flags that are transient. The problem is not the amount of free space. The problem is where is that free space. Because if you will insert again in the same range of values, then that space will be reused. Wasted space occurs only when lot of rows were deleted in a range where you will not insert again. For exemple, when you purge old ORDERS, then the index on the ORDER_DATE &#8211; or on the ORDER_ID coming from a sequence &#8211; will be affected. Note that the problem occurs only for sparse purges because full blocks are reclaimed when needed and can get rows from an other range of value.</p>
+<p>I have a script that shows the number of rows per block, as well as used and free space per block, and aggregates that by range of values.</p>
+<p>First, let&#8217;s create a table with a date and an index on it:
+<pre>drop table DEMOTABLE;
+create table DEMOTABLE as select sysdate-900+rownum/1000 order_date,decode(mod(rownum,100),0,'N','Y') delivered , dbms_random.string('U',16) cust_id  from (select * from dual connect by level &lt;= 1e4 );
+create index DEMOINDEX on DEMOTABLE(ORDER_DATE) pctfree 90;</pre>
+My script shows 10 buckets with begin and end value and for each of them the averge number of rows per block and the free space:
+<pre>SQL&gt; @index_fragmentation
+
+ORDER_DAT -&gt; ORDER_DAT rows/block bytes/block %free space     blocks free
+--------- -- --------- ---------- ----------- ----------- ---------- -----
+24-APR-12 -&gt; 02-AUG-12        377        7163          11        266
+03-AUG-12 -&gt; 11-NOV-12        377        7163          11        266
+11-NOV-12 -&gt; 19-FEB-13        377        7163          11        266
+19-FEB-13 -&gt; 30-MAY-13        377        7163          11        265
+30-MAY-13 -&gt; 07-SEP-13        377        7163          11        265
+07-SEP-13 -&gt; 16-DEC-13        377        7163          11        265
+16-DEC-13 -&gt; 26-MAR-14        377        7163          11        265
+26-MAR-14 -&gt; 03-JUL-14        377        7163          11        265
+04-JUL-14 -&gt; 11-OCT-14        377        7163          11        265
+12-OCT-14 -&gt; 19-JAN-15        376        7150          11        265
+</pre>
+Note that the script reads all the table (it can do a sample but here it is 100%). Not exactly the table but only the index. It counts the index leaf blocks with the undocumented function sys_op_lbid() which is used by oracle to estimate the clustering factor.</p>
+<p>So here I have no fragmentation. All blocks have about 377 rows and no free space. This is because I inserted them in increasing order and the so colled &#8217;90-10&#8242; block split occured.</p>
+<p>Let&#8217;s see what I get if I delete most of the rows before the 01-JAN-2014:
+<pre>SQL&gt; delete from DEMOTABLE where order_dateSQL&gt; @index_fragmentation
+
+ORDER_DAT -&gt; ORDER_DAT rows/block bytes/block %free space     blocks free
+--------- -- --------- ---------- ----------- ----------- ---------- -----
+25-APR-12 -&gt; 02-AUG-12          4          72          99        266 oooo
+03-AUG-12 -&gt; 11-NOV-12          4          72          99        266 oooo
+11-NOV-12 -&gt; 19-FEB-13          4          72          99        266 oooo
+19-FEB-13 -&gt; 30-MAY-13          4          72          99        265 oooo
+30-MAY-13 -&gt; 07-SEP-13          4          72          99        265 oooo
+07-SEP-13 -&gt; 16-DEC-13          4          72          99        265 oooo
+16-DEC-13 -&gt; 26-MAR-14          4          72          99        265 oooo
+26-MAR-14 -&gt; 03-JUL-14          4          72          99        265 oooo
+04-JUL-14 -&gt; 11-OCT-14         46         870          89        265 oooo
+12-OCT-14 -&gt; 19-JAN-15        376        7150          11        265
+</pre>
+I have the same buckets, and same number of blocks. But blocks which are in the range below 01-JAN-2014 have only 4 rows and a lot of free space. This is exactly what I want to detect: I can check if that free space will be reused.</p>
+<p>Here I know I will not enter any orders with a date in the past, so those blocks will never have an insert into them. I can reclaim that free space with a COALESCE:
+<pre>SQL&gt; alter index DEMOINDEX coalesce;
+Index altered.
+SQL&gt; @index_fragmentation
+ORDER_DAT to ORDER_DAT rows/block bytes/block %free space blocks free
+ --------- -- --------- ---------- ----------- ----------- ---------- -----
+ 25-APR-12 -&gt; 03-OCT-14 358 6809 15 32
+ 03-OCT-14 -&gt; 15-OCT-14 377 7163 11 32
+ 15-OCT-14 -&gt; 27-OCT-14 377 7163 11 32
+ 27-OCT-14 -&gt; 08-NOV-14 377 7163 11 32
+ 08-NOV-14 -&gt; 20-NOV-14 377 7163 11 32
+ 20-NOV-14 -&gt; 02-DEC-14 377 7163 11 32
+ 02-DEC-14 -&gt; 14-DEC-14 377 7163 11 32
+ 14-DEC-14 -&gt; 26-DEC-14 377 7163 11 32
+ 27-DEC-14 -&gt; 07-JAN-15 377 7163 11 32
+ 08-JAN-15 -&gt; 19-JAN-15 371 7056 12 32</pre>
+I still have 10 buckets because this is defined in my script, but each bucket noew has less rows. I&#8217;ve defragmented the blocks and reclaimed the free blocks.</p>
+<p>Time to share the script now. Here it is: <a title="title" href="http://blog.dbi-services.com/images/easyblog_images/139/index_fragmentation.zip" target="_self">index_fragmentation.zip</a></p>
+<p>The script is quite ugly. It&#8217;s SQL generated by PL/SQL. It&#8217;s generated because it selects the index columns. And as I don&#8217;t want to have it too large it is not indented nor commented. However, if you run it with set servertoutput on you will see the generated query.</p>
+<p>How to use it? Just change the owner, table_name, and index name. It reads the whole index so if you have a very large index you may want to change the sample size.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5090"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 7 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-2535">
+				<div id="div-comment-2535" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6ba0e6330f5eb40e6986ff413c1a4570?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.sphanalytics.com/' rel='external nofollow' class='url'>Eddy Soeparmin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2535">
+			January 8, 2016 at 22 h 21 min</a>		</div>
+
+		<p>Hi Franck, this is a great blog I read and it really helps. Although it&#8217;s very time consuming for large database (billion of rows), but the result set is excellent. I manage away to capture the dynamic sql into a table so I can use it to globally to rebuild index. </p>
+<p>I have a few questions for you
+1.	To reduce the time, what will be the ideal value for the bucket and sample? If I reduce the bucket to 5 and sample to 50, will it give me the same accuracy as 10 and 100?
+2.	To determine if index needs to be rebuilt, simply look at the “free space” if it has at least “o” it’s a candidate to rebuild, correct?
+3.	I rebuild the index either coalesce, rebuild or rebuild online then run the script again, it still shows the same result as of I need to rebuild that index again. Not sure why or does it suppose to work that way?
+4.    How do I determine a partition index?</p>
+<p>Thanks Franck.</p>
+<p>Eddy Soeparmin
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25361"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2535' onclick='return addComment.moveForm( "div-comment-2535", "2535", "respond", "508" )' aria-label='Reply to Eddy to Eddy Soeparmin'>Reply to Eddy</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-2536">
+				<div id="div-comment-2536" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2536">
+			January 8, 2016 at 22 h 41 min</a>		</div>
+
+		<p>Hi Eddy,
+1. sample is sample of leaf blocks read, buckets is for number of lines displayed. On big index, start with sample 1, then sample 10, see if it is very different. You can even change the generated query to focus on a specific range of values.
+2. No, it&#8217;s not because there is free space that you have to rebuild. The range of value is displayed so that you know if that space will be reused or not. the whole idea is to understand why you have lot of free space in some range of value.
+3. when you rebuild, you can expect to have PCTFREE (default 10%) free space. After some DML it will tend to 75% (average between full blocks and 50-50 split)
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25371"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2536' onclick='return addComment.moveForm( "div-comment-2536", "2536", "respond", "508" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-2572">
+				<div id="div-comment-2572" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6ba0e6330f5eb40e6986ff413c1a4570?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.sphanalytics.com/' rel='external nofollow' class='url'>Eddy Soeparmin</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2572">
+			January 12, 2016 at 23 h 56 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>I guess I still don&#8217;t understand how to read the range of value or how to determine if the index needs to be rebuilt. The generated script shows the field name(s) from a given index file, rows/block, bytes/block, %free space, blocks, and free. If this scripts is run as an Oracle job, how do I determine which index needs to be rebuilt and which one to skip? Do I need to join with other table such dba_indexes, dba_segments, dba_tables??</p>
+<p>Please advised since i&#8217;m still new in this area. Thanks Franck.</p>
+<p>Eddy Soeparmin
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25731"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2572' onclick='return addComment.moveForm( "div-comment-2572", "2572", "respond", "508" )' aria-label='Reply to Eddy to Eddy Soeparmin'>Reply to Eddy</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-2577">
+				<div id="div-comment-2577" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2577">
+			January 13, 2016 at 9 h 32 min</a>		</div>
+
+		<p>Hi Eddy,
+Unfortunately there is nothing that can tell you if you have to rebuild or not. The script gives you the free space but in order to decide if it&#8217;s good or not to have that free space, you need to know your application. It depends on the queries that are done (do you read lot of leaf blocks) and it depends on the way data is inserted and updated. You need free space for new entries, or the block will be split and then you will have two half empty blocks.
+This is the reason why I show the range of values. It helps to match unexpected free space with application behavior, purge operations, etc.
+Regards,
+Franck
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25781"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2577' onclick='return addComment.moveForm( "div-comment-2577", "2577", "respond", "508" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-4983">
+				<div id="div-comment-4983" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ae49ae9d1f4e8fe805b4b79858df4a43?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Nonra</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4983">
+			October 24, 2016 at 20 h 38 min</a>		</div>
+
+		<p>I executed script, but on a index with more than 30GB I got this error:</p>
+<p>ERROR at line 1:
+ORA-06502: PL/SQL: numeric or value error: character string buffer too small
+ORA-06512: at line 20
+ORA-06512: at line 48</p>
+<p>I tried with change the sample size but doesn&#8217;t works.</p>
+<p>Can you help me?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-49841"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4983' onclick='return addComment.moveForm( "div-comment-4983", "4983", "respond", "508" )' aria-label='Reply to Nonra to Nonra'>Reply to Nonra</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-4985">
+				<div id="div-comment-4985" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4985">
+			October 24, 2016 at 21 h 28 min</a>		</div>
+
+		<p>Bonjour,
+Vous pouvez augmenter les varchar(2000). Ici l&#8217;erreur est probablement sur &#8216;s&#8217;
+Cordialement,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-49861"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4985' onclick='return addComment.moveForm( "div-comment-4985", "4985", "respond", "508" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="pingback even thread-odd thread-alt depth-1" id="comment-7262">
+				<div id="div-comment-7262" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://dbakevlar.com/2017/04/indexing-oracle-fragmentation/' rel='external nofollow' class='url'>Indexing in Oracle, Fragmentation - DBA Kevlar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7262">
+			April 6, 2017 at 0 h 44 min</a>		</div>
+
+		<p>[&#8230;] vs. SQL Server Index performance, I ran across this great script to check for fragmentation from Franck Pachot.  You&#8217;ll need to simply update the script to declare the table and index name or simply edit [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-72631"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7262' onclick='return addComment.moveForm( "div-comment-7262", "7262", "respond", "508" )' aria-label='Reply to Indexing to Indexing in Oracle, Fragmentation - DBA Kevlar'>Reply to Indexing</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

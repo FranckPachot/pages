@@ -1,0 +1,218 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/learning-and-troubleshooting-follow-the-path />
+<meta name=description content='A blog post from 2016 about Learning and troubleshooting: Follow the path'>
+<title>Learning and troubleshooting: Follow the path</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/learning-and-troubleshooting-follow-the-path>https://blog.dbi-services.com/learning-and-troubleshooting-follow-the-path</a> (2016-05-28), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Learning and troubleshooting: Follow the path</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>You query a simple table to get its rows. Did you ever ask yourself how oracle knows which blocks to read from disk? Let&#8217;s question everything and follow the path to dictionary, bootstrapping, spfile,&#8230; up to GPnP profile.
+<span id="more-8880"></span>
+If you want to read the rows that are stored in a table, you have to read from the segment extents. </p>
+<h3>Segment Extents</h3>
+<p>How do you find those extents? You need to get the extent list from the tablespace header, and some information from the segment header</p>
+<p>Where is the segment header? This is recorded in the dictionary. For a table it is in SYS.TAB$</p>
+<p>Here is the definition that you can see in ?/rdbms/admin/dcore.bsq which is run at CREATE DATABASE time
+<pre>
+create table tab$                                             /* table table */
+( obj#          number not null,                            /* object number */
+  dataobj#      number,                          /* data layer object number */
+  ts#           number not null,                        /* tablespace number */
+  file#         number not null,               /* segment header file number */
+  block#        number not null,              /* segment header block number */
+</pre></p>
+<p>TAB$ has all table definition and the TS#, FILE# and BLOCK# identifies uniquely the block where the segment header is. TS# identifies the tablespace. FILE# identifies the datafile within the tablespace. And BLOCK# is the offset within that file (there is only one block size for a tablespace). This is the physical identifier of a segment.</p>
+<p>Let&#8217;s take SCOTT.EMP as an example</p>
+<p><pre>
+SQL&gt; select object_id,object_type,data_object_id from dba_objects where owner='SCOTT' and object_name='EMP';
+
+ OBJECT_ID OBJECT_TYPE             DATA_OBJECT_ID
+---------- ----------------------- --------------
+    121515 TABLE                           121533
+</pre></p>
+<p>I get segment header from TAB$</p>
+<p><pre>
+SQL&gt; select ts#,file#,block# from sys.tab$ where obj#=121515;
+
+       TS#      FILE#     BLOCK#
+---------- ---------- ----------
+         4          6        458
+</pre></p>
+<p>The extents listed in the tablespace header can be displayed from X$KTFBUE fixed table (if it were a Dictionary Managed Tablespace this information would be in the dictionary table UET$)</p>
+<p><pre>
+SQL&gt; select ktfbuefno,ktfbuebno,ktfbueblks from x$ktfbue where ktfbuesegtsn=4 and ktfbuesegfno=6 and ktfbuesegbno=458;
+
+ KTFBUEFNO  KTFBUEBNO KTFBUEBLKS
+---------- ---------- ----------
+         6        456          8
+</pre></p>
+<p>From there we know that SCOTT.EMP data is stored in 8 blocks starting from block number 456 in file 6. This file number is relative to the tablespace, which is the tablespace number 4 because all segment extents are in the same tablespace as the segment header.</p>
+<h3>BOOTSTRAP$</h3>
+<p>Ok, so you can get everything from the dictionary, starting from TAB$. But it&#8217;s a table. So if you want to read it you need to read blocks from it&#8217;s extents. Where are those extents?</p>
+<p>Easy, TAB$ itself has information in TAB$</p>
+<p><pre>
+SQL&gt; select obj# from obj$ where name='TAB$';
+
+      OBJ#
+----------
+         4
+
+SQL&gt; select ts#,file#,block# from sys.tab$ where obj#=4;
+
+       TS#      FILE#     BLOCK#
+---------- ---------- ----------
+         0          1        144
+</pre></p>
+<p>Information is there: segment header is in tablespace 0 (which is SYSTEM) file 1 and block 144. And we can get extents from x$ktfbue where ktfbuesegtsn=0 and ktfbuesegfno=1 and ktfbuesegbno=144</p>
+<p>But wait a minute&#8230; Am I saying that in order to get TAB$ data you need first to get TAB$ data? This is not possible. It&#8217;s a Catch 22 here. TAB$ metadata about itself must be available before being able to read the table. This core dictionary table information must be hardcoded and this is done by special bootstrapping code. The dcore.bsq above is not a normal SQL script, but a Bootstrap SQL which has a special syntax. When those core dictionary objects are created, by CREATE DATABASE, their extents go into an hardcoded location in the SYSTEM datafile.</p>
+<p>And when an instance opens a database, the metadata about them is hardcoded in order to have the minimal information to be able to find the other dictionary information. This is done by pre-filling the dictionary cache with some bootstrap code. And this code is visible:</p>
+<p><pre>
+SQL&gt; select * from bootstrap$ where sql_text like 'CREATE TABLE TAB$%';
+
+     LINE#       OBJ# SQL_TEXT
+---------- ---------- ---------------------------------------------------------------------------------------------------------------------------------
+         4          4 CREATE TABLE TAB$("OBJ#" NUMBER NOT NULL,"DATAOBJ#" NUMBER,"TS#" NUMBER NOT NULL,"FILE#" NUMBER NOT NULL,"BLOCK#" NUMBER NOT NULL
+                      ,"BOBJ#" NUMBER,"TAB#" NUMBER,"COLS" NUMBER NOT NULL,"CLUCOLS" NUMBER,"PCTFREE$" NUMBER NOT NULL,"PCTUSED$" NUMBER NOT NULL,"INIT
+                      RANS" NUMBER NOT NULL,"MAXTRANS" NUMBER NOT NULL,"FLAGS" NUMBER NOT NULL,"AUDIT$" VARCHAR2(38) NOT NULL,"ROWCNT" NUMBER,"BLKCNT"
+                      NUMBER,"EMPCNT" NUMBER,"AVGSPC" NUMBER,"CHNCNT" NUMBER,"AVGRLN" NUMBER,"AVGSPC_FLB" NUMBER,"FLBCNT" NUMBER,"ANALYZETIME" DATE,"SA
+                      MPLESIZE" NUMBER,"DEGREE" NUMBER,"INSTANCES" NUMBER,"INTCOLS" NUMBER NOT NULL,"KERNELCOLS" NUMBER NOT NULL,"PROPERTY" NUMBER NOT
+                      NULL,"TRIGFLAG" NUMBER,"SPARE1" NUMBER,"SPARE2" NUMBER,"SPARE3" NUMBER,"SPARE4" VARCHAR2(1000),"SPARE5" VARCHAR2(1000),"SPARE6" D
+                      ATE) STORAGE (  OBJNO 4 TABNO 1) CLUSTER C_OBJ#(OBJ#)
+</pre></p>
+<p>The code to create TAB$ is there with additional bootstrapping SQL syntax to hardcoded the OBJECT_ID. This table is actually stored in a CLUSTER segment, and its definition is also harcoded in bootstrapping code:</p>
+<p><pre>
+SQL&gt; select * from bootstrap$ where sql_text like 'CREATE CLUSTER C_OBJ#%';
+
+     LINE#       OBJ# SQL_TEXT
+---------- ---------- --------------------------------------------------------------------------------
+         2          2 CREATE CLUSTER C_OBJ#("OBJ#" NUMBER) PCTFREE 5 PCTUSED 40 INITRANS 2 MAXTRANS 25
+                      5 STORAGE (  INITIAL 136K NEXT 200K MINEXTENTS 1 MAXEXTENTS 2147483645 PCTINCREA
+                      SE 0 OBJNO 2 EXTENTS (FILE 1 BLOCK 144)) SIZE 800
+</pre></p>
+<p>File 1 Block 144 this is exactly what we have seen when querying TAB$ but actually it&#8217;s an hardcoded value. You will find exactly the same in all Oracle Database since 8.0</p>
+<p>It seems that it was a different value in Oracle 7:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/05/CaptureBOOTSTRAP.png" rel="lightbox[8880]"><img src="../wp-insides/uploads/sites/2/2016/05/CaptureBOOTSTRAP.png" alt="CaptureBOOTSTRAP" width="632" height="149" class="alignnone size-full wp-image-8888" /></a>
+I don&#8217;t remember that upgrade to 8.0 had to update the first blocks of SYSTEM datafiles, but it was probably the case. If anyone has a database that has been upgraded since Oracle 7 then please tell me, but that should be rare nowadays. But for sure the code that warms up the dictionary cache must be consistent with how those segments are stored in the SYSTEM tablespace.</p>
+<h3>Controlfile</h3>
+<p>Let&#8217;s continue. We know how to read data as soon as the database is opened because all required information is in the SYSTEM datafile. </p>
+<p>But how do we know where is this datafile? The controlfile knows the location of all datafiles and this information is available since the database mount stage</p>
+<p>Here is an example after alter database backup controlfile to trace;</p>
+<p><pre>
+CREATE CONTROLFILE REUSE DATABASE "RACDB" NORESETLOGS  NOARCHIVELOG
+    MAXLOGFILES 192
+    MAXLOGMEMBERS 3
+    MAXDATAFILES 1024
+    MAXINSTANCES 32
+    MAXLOGHISTORY 292
+LOGFILE
+  GROUP 1 '+DATA/RACDB/ONLINELOG/group_1.262.906247575'  SIZE 50M BLOCKSIZE 512,
+  GROUP 2 '+DATA/RACDB/ONLINELOG/group_2.263.906247575'  SIZE 50M BLOCKSIZE 512,
+  GROUP 3 '+DATA/RACDB/ONLINELOG/group_3.264.906247575'  SIZE 50M BLOCKSIZE 512,
+  GROUP 4 '+DATA/RACDB/ONLINELOG/group_4.274.906299789'  SIZE 50M BLOCKSIZE 512,
+  GROUP 5 '+DATA/RACDB/ONLINELOG/group_5.275.906299789'  SIZE 50M BLOCKSIZE 512,
+  GROUP 6 '+DATA/RACDB/ONLINELOG/group_6.276.906299789'  SIZE 50M BLOCKSIZE 512
+-- STANDBY LOGFILE
+DATAFILE
+  '+DATA/RACDB/DATAFILE/system.258.906247493',
+  '+DATA/RACDB/DATAFILE/sysaux.257.906247463',
+  '+DATA/RACDB/DATAFILE/undotbs1.260.906247529',
+</pre></p>
+<p>Now the question is:
+Where is the controlfile? This information is known from the instance parameter:</p>
+<p><pre>
+SQL&gt; show parameter control_files
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ---------------------------------------------
+control_files                        string      +DATA/RACDB/CONTROLFILE/current.261.906247573
+</pre></p>
+<p>Oh good. I&#8217;m in ASM so I can continue my path, with question such as: how do we find the controlfile?</p>
+<p>But before that, where this instance parameter comes from? SPFILE is read at instance startup.</p>
+<p>Where is the SPFILE?</p>
+<h3>Database SPFILE</h3>
+<p><pre>
+SQL&gt; show parameter spfile
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ----------------------------------------------
+spfile                               string      +DATA/RACDB/PARAMETERFILE/spfile.269.906247759
+</pre></p>
+<p>In single instance, the SPFILE is found in $ORACLE_HOME/dbs but here I&#8217;m in RAC and the database resource has this information:
+<pre>
+[oracle@racp1vm1 ~]$ srvctl config database -db RACDB
+Database unique name: RACDB
+Database name: RACDB
+Oracle home: /u01/app/oracle/product/12.1.0/dbhome_1
+Oracle user: oracle
+Spfile: +DATA/RACDB/PARAMETERFILE/spfile.269.906247759
+</pre></p>
+<h3>ASM</h3>
+<p>So in order to find the datafiles or the SPFILE you must have access to the +DATA diskgroup. The information about it is available from the ASM instance and this is easy to find because you have only one asm instance on the server.</p>
+<p>But now, let&#8217;s go to the ASM instance. It stores all metadata in the disks that are accessible once the instance has started. What does it need to start and to find those disks?
+The ASM instance has a SPFILE and information from the SPFILE is mandatory to access the diskgroups. So where is the SPFILE of the ASM instance?</p>
+<p><pre>
+[grid@racp1vm1 ~]$ asmcmd spget
++CRS_DG/ws-dbi-scan1/ASMPARAMETERFILE/registry.253.905527691
+</pre></p>
+<p>Okay&#8230; another Catch 22 here. the ASM SPFILE is stored in ASM and you need an ASM instance to access to it&#8230; but starting an ASM instance needs SPFILE information&#8230;</p>
+<h3>GPnP profile</h3>
+<p>I&#8217;ll not go into details which are very well explained by Anju Garg in her blog post <a href="http://oracleinaction.com/asm-spfile-on-asm/#trackback" target="_blank">http://oracleinaction.com/asm-spfile-on-asm/</a> and Robert Bialek one referenced at the end of it.</p>
+<p><pre>
+[grid@racp1vm1 ~]$ gpnptool get -o- | xmllint --format - | grep SPFile
+
+Success.
+  &lt;orcl:ASM-Profile id="asm" DiscoveryString="/dev/mapper/*" SPFile="+CRS_DG/ws-dbi-scan1/ASMPARAMETERFILE/registry.253.905527691" Mode="remote"/&gt;
+</pre></p>
+<p>Everything is there. The GPnP profile has the ASM discovery string that lists the system disks. They are scanned at cluster start and all bootstrap information is found in the bootstrap header. </p>
+<p>When you change the asm_diskstring from the ASM instance, or when you change the SPFILE location from asmcmd, the GPnP profile is updated. And if it is corrupted, the cluster doesn&#8217;t start. </p>
+<p>I used &#8216;gnpnptool get&#8217; but that doesn&#8217;t tell us where is the GPnP profile stored.</p>
+<p><pre>
+[grid@racp1vm1 ~]$ ls $ORACLE_HOME/gpnp/$HOSTNAME/profiles/peer/profile.xml
+/u01/app/12.1.0/grid/gpnp/racp1vm1/profiles/peer/profile.xml
+</pre>
+Here is the content, but you need gpnptool to change it because it is signed.
+<pre>
+[grid@racp1vm1 ~]$ cat $ORACLE_HOME/gpnp/$HOSTNAME/profiles/peer/profile.xml
+&lt;?xml version="1.0" encoding="UTF-8"?&gt;&lt;gpnp:GPnP-Profile Version="1.0" xmlns="http://www.grid-pnp.org/2005/11/gpnp-profile" xmlns:gpnp="http://www.grid-pnp.org/2005/11/gpnp-profile" xmlns:orcl="http://www.oracle.com/gpnp/2005/11/gpnp-profile" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.grid-pnp.org/2005/11/gpnp-profile gpnp-profile.xsd" ProfileSequence="9" ClusterUId="3db40dc75a3aef58bf2f0b71e011b137" ClusterName="ws-dbi-scan1" PALocation=""&gt;&lt;gpnp:Network-Profile&gt;&lt;gpnp:HostNetwork id="gen" HostName="*"&gt;&lt;gpnp:Network id="net1" IP="192.168.22.0" Adapter="bond0" Use="public"/&gt;&lt;gpnp:Network id="net2" IP="10.1.1.0" Adapter="enp0s10" Use="cluster_interconnect,asm"/&gt;&lt;/gpnp:HostNetwork&gt;&lt;/gpnp:Network-Profile&gt;&lt;orcl:CSS-Profile id="css" DiscoveryString="+asm" LeaseDuration="400"/&gt;&lt;orcl:ASM-Profile id="asm" DiscoveryString="" SPFile="+CRS_DG/ws-dbi-scan1/ASMPARAMETERFILE/registry.253.905527691" Mode="remote"/&gt;&lt;ds:Signature xmlns:ds="http://www.w3.org/2000/09/xmldsig#"&gt;&lt;ds:SignedInfo&gt;&lt;ds:CanonicalizationMethod Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"/&gt;&lt;ds:SignatureMethod Algorithm="http://www.w3.org/2000/09/xmldsig#rsa-sha1"/&gt;&lt;ds:Reference URI=""&gt;&lt;ds:Transforms&gt;&lt;ds:Transform Algorithm="http://www.w3.org/2000/09/xmldsig#enveloped-signature"/&gt;&lt;ds:Transform Algorithm="http://www.w3.org/2001/10/xml-exc-c14n#"&gt; &lt;InclusiveNamespaces xmlns="http://www.w3.org/2001/10/xml-exc-c14n#" PrefixList="gpnp orcl xsi"/&gt;&lt;/ds:Transform&gt;&lt;/ds:Transforms&gt;&lt;ds:DigestMethod Algorithm="http://www.w3.org/2000/09/xmldsig#sha1"/&gt;&lt;ds:DigestValue&gt;3MkzWCCTRYJ1FDJ4h8G6PHrgfQQ=&lt;/ds:DigestValue&gt;&lt;/ds:Reference&gt;&lt;/ds:SignedInfo&gt;&lt;ds:SignatureValue&gt;XQtNrjbazMkfCO1e52scpC8y3tdpVbyFxWPPXirbZOmZ+ajcnAOD85qMJUPBaXG8G2sLCWVX5ir+Reo5f0ewyHCtzpGud9IWoYhb01T2W0o4WYzFFcwncxHDWDBCdLiKdSBOEJytRMCufgfciA/v6nzxWzDRS/7svWzG7shVzpI=&lt;/ds:SignatureValue&gt;&lt;/ds:Signature&gt;&lt;/gpnp:GPnP-Profile&gt;
+</pre></p>
+<h3>/etc/oratab</h3>
+<p>I used $ORACLE_HOME which is the Grid infrastructure home. If you&#8217;re not sure where it is, look at the +ASM entry in /etc/oratab:
+<pre>
+[grid@racp1vm1 ~]$ grep +ASM /etc/oratab
++ASM1:/u01/app/12.1.0/grid:N            # line added by Agent
+</pre></p>
+<p>So, with $HOSTNAME and /etc/oratab you can follow the path and understand how oracle can get any information from the system: configuration, metadata, data. Of course you can continue your questions at the system level: how the disks are opened and find your way with devices, multipathing,&#8230;</p>
+<h3>Conclusion</h3>
+<p>Even when a system is complex (and Grid Infrastructure / RAC is complex) you can follow the path and understand where information comes from. There&#8217;s no magic. There&#8217;s no black box. Everything can be understood. It may take time reading documentation, reading logs, testing, tracing,&#8230; But this is how you can understand exactly how it works and thus be prepared to troubleshoot any issue. As an example, in a lab (such as the <a href="https://en.wikibooks.org/wiki/RAC_Attack_-_Oracle_Cluster_Database_at_Home" target="_blank">racattack</a> one) you can try to mess-up some ASM SPFILE parameters, for example change asm_diskstring to some random characters, and try to restart the cluster. If you don&#8217;t know how it works, you may spend a long time before fixing the issue, and the risk is that you break it even more. If you have read and understood the above then you will know exactly what has to be fixed: if the GPnP profile can&#8217;t find the disks then nothing can go further.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-88810" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/05/CaptureBOOTSTRAP.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

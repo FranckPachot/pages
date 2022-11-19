@@ -1,0 +1,215 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-iii />
+<meta name=description content='A blog post from 2017 about Postgres vs. Oracle access paths III &#8211; Partial Index'>
+<title>Postgres vs. Oracle access paths III &#8211; Partial Index</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-iii>https://blog.dbi-services.com/postgres-vs-oracle-access-paths-iii</a> (2017-08-03), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Postgres vs. Oracle access paths III &#8211; Partial Index</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="../postgres-vs-oracle-access-paths-ii/index.html" target="_blank">previous post</a> I said that an Index Only Access needs to find all rows in the index. Here is a case where, with similar data, Postgres can find all rows but Oracle needs additional considerations.
+<span id="more-17674"></span>
+In the previous post I&#8217;ve executed:
+<pre>select sum(n) from demo1</pre>
+The execution plan was:
+<pre>
+ Aggregate  (cost=295.29..295.30 rows=1 width=8) (actual time=2.192..2.193 rows=1 loops=1)
+   Output: sum(n)
+   Buffers: shared hit=30
+   -&gt;  Index Only Scan using demo1_n on public.demo1  (cost=0.29..270.29 rows=10000 width=4) (actual time=0.150..1.277 rows=10000 loops=1)
+         Output: n
+         Heap Fetches: 0
+         Buffers: shared hit=30
+</pre></p>
+<p>Basically, this reads all values of the column N and then aggregates them to the sum.
+If I remove the SUM() I have only the part that reads all values from N:
+<pre>
+explain (analyze,verbose,costs,buffers) select n from demo1 ;
+                                                             QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_n on public.demo1  (cost=0.29..270.29 rows=10000 width=4) (actual time=0.150..1.284 rows=10000 loops=1)
+   Output: n
+   Heap Fetches: 0
+   Buffers: shared hit=30
+ Planning time: 0.440 ms
+ Execution time: 1.972 ms
+</pre></p>
+<h3>Oracle</h3>
+<p>This sounds logical. Now let&#8217;s run the same query, a simple &#8216;select n from demo1&#8242; in Oracle:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  ad4z7tpt0dkta, child number 0
+-------------------------------------
+select /*+  */ n from demo1
+--------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |       |      1 |        |   397 (100)|  10000 |00:00:00.01 |    1451 |
+|   1 |  TABLE ACCESS FULL| DEMO1 |      1 |  10000 |   397   (0)|  10000 |00:00:00.01 |    1451 |
+--------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<p>Here the access path is different: a full table scan instead of an index only access (Index Fast Full Scan). It is not a cost decision. If we try to force an index access, with INDEX_FFS() or INDEX() hints, the query will still do a Full Table Scan. The reason is that and index only access is possible only if all columns and all rows are present in the index. But Oracle does not always index all rows. The Oracle index has no entry for the rows where all the indexed columns are nulls.</p>
+<h3>Where n is not null</h3>
+<p>If I run the same query with the purpose of showing only non-null values, with a &#8216;where n is not null&#8217; predicate, then an index only access is possible:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  2gbjpw5u0v9cw, child number 0
+-------------------------------------
+select /*+  */ n from demo1 where n is not null
+-------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |         |      1 |        |     7 (100)|  10000 |00:00:00.01 |      28 |
+|   1 |  INDEX FAST FULL SCAN| DEMO1_N |      1 |  10000 |     7   (0)|  10000 |00:00:00.01 |      28 |
+-------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter("N" IS NOT NULL)
+</pre></p>
+<h3>Constraints</h3>
+<p>An alternative, if we know that we will never have null values here, is to give the information to the optimizer that there are no null values in the column N:
+In Oracle:
+<pre>alter table demo1 modify n not null;</pre>
+This is the equivalent of the PostgreSQL
+<pre>alter table demo1 alter column n set not null;</pre>
+Then, in addition to ensuring the verification of the constraint, the constraint informs the optimizer that there is no null values and that all rows can be find in the index:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  ad4z7tpt0dkta, child number 0
+-------------------------------------
+select /*+  */ n from demo1
+-------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |         |      1 |        |     7 (100)|  10000 |00:00:00.01 |      28 |
+|   1 |  INDEX FAST FULL SCAN| DEMO1_N |      1 |  10000 |     7   (0)|  10000 |00:00:00.01 |      28 |
+-------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<h3>Additional columns</h3>
+<p>Even if the column can have some null values, it is easy to have an index on null values in Oracle, just by adding a non-null column or expression. And if you don&#8217;t need this additional column, you can even add a constant, such as in the following index definition:
+<pre>
+create unique index demo1_n on demo1(n,0);
+</pre>
+This works because all index entries have at least one non null value. But looking at the buffers you can see that this additional byte (0 is stored in 1 byte) has a little overhead (31 blocks read here instead of 28):
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  ad4z7tpt0dkta, child number 0
+-------------------------------------
+select /*+  */ n from demo1
+-------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |         |      1 |        |     8 (100)|  10000 |00:00:00.01 |      31 |
+|   1 |  INDEX FAST FULL SCAN| DEMO1_N |      1 |  10000 |     8   (0)|  10000 |00:00:00.01 |      31 |
+-------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<h3>Oracle Partial Indexes</h3>
+<p>In Oracle, all indexes that include a nullable column are partial indexes: not all rows are indexed, and an index access is possible only if the WHERE clause, or a constraint, guarantees that we don&#8217;t need the non-indexed rows. Combined with expression, it can be a way to implement partial indexes when the expression returns null for a specific condition. Oracle even provides computed columns (aka virtual columns) so that the expression does not have to be coded in the where clause of the query.</p>
+<p>As an example with expressions, the following index has entries only for the values lower than 10:
+<pre>create index demo_top10 on demo1(case when n&lt;=10 then n end)</pre></p>
+<p>However, to use it, we must mention the expression explicitly:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  863drbjwayrt7, child number 0
+-------------------------------------
+select /*+  */ (case when n&lt;=10 then n end) from demo1 where (case when
+n&lt;=10 then n end)&lt;=5
+---------------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name          | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |               |      1 |        |     1 (100)|      4 |00:00:00.01 |       2 |
+|*  1 |  INDEX RANGE SCAN| DEMO1_N_TOP10 |      1 |      5 |     1   (0)|      4 |00:00:00.01 |       2 |
+---------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - access(&quot;DEMO1&quot;.&quot;SYS_NC00004$&quot;&lt;=5)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - &quot;DEMO1&quot;.&quot;SYS_NC00004$&quot;[NUMBER,22]
+</pre>
+We can see that internally, a virtual column (&#8220;SYS_NC00004$&#8221;) has been created for the indexed expression, and is used for the predicate and the projection which uses the same expression. There is another possibility with the &#8216;partial index&#8217; feature introduced in 12<i>c</i> but it has not the flexibility of a predicate: it is based on partitioning where only some partitions can be indexed.</p>
+<h3>Postgres Partial Indexes</h3>
+<p>Postgres does not need those workarounds. An index indexes all rows, including null entries, and partial indexes can be defined with a where clause:
+<pre>create index demo_top10 on demo1(n) where n&lt;=10</pre></p>
+<p>No need to change the query. As long as the result can come from the partial index, we can use the column without an expression on it:
+<pre>
+explain (analyze,verbose,costs,buffers) select n from demo1 where n&lt;=5 ;
+                                                           QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_n_top10 on public.demo1  (cost=0.14..4.21 rows=4 width=4) (actual time=0.114..0.114 rows=5 loops=1)
+   Output: n
+   Index Cond: (demo1.n &lt;= 5)
+   Heap Fetches: 0
+   Buffers: shared hit=2
+ Planning time: 0.557 ms
+ Execution time: 0.129 ms
+</pre>
+Here the smaller partial index (demo1_n_top10) has been chosen by the query planner.</p>
+<p>As you see I&#8217;ve not used exactly the same condition. The query planner understood that n&lt;=5 (in the WHERE clause) is a subset of n&lt;=10 (in the index definition). However, if the predicate is too different, it cannot use the index:
+<pre>
+fpa=# explain (analyze,verbose,costs,buffers) select n from demo1 where 2*n&lt;=10;
+                                                           QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_n on public.demo1  (cost=0.29..320.29 rows=3333 width=4) (actual time=0.020..1.086 rows=5 loops=1)
+   Output: n
+   Filter: ((2 * demo1.n) &lt;= 10)
+   Rows Removed by Filter: 9995
+   Heap Fetches: 0
+   Buffers: shared hit=30
+</pre></p>
+<p>Here, instead of &#8220;Index Cond&#8221; we have a simple &#8220;Filter&#8221;. The Index Only Scan has read all the rows, and they were filtered afterward (&#8220;Rows Removed by Filter&#8221;).</p>
+<h3>Index condition</h3>
+<p>With the VERBOSE option of EXPLAIN we see the condition used by the index access:
+<pre>Index Cond: (demo1.n &lt;= 5)</pre>
+&#8216;Index Cond.&#8217; is not a simple filter removing rows after an operation, but it is the condition which is used for fast access to the index entries in the sorted index structure. We have the equivalent in Oracle with the &#8216;+predicate&#8217; format of dbms_xplan:
+<pre>
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - access("N"&lt;=5)
+</pre></p>
+<p>Before going further on index access for WHERE clause predicate, the <a href="../postgres-vs-oracle-access-paths-iv/index.html" target="_blank">next post</a> will show the major characteristic of indexes (besides the fact that it stores a redundant subset of columns and rows): they are maintained sorted and may return the resulting rows in order.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-176750"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

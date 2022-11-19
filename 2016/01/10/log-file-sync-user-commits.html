@@ -1,0 +1,195 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/log-file-sync-user-commits />
+<meta name=description content='A blog post from 2016 about log file sync / user commits'>
+<title>log file sync / user commits</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/log-file-sync-user-commits>https://blog.dbi-services.com/log-file-sync-user-commits</a> (2016-01-10), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">log file sync / user commits</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When presenting &#8216;Interpreting AWR Reports &#8211; Straight to the Goal&#8217; at UKOUG TECH15 I had a very good question about the Statspack report I read which had log file sync much smaller than user commits. I realized that this needs a longer explanation, and that my slide is very misleading because I divided log file sync wait time per user commits, which probably make no sense here.
+<span id="more-6474"></span>
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/01/CapturePreziAWR-Commit.jpg" rel="lightbox[6474]"><img src="../wp-insides/uploads/sites/2/2016/01/CapturePreziAWR-Commit.jpg" alt="CapturePreziAWR-Commit" width="605" height="452" class="alignnone size-full wp-image-6475" /></a></p>
+<h3>log file sync</h3>
+<p>&#8216;log file sync&#8217; occurs at commit time when your session waits that all redo protecting the transaction is written on disk. The idea is that when the end-user receives a &#8216;commit successful&#8217; response, he expects that the changes are durable &#8211; as the D in ACID &#8211; even in case of instance crash. That means that the redo must be on a persistent storage.</p>
+<h3>User commits</h3>
+<p>In my presentation about reading an AWR report I show how we must always match the event time with the end-user response time. And that was probably my idea when dividing &#8216;log file sync&#8217; by &#8216;user commits&#8217;. But that was probably a bad idea here and I&#8217;ll change this slide for the next presentation (soon: <a href="http://oraclemidlands.com/" target="_blank">http://oraclemidlands.com/</a>) because it makes no sense.</p>
+<h3>SQL commit</h3>
+<p>I&#8217;ll take simple examples to explain. In the first example I run 2000 insert + commit and chack the session statistics:
+<pre>
+STAT/EVENT                                              VALUE
+-------------------------------------------------- ----------
+STAT user commits                                        2000
+STAT user calls                                          8017
+STAT redo size                                        1121052
+WAIT log file sync                                       2001
+</pre>
+As you can see here, each commit (&#8216;user commit&#8217;) increase the &#8216;log file sync&#8217; event. It may be very quick if redo is already on disk but the wait event is always incremented.</p>
+<h3>SQL commit write</h3>
+<p>Same with &#8216;commit write&#8217; which uses the commit_logging and commit_wait parameters (the default here):
+<pre>
+STAT/EVENT                                              VALUE
+-------------------------------------------------- ----------
+STAT user commits                                        2000
+STAT redo size                                        1171124
+STAT commit batch/immediate requested                    2000
+STAT commit immediate requested                          2000
+STAT commit batch/immediate performed                    2000
+STAT commit immediate performed                          2000
+STAT commit wait/nowait requested                        2000
+STAT commit wait requested                               2000
+STAT commit wait/nowait performed                        2000
+STAT commit wait performed                               2000
+STAT execute count                                       4128
+WAIT log file sync                                       2001
+</pre>
+Same values here, but more detail. From the values we see that commit write IMMEDIATE WAIT was performed</p>
+<h3>SQL commit write batch nowait</h3>
+<p>I&#8217;ll not show all combinations here. Here is BATCH (to optimize redo size to write) and NOWAIT:
+<pre>
+STAT/EVENT                                              VALUE
+-------------------------------------------------- ----------
+STAT user commits                                        2000
+STAT redo size                                        1034768
+STAT commit batch/immediate requested                    2000
+STAT commit batch requested                              2000
+STAT commit batch/immediate performed                    2000
+STAT commit batch performed                              2000
+STAT commit wait/nowait requested                        2000
+STAT commit nowait requested                             2000
+STAT commit wait/nowait performed                        2000
+STAT commit nowait performed                             2000
+WAIT log file sync                                          1
+</pre>
+With NOWAIT, we don&#8217;t wait for log writer and we don&#8217;t have any &#8216;log file sync&#8217;. Which means that the response time of the commit is nearly immediate (only the time to update the transaction table). But of course, we may lose a commited transaction if log writer didn&#8217;t have time to write it before an instance crash.</p>
+<p>This is the case I have in my example, and this is the reason why &#8216;log file sync&#8217; is lower than &#8216;user commits';
+Actually the example was done with <a href="http://www.dominicgiles.com/swingbench.html" target="_blank">Swingbench</a> where transactions are done in a pl/sql procedure.</p>
+<h3>PL/SQL loop with commit</h3>
+<p>Here I&#8217;m calling 100 times a PL/SQL procedure that do 20 commits inside.
+<pre>
+STAT/EVENT                                              VALUE
+-------------------------------------------------- ----------
+STAT user commits                                        2000
+STAT redo size                                        1044088
+WAIT log file sync                                        101
+</pre>
+PL/SQL default is different. It is doing something like NOWAIT BATCH implicitly. The idea is that you care that redo is persisted or not when it&#8217;s in the middle of a user call, because if it crashes, nobody has been notified that it is committed. Of course that may not be the right way if there are other users notified. We can go back to the SQL behavior by issuing &#8216;COMMIT WRITE&#8217;.</p>
+<p>When the PL/SQL exits and there has been some commit done, an additional commit is done in WAIT mode this time, to be sure that all redo is persisted before returning to end-user.</p>
+<h3>Conclusion</h3>
+<p>The &#8216;log file sync wait event&#8217; is actually the one that measure the number of times the end-user has waited on commit. And I was wrong to divide it by &#8216;user commits&#8217;. I&#8217;m changing the slide to the following.
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/01/CapturePreziAWR-Commit2.jpg" rel="lightbox[6474]"><img src="../wp-insides/uploads/sites/2/2016/01/CapturePreziAWR-Commit2.jpg" alt="CapturePreziAWR-Commit2" width="867" height="511" class="alignnone size-full wp-image-6481" /></a></p>
+<p>Hope to see you in Birmingham, Tuesday 26 January, 18:00 &#8211; 21:00</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-64750" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/01/CapturePreziAWR-Commit.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-2546">
+				<div id="div-comment-2546" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/d6a7d28aa19fb14f867461a3dad72978?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://savvinov.com' rel='external nofollow' class='url'>Nikolay Savvinov</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2546">
+			January 10, 2016 at 22 h 51 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>it might be helpful to mention the piggyback commit mechanism here: it would explain to your audience the difference between user commits and log file sync events and make it easier to understand why log file sync wait time should not be divided by user commits.</p>
+<p>Best regards,
+  Nikolay
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25471"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2546' onclick='return addComment.moveForm( "div-comment-2546", "2546", "respond", "6474" )' aria-label='Reply to Nikolay to Nikolay Savvinov'>Reply to Nikolay</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-2552">
+				<div id="div-comment-2552" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2552">
+			January 11, 2016 at 8 h 37 min</a>		</div>
+
+		<p>Hi Nikolay,
+Thanks for your comment. I may be wrong and then don&#8217;t hesitate to comment here or on your blog, but I&#8217;m not sure piggyback commit comes into play here between &#8216;user commits&#8217; and &#8216;log file sync&#8217;. For sure it can explain difference with &#8216;log file parallel write&#8217;, but with &#8216;user commits&#8217; I think that only the commit nowait is responsible for the difference here.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25531"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2552' onclick='return addComment.moveForm( "div-comment-2552", "2552", "respond", "6474" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-2562">
+				<div id="div-comment-2562" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a2a19e1fb1fdd173d1a39b0e73390c09?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Foued</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2562">
+			January 11, 2016 at 22 h 16 min</a>		</div>
+
+		<p>Thank you for this post. Appreciated .
+Foued
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-25631"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2562' onclick='return addComment.moveForm( "div-comment-2562", "2562", "respond", "6474" )' aria-label='Reply to Foued to Foued'>Reply to Foued</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

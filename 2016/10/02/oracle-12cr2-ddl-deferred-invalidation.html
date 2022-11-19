@@ -1,0 +1,280 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-12cr2-ddl-deferred-invalidation />
+<meta name=description content='A blog post from 2016 about Oracle 12cR2: DDL deferred invalidation'>
+<title>Oracle 12cR2: DDL deferred invalidation</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-12cr2-ddl-deferred-invalidation>https://blog.dbi-services.com/oracle-12cr2-ddl-deferred-invalidation</a> (2016-10-02), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle 12cR2: DDL deferred invalidation</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a <a href="http://blog.dbi-services.com/oracle-12cr2-is_rolling_invalid-in-vsql/" target="_blank">previous post</a> I described the new V$SQL views about rolling invalidation. I did the example with dbms_stats which is able to do rolling invalidation since 11g. But more is coming with 12.2 as you can use rolling invalidation for some DDL.
+<span id="more-10875"></span>
+When you do some DDL on an object, dependent cursors are invalidated. On a busy database it&#8217;s something to avoid. I&#8217;ve seen recently a peak of hanging sessions during 10 minutes and the root cause was an ALTER TABLE ADD COMMENT. This do not change anything in the execution plan, but the cursors are invalidated. And doing that on a central table can trigger a hard parse storm.</p>
+<p>For the example, I&#8217;ll reduce the rolling invalidation window to 25 seconds as I don&#8217;t want to wait hours:
+<pre>SQL&gt; alter system set "_optimizer_invalidation_period"=25;
+System altered.</pre>
+Currently 12.2 is available only on Oracle Database Express Cloud Service, but please don&#8217;t ask me how I was able to set an underscore parameter there. However you can reproduce the same by waiting 5 hours instead of 25 seconds.</p>
+<p>I create a simple table and prepare my query to check cursor information:
+<pre>
+SQL&gt; create table DEMO as select * from dual;
+Table created.
+
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+no rows selected
+
+</pre>
+I run a simple query and check the cursor:
+<pre>
+SQL&gt; SELECT * FROM DEMO;
+
+D
+-
+X
+
+SQL&gt;
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           1          1 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    N
+</pre>
+1 parse call, cursor loaded, hard parsed and executed.</p>
+<p>I create an index on the table with the DEFERRED INVALIDATION new syntax:</p>
+<p><pre>
+SQL&gt; create index DEMO on DEMO(dummy) deferred invalidation;
+Index created.
+</pre>
+I see that it is flagged as rolling invalid:
+<pre>
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           1          1 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    Y
+</pre>
+When I run it, a timestamp is set within the rolling invalidation window (5 hours by default, but here 25 seconds):
+<pre>
+SQL&gt; SELECT * FROM DEMO;
+
+D
+-
+X
+
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    X
+</pre>
+As you see, this Y/N flag has a third value to show that it has been executed after being rolling invalidated.</p>
+<p>I wait 30 seconds:
+<pre>
+SQL&gt; host sleep 30
+</pre>
+From that point, the invalidation timestamp has been reached so a new execution will create a new child cursor:
+<pre>
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    X
+
+SQL&gt; SELECT * FROM DEMO;
+
+D
+-
+X
+
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    X
+SELECT * FROM DEMO              0          1           1          1 2016-09-17/01:04:16 2016-09-17/01:04:45 01:04:45    N
+</pre></p>
+<p>You must be careful here. If you used to check the INVALIDATIONS column, then you may miss the rolling ones. INVALIDATIONS is for parent cursors. IS_ROLLING_INVALID is for invalidated child cursors.</p>
+<p>Note that, of course, until the invalidation, the new index will not be used by those cursors. So if you create the index to solve an performance issue you may prefer to invalidate the cursors immediately.</p>
+<p>Same can be done with index rebuild:</p>
+<p><pre>
+SQL&gt; alter index DEMO rebuild deferred invalidation;
+Index altered.
+
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    X
+SELECT * FROM DEMO              0          1           1          1 2016-09-17/01:04:16 2016-09-17/01:04:45 01:04:45    Y
+
+SQL&gt; SELECT * FROM DEMO;
+
+D
+-
+X
+
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    X
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:45 01:04:46    X
+</pre></p>
+<p>Of course, rolling invalidation can happen only for the cursors that do not use the index. The execution plans which use the index are invalidated immediately.</p>
+<p>With the same restriction, you can do it when you set an index unusable</p>
+<p><pre>
+SQL&gt; alter index DEMO unusable deferred invalidation;
+
+Index altered.
+
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    X
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:45 01:04:46    X
+
+SQL&gt; SELECT * FROM DEMO;
+
+D
+-
+X
+
+SQL&gt; select sql_text,invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time,is_rolling_invalid from v$sql where sql_text like 'S%DEMO%';
+
+SQL_TEXT            INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE IS_ROLLING_INVALID
+------------------- ------------- ---------- ----------- ---------- ------------------- ------------------- ----------- --------------------
+SELECT * FROM DEMO              0          1           2          2 2016-09-17/01:04:16 2016-09-17/01:04:16 01:04:16    X
+SELECT * FROM DEMO              0          1           3          3 2016-09-17/01:04:16 2016-09-17/01:04:45 01:04:46    X
+</pre></p>
+<p>You get the same behavior if you drop the index: cursors that do not use it are no invalidated immediately.</p>
+<p>From my tests, you can add DEFERRED INVALIDATION when you MOVE TABLE, but invalidation is immediate. Only when moving partitions, the rolling invalidation occurs.</p>
+<p>An alternative to specify DEFERRED INVALIDATION in the DDL is to set it as the default:</p>
+<p><pre>
+SQL&gt; show parameter cursor_invalidation
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+cursor_invalidation                  string      IMMEDIATE
+
+SQL&gt; alter session set cursor_invalidation=deferred;
+
+Session altered.
+
+</pre></p>
+<p>But remember, not all DDL will do rolling invalidation, even when the syntax is accepted.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-108760"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-7556">
+				<div id="div-comment-7556" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/08b4eccce68cd521b54671abb0442ae1?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://jonathanlewis.wordpress.com' rel='external nofollow' class='url'>Jonathan Lewis</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7556">
+			May 25, 2017 at 22 h 01 min</a>		</div>
+
+		<p>Franck,</p>
+<p>Useful information, thanks.</p>
+<p>I&#8217;m guessing that deferred invalidation would probably not apply to exchange partition &#8211; but if you happened to have time to test it it would be nice to know the results; it&#8217;s a fairly common one.</p>
+<p>Regards
+Jonathan Lewis
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75571"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7556' onclick='return addComment.moveForm( "div-comment-7556", "7556", "respond", "10875" )' aria-label='Reply to Jonathan to Jonathan Lewis'>Reply to Jonathan</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7557">
+				<div id="div-comment-7557" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7557">
+			May 26, 2017 at 10 h 13 min</a>		</div>
+
+		<p>Hi Jonathan,
+Thanks. From a first test, it works with partition exchange: rolling invalidation for all cursors (even those accessing the exchanged partition) when exchange table has same indexes. Immediate invalidation if indexes are not included in the exchange. I&#8217;ll post about it and also open SR because the column IS_ROLLING_INVALID is not updated to Y and X in this case.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75581"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7557' onclick='return addComment.moveForm( "div-comment-7557", "7557", "respond", "10875" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-7569">
+				<div id="div-comment-7569" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7569">
+			May 29, 2017 at 21 h 38 min</a>		</div>
+
+		<p>Here is the test with exchange partition: <a href="../oracle-12cr2-exchange-partition-deferred-invalidation/index.html" rel="nofollow">https://blog.dbi-services.com/oracle-12cr2-exchange-partition-deferred-invalidation/</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75701"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7569' onclick='return addComment.moveForm( "div-comment-7569", "7569", "respond", "10875" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

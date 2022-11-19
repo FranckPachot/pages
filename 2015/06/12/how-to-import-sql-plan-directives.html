@@ -1,0 +1,163 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/how-to-import-sql-plan-directives />
+<meta name=description content='A blog post from 2015 about How to import SQL Plan Directives'>
+<title>How to import SQL Plan Directives</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/how-to-import-sql-plan-directives>https://blog.dbi-services.com/how-to-import-sql-plan-directives</a> (2015-06-12), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">How to import SQL Plan Directives</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Today I&#8217;ve presented SQL Plan Directives at the SOUG Romandie event. I had a question about the import/export of directives by Data Pump. The idea is that a lot of testing has been done on QA in order to validate the upgrade to 12c. A few directives had bad consequences (see <a href="http://www.ludovicocaldara.net/dba/sql-plan-directives-problem">Ludovico Caldara blog post</a> for an example), then directives have been disabled. When going to production, they want to start with those directives disabled. Yes, they can be imported. We have to pack them into a staging table, import that table, and unpack them. It&#8217;s similar tho what we do with SQL Plan Baselines.</p>
+<h3>testcase: a PERMANENT SPD</h3>
+<p>I&#8217;m using the state of the demo in my presentation where I have a PERMANENT directive that I have disabled because I don&#8217;t want to do too much dynamic sampling.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; show user
+ USER is "DEMO"
+ SQL&gt; select table_name,num_rows,last_analyzed from user_tables;
+ TABLE_NAME NUM_ROWS LAST_ANA
+ -------------------- ---------- --------
+ STGTAB
+ DEMO_TABLE 1000 17:35:51
+ SQL&gt; select table_name,column_name,num_distinct,last_analyzed from user_tab_col_statistics;
+ TABLE_NAME COLUMN_NAME NUM_DISTINCT LAST_ANA
+ -------------------- ------------ ------------ --------
+ DEMO_TABLE A 2 17:35:51
+ DEMO_TABLE B 2 17:35:51
+ DEMO_TABLE C 2 17:35:51
+ DEMO_TABLE D 2 17:35:51
+ DEMO_TABLE SYS_STSPJNMI 2 17:35:51
+ SQL&gt; select directive_id,state,created,last_modified,last_used,enabled,extract(notes,'//internal_state/text()') internal_state from dba_sql_plan_directives where directive_id in( select directive_id from dba_sql_plan_dir_objects where owner=user ) order by created;
+ DIRECTIVE_ID STATE CREATED LAST_MOD LAST_USE ENABLED INTERNAL_
+ ----------------------- ---------- -------- -------- -------- ------- ---------
+ 9456295843023884415 USABLE 17:35:45 18:07:16 18:07:16 NO PERMANENT</pre>
+<h3>Pack directive</h3>
+<p>Datapump can export/import the table, the extended statistics and the statistics, but the SQL Plan Directives are not included. We have to pack then into a staging table in order to export/import that table and umpack it at the destination site.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_spd.create_stgtab_directive('STGTAB');
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select dbms_spd.pack_stgtab_directive('STGTAB',user,9456295843023884415) from dual;
+
+DBMS_SPD.PACK_STGTAB_DIRECTIVE('STGTAB',USER,9456295843023884415)
+-----------------------------------------------------------------
+                                                                1
+
+</pre>
+<h3>DataPump</h3>
+<p>Here I&#8217;ll import the DEMO table, and the STGTAB which contains the packed statistics, through a loopback database link, and import it to another schema: DEMO_SITE2</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create database link LOOPBACK connect to demo identified by demo using '&amp;_CONNECT_IDENTIFIER';
+Database link created.
+
+SQL&gt; host impdp demo/demo@&amp;_CONNECT_IDENTIFIER network_link=LOOPBACK tables="DEMO.DEMO_TABLE,DEMO.STGTAB" remap_schema='DEMO:DEMO_&amp;&amp;1';
+
+Import: Release 12.1.0.1.0 - Production on Thu May 21 18:07:42 2015
+
+Copyright (c) 1982, 2013, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+Starting "DEMO"."SYS_IMPORT_TABLE_01":  demo/********@//192.168.78.114/DEMO14 network_link=LOOPBACK tables=DEMO.DEMO_TABLE,DEMO.STGTAB remap_schema='DEMO:DEMO
+_SITE2'
+Estimate in progress using BLOCKS method...
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+Total estimation using BLOCKS method: 256 KB
+Processing object type TABLE_EXPORT/TABLE/TABLE
+. . imported "DEMO_SITE2"."STGTAB"                            6 rows
+. . imported "DEMO_SITE2"."DEMO_TABLE"                     1000 rows
+Processing object type TABLE_EXPORT/TABLE/INDEX/INDEX
+Processing object type TABLE_EXPORT/TABLE/INDEX/STATISTICS/INDEX_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Job "DEMO"."SYS_IMPORT_TABLE_01" successfully completed at Thu May 21 18:08:18 2015 elapsed 0 00:00:37
+</pre>
+<h3>Check what is imported:</h3>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; show user
+USER is "DEMO_SITE2"
+SQL&gt; select table_name,num_rows,last_analyzed from user_tables;
+
+TABLE_NAME             NUM_ROWS LAST_ANA
+-------------------- ---------- --------
+DEMO_TABLE                 1000 17:35:51
+STGTAB
+
+SQL&gt; select table_name,column_name,num_distinct,last_analyzed from user_tab_col_statistics;
+
+TABLE_NAME           COLUMN_NAME  NUM_DISTINCT LAST_ANA
+-------------------- ------------ ------------ --------
+DEMO_TABLE           A                       2 17:35:51
+DEMO_TABLE           B                       2 17:35:51
+DEMO_TABLE           C                       2 17:35:51
+DEMO_TABLE           D                       2 17:35:51
+DEMO_TABLE           SYS_STSPJNMI            2 17:35:51
+
+SQL&gt; select directive_id,type,state,created,last_modified,last_used,enabled,notes from dba_sql_plan_directives where directive_id in( select directive_id from dba_sql_plan_dir_objects where owner=user ) order by created;
+
+no rows selected
+
+</pre>
+<p>I have my statistics (columns and extended stats for the column group) but no directives. If I stop here, a new query will probably create a new SQL Plan Directive, which will became PERMANENT and will trigger Adaptive Dynamic Sampling. I want to avoid that and get my disabled directive from the previous environment.</p>
+<h3>Unpack directive</h3>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select dbms_spd.unpack_stgtab_directive('STGTAB',user,9456295843023884415) from dual;
+
+DBMS_SPD.UNPACK_STGTAB_DIRECTIVE('STGTAB',USER,9456295843023884415)
+-------------------------------------------------------------------
+                                                                  0
+</pre>
+<p>Look at the returned number: no directive has been unpacked. Because I&#8217;m now into another schema, I have to update the owner. I don&#8217;t know if there is a better way to do it, but here I update the STGTAB:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; update stgtab set c1='DEMO_SITE2';
+
+6 rows updated.
+
+SQL&gt; commit;
+
+Commit complete.
+
+</pre>
+<p>don&#8217;t forget to commit. It doesn&#8217;t work if you don&#8217;t.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select dbms_spd.unpack_stgtab_directive('STGTAB',user,9456295843023884415) from dual;
+
+DBMS_SPD.UNPACK_STGTAB_DIRECTIVE('STGTAB',USER,9456295843023884415)
+-------------------------------------------------------------------
+                                                                  1
+
+SQL&gt; select directive_id,state,created,last_modified,last_used,enabled,extract(notes,'//internal_state/text()') internal_state from dba_sql_plan_directives where directive_id in( select directive_id from dba_sql_plan_dir_objects where owner=user ) order by created;
+
+           DIRECTIVE_ID STATE      CREATED  LAST_MOD LAST_USE ENABLED INTERNAL_
+----------------------- ---------- -------- -------- -------- ------- ---------
+   18397758907897483632 USABLE     18:09:12                   NO      PERMANENT
+
+</pre>
+<p>The directive is there. It&#8217;s disabled which is what I wanted. Creation date and last used has been reset. If you see a directive with a status different than NEW and without a LAST_USED then it&#8217;s an imported one. Note that the directive ID has changed.</p>
+<h3>Conclusion</h3>
+<p>When you have directives in HAS_STATS, then because Data Pump imports the statistics by default (including extended statistics), you probably don&#8217;t need to import the SQL Plan Directives. But if you disabled some statistics and want the same in another environment, you have to pack/import/unpack them.</p>
+<p>This morning event was a great event. Thanks Ludovico for the picture.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-23020"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

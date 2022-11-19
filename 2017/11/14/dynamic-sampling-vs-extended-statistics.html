@@ -1,0 +1,233 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/dynamic-sampling-vs-extended-statistics />
+<meta name=description content='A blog post from 2017 about Dynamic Sampling vs. Extended Statistics'>
+<title>Dynamic Sampling vs. Extended Statistics</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/dynamic-sampling-vs-extended-statistics>https://blog.dbi-services.com/dynamic-sampling-vs-extended-statistics</a> (2017-11-14), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Dynamic Sampling vs. Extended Statistics</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>On datawarehouse databases, I frequently recommend increasing the level of dynamic sampling because:</p>
+<ul>
+<li>Queries have complex predicates with AND, OR, IN(), ranges and correlated values for which the optimizer cannot estimate the cardinality properly</li>
+<li>Queries are long anyway (compared to OLTP) and can afford more parse time to get an optimized execution plan</li>
+</ul>
+<p>However, there&#8217;s a drawback with this approach because sometimes the dynamic sampling estimation may give bad estimations, and supersedes the static statistics which were better. Here is an example in 12.2.0.1
+<span id="more-19565"></span>
+I run with the following parameters:
+<pre>
+SQL&gt; show parameter adaptive;
+NAME                              TYPE    VALUE
+--------------------------------- ------- -----
+optimizer_adaptive_plans          boolean TRUE
+optimizer_adaptive_reporting_only boolean FALSE
+optimizer_adaptive_statistics     boolean FALSE
+optimizer_dynamic_sampling        integer 4
+</pre>
+The Dynamic Sampling level comes from previous version (11<em>g</em>) and the Adaptive Statistics have been disabled because of all the problems seen in 12<em>c</em>R1 with Adaptive Dynamic Sampling bugs.</p>
+<p>I have a query with very bad response time for some values, going to nested loops for 50000 rows. The reason is an under-estimate in the following part of the query:
+<pre>
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+&amp;nbspM
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID |    82 |   574 |   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(UPPER("OPRID")='QWERTZ')
+
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=4)
+</pre></p>
+<p>The estimation is 82 rows but there are actually 50000 rows. We can see dynamic sampling. The misestimate is probably caused by a sample too small.</p>
+<p>Ok, a query with an UPPER() function on the column is not a good idea. Let&#8217;s try to gather statistics for the expression:
+<pre>
+SQL&gt; exec dbms_stats.gather_table_stats('APP_OWNR','TBL_APPLICATION1_ID',method_opt=&gt;'for all columns size auto for columns (upper(OPRID)) size auto');
+PL/SQL procedure successfully completed.
+
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID |    82 |   574 |   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(UPPER("OPRID")='QWERTZ')
+PLAN_TABLE_OUTPUT
+
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=4)
+</pre></p>
+<p>We have the same misestimate. But the problem is not our statistics on expression. This query is still doing dynamic sampling.</p>
+<p>Here&#8217;s the proof that we have good static statistics:
+<pre>
+SQL&gt; alter session set optimizer_dynamic_sampling=2;
+Session altered.
+
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID | 48594 |   332K|   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(UPPER("OPRID")='QWERTZ')
+</pre>
+Dynamic Sampling did not occur at level 2. Now the estimation is ok thanks to the extended statistics. I have a top-frequency histogram where the cardinality of popular value is exact.</p>
+<p>The problem is that dynamic sampling is supposed to add more information to the optimizer, but in this case, it replaces the static statistics. In level 4, dynamic sampling is done as soon as there is a complex predicate in the where clause. And the use of the UPPER() function is considered as a complex predicate. However, in this case, because I have extended statistics, it should be considered as a simple column=value predicate. </p>
+<p>Here I&#8217;ve set dynamic sampling manually, but this is also what happens when SQL Plan Directives trigger the use of Dynamic Sampling and the good histogram is ignored. This reminds me a <a href="http://www.ludovicocaldara.net/dba/sql-plan-directives-problem/" target="_blank">Ludovico Caldara blog post about SPD</a>.</p>
+<p>Here, maybe, the solution would be Adaptive Dynamic Sampling which may increase the level of sampling when needed:
+<pre>
+SQL&gt; alter session set optimizer_dynamic_sampling=11;
+Session altered.
+
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID | 37831 |   258K|   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(UPPER("OPRID")='QWERTZ')
+
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=AUTO)
+</pre></p>
+<p>In this case, Adaptive Dynamic Sampling is a good approximation. But it would be better to have a level of dynamic sampling that does not consider a predicate as a complex one when the extended statistics exactly match the predicate. Before there is enough artificial intelligence to cope with this, the best recommendation is to focus on design. In this case, ensuring that we have only uppercase values is the best way to keep queries and estimations simple.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-195660"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-9359">
+				<div id="div-comment-9359" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/dc43e6499ba6196ef99509ef5a7f3120?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.hourim.wordpress.com' rel='external nofollow' class='url'>Houri</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-9359">
+			November 18, 2017 at 17 h 13 min</a>		</div>
+
+		<p>There is a case in the internal code of the Dynamic sampling algorithm which says that whenever the predicate part, applied on a sample of the table, returns o rows Oracle has then, to let down the dynamic sampling and use the available statistics. I have explained this case here:</p>
+<p><a href="https://hourim.wordpress.com/2015/06/12/why-dynamic-sampling-has-not-been-used/" rel="nofollow">https://hourim.wordpress.com/2015/06/12/why-dynamic-sampling-has-not-been-used/</a></p>
+<p>This is why I always check the Dynamic sampling value for execution plans that have wrong estimations and don&#8217;t have a Note about the Dynamic sampling at their bottom</p>
+<p>Best regards
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-93601"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-9359' onclick='return addComment.moveForm( "div-comment-9359", "9359", "respond", "19565" )' aria-label='Reply to Houri to Houri'>Reply to Houri</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-9519">
+				<div id="div-comment-9519" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/50b817b9aaeee111b6515b9d34f3dcb3?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Michael Milligan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-9519">
+			December 1, 2017 at 15 h 55 min</a>		</div>
+
+		<p>Nice article. As cardinality mis-estimations are a common driver of poor SQL performance, I wonder how often dynamic samplic is the cause.</p>
+<p>Best regards,</p>
+<p>Michael Milligan
+Layton, Utah
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-95201"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-9519' onclick='return addComment.moveForm( "div-comment-9519", "9519", "respond", "19565" )' aria-label='Reply to Michael to Michael Milligan'>Reply to Michael</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

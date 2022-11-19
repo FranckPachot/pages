@@ -1,0 +1,267 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/sql-plan-directive-disabling-usage-and-column-groups />
+<meta name=description content='A blog post from 2015 about SQL Plan Directive: disabling usage and column groups'>
+<title>SQL Plan Directive: disabling usage and column groups</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/sql-plan-directive-disabling-usage-and-column-groups>https://blog.dbi-services.com/sql-plan-directive-disabling-usage-and-column-groups</a> (2015-12-03), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">SQL Plan Directive: disabling usage and column groups</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Yesterday I came upon a comment on <a href="https://www.freelists.org/post/oracle-l/Is-it-possible-to-disable-SQL-Directive-collection-for-few-tables,3" target="_blank">oracle-l</a> while I was reading my slides for the UKOUG TECH15 SuperSunday. I&#8217;ve one slide and one demo about disabling SPD usage but that&#8217;s not enough to explain all variations of what &#8216;usage&#8217; means here.
+<span id="more-5660"></span>
+The comment on Oracle-L was:
+<em>Seems like even after disabling sql plan directives they are still used by dbms_stats to create extended statistics</em>
+and my slides (with presenter notes) is:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/12/CaptureSPDDISABLE.jpg" rel="lightbox[5660]"><img src="../wp-insides/uploads/sites/2/2015/12/CaptureSPDDISABLE.jpg" alt="CaptureSPDDISABLE" width="648" height="648" class="alignnone size-full wp-image-5662" /></a></p>
+<p>Basically when we talk about SPD usage we are talking about the Dynamic Sampling that is triggered by a MISSING_STATS or PERMANENT state SPD. We are not talking about the column groups that are created by dbms_stats when it encounter a &#8216;MISSING_STATS&#8217; SPD in the hope to get better estimation and have finally the SPD as HAS_STATS until it is purged by Auto Drop.
+(if you find that sentence too long, please come to my presentation on Sunday, there&#8217;s a demo and a diagram about those states)</p>
+<p>Let&#8217;s see the different ways we can disable SQL Plan Directives usage, and what is the consequence on dynamic sampling and column groups.</p>
+<h3>Default behaviour</h3>
+<p>The default behaviour is that a misestimate creates a SPD in NEW, and future optimizations will &#8216;use&#8217; the SPD, doing dynamic sampling. When misestimate is confirmed, state is MISSING_STATS. At that point, dbms_stats may create column groups. Future optimizations can set the state in HAS_STATS or PERMANENT depending on whether the misestimate is fixed by the column group statistics.
+You may want to disable that normal behavior because:
+<ul>
+<li>You have a problem with dynamic sampling (long parse time, bugs, etc)</li>
+<li>You have a problem with extended stats (bad execution plans)</li>
+</ul>
+<p>You see the usage from the execution plan:
+<pre>
+ Note:
+   - dynamic statistics used: dynamic sampling (level=2)
+   - 1 Sql Plan Directive used for this statement
+</pre>
+and you see the column group from :
+<pre>
+SQL&gt; select extension_name,extension from user_stat_extensions where table_name='DEMO';
+EXTENSION_NAME                           EXTENSION
+---------------------------------------- ----------------------------------------
+SYS_STSPJNMIY_SDQK5$W04PFYKBIW           ("A","B","C","D")
+</pre></p>
+<h3>set optimizer_features_enable=&#8217;11.2.0.4&#8242;</h3>
+<p>SQL Plan directives being a 12c feature, you can disable all 12c optimizer features.
+Actually, this is the same as setting &#8220;_optimizer_dsdir_usage_control&#8221;=0 so you can see below that it doesn&#8217;t disable all SPD behavior.</p>
+<h3>set &#8220;_optimizer_dsdir_usage_control&#8221;=0</h3>
+<p>Look at the name and the description: <em>controls optimizer usage of dynamic sampling directives</em>
+It disables only the usage. Not the creation of SPD (status NEW) and not the creation of column groups (if you already have a SPD in MISSING_STATS).
+So if you have no SPD at all (all dropped) and you set &#8220;_optimizer_dsdir_usage_control&#8221;=0 then you will see SPD created but not used. Which means no dynamic sampling coming from SPD. And because they are not used the state remains in NEW and no column groups are created.</p>
+<p>However, if you already have SPD or set this at session level only, you may have unexpected behaviour.</p>
+<h3>set optimizer_adaptive_features=false</h3>
+<p>This disables all adaptive features of the optimizer and that&#8217;s probably too wide.
+It achieves our goal as it even disables the creation of SPD, but it also disables Adaptive Plan, which is a very nice feature. I haven&#8217;t seen any bad effect of Adaptive Join until now (please comment if you had bad experience with it).</p>
+<p>I tried to disable adaptive feature and then enable the adaptive plans only:
+<pre>
+SQL&gt; alter session set optimizer_adaptive_features=false;
+Session altered.
+SQL&gt; alter session set "_optimizer_adaptive_plans"=true;
+Session altered.
+</pre>
+but it doesn&#8217;t work. Adaptive Plan remains disabled.</p>
+<h3>set &#8220;_optimizer_gather_feedback&#8221;=false</h3>
+<p>SPD are created when a Auto Re-optimization occurs, which is an evolution of Cardinality Feedback.
+<del datetime="2016-07-18T15:20:13+00:00">If you disable Cardinality Feedback, then you will have no SPD created.</del>
+<strong>Updated 18-JUL-2016:</strong> It seems that I was wrong here. We can see SPD created even auto-reoptimization is disabled.</p>
+<p>You might think that I&#8217;ve the same problem as above because it disables more features than only SPD, but actually I don&#8217;t like cardinality feedback, so that&#8217;s not a problem for me&#8230;</p>
+<h3>set &#8220;_optimizer_enable_extended_stats&#8221;=false</h3>
+<p>Ok, if you problem is not about dynamic sampling but only the extended stats that are coming from the column groups created, then you can disable extended statistics usage for your session or query.</p>
+<h3>set &#8220;_column_tracking_level&#8221;=0</h3>
+<p>I was going to write &#8220;I don&#8217;t know yet a way to disable column group creation&#8221; but then remembered about the 11g way to create column groups automatically, with dbms_stats.seed_col_usage. Actually, what it does is to set &#8220;_column_tracking_level&#8221; to 3.
+Then I tried &#8220;_column_tracking_level&#8221;=0 and it&#8217;s actually a way to avoid column group creation by dbms_stats. But the basic column usage will not be tracked either.</p>
+<h3>dbms_spd.alter_sql_plan_directive(:directive_id,&#8217;ENABLED&#8217;,&#8217;NO&#8217;);</h3>
+<p>Yes you can disable the directive, but once again, this disables only the usage: not the creation of the SPD in NEW, and not the creation of column groups for MISSING_STATS. It&#8217;s similar to _optimizer_dsdir_usage_control but at directive level.
+Which means if the state is MISSING_STATS then column groups may be created anyway:
+<pre>
+12:10:27 SQL&gt; select directive_id,state,last_used,extract(notes,'/spd_note') from dba_sql_plan_directives where directive_id in(select directive_id from dba_sql_plan_dir_objects where owner='DEMO' ) order by type desc;
+                  DIRECTIVE_ID STATE      LAST_USED
+------------------------------ ---------- ---------------------------------------------------------------------------
+EXTRACT(NOTES,'/SPD_NOTE')
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+          17377721491866490983 USABLE     03-DEC-15 12.10.26.000000000 PM
+&lt;spd_note&gt;&lt;internal_state&gt;MISSING_STATS&lt;/internal_state&gt;&lt;redundant&gt;NO&lt;/redundant&gt;&lt;spd_text&gt;{EC(DEMO.DEMO)[A, B, C, D]}&lt;/spd_text&gt;&lt;/spd_note&gt;
+
+12:10:27 SQL&gt; exec dbms_spd.alter_sql_plan_directive(&amp;d,'ENABLED','NO');
+12:10:27 SQL&gt; exec dbms_spd.alter_sql_plan_directive(&amp;d,'STATE','NEW');
+12:10:27 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO',options=&gt;'GATHER AUTO',no_invalidate=&gt;false);
+12:10:27 SQL&gt; select extension_name,extension from user_stat_extensions where table_name='DEMO';
+
+EXTENSION_NAME                           EXTENSION
+---------------------------------------- ----------------------------------------
+SYS_STSPJNMIY_SDQK5$W04PFYKBIW           ("A","B","C","D")
+</pre></p>
+<h3>dbms_spd.alter_sql_plan_directive(:directive_id,&#8217;ENABLED&#8217;,&#8217;NO&#8217;);
+dbms_spd.alter_sql_plan_directive(:directive_id,&#8217;STATE&#8217;,&#8217;NEW&#8217;);</h3>
+<p>Because of problem above, the idea is to set the state to NEW because we observed that in NEW the column groups are not created. Unfortunately, they are still created here. I tried to set LAST_USAGE to null but not better. It&#8217;s probably easy to see what is different in the underlying tables but that&#8217;s enough for this blog post&#8230;</p>
+<p>There is something else about disabling the SPDs. If you disabled them in NEW status, they will be purged after 53 weeks and you are in the next case where they are dropped.</p>
+<h3>dbms_spd.drop_sql_plan_directive(:directive id);</h3>
+<p>If you drop it (or if it&#8217;s dropped by auto drop after retention) then it will probably reappear for the same reason as it appeared the first time (misestimate) so this is not a solution.</p>
+<h3>set &#8220;_optimizer_ads_use_result_cache&#8221;=false</h3>
+<p>OK, last one. Maybe you have no problem with SPD, nor extended stats, nor even with Dynamic Sampling. If you have an issue with the fact that dynamix sampling uses result cache, then you can disable that point. &#8220;_optimizer_ads_use_result_cache&#8221;=false will remove the RESULT_CACHE(snapshot=3600) hint from DS_SVC queries. But try to increase result cache size before that.</p>
+<h3>Conclusion</h3>
+<p>Don&#8217;t disable all 12c features, don&#8217;t disable all adaptive features.
+If you don&#8217;t want SPD at all, the most reliable is to drop all existing SPD and  set &#8220;_optimizer_dsdir_usage_control&#8221;=0
+If you want to manage them and disable some of them, then look at dbms_spd for that and monitor their state.</p>
+<h3>Added 19-05-2016</h3>
+<p>One more with Patch <a href="https://updates.oracle.com/download/21171382.html">21171382</a>: disable creation of extended stats by dbms_stats. It adds AUTO_STAT_EXTENSIONS dbms_stats preference (defaults to OFF).</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-56610" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/12/CaptureSPDDISABLE.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 5 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-2907">
+				<div id="div-comment-2907" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/564911bcb622eac0bf9132672c30cc46?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Lassere</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2907">
+			February 27, 2016 at 9 h 40 min</a>		</div>
+
+		<p>Bonjour,
+Je suis intéressé par les différents états des SPD et les cas de changements.
+Dans un benchmark 12c je suis confronté à une création massive de spd (1000)
+Je pense les désactiver car j ai des changements de plan en permanence.
+Je comprends que les Stats sont imprécises.
+Je calcule les Stats à la volée dans les traitements sans histo sur les tables temporaires mais lors du calcul de Stats il me crée quand même les Stats étendues Mais sans histo.y a t il un moyen de laisser les histos en auto sur les colonnes groupées et laisser sans  histos sur les mono colonnes.sans savoir à l avance quelles Stats étendues vont être créés.
+Merci de votre éventuelle aide.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-29081"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2907' onclick='return addComment.moveForm( "div-comment-2907", "2907", "respond", "5660" )' aria-label='Reply to Lassere to Lassere'>Reply to Lassere</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1 parent" id="comment-2913">
+				<div id="div-comment-2913" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2913">
+			February 28, 2016 at 21 h 14 min</a>		</div>
+
+		<p>Bonjour,
+Les états et cas de changements sont résumés ici: <a href="https://twitter.com/FranckPachot/status/704021163161288705" rel="nofollow">https://twitter.com/FranckPachot/status/704021163161288705</a>
+En 12.1 ce n&#8217;est pas si marginal de désactiver quelques SPD&#8230;
+Cordialement,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-29141"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2913' onclick='return addComment.moveForm( "div-comment-2913", "2913", "respond", "5660" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment even depth-2" id="comment-2915">
+				<div id="div-comment-2915" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/564911bcb622eac0bf9132672c30cc46?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Lassere</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2915">
+			February 29, 2016 at 12 h 08 min</a>		</div>
+
+		<p>Merci beaucoup sur des systèmes surchargés ou sous dimensionnés votre travail et le niveau de nuances apportées est très précieux.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-29161"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2915' onclick='return addComment.moveForm( "div-comment-2915", "2915", "respond", "5660" )' aria-label='Reply to Lassere to Lassere'>Reply to Lassere</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-4211">
+				<div id="div-comment-4211" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75234dd34f80230790f957f674492496?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://dba24.pl' rel='external nofollow' class='url'>Maciej Tokar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4211">
+			August 10, 2016 at 22 h 21 min</a>		</div>
+
+		<p>Great piece of information. I had a problem with lots of dynamic sampling &#8211; almost 20K  dynamic sampling queries in the shared_pool and had to disable usage of sql plan directives. Thanks for sharing.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-42121"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4211' onclick='return addComment.moveForm( "div-comment-4211", "4211", "respond", "5660" )' aria-label='Reply to Maciej to Maciej Tokar'>Reply to Maciej</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-7390">
+				<div id="div-comment-7390" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e5b5eb0b17abeae47ed189f8e2ae951e?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Michael Meyer</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7390">
+			April 27, 2017 at 10 h 33 min</a>		</div>
+
+		<p>Great compilation. Thanks for sharing this!
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73911"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7390' onclick='return addComment.moveForm( "div-comment-7390", "7390", "respond", "5660" )' aria-label='Reply to Michael to Michael Meyer'>Reply to Michael</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

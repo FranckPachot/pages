@@ -1,0 +1,272 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/db_flashback_retention_target-may-hang-your-database />
+<meta name=description content='A blog post from 2016 about DB_FLASHBACK_RETENTION_TARGET may hang your database'>
+<title>DB_FLASHBACK_RETENTION_TARGET may hang your database</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/db_flashback_retention_target-may-hang-your-database>https://blog.dbi-services.com/db_flashback_retention_target-may-hang-your-database</a> (2016-05-26), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">DB_FLASHBACK_RETENTION_TARGET may hang your database</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>DB_FLASHBACK_RETENTION_TARGET is set to keep enough flashback logs to be able to flashback database within the specified retention window. But it&#8217;s supposed to be a target only, meaning that on space pressure some files can be deleted. But be careful, there are cases where they are not and then the database hangs until you set a lower retention.
+<span id="more-8827"></span>
+The fun part is the message telling you that it cannot reclaim space from a 50GB FRA where 0% is used:</p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr">Humm&#8230;Can&#39;t reclaim space because 0% is used <a href="https://t.co/4snP3OQZUV">pic.twitter.com/4snP3OQZUV</a></p>
+<p>&mdash; Franck Pachot (@FranckPachot) <a href="https://twitter.com/FranckPachot/status/735747180577718272">May 26, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>Less funny is the primary database hanging because its own FRA is full (deletion policy being APPLIED ON ALL STANDBY)</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/05/CaptureCDB02FLASHBACKRET.png" rel="lightbox[8827]"><img src="../wp-insides/uploads/sites/2/2016/05/CaptureCDB02FLASHBACKRET.png" alt="CaptureCDB02FLASHBACKRET" width="1920" height="372" class="alignnone size-full wp-image-8830" /></a></p>
+<h3>What happened</h3>
+<p>So, I&#8217;ve a Data Guard configuration where the deletion policy is &#8216;APPLIED ON ALL STANDBY&#8217; and both sites have FLASHBACK ON.</p>
+<p>I&#8217;ve no guaranteed restore points:
+<pre>
+RMAN&gt; list restore point all;
+
+using target database control file instead of recovery catalog
+SCN              RSP Time  Type       Time      Name
+---------------- --------- ---------- --------- ----
+
+</pre></p>
+<p>and flashback retention is 1 day to allow a possible reinstate, or simple to allow to use the standby to flashback to recent point in time:
+<pre>
+SQL&gt; show parameter flashback
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_flashback_retention_target        integer     1440
+</pre></p>
+<p>Here is the space usage of my standby database FRA when I have high activity on the primary:</p>
+<p><pre>
+SQL&gt; select * from v$recovery_area_usage;
+
+FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES     CON_ID
+----------------------- ------------------ ------------------------- --------------- ----------
+CONTROL FILE                             0                         0               0          0
+REDO LOG                                 0                         0               0          0
+ARCHIVED LOG                             0                         0               0          0
+BACKUP PIECE                            .1                         0               3          0
+IMAGE COPY                               0                         0               0          0
+FLASHBACK LOG                         98.5                         0              50          0
+FOREIGN ARCHIVED LOG                     0                         0               0          0
+AUXILIARY DATAFILE COPY                  0                         0               0          0
+</pre></p>
+<p>FLASHBACK LOG are filling the 50GB I have because I generate more than 50GB of changes per day. They are not set as reclaimable but I expected that they can be reclaimaible in case of space pressure on FRA because the retention is a target retention &#8211; not a guaranteed retention.</p>
+<p>ARCHIVED LOG become reclaimable as soon as they are applied thanks to the deletion policy. And they are actually reclaimed because space is needed for flashback logs.</p>
+<p>At that point, I can expect that when new redo is coming the archived logs can always be written because archived logs have priority on non-guaranteed flashback logs.</p>
+<p>I forgot to tell you that the UNDO tablespace has not been created with RETENTION GUARANTEE:
+<pre>
+SQL&gt; select contents,retention from dba_tablespaces;
+
+CONTENTS  RETENTION
+--------- -----------
+PERMANENT NOT APPLY
+PERMANENT NOT APPLY
+UNDO      NOGUARANTEE
+TEMPORARY NOT APPLY
+PERMANENT NOT APPLY
+</pre></p>
+<p>But actually, my standby database is in an archiver stuck situation:
+<pre>
+Thu May 26 07:42:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19815: WARNING: db_recovery_file_dest_size of 53687091200 bytes is 0.00% used, and has 53687091200 remaining bytes available.
+Thu May 26 07:42:01 2016
+************************************************************************
+You have following choices to free up space from recovery area:
+1. Consider changing RMAN RETENTION POLICY. If you are using Data Guard,
+   then consider changing RMAN ARCHIVELOG DELETION POLICY.
+2. Back up files to tertiary device such as tape using RMAN
+   BACKUP RECOVERY AREA command.
+3. Add disk space and increase db_recovery_file_dest_size parameter to
+   reflect the new space.
+4. Delete unnecessary files using RMAN DELETE command. If an operating
+   system command was used to delete files, then use RMAN CROSSCHECK and
+   DELETE EXPIRED commands.
+************************************************************************
+Thu May 26 07:42:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19809: limit exceeded for recovery files
+ORA-19804: cannot reclaim 1073741824 bytes disk space from 53687091200 limit
+Thu May 26 07:43:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19815: WARNING: db_recovery_file_dest_size of 53687091200 bytes is 0.00% used, and has 53687091200 remaining bytes available.
+Thu May 26 07:43:01 2016
+************************************************************************
+You have following choices to free up space from recovery area:
+1. Consider changing RMAN RETENTION POLICY. If you are using Data Guard,
+   then consider changing RMAN ARCHIVELOG DELETION POLICY.
+2. Back up files to tertiary device such as tape using RMAN
+   BACKUP RECOVERY AREA command.
+3. Add disk space and increase db_recovery_file_dest_size parameter to
+   reflect the new space.
+4. Delete unnecessary files using RMAN DELETE command. If an operating
+   system command was used to delete files, then use RMAN CROSSCHECK and
+   DELETE EXPIRED commands.
+************************************************************************
+Thu May 26 07:43:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19809: limit exceeded for recovery files
+ORA-19804: cannot reclaim 1073741824 bytes disk space from 53687091200 limit
+Thu May 26 07:43:46 2016
+</pre></p>
+<p>This blocks the standby with a big gap and this may have bad consequence on primary availability and protection.</p>
+<h3>Workaround</h3>
+<p>The workaround is to lower the flashback retention target so that all changes fit in the FRA:
+<pre>
+SQL&gt; alter system set db_flashback_retention_target=60;
+</pre></p>
+<p>and as soon as I did it some flashback logs became reclaimable:
+<pre>
+SQL&gt; select * from v$recovery_area_usage;
+
+FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES     CON_ID
+----------------------- ------------------ ------------------------- --------------- ----------
+CONTROL FILE                             0                         0               0          0
+REDO LOG                                 0                         0               0          0
+ARCHIVED LOG                             0                         0               0          0
+BACKUP PIECE                            .1                         0               3          0
+IMAGE COPY                               0                         0               0          0
+FLASHBACK LOG                         96.5                        68              49          0
+FOREIGN ARCHIVED LOG                     0                         0               0          0
+AUXILIARY DATAFILE COPY                  0                         0               0          0
+</pre></p>
+<p>Which you can see in the alert.log as they are deleted to reclaim space:</p>
+<p><pre>
+Thu May 26 07:43:46 2016
+ALTER SYSTEM SET db_flashback_retention_target=60 SCOPE=BOTH;
+Thu May 26 07:44:01 2016
+Deleted Oracle managed file /u03/app/oracle/fast_recovery_area/CDB_02/flashback/o1_mf_cncs7qnx_.flb
+Deleted Oracle managed file /u03/app/oracle/fast_recovery_area/CDB_02/archivelog/2016_05_26/o1_mf_0_0_cnfbb1b4_.arc
+</pre></p>
+<h3>Conclusion</h3>
+<p>I&#8217;ll open a SR for it (easier to format in WordPress than in MOS). This is in 12<em>c</em>R1 multitenant with Patch Set Update : 12.1.0.2.160119
+For the moment, the recommandation is: always monitor the FRA for (used-reclaimable) space even in a standby where archvielogs become reclaimable as soon as they are applied.</p>
+<h3>Update 19-JUN-2016</h3>
+<p>The recommandation is to monitor ORA-19815 and ignore the 0%. There is a BUG 16664572 (DIAG: IMPROVE DIAGNOSTIC RELATED TO ORA-19815) about that problem under dev.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-88280" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/05/CaptureCDB02FLASHBACKRET.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3614">
+				<div id="div-comment-3614" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/896349331f8a46c61a20c02041153e14?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://iarsov.com' rel='external nofollow' class='url'>Ivica Arsov</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3614">
+			May 30, 2016 at 1 h 10 min</a>		</div>
+
+		<p>Hey Franck,</p>
+<p>Is this a test environment and are those flashback logs couple of hours/days old ? </p>
+<p>There is a hard limit on how many flashback logs can be removed.
+It is controlled by &#8220;_MINIMUM_DB_FLASHBACK_RETENTION&#8221;, with default value of 60 minutes.</p>
+<p>Regards,
+Ivica Arsov
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-36151"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3614' onclick='return addComment.moveForm( "div-comment-3614", "3614", "respond", "8827" )' aria-label='Reply to Ivica to Ivica Arsov'>Reply to Ivica</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-3949">
+				<div id="div-comment-3949" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75234dd34f80230790f957f674492496?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://dba24.pl' rel='external nofollow' class='url'>Maciej Tokar</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3949">
+			July 7, 2016 at 7 h 43 min</a>		</div>
+
+		<p>As you can see below lowering of the DB_FLASHBACK_RETENTION_TARGET didn&#8217;t help me. I had to disable flashback to reclaim space, there was no reaction after the retention had been lowered.
+<pre>
+ORA-19804: cannot reclaim 263192576 bytes disk space from 161061273600 limit
+Thu Jul 07 07:02:29 2016
+ALTER SYSTEM SET db_flashback_retention_target=19 SCOPE=BOTH;
+Thu Jul 07 07:03:00 2016
+alter database flashback off
+Stopping background process RVWR
+Thu Jul 07 07:03:01 2016
+Deleted Oracle managed file +FRA/CDB1/FLASHBACK/log_1.1426.916510671
+Deleted Oracle managed file +FRA/CDB1/FLASHBACK/log_2.1466.916435689
+Deleted Oracle managed file +FRA/CDB1/FLASHBACK/log_3.1061.916510709
+</pre>
+My version is 12.1.0.2.5
+&#8230;&#8230;..
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39501"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3949' onclick='return addComment.moveForm( "div-comment-3949", "3949", "respond", "8827" )' aria-label='Reply to Maciej to Maciej Tokar'>Reply to Maciej</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-3952">
+				<div id="div-comment-3952" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3952">
+			July 7, 2016 at 11 h 26 min</a>		</div>
+
+		<p>Thanks Maciej. Good to know.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39531"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3952' onclick='return addComment.moveForm( "div-comment-3952", "3952", "respond", "8827" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

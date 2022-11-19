@@ -1,0 +1,197 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/partial-join-evaluation-in-oracle-12c />
+<meta name=description content='A blog post from 2014 about Partial Join Evaluation in Oracle 12c'>
+<title>Partial Join Evaluation in Oracle 12c</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/partial-join-evaluation-in-oracle-12c>https://blog.dbi-services.com/partial-join-evaluation-in-oracle-12c</a> (2014-07-14), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Partial Join Evaluation in Oracle 12c</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Do you think that it&#8217;s better to write semi-join SQL statements with IN(), EXISTS(), or to do a JOIN? Usually, the optimizer will evaluate the cost and do the transformation for you. And in this area, one more transformation has been introduced in 12c which is the Partial Join Evaluation (PJE).</p>
+<p>First, let&#8217;s have a look at the 11g behaviour. For that example, I use the SCOTT schema, but I hire a lot more employees in departement 40:
+<pre>
+SQL&gt; alter table EMP modify empno number(10);
+Table altered.
+SQL&gt; insert into EMP(empno,deptno) select rownum+10000,40 from EMP,(select * from dual connect by level
+</pre>
+Why department 40? I&#8217;ll explain it below, but I let you think about it before. In the default SCOTT schema, there is a department 40 in DEPT table, but which has no employees in EMP. And the new transformation is not useful in that case.</p>
+<h3>11g behaviour</h3>
+<p>Now, I&#8217;m running the following query to check all the departments that have at least one employee:
+I can write it with IN:
+<pre>
+PLAN_TABLE_OUTPUT
+ ------------------------------------------------------------------------
+ SQL_ID 6y71msam9w32r, child number 0
+ -------------------------------------
+ select distinct deptno,dname from dept
+ where deptno in ( select deptno from emp)
+
+Plan hash value: 1754319153
+
+------------------------------------------------------------------------
+| Id  | Operation          | Name | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |      |      1 |        |      4 |      15 |
+|*  1 |  HASH JOIN SEMI    |      |      1 |      4 |      4 |      15 |
+|   2 |   TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   3 |   TABLE ACCESS FULL| EMP  |      1 |  15068 |    388 |       8 |
+------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+ ---------------------------------------------------
+
+   1 - access("DEPTNO"="DEPTNO")
+</pre>
+or with EXISTS:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------
+SQL_ID  cbpa3zjtzfzrn, child number 0
+-------------------------------------
+select distinct deptno,dname from dept
+ where exists ( select 1 from emp where emp.deptno=dept.deptno)
+
+Plan hash value: 1754319153
+
+------------------------------------------------------------------------
+| Id  | Operation          | Name | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |      |      1 |        |      4 |      15 |
+|*  1 |  HASH JOIN SEMI    |      |      1 |      4 |      4 |      15 |
+|   2 |   TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   3 |   TABLE ACCESS FULL| EMP  |      1 |  15068 |    388 |       8 |
+------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access("DEPTNO"="DEPTNO")
+</pre>
+Both are good. We didn&#8217;t have to read the whole EMP table. I have 15000 rows in my table, I do a full scan on it, but look at the A-Rows: only 388 rows were actually read.</p>
+<p>The HASH JOIN first read the DEPT table in order to build the hash table. So it already knows that we cannot have more than 4 distinct departments.</p>
+<p>Then we do the join to EMP just to check which of those departments have an employee. But we can stop as soon as we find the 4 departments. This is the reason why we have read only 388 rows here. And this is exactly what a Semi Join is: we don&#8217;t need all the matching rows, we return at most one row per matching pair.</p>
+<p>Ok. What if we write the join ourselves?
+<pre>
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------
+SQL_ID  2xjj9jybqja87, child number 1
+-------------------------------------
+select distinct deptno,dname from dept join emp using(deptno)
+
+Plan hash value: 2962452962
+
+-------------------------------------------------------------------------
+| Id  | Operation           | Name | Starts | E-Rows | A-Rows | Buffers |
+-------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |      |      1 |        |      4 |     129 |
+|   1 |  HASH UNIQUE        |      |      1 |  15068 |      4 |     129 |
+|*  2 |   HASH JOIN         |      |      1 |  15068 |  14014 |     129 |
+|   3 |    TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   4 |    TABLE ACCESS FULL| EMP  |      1 |  15068 |  14014 |     122 |
+-------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("DEPT"."DEPTNO"="EMP"."DEPTNO")
+</pre>
+Bad luck. We have to read all the rows. More rows and more buffers.</p>
+<h3>12c behaviour</h3>
+<p>Let&#8217;s do the same in 12.1.0.1:
+<pre>
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------
+SQL_ID  2xjj9jybqja87, child number 0
+-------------------------------------
+select distinct deptno,dname from dept join emp using(deptno)
+
+Plan hash value: 1629510749
+
+-------------------------------------------------------------------------
+| Id  | Operation           | Name | Starts | E-Rows | A-Rows | Buffers |
+-------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |      |      1 |        |      4 |      14 |
+|   1 |  HASH UNIQUE        |      |      1 |      4 |      4 |      14 |
+|*  2 |   HASH JOIN SEMI    |      |      1 |      4 |      4 |      14 |
+|   3 |    TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   4 |    TABLE ACCESS FULL| EMP  |      1 |  15068 |    388 |       7 |
+-------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("DEPT"."DEPTNO"="EMP"."DEPTNO")
+</pre>
+Same plan but less rows have been read. If we check the outlines, we see the new feature:
+<pre>
+      PARTIAL_JOIN(@"SEL$58A6D7F6" "EMP"@"SEL$1")
+</pre>
+And here is what we see in the optimizer trace:
+<pre>
+OPTIMIZER STATISTICS AND COMPUTATIONS
+PJE: Checking validity of partial join eval on query block SEL$58A6D7F6 (#1)
+PJE: Passed validity of partial join eval by query block SEL$58A6D7F6 (#1)
+PJE: Partial join eval conversion for query block SEL$58A6D7F6 (#1).
+PJE: Table marked for partial join eval: EMP[EMP]#1
+</pre>
+The hints that control the feature are PARTIAL_JOIN and NO_PARTIAL_JOIN and the transformation is enabled by _optimizer_partial_join_eval which appeared in 12<i>c</i>.</p>
+<p>But of course, the optimization is useful only when we have all the values at the beginning of the table. This is why I added at least one employee in department 40. If there are some rows in DEPT that have no matching row in EMP, then Oracle cannot know the result before reaching the end of the table.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-1180"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="pingback even thread-even depth-1" id="comment-7642">
+				<div id="div-comment-7642" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://jonathanlewis.wordpress.com/2017/03/09/join-elimination/' rel='external nofollow' class='url'>Join Elimination | Oracle Scratchpad</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7642">
+			June 14, 2017 at 20 h 22 min</a>		</div>
+
+		<p>[&#8230;] the problem. Rather than a side effect of join elimination the anomaly has appeared because of the &#8220;partial join evaluation&#8221; mechanism introduced in 12c. There is a hint to disable the mechanism /*+ no_partial_join(alias) */ [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-76431"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7642' onclick='return addComment.moveForm( "div-comment-7642", "7642", "respond", "117" )' aria-label='Reply to Join to Join Elimination | Oracle Scratchpad'>Reply to Join</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

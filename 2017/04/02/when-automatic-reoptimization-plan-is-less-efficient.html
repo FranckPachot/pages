@@ -1,0 +1,473 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/when-automatic-reoptimization-plan-is-less-efficient />
+<meta name=description content='A blog post from 2017 about When automatic reoptimization  plan is less efficient'>
+<title>When automatic reoptimization  plan is less efficient</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/when-automatic-reoptimization-plan-is-less-efficient>https://blog.dbi-services.com/when-automatic-reoptimization-plan-is-less-efficient</a> (2017-04-02), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">When automatic reoptimization  plan is less efficient</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>11<em>g</em>R2 started to have the optimizer react at execution time when a misestimate is encountered. Then the next executions are re-optimized with more accurate estimation, derived from the execution statistics. This was called cardinality feedback. Unfortunately, in rare cases we had a fast execution plan with bad estimations, and better estimations lead to worse execution plan. This is rare, but even when 9999 queries are faster, the one that takes too long will gives a bad perception of this optimizer feature.
+This feature has been improved in 12cR1 with new names: auto-reoptimization and statistics feedback. I&#8217;m showing an example here in 12.1.0.2 without adaptive statistics (the 12.2 backport) and I&#8217;ve also disabled adaptive plan because they show the wrong numbers (similar to what I described in <a href="../adaptive-plans-and-cost-of-inactive-branches/index.html" target="_blank">this</a> post). I&#8217;ll show that at one point, the re-optimization can go back to the initial plan if it was the best in execution time.
+<span id="more-15557"></span></p>
+<h3>V$SQL</h3>
+<p>Basically, here is what happened: first execution was fast, but with actual number of rows far from the estimated ones. Auto-reoptimisation kicks in for next execution and get a new plan, but with longer execution time. Third execution is another re-optimization, leading to same bad plan. Finally starting at 4th execution, the time is back to reasonable and we see the same as the first plan is used:
+<pre>
+SQL&gt; select sql_id,child_number,plan_hash_value,is_reoptimizable,is_resolved_adaptive_plan,parse_calls,executions,elapsed_time/1e6
+        from v$sql where sql_id='b4rhzfw7d6vdp';
+
+SQL_ID        CHILD_NUMBER PLAN_HASH_VALUE I I PARSE_CALLS EXECUTIONS ELAPSED_TIME/1E6
+------------- ------------ --------------- - - ----------- ---------- ----------------
+b4rhzfw7d6vdp            0      1894156093 Y             1          1          .346571
+b4rhzfw7d6vdp            1       955499861 Y             1          1         5.173733
+b4rhzfw7d6vdp            2       955499861 Y             1          1         4.772258
+b4rhzfw7d6vdp            3      1894156093 N             7          7            .5008</pre></p>
+<p>The scope of statistic feedback is not to get optimal execution from the first execution. This requires accurate statistics, static or dynamic, and SQL Plan Directives is a try to get that. Statistics feedback goal is to try to get a better plan rather than re-use one that is based on misestimates. But sometimes the better is the enemy of the good and we have an example here in child cursors 1 and 2. But the good thing is that finally we are back to acceptable execution time, with a final plan that can be re-used without re-optimization.</p>
+<p>What surprised me here is that the final plan has the same hash value than the initial one. Is it a coincidence that different estimations gives the same plan? Or did the optimizer finally gave up to try to find better?</p>
+<h3>V$SQL_REOPTIMIZATION_HINTS</h3>
+<p>In 12<em>c</em> the statistics feedback are exposed in V$SQL_REOPTIMIZATION_HINTS.</p>
+<p><pre>SQL&gt; select sql_id,child_number,hint_text,client_id,reparse from v$sql_reoptimization_hints where sql_id='b4rhzfw7d6vdp';
+
+SQL_ID        CHILD_NUMBER HINT_TEXT                                                                                             CLIENT_ID    REPARSE
+------------- ------------ ---------------------------------------------------------------------------------------------------- ---------- ----------
+b4rhzfw7d6vdp            0 OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" ROWS=1517.000000 )            1          1
+b4rhzfw7d6vdp            0 OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" MIN=1517.000000 )               1          1
+b4rhzfw7d6vdp            0 OPT_ESTIMATE (@"SEL$1" TABLE "DM_FOLDER_R1"@"SEL$1" ROWS=1517.000000 )                                        1          1
+b4rhzfw7d6vdp            0 OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 )             1          0
+b4rhzfw7d6vdp            0 OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 )               1          0
+b4rhzfw7d6vdp            0 OPT_ESTIMATE (@"SEL$1" TABLE "DM_SYSOBJECT_R2"@"SEL$1" MIN=3.000000 )                                         1          0
+b4rhzfw7d6vdp            1 OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" ROWS=1517.000000 )            1          0
+b4rhzfw7d6vdp            1 OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" MIN=1517.000000 )               1          0
+b4rhzfw7d6vdp            1 OPT_ESTIMATE (@"SEL$1" TABLE "DM_FOLDER_R1"@"SEL$1" ROWS=1517.000000 )                                        1          0
+b4rhzfw7d6vdp            1 OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 )             1          0
+b4rhzfw7d6vdp            1 OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 )               1          0
+b4rhzfw7d6vdp            1 OPT_ESTIMATE (@"SEL$1" TABLE "DM_SYSOBJECT_R2"@"SEL$1" MIN=3.000000 )                                         1          0
+b4rhzfw7d6vdp            1 OPT_ESTIMATE (@"SEL$582FA660" QUERY_BLOCK ROWS=1491.000000 )                                                  1          1
+</pre></p>
+<p>The child cursor 0 was re-optimized to cursor 1 with different number of rows for &#8220;DM_FOLDER_R1&#8243; and &#8220;DM_SYSOBJECT_R2&#8243;
+The child cursor 1 has the same values, but an additional number of row correction for a query block.</p>
+<p>But we don&#8217;t see anything about cursor 2. It was re-optimizable, and was actually re-optimized into cursor 3 but no statistics corrections are displayed here.</p>
+<h3>Trace</h3>
+<p>As it is a reproducible case, I&#8217;ve run the same while tracing 10046, 10053 and 10507 (level 512) to get all information about SQL execution, Optimiser compilation, and statistics feedback. For each child cursor, I&#8217;ll show the execution plan with estimated and actual number of rows (E-Rows and A-Rows) and then some interesting lines from the trace, mainly those returned by:
+<pre>grep -E "KKSMEC|^atom_hint|^@"</pre></p>
+<h3>Child cursor 0 &#8211; plan 1894156093 &#8211; 0.34 seconds</h3>
+<p><pre>Plan hash value: 1894156093
+----------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                  | Name               | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                           |                    |      1 |        |   171 (100)|      1 |00:00:00.04 |   17679 |
+|   1 |  SORT AGGREGATE                            |                    |      1 |      1 |            |      1 |00:00:00.04 |   17679 |
+|   2 |   NESTED LOOPS                             |                    |      1 |      1 |   116   (0)|   1491 |00:00:00.04 |   17679 |
+|   3 |    NESTED LOOPS                            |                    |      1 |      1 |   115   (0)|   1491 |00:00:00.04 |   17456 |
+|   4 |     NESTED LOOPS                           |                    |      1 |     49 |    17   (0)|   5648 |00:00:00.01 |     537 |
+|*  5 |      INDEX RANGE SCAN                      | D_1F0049A880000016 |      1 |      3 |     3   (0)|   1517 |00:00:00.01 |      13 |
+|   6 |      TABLE ACCESS BY INDEX ROWID BATCHED   | DM_SYSOBJECT_R     |   1517 |     16 |    10   (0)|   5648 |00:00:00.01 |     524 |
+|*  7 |       INDEX RANGE SCAN                     | D_1F0049A880000010 |   1517 |     71 |     2   (0)|   5648 |00:00:00.01 |     249 |
+|*  8 |     TABLE ACCESS BY INDEX ROWID            | DM_SYSOBJECT_S     |   5648 |      1 |     2   (0)|   1491 |00:00:00.03 |   16919 |
+|*  9 |      INDEX UNIQUE SCAN                     | D_1F0049A880000108 |   5648 |      1 |     1   (0)|   1491 |00:00:00.03 |   15428 |
+|  10 |       NESTED LOOPS SEMI                    |                    |   5648 |      2 |    25   (0)|   1491 |00:00:00.02 |   14828 |
+|  11 |        NESTED LOOPS                        |                    |   5648 |      7 |    18   (0)|   2981 |00:00:00.02 |   12869 |
+|  12 |         TABLE ACCESS BY INDEX ROWID BATCHED| DM_SYSOBJECT_R     |   5648 |     71 |     4   (0)|   2981 |00:00:00.01 |    7747 |
+|* 13 |          INDEX RANGE SCAN                  | D_1F0049A880000010 |   5648 |     16 |     3   (0)|   2981 |00:00:00.01 |    6145 |
+|* 14 |         TABLE ACCESS BY INDEX ROWID        | DM_SYSOBJECT_S     |   2981 |      1 |     2   (0)|   2981 |00:00:00.01 |    5122 |
+|* 15 |          INDEX UNIQUE SCAN                 | D_1F0049A880000108 |   2981 |      1 |     1   (0)|   2981 |00:00:00.01 |    2140 |
+|* 16 |        INDEX UNIQUE SCAN                   | D_1F0049A880000145 |   2981 |  52759 |     1   (0)|   1491 |00:00:00.01 |    1959 |
+|* 17 |    INDEX UNIQUE SCAN                       | D_1F0049A880000142 |   1491 |      1 |     1   (0)|   1491 |00:00:00.01 |     223 |
+----------------------------------------------------------------------------------------------------------------------------------------</pre></p>
+<p>Because of low cardinality estimation of DM_SYSOBJECT_R predicate (E-Rows=3) the optimizer goes to NESTED LOOP. This plan has good execution time here because all blocks are in buffer cache. Reading 17679 blocks from buffer cache takes less than one second. It would have been much longer if those were physical I/O.</p>
+<p>This is a case where the optimizer detects misestimate at execution time. Here is what is recorded in the trace:</p>
+<p><pre>Reparsing due to card est...
+@=0x63a56820 type=3 nodeid=5 monitor=Y halias="DM_FOLDER_R1" loc="SEL$1" oname="SEL$F5BB74E1" act=1517 min=0 est=3 next=(nil)
+Reparsing due to card est...
+@=0x638fe2b0 type=5 nodeid=4 monitor=Y halias="" loc="SEL$F5BB74E1" onames="SEL$07BDC5B4"@"SEL$5" "SEL$2"@"SEL$5" act=5648 min=0 est=49 next=0x638fe250
+Reparsing due to card est...
+@=0x638fe4c0 type=5 nodeid=3 monitor=Y halias="" loc="SEL$F5BB74E1" onames="SEL$07BDC5B4"@"SEL$5" "SEL$2"@"SEL$5" "SEL$3"@"SEL$1" act=1491 min=0 est=1 next=0x638fe460
+Reparsing due to card est...
+@=0x638fe688 type=5 nodeid=2 monitor=Y halias="" loc="SEL$F5BB74E1" onames="SEL$07BDC5B4"@"SEL$5" "SEL$2"@"SEL$5" "SEL$3"@"SEL$1" "R_OBJECT_ID"@"SEL$1" act=1491 min=0 est=1 next=0x638fe5f8
+kkocfbCheckCardEst [sql_id=b4rhzfw7d6vdp] reparse=y ecs=n efb=n ost=n fbs=n</pre></p>
+<p>Those are the misestimates which triggers re-optimization.</p>
+<p>And here are all statistics feedback.</p>
+<p><pre>*********** Begin Dump Context (kkocfbCheckCardEst) [sql_id=b4rhzfw7d6vdp cpcnt=0] ***********
+@=0x638fe688 type=5 nodeid=2 monitor=Y halias="" loc="SEL$F5BB74E1" onames="DM_FOLDER_R1"@"SEL$1" "DM_SYSOBJECT_R2"@"SEL$1" "TE_"@"SEL$2" "LJ_"@"SEL$2" act=1491 min=0 est=1 next=0x638fe5f8
+@=0x638fe5f8 type=3 nodeid=17 monitor=Y halias="LJ_" loc="SEL$2" oname="D_1F0049A880000142" act=0 min=1 est=1 next=0x638fe4c0
+@=0x638fe4c0 type=5 nodeid=3 monitor=Y halias="" loc="SEL$F5BB74E1" onames="DM_FOLDER_R1"@"SEL$1" "DM_SYSOBJECT_R2"@"SEL$1" "TE_"@"SEL$2" act=1491 min=0 est=1 next=0x638fe460
+@=0x638fe460 type=1 nodeid=8 monitor=Y halias="TE_" loc="SEL$2" act=0 min=1 est=1 next=0x638fe3d0
+@=0x638fe3d0 type=3 nodeid=9 monitor=Y halias="TE_" loc="SEL$2" oname="D_1F0049A880000108" act=0 min=1 est=1 next=0x638fe2b0
+@=0x638fe2b0 type=5 nodeid=4 monitor=Y halias="" loc="SEL$F5BB74E1" onames="DM_FOLDER_R1"@"SEL$1" "DM_SYSOBJECT_R2"@"SEL$1" act=5648 min=0 est=49 next=0x638fe250
+@=0x638fe250 type=1 nodeid=6 monitor=Y halias="DM_SYSOBJECT_R2" loc="SEL$1" act=3 min=1 est=16 next=0x638fe1c0
+@=0x638fe1c0 type=3 nodeid=7 monitor=Y halias="DM_SYSOBJECT_R2" loc="SEL$1" oname="D_1F0049A880000010" act=3 min=1 est=71 next=0x63a56820
+@=0x63a56820 type=3 nodeid=5 monitor=Y halias="DM_FOLDER_R1" loc="SEL$1" oname="D_1F0049A880000016" act=1517 min=0 est=3 next=(nil)
+*********** End Dump Context ***********</pre></p>
+<p>We also see some information about execution performance:</p>
+<p><pre>kkoarCopyCtx: [sql_id=b4rhzfw7d6vdp] origin=CFB old=0x63a565d0 new=0x7fe74e2153f0 copyCnt=1 copyClient=y
+**************************************************************
+kkocfbCopyBestEst: Best Stats
+Exec count:         1
+CR gets:            17679
+CU gets:            0
+Disk Reads:         0
+Disk Writes:        0
+IO Read Requests:   0
+IO Write Requests:  0
+Bytes Read:         0
+Bytes Written:      0
+Bytes Exchanged with Storage:  0
+Bytes Exchanged with Disk:  0
+Bytes Simulated Read:  0
+Bytes Simulated Returned:  0
+Elapsed Time: 51 (ms)
+CPU Time: 51 (ms)
+User I/O Time: 15 (us)
+*********** Begin Dump Context (kkocfbCopyBestEst) **********
+*********** End Dump Context ***********</pre></p>
+<p>They are labeled as &#8216;Best Stats&#8217; because we had only one execution at that time.</p>
+<p>Finally, the hints are dumped:</p>
+<p><pre>******** Begin CFB Hints [sql_id=b4rhzfw7d6vdp]  xsc=0x7fe74e215748 ********
+Dumping Hints
+=============
+atom_hint=(@=0x7fe74e21ebf0 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" TABLE "DM_SYSOBJECT_R2"@"SEL$1" MIN=3.000000 ) )
+atom_hint=(@=0x7fe74e21e758 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 ) )
+atom_hint=(@=0x7fe74e21e3f0 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 ) )
+atom_hint=(@=0x7fe74e21dfd0 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" ROWS=1517.000000 ) )
+atom_hint=(@=0x7fe74e21dc68 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" MIN=1517.000000 ) )
+atom_hint=(@=0x7fe74e21d8c8 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" TABLE "DM_FOLDER_R1"@"SEL$1" ROWS=1517.000000 ) )
+********** End CFB Hints **********</pre></p>
+<p>Those are exactly what we see in V$SQL_REOPTIMIZATION_HINTS</p>
+<p>This is all what we see for this first execution. The next execution starts with:</p>
+<p><pre>KKSMEC: Invalidating old cursor 0 with hash val = 1894156093
+KKSMEC: Produced New cursor 1 with hash val = 955499861</pre></p>
+<p>As a consequence of child cursor 0 marked as reoptimizable, the next execution invalidates it and creates a new child cursor 1. </p>
+<h3>Child cursor 1 &#8211; new plan 955499861 &#8211; 5.17 seconds</h3>
+<p>Here is the new plan we see after that second execution:</p>
+<p><pre>Plan hash value: 955499861
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name               | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers | Reads  |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |                    |      1 |        | 30996 (100)|      1 |00:00:04.58 |     102K|    101K|       |       |          |
+|   1 |  SORT AGGREGATE            |                    |      1 |      1 |            |      1 |00:00:04.58 |     102K|    101K|       |       |          |
+|   2 |   VIEW                     | VM_NWVW_2          |      1 |  12039 | 30996   (1)|   1491 |00:00:04.58 |     102K|    101K|       |       |          |
+|   3 |    HASH UNIQUE             |                    |      1 |  12039 | 30996   (1)|   1491 |00:00:04.58 |     102K|    101K|   941K|   941K| 2597K (0)|
+|*  4 |     HASH JOIN RIGHT SEMI   |                    |      1 |  12039 | 30490   (1)|   4132 |00:00:04.57 |     102K|    101K|    12M|  3867K|   14M (0)|
+|   5 |      TABLE ACCESS FULL     | DM_DOCUMENT_S      |      1 |    213K|   210   (1)|    213K|00:00:00.01 |     741 |      0 |       |       |          |
+|*  6 |      HASH JOIN             |                    |      1 |  36463 | 29665   (1)|   5622 |00:00:04.51 |     101K|    101K|  1405K|  1183K| 2026K (0)|
+|*  7 |       HASH JOIN            |                    |      1 |  36463 | 18397   (1)|   5622 |00:00:02.23 |   65103 |  65050 |   940K|   940K| 1339K (0)|
+|*  8 |        HASH JOIN           |                    |      1 |   2222 | 14489   (1)|   1499 |00:00:01.58 |   51413 |  51369 |   992K|   992K| 1377K (0)|
+|*  9 |         HASH JOIN          |                    |      1 |   2222 | 14120   (1)|   1499 |00:00:01.46 |   50088 |  50057 |  3494K|  1598K| 4145K (0)|
+|* 10 |          TABLE ACCESS FULL | DM_SYSOBJECT_S     |      1 |  39235 | 10003   (1)|  39235 |00:00:00.83 |   36385 |  36376 |       |       |          |
+|* 11 |          HASH JOIN         |                    |      1 |  24899 |  3920   (1)|   5648 |00:00:00.62 |   13703 |  13681 |  1199K|  1199K| 1344K (0)|
+|* 12 |           INDEX RANGE SCAN | D_1F0049A880000016 |      1 |   1517 |    12   (0)|   1517 |00:00:00.01 |      13 |      0 |       |       |          |
+|* 13 |           TABLE ACCESS FULL| DM_SYSOBJECT_R     |      1 |    646K|  3906   (1)|    646K|00:00:00.50 |   13690 |  13681 |       |       |          |
+|  14 |         TABLE ACCESS FULL  | DM_FOLDER_S        |      1 |    431K|   367   (1)|    431K|00:00:00.04 |    1325 |   1312 |       |       |          |
+|* 15 |        TABLE ACCESS FULL   | DM_SYSOBJECT_R     |      1 |    646K|  3906   (1)|    646K|00:00:00.51 |   13690 |  13681 |       |       |          |
+|* 16 |       TABLE ACCESS FULL    | DM_SYSOBJECT_S     |      1 |    646K| 10000   (1)|    646K|00:00:02.14 |   36385 |  36376 |       |       |          |
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+Note
+-----
+   - statistics feedback used for this statement</pre></p>
+<p>The notes makes it clear that the estimations comes from previous run (statistics feedback) and we see that for most operations E-Rows = A-Rows. With those a new plan has been chosen, with complex view merging: VM_NWWM. You can find clues about those internal view names on <a href="https://jonathanlewis.wordpress.com/2011/02/27/internal-views/" target="_blank">Jonathan Lewis blog</a>. Here probably because the estimated number of rows is high, the subquery has been unnested. It is an &#8216;EXISTS&#8217; subquery, which is transformed to semi join and merged to apply a distinct at the end.</p>
+<p>So, we have a different plan, which is supposed to be better because it has been costed with more accurate cardinalities. .The goal of this post is not to detail the reason why the execution time is longer with a &#8216;better&#8217; plan. If you look at &#8216;Reads&#8217; column you can see that the first one has read all blocks from buffer cache but second one had to do physical I/O for all. With nothing from buffer cache, reading 101K blocks in multiblock reads may be faster than reading 17679 so the optimizer decision was not bad. I&#8217;ll have to estimate if it is expected to have most of the blocks in buffer cache in real production life as behavior in UAT is different. Some people will stop here, say that cardinality feedback is bad, disable it or even set optimizer_cost_adj to get the nested loop, but things are more complex than that.</p>
+<p>The important thing is that the optimizer doesn&#8217;t stop there and compares the new execution statistics with the previous one.</p>
+<p><pre>**************************************************************
+kkocfbCompareExecStats : Current
+Exec count:         1
+CR gets:            102226
+CU gets:            3
+Disk Reads:         101426
+Disk Writes:        0
+IO Read Requests:   1633
+IO Write Requests:  0
+Bytes Read:         830881792
+Bytes Written:      0
+Bytes Exchanged with Storage:  830881792
+Bytes Exchanged with Disk:  830881792
+Bytes Simulated Read:  0
+Bytes Simulated Returned:  0
+Elapsed Time: 4586 (ms)
+CPU Time: 1305 (ms)
+User I/O Time: 3040 (ms)
+**************************************************************
+kkocfbCompareExecStats : Best
+Exec count:         1
+CR gets:            17679
+CU gets:            0
+Disk Reads:         0
+Disk Writes:        0
+IO Read Requests:   0
+IO Write Requests:  0
+Bytes Read:         0
+Bytes Written:      0
+Bytes Exchanged with Storage:  0
+Bytes Exchanged with Disk:  0
+Bytes Simulated Read:  0
+Bytes Simulated Returned:  0
+Elapsed Time: 51 (ms)
+CPU Time: 51 (ms)
+User I/O Time: 15 (us)
+kkocfbCompareExecStats: improvement BG: 0.172935 CPU: 0.039555
+</pre></p>
+<p>The first execution, with &#8216;bad&#8217; statistics, is still the best one and this new execution has an improvement of 0.17, which means 5 times slower.</p>
+<p>Then in the trace we see again that re-optimisation (reparsing) is considered:</p>
+<p><pre>Reparsing due to card est...
+@=0x6a368338 type=5 nodeid=11 monitor=Y halias="" loc="SEL$582FA660" onames="SEL$608EC1F7"@"SEL$582FA660" "SEL$04458B50"@"SEL$582FA660" act=5648 min=0 est=24899 next=0x6a3682d8
+Reparsing due to card est...
+@=0x6a3687b0 type=5 nodeid=7 monitor=Y halias="" loc="SEL$582FA660" onames="SEL$608EC1F7"@"SEL$582FA660" "SEL$04458B50"@"SEL$582FA660" "SEL$FB0FE72C"@"SEL$33802F1B" "SEL$5"@"SEL$33802F1B" "SEL$07BDC5B4"@"SEL$636B5685" act=5622 min=0 est=36463 next=0x6a368750
+Reparsing due to card est...
+@=0x6a368990 type=5 nodeid=6 monitor=Y halias="" loc="SEL$582FA660" onames="SEL$608EC1F7"@"SEL$582FA660" "SEL$04458B50"@"SEL$582FA660" "SEL$FB0FE72C"@"SEL$33802F1B" "SEL$5"@"SEL$33802F1B" "SEL$07BDC5B4"@"SEL$636B5685" "SEL$FB0FE72C"@"SEL$4" act=5622 min=0 est=36463 next=0x6a368930
+Reparsing due to card est...
+@=0x6a368b90 type=5 nodeid=4 monitor=Y halias="" loc="SEL$582FA660" onames="SEL$608EC1F7"@"SEL$582FA660" "SEL$04458B50"@"SEL$582FA660" "SEL$FB0FE72C"@"SEL$33802F1B" "SEL$5"@"SEL$33802F1B" "SEL$07BDC5B4"@"SEL$636B5685" "SEL$FB0FE72C"@"SEL$4" "SEL$F5BB74E1"
+@"SEL$4" act=4132 min=0 est=12039 next=0x6a368b30
+Reparsing due to card est...
+@=0x6a368d60 type=4 nodeid=3 monitor=Y halias="" loc="SEL$582FA660" act=1491 min=0 est=12039 next=0x6a368b90</pre></p>
+<p>An additional OPT_ESTIMATE hint is generated for the complext view merging view query block:</p>
+<p><pre>atom_hint=(@=0x7fe74e21eb90 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" ROWS=1517.000000 ) )
+atom_hint=(@=0x7fe74e21e7b0 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_FOLDER_R1"@"SEL$1" "D_1F0049A880000016" MIN=1517.000000 ) )
+atom_hint=(@=0x7fe74e21e470 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" TABLE "DM_FOLDER_R1"@"SEL$1" ROWS=1517.000000 ) )
+atom_hint=(@=0x7fe74e21e050 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_FILTER "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 ) )
+atom_hint=(@=0x7fe74e21dce8 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" INDEX_SCAN "DM_SYSOBJECT_R2"@"SEL$1" "D_1F0049A880000010" MIN=3.000000 ) )
+atom_hint=(@=0x7fe74e21da38 err=0 resol=0 used=0 token=1018 org=6 lvl=2 txt=OPT_ESTIMATE (@"SEL$582FA660" QUERY_BLOCK ROWS=1491.000000 ) )
+atom_hint=(@=0x7fe74e21d600 err=0 resol=0 used=0 token=1018 org=6 lvl=3 txt=OPT_ESTIMATE (@"SEL$1" TABLE "DM_SYSOBJECT_R2"@"SEL$1" MIN=3.000000 ) )</pre></p>
+<p>Whith this new cardinality estimation, the next execution will try to get a better execution, but it doesn&#8217;t change the optimizer choice and the new child cursor gets the same execution plan:
+<pre>KKSMEC: Invalidating old cursor 1 with hash val = 955499861
+KKSMEC: Produced New cursor 2 with hash val = 955499861</pre></p>
+<h3>Child cursor 2 &#8211; plan 955499861 again &#8211; 4.77 seconds</h3>
+<p>This the third execution:</p>
+<p><pre>Plan hash value: 955499861
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name               | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers | Reads  |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |                    |      1 |        | 30996 (100)|      1 |00:00:04.19 |     102K|    101K|       |       |          |
+|   1 |  SORT AGGREGATE            |                    |      1 |      1 |            |      1 |00:00:04.19 |     102K|    101K|       |       |          |
+|   2 |   VIEW                     | VM_NWVW_2          |      1 |   1491 | 30996   (1)|   1491 |00:00:04.19 |     102K|    101K|       |       |          |
+|   3 |    HASH UNIQUE             |                    |      1 |   1491 | 30996   (1)|   1491 |00:00:04.19 |     102K|    101K|   941K|   941K| 1355K (0)|
+|*  4 |     HASH JOIN RIGHT SEMI   |                    |      1 |  12039 | 30490   (1)|   4132 |00:00:04.19 |     102K|    101K|    12M|  3867K|   14M (0)|
+|   5 |      TABLE ACCESS FULL     | DM_DOCUMENT_S      |      1 |    213K|   210   (1)|    213K|00:00:00.01 |     740 |      0 |       |       |          |
+|*  6 |      HASH JOIN             |                    |      1 |  36463 | 29665   (1)|   5622 |00:00:04.12 |     101K|    101K|  1405K|  1183K| 2021K (0)|
+|*  7 |       HASH JOIN            |                    |      1 |  36463 | 18397   (1)|   5622 |00:00:03.39 |   65102 |  65050 |   940K|   940K| 1359K (0)|
+|*  8 |        HASH JOIN           |                    |      1 |   2222 | 14489   (1)|   1499 |00:00:02.94 |   51412 |  51369 |   992K|   992K| 1331K (0)|
+|*  9 |         HASH JOIN          |                    |      1 |   2222 | 14120   (1)|   1499 |00:00:01.04 |   50088 |  50057 |  3494K|  1598K| 4145K (0)|
+|* 10 |          TABLE ACCESS FULL | DM_SYSOBJECT_S     |      1 |  39235 | 10003   (1)|  39235 |00:00:00.47 |   36385 |  36376 |       |       |          |
+|* 11 |          HASH JOIN         |                    |      1 |  24899 |  3920   (1)|   5648 |00:00:00.55 |   13703 |  13681 |  1199K|  1199K| 1344K (0)|
+|* 12 |           INDEX RANGE SCAN | D_1F0049A880000016 |      1 |   1517 |    12   (0)|   1517 |00:00:00.01 |      13 |      0 |       |       |          |
+|* 13 |           TABLE ACCESS FULL| DM_SYSOBJECT_R     |      1 |    646K|  3906   (1)|    646K|00:00:00.43 |   13690 |  13681 |       |       |          |
+|  14 |         TABLE ACCESS FULL  | DM_FOLDER_S        |      1 |    431K|   367   (1)|    431K|00:00:01.82 |    1324 |   1312 |       |       |          |
+|* 15 |        TABLE ACCESS FULL   | DM_SYSOBJECT_R     |      1 |    646K|  3906   (1)|    646K|00:00:00.33 |   13690 |  13681 |       |       |          |
+|* 16 |       TABLE ACCESS FULL    | DM_SYSOBJECT_S     |      1 |    646K| 10000   (1)|    646K|00:00:00.60 |   36385 |  36376 |       |       |          |
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+Note
+-----
+   - statistics feedback used for this statement</pre></p>
+<p>Same plan and same execution time here. Tables are large and SGA is small here.</p>
+<p><pre>*********** Begin Dump Context: best estimates ***********
+
+**************************************************************
+kkocfbCompareExecStats : Current
+Exec count:         1
+CR gets:            102224
+CU gets:            3
+Disk Reads:         101426
+Disk Writes:        0
+IO Read Requests:   1633
+IO Write Requests:  0
+Bytes Read:         830881792
+Bytes Written:      0
+Bytes Exchanged with Storage:  830881792
+Bytes Exchanged with Disk:  830881792
+Bytes Simulated Read:  0
+Bytes Simulated Returned:  0
+Elapsed Time: 4206 (ms)
+CPU Time: 1279 (ms)
+User I/O Time: 3084 (ms)
+**************************************************************
+kkocfbCompareExecStats : Best
+Exec count:         1
+CR gets:            17679
+CU gets:            0
+Disk Reads:         0
+Disk Writes:        0
+IO Read Requests:   0
+IO Write Requests:  0
+Bytes Read:         0
+Bytes Written:      0
+Bytes Exchanged with Storage:  0
+Bytes Exchanged with Disk:  0
+Bytes Simulated Read:  0
+Bytes Simulated Returned:  0
+Elapsed Time: 51 (ms)
+CPU Time: 51 (ms)
+User I/O Time: 15 (us)
+kkocfbCompareExecStats: improvement BG: 0.172939 CPU: 0.040363</pre></p>
+<p>So where we are here? We had an execution which was based on bad estimations. Then two tries on good estimations, but because of different buffer cache behavior they are finally 5 times slower. Nothing else to try.</p>
+<p>The good thing is that the optimizer admits it cannot do better and falls back to the best execution time, now considered as the best estimate:</p>
+<p><pre>kkocfbCheckCardEst: reparse using best estimates
+...
+kkocfbCopyCardCtx: No best stats found</pre></p>
+<p>We see no OPT_ESTIMATE hints here, reason why there was noting in V$SQL_REOPTIMIZATION_HINTS for cursor 2, but this cursor is still marked as re-optimizable and next execution invalidates it:</p>
+<p><pre>KKSMEC: Invalidating old cursor 2 with hash val = 955499861
+KKSMEC: Produced New cursor 3 with hash val = 1894156093</pre></p>
+<p>We see that we are back to the original plan, which is expected because the static statistics have not changed, and there are no statistics feedback this time.</p>
+<h3>Child cursor 3 &#8211; back to plan 1894156093 &#8211; 0.5 seconds</h3>
+<p>This is the plan that si used for all subsequent executions now.</p>
+<p><pre>Plan hash value: 1894156093
+----------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                  | Name               | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                           |                    |      1 |        |   171 (100)|      1 |00:00:00.04 |   17677 |
+|   1 |  SORT AGGREGATE                            |                    |      1 |      1 |            |      1 |00:00:00.04 |   17677 |
+|   2 |   NESTED LOOPS                             |                    |      1 |      1 |   116   (0)|   1491 |00:00:00.04 |   17677 |
+|   3 |    NESTED LOOPS                            |                    |      1 |      1 |   115   (0)|   1491 |00:00:00.04 |   17454 |
+|   4 |     NESTED LOOPS                           |                    |      1 |     49 |    17   (0)|   5648 |00:00:00.01 |     536 |
+|*  5 |      INDEX RANGE SCAN                      | D_1F0049A880000016 |      1 |      3 |     3   (0)|   1517 |00:00:00.01 |      13 |
+|   6 |      TABLE ACCESS BY INDEX ROWID BATCHED   | DM_SYSOBJECT_R     |   1517 |     16 |    10   (0)|   5648 |00:00:00.01 |     523 |
+|*  7 |       INDEX RANGE SCAN                     | D_1F0049A880000010 |   1517 |     71 |     2   (0)|   5648 |00:00:00.01 |     249 |
+|*  8 |     TABLE ACCESS BY INDEX ROWID            | DM_SYSOBJECT_S     |   5648 |      1 |     2   (0)|   1491 |00:00:00.03 |   16918 |
+|*  9 |      INDEX UNIQUE SCAN                     | D_1F0049A880000108 |   5648 |      1 |     1   (0)|   1491 |00:00:00.03 |   15427 |
+|  10 |       NESTED LOOPS SEMI                    |                    |   5648 |      2 |    25   (0)|   1491 |00:00:00.02 |   14827 |
+|  11 |        NESTED LOOPS                        |                    |   5648 |      7 |    18   (0)|   2981 |00:00:00.02 |   12868 |
+|  12 |         TABLE ACCESS BY INDEX ROWID BATCHED| DM_SYSOBJECT_R     |   5648 |     71 |     4   (0)|   2981 |00:00:00.01 |    7747 |
+|* 13 |          INDEX RANGE SCAN                  | D_1F0049A880000010 |   5648 |     16 |     3   (0)|   2981 |00:00:00.01 |    6145 |
+|* 14 |         TABLE ACCESS BY INDEX ROWID        | DM_SYSOBJECT_S     |   2981 |      1 |     2   (0)|   2981 |00:00:00.01 |    5121 |
+|* 15 |          INDEX UNIQUE SCAN                 | D_1F0049A880000108 |   2981 |      1 |     1   (0)|   2981 |00:00:00.01 |    2140 |
+|* 16 |        INDEX UNIQUE SCAN                   | D_1F0049A880000145 |   2981 |  52759 |     1   (0)|   1491 |00:00:00.01 |    1959 |
+|* 17 |    INDEX UNIQUE SCAN                       | D_1F0049A880000142 |   1491 |      1 |     1   (0)|   1491 |00:00:00.01 |     223 |
+----------------------------------------------------------------------------------------------------------------------------------------</pre></p>
+<p>After a few tries to get a better plan, the optimizer finally switched back to the first one because it was the best in term of response time (I don&#8217;t know exactly which execution statistics are used for this decision, elapsed time is just my guess here).</p>
+<p>The interesting point here is to understand that you can see a reoptimized cursor without statistics feedback:
+<ul>
+<li>No rows for the previous cursor in V$SQL_REOPTIMIZATION_HINTS</li>
+<li>No &#8216;statistics feedback&#8217; not in the new cursor plan</li>
+<li>Difference between E-Rows and A-Rows in the new plan</li>
+</ul>
+<h3>So what?</h3>
+<p>SQL optimization is a complex task and there is nothing like an execution is &#8216;fast&#8217; or &#8216;slow&#8217;, an execution plan is &#8216;good&#8217; or &#8216;bad&#8217;, an optimizer decision is &#8216;right&#8217; or &#8216;wrong&#8217;. What is fast after several similar executions can be slow on a busy system because less blocks remains in cache. What is slow at a time where the storage is busy may be fast at another time of the day. What is fast with one single user may raise more concurrency contention on a busy system. Cardinality feedback is a reactive attempt to improve an execution plan. On average, things go better with it, but it is not abnormal that few cases can go wrong for a few executions. You can&#8217;t blame the optimizer for that, and fast conclusions or optimizer parameter tweaking are not sustainable solutions. And don&#8217;t forget that if your data model is well designed, then the critical queries should have one clear optimal access path which will not depend on a small difference in estimated number of rows. </p>
+<p>The only thing I can always conclude when I see cardinality feedback going wrong is that there is something to fix in the design of data model, the statistics gathering and/or the query design. When statistics feedback gives a worse execution plan, it is the consequence of the combination of:</p>
+<ul>
+<li>mis-estimation of cardinalities: bad, insufficient, or stale statistics </li>
+<li>mis-estimation of response time: bad system statistics, untypical memory sizing, unrepresentative execution context</li>
+<li>no clear optimal access path: sub-optimal indexing, lack of partitioning,&#8230;</li>
+</ul>
+<p>It is a good thing to have the auto-reoptimization coming back to the initial plan when nothing better has been observed. I would love to see more control about it. For example, a hint that sets a threshold of execution time where the optimizer should not try to find better. I filled this idea in <a href="https://community.oracle.com/ideas/17514" target="_blank">https://community.oracle.com/ideas/17514</a> and you can vote for it.</p>
+<h3>Update 2-APR-2017</h3>
+<p>I was not clear in this post, but this is the first time I observed this behavior (multiple reoptimization and then back to original plan), so I&#8217;m not sure about the reasons and the different conditions required. This was on 12.1.0.2 with JAN17 PSU and the two Adaptive Statistics backport from 12<em>c</em>R2, adaptive plans set to false and no bind variables.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-155580"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-7252">
+				<div id="div-comment-7252" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/dc43e6499ba6196ef99509ef5a7f3120?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.hourim.wordpress.com' rel='external nofollow' class='url'>Houri</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7252">
+			April 3, 2017 at 16 h 45 min</a>		</div>
+
+		<p>Bonjour Franck,</p>
+<p>The fact that Oracle came back to its initial execution plan is not new. I have already experienced this in a real life case which I have blogged about it in this article</p>
+<p><a href="https://hourim.wordpress.com/2015/08/21/cardinality-feedback-a-practical-case/#comments" rel="nofollow">https://hourim.wordpress.com/2015/08/21/cardinality-feedback-a-practical-case/#comments</a></p>
+<p>I have read the US Patent about Cardinality Feedback; if my memory serves me well Oracle will stop monitoring a cursor for cardinality feedback at the third round. May be the absence of opt_estimate hint at the third cursor (n°2) has to be linked with this upper limit of the maximum number of cardinality feedback re-optimisation attemps Oracle is allowed to accomplish before giving up.</p>
+<p>Bien Cordialement
+Mohamed Houri
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-72531"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7252' onclick='return addComment.moveForm( "div-comment-7252", "7252", "respond", "15557" )' aria-label='Reply to Houri to Houri'>Reply to Houri</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7269">
+				<div id="div-comment-7269" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7269">
+			April 7, 2017 at 7 h 27 min</a>		</div>
+
+		<p>Salut Mohamed,
+Interesting. Do you have the reference of the patent?
+Thanks,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-72701"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7269' onclick='return addComment.moveForm( "div-comment-7269", "7269", "respond", "15557" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-7302">
+				<div id="div-comment-7302" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/dc43e6499ba6196ef99509ef5a7f3120?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.hourim.wordpress.com' rel='external nofollow' class='url'>Houri</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7302">
+			April 12, 2017 at 20 h 29 min</a>		</div>
+
+		<p>Bonsoir Franck,</p>
+<p>Désolé pour ce retard.</p>
+<p>I have been looking over my saved US Patent until I have finally realised that I have read about this cardinality monitoring in the following Oracle optimizer blog and not in an US patent</p>
+<p><a href="https://blogs.oracle.com/optimizer/entry/cardinality_feedback" rel="nofollow">https://blogs.oracle.com/optimizer/entry/cardinality_feedback</a></p>
+<p>In this blog they have mentioned the implementation of safeguards to guarantee that cardinality feedback will stabilise after a small number of executions. They refer alos ti a VLDB article for more details.</p>
+<p>Bien Cordialement
+Mohamed Houri
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73031"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7302' onclick='return addComment.moveForm( "div-comment-7302", "7302", "respond", "15557" )' aria-label='Reply to Houri to Houri'>Reply to Houri</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

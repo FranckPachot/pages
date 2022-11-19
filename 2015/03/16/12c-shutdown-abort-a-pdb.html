@@ -1,0 +1,136 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/12c-shutdown-abort-a-pdb />
+<meta name=description content='A blog post from 2015 about 12c: shutdown abort a PDB?'>
+<title>12c: shutdown abort a PDB?</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/12c-shutdown-abort-a-pdb>https://blog.dbi-services.com/12c-shutdown-abort-a-pdb</a> (2015-03-16), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">12c: shutdown abort a PDB?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Can we shutdown abort a PDB? Let&#8217;s try:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; show con_id
+CON_ID
+------------------------------
+3SQL&gt; shutdown abort;
+Pluggable Database closed.</pre>
+<p>But is it really a shutdown abort?</p>
+<p>The shutdown abort we know in non-CDB &#8211; or in a CDB from CDB$ROOT &#8211; is used when the instance cannot checkpoint before closing the file. It leaves the files fuzzy. And shutdown abort crashes the instance &#8211; loosing all changes made in buffer cache and not yet checkpointed. This is why we have online redo logs so that an instance recovery can be used to recover those changes.</p>
+<p>But if I shutdown abort only a PDB the instance is still there. Let&#8217;s see from alert.log what it did:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">2015-03-16 06:59:51.487000 +01:00
+ ALTER PLUGGABLE DATABASE CLOSE ABORT
+ ALTER SYSTEM: Flushing buffer cache inst=0 container=3 local
+ Pluggable database PDB closed
+ Completed: ALTER PLUGGABLE DATABASE CLOSE ABORT</pre>
+<p>Ok. even if it&#8217;s called &#8216;close abort&#8217; a checkpoint occured. Look at the file fuzziness:</p>
+<pre> SQL&gt; select file#,con_id,fuzzy from v$datafile_header;</pre>
+<pre>     FILE#     CON_ID FUZ
+---------- ---------- ---
+         4          0 YES
+         8          3 NO
+         9          3 NO
+        10          3 NO</pre>
+<p>Except for the UNDO which is in CDB$ROOT, none of my PDB files are fuzzy. There were closed cleanly.</p>
+<p>This is fine when we can write into the datafiles in order to checkpoint them. But if the file is not there we can&#8217;t checkpoint it. Then what happens?</p>
+<p>On a non-CDB &#8211; or on the CDB$ROOT of a CDB &#8211; it&#8217;s simple. The instance crashes. By default, since 11.2.0.2, and without changing the &#8220;_datafile_write_errors_crash_instance&#8221; default value, the instance crashes as soon as a file is missing at checkpoint. If &#8220;_datafile_write_errors_crash_instance&#8221; is set to true, the instance crashes only when the datafiles is a system one.</p>
+<p>Okay, we have to think about that behaviour change (and that&#8217;s for a future blog post) but usually the application is down when a datafile is missing, so better to stop everything.</p>
+<p>But the problem is in multitenant. As we have seen in previous posts, the whole instance crashes at checkpoint, even when a PDB only datafile is missing. You can set &#8220;_datafile_write_errors_crash_instance&#8221; but the issue is still there for system datafiles. I had open a bug about it and it&#8217;s fixed in latest patchset, but that is not sufficient.</p>
+<p>The problem is that offlining a file without checkpoint leaves it in a &#8216;need recovery&#8217; state. But if the instance is still running then the online redo logs can be overwriten and all changes are lost. Of course, in archivelog mode you should be able to restore them. But by default crashing the instance is chosen.</p>
+<p>I&#8217;m in archivelog mode and I can shutdown abort the PDB as soon as I know that the datafile is missing (and before next checkpoint):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">RMAN&gt; host "rm /u02/oradata/CDB/datafile/o1_mf_system_bjdz9ldm_.dbf";
+
+host command complete
+
+RMAN&gt; alter pluggable database pdb close abort;
+
+Statement processed</pre>
+<p>and here is the alert.log:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">2015-03-16 08:04:37.194000 +01:00
+alter pluggable database pdb close abort
+**********************************************************
+Pluggable Database PDB with id - 3 has a missing or corrupt
+datafile belonging to the pluggable database. It will be
+closed abnormally. The pdb needs to be dropped or recovered
+**********************************************************
+Checker run found 1 new persistent data failures
+Pluggable database PDB closed
+Completed: alter pluggable database pdb close abort</pre>
+<p>So I&#8217;m able to shutdown abort a PDB when I&#8217;m in archivelog mode. If I&#8217;m not in archivelog mode can&#8217;t do it (except if &#8220;_enable_pdb_close_noarchivelog&#8221;=true but that is very risky ).</p>
+<p>But I want that shutdown to occur automatically because consolidation should not decrease databases availability and I&#8217;m not sure to be able to manually close abort before the next checkpoint. Then I have to set &#8220;_enable_pdb_close_abort&#8221;=true and here is what happens in alert.log:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">2015-03-16 08:55:18.833000 +01:00
+Errors in file /u01/app/oracle/diag/rdbms/cdb/CDB/trace/CDB_ckpt_1698.trc:
+ORA-01243: system tablespace file suffered media failure
+ORA-01116: error in opening database file 8
+ORA-01110: data file 8: '/u02/oradata/CDB/datafile/o1_mf_system_bjf31v1m_.dbf'
+ORA-27041: unable to open file
+Linux-x86_64 Error: 2: No such file or directory
+Additional information: 3
+Internal PDB shutdown abort of PDB (container=3)</pre>
+<h3> Conclusion</h3>
+<p>I order to have only the PDB shut down in case of the loss of a system file &#8211; instead of the whole CDB &#8211; you need:</p>
+<ul>
+<li>to be in archivelog mode</li>
+<li>to have latest patchset (with fix for bug 19001390)</li>
+<li>to set &#8220;_enable_pdb_close_abort&#8221;=true</li>
+</ul>
+<p>As you are in archivelog mode, you should be able to recover, but I suppose you will not wait too long to restore and recover the missing datafiles.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-6000"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7375">
+				<div id="div-comment-7375" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a2a19e1fb1fdd173d1a39b0e73390c09?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Foued</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7375">
+			April 25, 2017 at 15 h 51 min</a>		</div>
+
+		<p>Thanks Franck  for the post.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-73761"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7375' onclick='return addComment.moveForm( "div-comment-7375", "7375", "respond", "599" )' aria-label='Reply to Foued to Foued'>Reply to Foued</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

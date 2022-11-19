@@ -1,0 +1,187 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracletext-deletes-and-garbage />
+<meta name=description content='A blog post from 2015 about OracleText: deletes and garbage'>
+<title>OracleText: deletes and garbage</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracletext-deletes-and-garbage>https://blog.dbi-services.com/oracletext-deletes-and-garbage</a> (2015-02-15), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">OracleText: deletes and garbage</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="http://www.dbi-services.com/index.php/blog/entry/oracletext-inserts-and-fragmentation">previous post</a> we have seen how the OracleText index tables are maintained when new document arrives: At sync the new documents are read up to the available memory and words are inserted in the $I table with their mapping information. Now we will see how removed documents are processed. We will not cover updates as their are just delete + insert.</p>
+<h3>Previous state</h3>
+<p>Here is the state from the previous post where I had those 3 documents:</p>
+<ul>
+<li>&#8216;Hello World&#8217;</li>
+</ul>
+<p>which was synced alone, and then the two following ones were synced together:</p>
+<ul>
+<li>&#8216;Hello Moon, hello, hello&#8217;</li>
+<li>&#8216;Hello Mars&#8217;</li>
+</ul>
+<p>The $K is a IOT which maps the OracleText table ROWID to the DOCID (the fact that the primary key TEXTKEY is not at start is a bit misleading):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$K;
+
+     DOCID TEXTKEY
+---------- ------------------
+         1 AAAXUtAAKAAABWlAAA
+         2 AAAXUtAAKAAABWlAAB
+         3 AAAXUtAAKAAABWlAAC
+</pre>
+<p>The $R is a table mapping the opposite navigation (docid to rowid) storing a fixed-length array of ROWIDs indexed by the docid, and split into several lines:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$R;
+
+    ROW_NO DATA
+---------- ------------------------------------------------------------
+         0 00001752D000280000056940414100001752D00028000005694041420000
+</pre>
+<p>The $I table stores the tokens, the first 5 columns being indexed ($X) and the TOKEN_INFO blob stores detailed location of the token:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$I;
+
+TOKEN_TEXT TOKEN_TYPE TOKEN_FIRST TOKEN_LAST TOKEN_COUNT TOKEN_INFO
+---------- ---------- ----------- ---------- ----------- ----------
+HELLO               0           1          1           1 008801
+WORLD               0           1          1           1 008802
+HELLO               0           2          3           2 0098010201
+MARS                0           3          3           1 008802
+MOON                0           2          2           1 008802
+</pre>
+<p>We have seen that the $I table can be fragmented for 3 reasons:</p>
+<ul>
+<li>Each sync insert his tokens (instead of merging with other ones)</li>
+<li>TOKEN_INFO size is limited to fit in-row (we will see 12c new features later)</li>
+<li>Only tokens that fit in the allocated memory can be merged</li>
+</ul>
+<p>And the $N is empty for the moment:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$N;
+
+no rows selected
+</pre>
+<h3>Delete</h3>
+<p>Do you remember how inserts are going to the CTXSYS.DR$PENDING table? Deletes are going to CTXSYS.DR$DELETE table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; delete from DEMO_CTX_FRAG where num=0002;
+
+1 row deleted.
+
+SQL&gt; select * from CTXSYS.DR$DELETE;
+
+DEL_IDX_ID DEL_IXP_ID  DEL_DOCID
+---------- ---------- ----------
+      1400          0          2
+</pre>
+<p>I&#8217;ve deleted docid=2 but the tokens are still there:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$I;
+
+TOKEN_TEXT TOKEN_TYPE TOKEN_FIRST TOKEN_LAST TOKEN_COUNT TOKEN_INFO
+---------- ---------- ----------- ---------- ----------- ----------
+HELLO               0           1          1           1 008801
+WORLD               0           1          1           1 008802
+HELLO               0           2          3           2 0098010201
+MARS                0           3          3           1 008802
+MOON                0           2          2           1 008802
+</pre>
+<p>as well as their mapping to the ROWID:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; -- $R is for rowid - docid mapping (IOT)
+SQL&gt; select * from DR$DEMO_CTX_INDEX$R;
+
+    ROW_NO DATA
+---------- ------------------------------------------------------------
+         0 00001752D000280000056940414100001752D00028000005694041420000
+</pre>
+<p>However, the $N has been maintained to know that docid=2 has been removed:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$N;
+
+ NLT_DOCID N
+---------- -
+         2 U
+</pre>
+<p>This is the goal of $N (Negative) table which records the docid that should not be there and that must be deleted at next optimization (garbage collection).</p>
+<p>From there, a search by words (&#8216;normal lookup&#8217;) will give docid&#8217;s and rowid&#8217;s and the CTXSYS.DR$DELETE must be read in order to know that the document is not there anymore. It&#8217;s an IOT and the docid can be found with an index unique scan.</p>
+<p>However for the opposite way, having a ROWID and checking if it contains some words (&#8216;functional lookup&#8217;) we need to know that there is no document. In my case I deleted the row, but you may update the document, so the ROWID is still there. There is no pending table for that. It is maintained immediately in the $K table:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$K;
+
+     DOCID TEXTKEY
+---------- ------------------
+         1 AAAXUtAAKAAABWlAAA
+         3 AAAXUtAAKAAABWlAAC
+</pre>
+<p>the entry that addressed docid=2 has been deleted.</p>
+<h3>Commit</h3>
+<p>All those changes were done within the same transaction. Other sessions still see the old values. No need to read CTXSYS.DR$DELETE for them. What I described above is only for my session: the normal lookup reading the queuing table, and the functional lookup stopping at $K. We don&#8217;t have to wait a sync to process CTXSYS.DR$DELETE. It&#8217;s done at commit:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; commit;
+
+Commit complete.
+
+SQL&gt; select * from CTXSYS.DR$DELETE;
+
+no rows selected
+
+SQL&gt; select * from DR$DEMO_CTX_INDEX$R;
+
+    ROW_NO DATA
+---------- ------------------------------------------------------------
+         0 00001752D000280000056940414100000000000000000000000000000000
+</pre>
+<p>Of course we can&#8217;t read it but we see that part of it has been zeroed. That $R table is definitely special: it&#8217;s not stored in a relational way, and its maintenance is deferred at commit time.</p>
+<p>But nothing has changed in $I which contains garbage (and sync is not changing anything to that):</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$I;
+
+TOKEN_TEXT TOKEN_TYPE TOKEN_FIRST TOKEN_LAST TOKEN_COUNT TOKEN_INFO
+---------- ---------- ----------- ---------- ----------- ----------
+HELLO               0           1          1           1 008801
+WORLD               0           1          1           1 008802
+HELLO               0           2          3           2 0098010201
+MARS                0           3          3           1 008802
+MOON                0           2          2           1 008802
+</pre>
+<p>And of course $N row is still there to record the deleted docid:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from DR$DEMO_CTX_INDEX$N;
+
+ NLT_DOCID N
+---------- -
+         2 U
+</pre>
+<h3>Sync</h3>
+<p>I&#8217;ve not reproduced it here, but sync is not changing anything. Sync is for new documents &#8211; not for deleted ones.</p>
+<h3>Conclusion</h3>
+<p>What you need to remember here is:</p>
+<ul>
+<li>New documents are made visible through OracleText index <strong>at sync</strong></li>
+<li>Removed document are immediately made invisible <strong>at commit</strong></li>
+</ul>
+<p>Of course, you can sync at commit, but the second thing to remember is that</p>
+<ul>
+<li>New documents brings fragmentation</li>
+<li>Removed document brings garbage</li>
+</ul>
+<p>and both of them increase the size of the $I table and its $X index, making range scans less efficient. We will see more about that but the next post will be about queries. I&#8217;ve talked about normal and functional lookups and we will see how they are done. Let&#8217;s detail that.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5850"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

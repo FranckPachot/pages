@@ -1,0 +1,198 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/never-gather-workload-stats-on-exadata />
+<meta name=description content='A blog post from 2015 about Never gather WORKLOAD stats on Exadata&#8230;'>
+<title>Never gather WORKLOAD stats on Exadata&#8230;</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/never-gather-workload-stats-on-exadata>https://blog.dbi-services.com/never-gather-workload-stats-on-exadata</a> (2015-02-09), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Never gather WORKLOAD stats on Exadata&#8230;</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>For Exadata, oracle has introduced an &#8216;EXADATA&#8217; mode which sets a high transfer rate (with IOTFRSPEED as in NOWORKLOAD statistics) and set a MBRC (as in WORKLOAD statistics). Those values are set rather than gathered because all the SmartScan optimization done at storage cell level, which makes the multiblock reads less expensive, is difficult to measure from the database.
+Here I will explain what I stated in a <a href="http://www.dbi-services.com/index.php/blog/entry/when-to-gather-workload-system-statistics">previous blog</a>: <strong>direct-path reads are not counted as multiblock reads for the MBRC system statistic</strong>. And direct-path read should be the main i/o path in Exadata as you probably bought that machine to benefit from SmartScan.</p>
+<h3>With direct-path reads</h3>
+<p>On a test database that has no activity, I’m creating a 1000 blocks table. My goal is to gather WORKLOAD system statistics during a simple table full scan on that table, and see how it calculates SREADTIM, MREADTIM and MBRC.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect demo/demo
+Connected.
+
+SQL&gt; drop table DEMO;
+Table dropped.
+
+SQL&gt; create table DEMO pctfree 99 as select rpad('x',1000,'x') n from dual connect by level &lt;=1000;
+Table created.
+</pre>
+<p>Then I run a simple select between the calls to ‘start’ and ‘stop’ procedures of the dbms_stats WORKLOAD system stats gathering.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_stats.gather_system_stats('start');
+PL/SQL procedure successfully completed.
+
+SQL&gt; connect demo/demo
+Connected.
+
+SQL&gt; select count(*) from DEMO;
+
+  COUNT(*)
+----------
+      1000
+
+</pre>
+<p>I check the physical read statistics (this is why have reconnected my session so that I can query v$mystat without doing the delta)</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select name,value from v$mystat join v$statname using(statistic#) where (name like 'phy%' or name like 'cell%') and value&gt;0;
+
+NAME                                                              VALUE
+------------------------------------------------------------ ----------
+physical read total IO requests                                      22
+physical read total multi block requests                              7
+physical read total bytes                                       8306688
+cell physical IO interconnect bytes                             8306688
+physical reads                                                     1000
+physical reads direct                                              1000
+physical read IO requests                                            15
+physical read bytes                                             8192000
+cell scans                                                            1
+cell blocks processed by cache layer                               1000
+cell blocks processed by txn layer                                 1000
+cell blocks processed by data layer                                1000
+cell physical IO bytes eligible for predicate offload           8192000
+cell physical IO interconnect bytes returned by smart scan       130760
+cell IO uncompressed bytes                                      8192000
+</pre>
+<p>I’ve read 1000 blocks in 15 i/o calls so I&#8217;m sure it is multiblock reads. All of them (1000 x 8k) was eligible for SmartScan and those 1000 blocks have been processed by the storage cell.</p>
+<p>If you wonder why I have only 7 &#8216;physical read total multi block requests&#8217; it&#8217;s because it accounts only the &#8216;full&#8217; multiblock reads &#8211; not those that are limited by extent boundary. See <a href="https://community.oracle.com/thread/3651966">here</a> for that analysis.</p>
+<p>If you wonder why I have only 22 &#8216;physical read total IO requests&#8217; then I&#8217;ve not the answer. The sql_trace shows only the 15 &#8216;direct path read&#8217;. And dbms_stats counts only the &#8216;physical read IO requests&#8217;. If you have any idea, please comment.</p>
+<p>I stop my WORKLOAD statistics gathering:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; exec dbms_stats.gather_system_stats('stop');
+PL/SQL procedure successfully completed.
+</pre>
+<p>And check the system statistics that have been set:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from sys.aux_stats$;
+
+SNAME           PNAME           PVAL1
+--------------- ---------- ----------
+SYSSTATS_INFO   STATUS
+SYSSTATS_INFO   DSTART
+SYSSTATS_INFO   DSTOP
+SYSSTATS_INFO   FLAGS               1
+SYSSTATS_MAIN   CPUSPEEDNW       2300
+SYSSTATS_MAIN   IOSEEKTIM          10
+SYSSTATS_MAIN   IOTFRSPEED       4096
+SYSSTATS_MAIN   SREADTIM
+SYSSTATS_MAIN   MREADTIM         .151
+SYSSTATS_MAIN   CPUSPEED         2300
+SYSSTATS_MAIN   MBRC
+SYSSTATS_MAIN   MAXTHR
+SYSSTATS_MAIN   SLAVETHR
+</pre>
+<p>I have no SREADTIM which is expected as I&#8217;ve done only multiblock reads. I have a MREADTIM. But I don&#8217;t have the MBRC set.</p>
+<h3>With conventional (aka buffered) reads</h3>
+<p>Let&#8217;s do the same after disabling serial direct-path reads:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set "_serial_direct_read"=never;
+Session altered.
+</pre>
+<p>I do the same as before, but now my session stats show only conventional reads:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">NAME                                                              VALUE
+------------------------------------------------------------ ----------
+physical read total IO requests                                      44
+physical read total multi block requests                             28
+physical read total bytes                                       8192000
+cell physical IO interconnect bytes                             8192000
+physical reads                                                     1000
+physical reads cache                                               1000
+physical read IO requests                                            44
+physical read bytes                                             8192000
+physical reads cache prefetch                                       956
+
+</pre>
+<p>and here are the gathered stats:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SNAME           PNAME           PVAL1
+--------------- ---------- ----------
+SYSSTATS_INFO   STATUS
+SYSSTATS_INFO   DSTART
+SYSSTATS_INFO   DSTOP
+SYSSTATS_INFO   FLAGS               1
+SYSSTATS_MAIN   CPUSPEEDNW       2300
+SYSSTATS_MAIN   IOSEEKTIM          10
+SYSSTATS_MAIN   IOTFRSPEED       4096
+SYSSTATS_MAIN   SREADTIM
+SYSSTATS_MAIN   MREADTIM         .028
+SYSSTATS_MAIN   CPUSPEED         2300
+SYSSTATS_MAIN   MBRC               23
+SYSSTATS_MAIN   MAXTHR
+SYSSTATS_MAIN   SLAVETHR
+
+</pre>
+<p>Now the MBRC is set with the gathered value.</p>
+<p>This proves that MBRC is set only for conventional multiblock reads. Direct-path reads are not accounted.</p>
+<h3>Conclusion</h3>
+<p>If you are on Exadata, you probably want to benefit from SmartScan. Then you probably want the CBO to choose FULL TABLE SCAN which will do direct-path reads for large tables (according that they don&#8217;t have a lot of updated buffers in SGA). If you gather WORKLOAD statistics they will set MBRC without accounting for those direct-path reads and it will probably be set lower than the average actual multiblock read (which &#8211; in direct-path reads &#8211; is close the the db_file_multiblock_read &#8211; default or set value).</p>
+<p>This is the reason why Oracle introduced the EXADATA mode: it sets the MBRC from the db_file_multiblock_read value.
+They also set the IOTFRSPEED to a high value because gathering MREADTIM will probably get a very low value &#8211; lower than SREADTIM &#8211; thanks to the SmartScan. And CBO ignores values where MREADTIM is less than SREADTIM.</p>
+<p>An alternative to EXADATA mode can be setting those values as NOWORKLOAD statistics and keep the db_file_multiblock_read_count set. You will have the same behavior because CBO uses db_file_multiblock_read_count when it is set and there are no MBRC system stats. But the danger is that if someone resets the db_file_multiblock_read_count (and I often advise to keep defaults) then the CBO will use a value of 8 and that will probably increase the cost of full table scans too much.</p>
+<p>All formulas are here with a script that shows what is used by the CBO.</p>
+<h3>Never say never</h3>
+<p>Well, that blog post title is too extreme because:</p>
+<blockquote class="twitter-tweet" lang="en"><p><a href="https://twitter.com/FranckPachot">@FranckPachot</a> <a href="https://twitter.com/kevinclosson">@kevinclosson</a> <a href="https://twitter.com/fritshoogland">@fritshoogland</a> <a href="https://twitter.com/moustafa_dba">@moustafa_dba</a> <a href="https://twitter.com/JLOracle">@JLOracle</a> never say never <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";-)" class="wp-smiley" /></p>
+<p>— Christian Antognini (@ChrisAntognini) <a href="https://twitter.com/ChrisAntognini/status/564406982816587776">February 8, 2015</a></p></blockquote>
+<p>So I should say:
+Never gather WORKLOAD stats on Exadata&#8230; except if your workload is not an Exadata optimized one.
+If you are using Exadata for OLTP, then yes, you can gather WORKLOAD statistics as they probably fit OLTP behaviour. But in any case, <strong>always check the gathered stats and see if they are relevant.</strong></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5790"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7550">
+				<div id="div-comment-7550" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/8c046ba355ec48679afb1e93e54eb533?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://blogs.oracle.com/performancediagnosis/' rel='external nofollow' class='url'>abel m macias</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7550">
+			May 24, 2017 at 20 h 08 min</a>		</div>
+
+		<p>The answer for the &#8220;physical-read-total-multi-block-requests&#8221; is here :
+<a href="https://blogs.oracle.com/performancediagnosis/physical-read-total-multi-block-requests" rel="nofollow">https://blogs.oracle.com/performancediagnosis/physical-read-total-multi-block-requests</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75511"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7550' onclick='return addComment.moveForm( "div-comment-7550", "7550", "respond", "578" )' aria-label='Reply to abel to abel m macias'>Reply to abel</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

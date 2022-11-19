@@ -1,0 +1,248 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/12c-dynamic-sampling-and-standard-edition />
+<meta name=description content='A blog post from 2015 about 12c Dynamic Sampling and Standard Edition'>
+<title>12c Dynamic Sampling and Standard Edition</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/12c-dynamic-sampling-and-standard-edition>https://blog.dbi-services.com/12c-dynamic-sampling-and-standard-edition</a> (2015-06-12), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">12c Dynamic Sampling and Standard Edition</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>12c is coming with more dynamic sampling, now called dynamic statistics and using the new Adaptive Dynamic Sampling algorithm. The goal is to have better estimations and better estimations gives better execution plans. However, this new approach will increase parse time because dynamic sampling kicks in more often, reads more blocs, and run more queries.</p>
+<p>It&#8217;s probably not a problem for applications that are well designed, using bind variables to avoid to many parses, having good statistics (histograms where it makes sense, extended statistics for correlated columns). The SQL Plan Directives are there to trigger dynamic sampling only where misestimates have been observed. An OLTP application should not parse often, and should not have huge misestimates. A reporting use-case can spend more time on parsing and the few seconds spend to do dynamic sampling will probably benefit to the execution time.</p>
+<p>In addition to that, in order to lower the dynamic sampling overhead, Oracle 12c Adaptive Dynamic Sampling run its queries with the /*+ result_cache(snapshot=3600) */ hint. The result is cached in the result cache and is not invalidated by dependencies. So even when the underlying table is updated, the dynamic sampling result is still valid in cache for 3600 seconds. This is why doing more dynamic sampling is not a big overhead according that:</p>
+<ul>
+<li>your result cache is sized accordingly. The default (0.25% of MEMORY_TARGET or 0.5% of SGA_TARGET or 1% of SHARED_POOL_SIZE) is probably too low to fit all the dynamic sampling result for frequently parsed statements.</li>
+<li>your result cache is enabled, meaning that you are in Enterprise Edition</li>
+</ul>
+<p>So the question of the day is that I want to know if the RESULT_CACHE hint is just ignored in Standard Edition, or if there is a mechanism that allows it from Adaptive Dynamic Sampling.</p>
+<p>If you have a bad application (not using bind variables, parse at each execution) and you are in Standard Edition, then there is a risk that the current parse contention you suffer from (CPU and latches) will be more problematic (more CPU and I/O). Let&#8217;s try the following:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">declare
+ c sys_refcursor;
+begin
+ for i in 1..100
+ loop
+  open c for 'select count(*) COUNT'||i||' from DEMO_TABLE where a+b=c+d';
+  dbms_sql.return_result(c);
+  null;
+ end loop;
+end;
+/
+</pre>
+<p>which run 100 times the same statement not using bind variables. So I&#8217;m parsing it each time, but it&#8217;s reading the same table with same predicate, so the result of dynamic sampling should not change a lot.</p>
+<p>I&#8217;ll run it in Standard and Enterprise editions, with no dynamic sampling, and with the new AUTO level.</p>
+<h3>Enterprise Edition with Adaptive Dynamic Sampling</h3>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+
+SQL&gt; show parameter optimizer_dynamic_sampling
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_dynamic_sampling           integer     11
+</pre>
+<p>I&#8217;m in Enterprise Edition and with the new AUTO dynamic sampling level (11). Here are a few statistics from v$mystat:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">NAME                                                                        VALUE
+------------------------------------------------------------ --------------------
+parse count (hard)                                                            204
+parse count (total)                                                           654
+parse time cpu                                                                 59
+parse time elapsed                                                             79
+recursive calls                                                             4,460
+session logical reads                                                     312,198
+
+</pre>
+<p>when I check result cache statistics, I can see that &#8216;Find Count&#8217; reaches the number of executions:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">        ID NAME                           VALUE
+---------- ------------------------------ --------
+         1 Block Size (Bytes)             1024
+         2 Block Count Maximum            5120
+         3 Block Count Current            32
+         4 Result Size Maximum (Blocks)   256
+         5 Create Count Success           17
+         6 Create Count Failure           0
+         7 Find Count                     104
+         8 Invalidation Count             0
+         9 Delete Count Invalid           0
+        10 Delete Count Valid             0
+        11 Hash Chain Length              1
+        12 Find Copy Count                104
+        13 Latch (Share)                  0
+</pre>
+<h3>Enterprise Edition without Dynamic Sampling</h3>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+
+SQL&gt; show parameter optimizer_dynamic_sampling
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_dynamic_sampling           integer     0
+
+</pre>
+<p>I&#8217;m in Enterprise Edition but disabled the dynamic sampling.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">NAME                                                                        VALUE
+------------------------------------------------------------ --------------------
+parse count (hard)                                                            196
+parse count (total)                                                           342
+parse time cpu                                                                 29
+parse time elapsed                                                             38
+recursive calls                                                             3,527
+session logical reads                                                     310,785
+
+</pre>
+<p>Here the parse time is smaller because we have less recursive calls. But the difference is not that big. Which means that the dynamic sampling was not a big overhead, thanks to result cache.</p>
+<h3>Standard Edition without Dynamic Sampling</h3>
+<pre class="brush: sql; gutter: true; first-line: 1">Connected to:
+Oracle Database 12c Release 12.1.0.1.0 - 64bit Production
+
+SQL&gt; show parameter optimizer_dynamic_sampling
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_dynamic_sampling           integer     0
+
+</pre>
+<p>I&#8217;m now connected to a Standard Edition with the dynamic sampling disabled:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">NAME                                                                        VALUE
+------------------------------------------------------------ --------------------
+parse count (hard)                                                            167
+parse count (total)                                                           271
+parse time cpu                                                                 26
+parse time elapsed                                                             22
+recursive calls                                                             2,131
+session logical reads                                                     309,449
+
+</pre>
+<p>This is very similar to the previous one. When dynamic sampling is not enabled, then the parsing time is similar in SE and in EE.</p>
+<h3>Standard Edition with Adaptive Dynamic Sampling</h3>
+<pre class="brush: sql; gutter: true; first-line: 1">Connected to:
+Oracle Database 12c Release 12.1.0.1.0 - 64bit Production
+
+SQL&gt; show parameter optimizer_dynamic_sampling
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_dynamic_sampling           integer     11
+
+</pre>
+<p>And finally here is the level=AUTO dynamic sampling in Standard Edition:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">NAME                                                                        VALUE
+------------------------------------------------------------ --------------------
+parse count (hard)                                                            204
+parse count (total)                                                           649
+parse time cpu                                                                690
+parse time elapsed                                                            879
+recursive calls                                                             4,256
+session logical reads                                                   1,019,986
+
+</pre>
+<p>This is where we have a problem. Now wit Adaptive Dynamic Sampling, we are doing the same number of recursive calls as in EE but the result cache is not there to optimize them. My parse time is 10x higher. The number of blocks read is huge. there is no result cache here. And I&#8217;ve been running the queries from the same session where an internal cache is supposed to help.</p>
+<h3>Conclusion</h3>
+<p>The result cache &#8211; which is very important to ensure that the new 12c adaptive dynamic sampling is not a huge overhead at parsing &#8211; is not available in Standard Edition. Which means that if you already have parsing issues, you should solve them before gping to 12c or maybe you will have to disable the adaptive dynamic sampling.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-23120"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1486">
+				<div id="div-comment-1486" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ed6ed998566a3e8eb6bf1a0c79f9b017?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Dominic Brooks</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1486">
+			June 15, 2015 at 8 h 57 min</a>		</div>
+
+		<p>Nice thinking, good find.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14871"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1486' onclick='return addComment.moveForm( "div-comment-1486", "1486", "respond", "2311" )' aria-label='Reply to Dominic to Dominic Brooks'>Reply to Dominic</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-3293">
+				<div id="div-comment-3293" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/0f11568bc1876f7c16d69284798f7fdd?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">CL</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3293">
+			April 11, 2016 at 14 h 47 min</a>		</div>
+
+		<p>Thanks. This is the first time I have seen this information about result cache and standard edition. Helps explain an issue I am having with a 3rd party application with very bad SQL.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-32941"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3293' onclick='return addComment.moveForm( "div-comment-3293", "3293", "respond", "2311" )' aria-label='Reply to CL to CL'>Reply to CL</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-3294">
+				<div id="div-comment-3294" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3294">
+			April 11, 2016 at 15 h 22 min</a>		</div>
+
+		<p>Hi CL,
+Thanks for your feedback.
+I cannot guarantee anything about it, but I&#8217;m sure that Oracle is aware of the problem, and I can bet that the optimization of Adaptive Dynamic Sampling will use something else than result cache in the future release (12.2).
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-32951"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3294' onclick='return addComment.moveForm( "div-comment-3294", "3294", "respond", "2311" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

@@ -1,0 +1,141 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/adwc-a-docker-container-to-startstop-oracle-cloud-services />
+<meta name=description content='A blog post from 2018 about ADWC &#8211; a Docker container to start/stop Oracle Cloud services'>
+<title>ADWC &#8211; a Docker container to start/stop Oracle Cloud services</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/adwc-a-docker-container-to-startstop-oracle-cloud-services>https://blog.dbi-services.com/adwc-a-docker-container-to-startstop-oracle-cloud-services</a> (2018-05-03), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">ADWC &#8211; a Docker container to start/stop Oracle Cloud services</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="https://blog.dbi-services.com/adwc-startstop-with-psm-command-line-interface" target="_blank">previous post</a>, I&#8217;ve explained how to start and stop the Autonomous Data Warehouse Cloud service from PSM (PaaS Service Manager). There&#8217;s a setup phase, and a run phase starting with service-start and ending with service-stop. And the setup is specific to an Oracle Cloud account, storing information in the local user home. You may want to run different setups, and even provide an easy way to start/stop an Oracle Cloud service without knowing the user, password and tenant name. </p>
+<p>A Docker container is perfect to isolate this.
+<span id="more-22879"></span></p>
+<h3>Dockerfile</h3>
+<p>Here is my quick (aka experimental) Dockerfile:
+<pre>
+FROM alpine:latest
+RUN apk add --update --no-cache python3 curl
+ENV user=my.cloud.account@me.com
+ENV password=MyP@ssw0rd
+ENV tenant=idcs-31bbd63c3cb9466cb8a96f627b6b6116
+ENV region=us
+# get PSM
+RUN curl -X GET -u ${user}:${password} -H X-ID-TENANT-NAME:${tenant} https://psm.us.oraclecloud.com/paas/core/api/v1.1/cli/${tenant}/client -o psmcli.zip
+# install PSM
+RUN pip3 install -U psmcli.zip
+# setup PSM
+RUN echo "{\"username\":\"${user}\",\"password\":\"${password}\",\"identityDomain\":\"${tenant}\",\"region\":\"${region}\",\"outputFormat\":\"short\"}" &gt; config-payload &amp;&amp;\
+    psm setup --config-payload config-payload &amp;&amp;\
+    rm 421d64918638 # remove file with password
+# patch PSM for bugs
+RUN sed -ie 's/core\\[/]//g' ~/.psm/data/ADWC.json
+# variables which can be overwritten at run time
+ENV service=ADWC
+ENV name=MYADWC1
+CMD trap 'echo "Stopping service ${service}...";psm ${service} stop-service --service-name ${name} -wc true ; exit 0'  SIGINT SIGSTOP SIGKILL; echo "Starting service ${service}...";psm ${service} start-service --service-name ${name} -wc true || exit 1 ; echo "You can access to ${service} console with ADMIN user at:";echo;psm ${service} service -s ${name} -of json | jq -r '.serviceConsole';echo ; while sleep 60 ; do echo "Status of service ${service} at $(date)...";psm ADWC service -s ADWC ; done
+</pre>
+We need curl to download PSM, and pip3 to install it, and python3 to run it.
+You can set your Oracle Cloud Account credentials as environment variables.
+Then it fills all required information in a &#8216;config-payload&#8217; file, runs &#8216;psm setup&#8217; and removes that file.</p>
+<p>At run, it calls a &#8216;start-service&#8217; and loops while showing the status every minute (you can see them with docker container logs). The INT, STOP and KILL signals call &#8216;stop-service&#8217;. Then, the idea is that while the container exists, the Cloud Service is running. And it is shutdown at the container end of life. There&#8217;s no other action to do with the container: it display the console url where you have everything to interact with the service (download client credentials, manage users, go to Machine Learning notebooks,&#8230;).</p>
+<h3>Run example:</h3>
+<p>Here is a simple example:
+<pre>
+# docker run --rm  franck/psm/awdc
+
+Starting service MYADWC1...
+ Message:    Job submitted successfully for start of service/system
+ Job ID:     25583108
+Waiting for the job to complete... (it cannot be cancelled)
+Command completed with status [SUCCEED].
+You can access to MYADWC1 console with ADMIN user at:
+
+h<i></i>ttps://adwc.uscom-east-1.oraclecloud.com/console/index.html?tenant_name=idcs-31bbd63c3cb9466cb8a96f627b6b6116&amp;database_name=MYADWC1
+
+Status of service MYADWC1 at Sun Apr 29 18:20:50 UTC 2018...
+ Service:                    MYADWC1
+ Status:                     Ready
+ Version:                    18.1.4.0
+ Edition:                    N/A
+ Compute Site:               N/A
+ Cloud Storage Container:    N/A
+ Created On:                 2018-04-19T19:22:18.360+0000
+Status of service MYADWC1 at Sun Apr 29 18:21:51 UTC 2018...
+ Service:                    MYADWC1
+ Status:                     Ready
+ Version:                    18.1.4.0
+ Edition:                    N/A
+ Compute Site:               N/A
+ Cloud Storage Container:    N/A
+ Created On:                 2018-04-19T19:22:18.360+0000
+
+^C
+
+Stopping service MYADWC1...
+ Message:    Job submitted successfully for stop of service/system
+ Job ID:     25620930
+Waiting for the job to complete... (it cannot be cancelled)
+Command completed with status [SUCCEED].
+</pre></p>
+<p>After 2 minutes I&#8217;ve hit &#8216;Control-C&#8217; to stop the container. The service has been cleanly shut-down.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-228800"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-10784">
+				<div id="div-comment-10784" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ba77413ffe0bb48d9da467d649464a6c?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.oracle.com' rel='external nofollow' class='url'>Thomas Teske</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10784">
+			May 3, 2018 at 17 h 28 min</a>		</div>
+
+		<p>Again something practical. One thought: if you can manage such cloud service from within a Docker container, then you can access it from just any Docker container i.e. DevOps people could use this as a start for their architecture blueprint.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107851"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10784' onclick='return addComment.moveForm( "div-comment-10784", "10784", "respond", "22879" )' aria-label='Reply to Thomas to Thomas Teske'>Reply to Thomas</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

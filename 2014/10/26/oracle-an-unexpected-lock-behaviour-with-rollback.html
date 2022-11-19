@@ -1,0 +1,129 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-an-unexpected-lock-behaviour-with-rollback />
+<meta name=description content='A blog post from 2014 about Oracle: an unexpected lock behavior with rollback'>
+<title>Oracle: an unexpected lock behavior with rollback</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-an-unexpected-lock-behaviour-with-rollback>https://blog.dbi-services.com/oracle-an-unexpected-lock-behaviour-with-rollback</a> (2014-10-26), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle: an unexpected lock behavior with rollback</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Here is an odd Oracle behavior I observed when a transaction that acquired a lock is rolled back. Note that this is related to a specific combination of locks that should not be encountered in production. So it&#8217;s not a bug. Just something unexpected.</p>
+<p>&nbsp;</p>
+<h3>First session</h3>
+<p>In my first session I lock the DEPT table in share mode (RS)
+<pre>20:56:56 SQL1&gt; lock table dept in row share mode;
+Table(s) Locked.
+</pre>
+My first session (SID=53) has acquired a TM lock in mode 2 (row share):
+<pre>20:56:56 SQL1&gt; select object_name,session_id,LOCKED_MODE from v$locked_object join dba_objects using(object_id);
+
+OBJECT_NAME SESSION_ID LOCKED_MODE
+----------- ---------- -----------
+DEPT                53           2
+</pre>
+&nbsp;</p>
+<h3>Second session</h3>
+<p>In my second session I lock the DEPT table in share + row exclusive mode (SRX). This is compatible with the RS.
+<pre>20:56:59 SQL2&gt; lock table dept in share row exclusive mode;
+Table(s) Locked.
+</pre>
+My second session (SID=59) has acquired a TM lock in mode 5 (share + row exclusive):
+<pre>20:56:59 SQL2&gt; select object_name,session_id,LOCKED_MODE from v$locked_object join dba_objects using(object_id);
+
+OBJECT_NAME SESSION_ID LOCKED_MODE
+----------- ---------- -----------
+DEPT                59           5
+DEPT                53           2
+</pre>
+Then I rollback my transaction
+<pre>20:56:59 SQL2&gt; rollback;
+</pre>
+My lock was released and I&#8217;ve only the one from Session 1 (SID=53):
+<pre>OBJECT_NAME SESSION_ID LOCKED_MODE
+----------- ---------- -----------
+DEPT                53           2
+</pre>
+Now comes the funny part. I run exactly the same SSX lock, which was immediately acquired before:
+<pre>21:14:30 SQL2&gt; lock table dept in share row exclusive mode wait 5 ;
+</pre>
+But now it hangs. Let&#8217;s see the blocking tree with utllockt.sql:
+<pre>WAITING_SESSION   LOCK_TYPE         MODE_REQUESTED MODE_HELD      LOCK_ID1          LOCK_ID2
+----------------- ----------------- -------------- -------------- ----------------- -----------------
+53                None
+   59             DML               Exclusive      Row-S (SS)     94228             0
+</pre>
+What? My session wants to acquire an Exclusive lock? I&#8217;ve never requested that.
+And finally it fails because my Session 1 has a RS lock which prevents exclusive locks.
+<pre>lock table dept in share row exclusive mode wait 5
+*
+ERROR at line 1:
+ORA-00054: resource busy and acquire with NOWAIT specified or timeout expired
+</pre>
+&nbsp;</p>
+<h3>Third session</h3>
+<p>But there is worse. I disconnect my second session and try to do the same from a third one. And I even try only a RS lock:
+<pre>21:15:20 SQL3&gt; lock table dept in row share mode wait 5 ;
+</pre>
+And I&#8217;m blocked again. It seems that because a session had acquired a SRX lock and has rolled back, while another session held a RS one, then any new transaction that wants to acquire any lock must acquire temporarily an exclusive one before.</p>
+<p>&nbsp;</p>
+<h3>Event 10704 &#8220;Print out information about what enqueues are being obtained&#8221;</h3>
+<p>In order to get further I traced the locks with event 10704 (see how in a previous <a href="../investigating-oracle-lock-issues-with-event-10704/index.html">post</a>).</p>
+<p>Here is the trace when it failed, filtering on &#8216;00017014&#8217; which is the object_id of DEPT in hexadecimal:
+<pre>ksqgtl *** TM-00017014-00000000-00000000-00000000 mode=2 flags=0x400 timeout=5 ***
+ksqrcl: TM-00017014-00000000-00000000-00000000
+ksqgtl *** TM-00017014-00000000-00000000-00000000 <strong>mode=6</strong> flags=0x400 timeout=5 ***
+ksqcmi: TM-00017014-00000000-00000000-00000000 mode=6 timeout=5
+ksqcmi: returns 51
+ksqgtl: <strong>RETURNS 51</strong>
+ksqrcl: returns 0
+</pre>
+My &#8216;lock table dept in row share mode&#8217; acquires a mode 2 (which is the &#8216;row share&#8217; mode) but then released it and tried to acquire a mode 6 (which is exclusive)</p>
+<p>And then here is a trace when it was successful, after the transaction in Session 1 has been committed:
+<pre>ksqgtl *** TM-00017014-00000000-00000000-00000000 mode=2 flags=0x400 timeout=5 ***
+ksqrcl: TM-00017014-00000000-00000000-00000000
+ksqgtl *** TM-00017014-00000000-00000000-00000000 <strong>mode=6</strong> flags=0x400 timeout=5 ***
+ksqcmi: TM-00017014-00000000-00000000-00000000 mode=6 timeout=5
+ksqcmi: returns 0
+ksqgtl: <strong>RETURNS 0</strong>
+ksqgtl *** TM-00017014-00000001-00000000-00000000 mode=3 flags=0x400 timeout=5 ***
+ksqgtl: RETURNS 0
+ksqcnv: TM-00017014-00000000-00000000-00000000 <strong>mode=2</strong> timeout=5
+ksqcmi: TM-00017014-00000000-00000000-00000000 mode=2 timeout=5
+ksqcmi: returns 0
+ksqrcl: TM-00017014-00000001-00000000-00000000
+ksqrcl: returns 0
+</pre>
+So it it did the same, but that time the mode 6 can be acquired. Then we see a conversion to mode 2 which is the RS we wanted.</p>
+<p>Finally I tried with all other combinations of locks, but it seems that only that one (RS then rolled back SRX) show that behavior. I tried also with DML instead of &#8216;lock table&#8217; statement but the Share lock acquired by DML (the non-indexed foreign key case) is released immediately so I cannot rollback it. And a failure in the statement do not trigger the same behaviour.</p>
+<p>Final note: the only reference I&#8217;ve find for that behavior is <a href="http://www.freelists.org/post/oracle-l/Lock-Table-Oddity">this</a> post on oracle-l</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4790"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

@@ -1,0 +1,130 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/variations-on-1m-rows-insert-1-bulk-insert />
+<meta name=description content='A blog post from 2015 about Variations on 1M rows insert (1): bulk insert'>
+<title>Variations on 1M rows insert (1): bulk insert</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/variations-on-1m-rows-insert-1-bulk-insert>https://blog.dbi-services.com/variations-on-1m-rows-insert-1-bulk-insert</a> (2015-05-18), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Variations on 1M rows insert (1): bulk insert</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This blog is the first one of a series about inserting 1 million rows. Do you have an idea about the time it takes? The idea came from another project, about NoSQL databases, but I&#8217;ll focus on Oracle in those posts. There are a lot of different ways to insert 1 million rows in Oracle: row-by-row insert or bulk, row-by-row commit or not, different ways to commit, In-Memory Database, Database In-Memory Option, etc.</p>
+<h3>Test case</h3>
+<p>Here is the table I create:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">create table DEMO ("id" number , "text" varchar2(15), "number" number) ;
+</pre>
+<p>Here is the first PL/SQL I&#8217;ll run:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">declare
+ type people_array is varray(12) of varchar(15);
+ people people_array := people_array( 'Marc', 'Bill', 'George', 'Eliot', 'Matt', 'Trey', 'Tracy','Greg', 'Steve', 'Kristina', 'Katie', 'Jeff' );
+ people_count number :=people.COUNT;
+ n number;
+begin
+ for i in 0..1e6 loop
+  n:=trunc(dbms_random.value(0,10000));
+  insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+ end loop;
+ commit;
+end;
+/
+</pre>
+<p>You may wonder why I chose this testcase. As I said, this comes from another project and you can google to find where the the test case comes from. The performance will be mainly about inserts but the idea is also to implement some procedural processing to show that it&#8217;s possible in different database system, here in PL/SQL on Oracle and in a future post in TimesTen.</p>
+<h3>Test environment</h3>
+<p>All the test will be done on a VM with only one CPU activated. This is important because some activity will involve background processes.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ grep "model name" /proc/cpuinfo
+model name      : Intel(R) Core(TM) i7-3630QM CPU @ 2.40GHz
+</pre>
+<h3>Oracle 11g</h3>
+<p>My first tests are done on the first Oracle Developer Day VM that was available for <a href="http://www.oracle.com/technetwork/community/developer-vm/index.html">download</a>. It&#8217;s a 11g version. We will see 12c later.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from v$version;
+
+BANNER
+--------------------------------------------------------------------------------
+Oracle Database 11g Enterprise Edition Release 11.2.0.2.0 - Production
+</pre>
+<p>And it&#8217;s 32-bit:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select addr,4*length(addr) from v$process where rownum=1;
+
+ADDR     4*LENGTH(ADDR)
+-------- --------------
+3B3C9F80             32
+
+</pre>
+<h3>With and without index</h3>
+<p>As you have seen above, I&#8217;ve created the table with a primary key, so I have an index on it. How long does it take to run the statement above to insert 1 million rows?</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:00:46.80
+</pre>
+<p>On one CPU it takes 46 seconds to insert one million rows, row-by-row, from a simple PL/SQL loop. We will take that as the base for future comparisons. Of course I&#8217;ve done several runs and I keep them as long as there is less than 5% difference.</p>
+<p>Just to show that the index has an important cost when inserting, let&#8217;s run the same testcase without the PRIMARY KEY:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:00:35.10
+</pre>
+<p>I&#8217;ll keep the testcase with the primary key index as a point of comparison. There is no point to insert one million rows if we can&#8217;t retreive one easily. And the table with primary key pattern is the most relevant one when comparing different databases &#8211; SQL or NoSQL.</p>
+<h3>Bulk insert</h3>
+<p>The previous inserts are quite optimal: directly done from PL/SQL in the database, so no roundtrips. Commit only at the end and we know that in Oracle it&#8217;s better not to commit too often. I will cover the need of row-by-row commits in a future post. But this is still row-by-row insert and this is not optimal. When we have all rows to insert from one session, then we can insert in bulk (one execution of the insert statement inserts several rows).</p>
+<p>There are several ways to do that depending on the client language. Here we are in PL/SQL, so it is easy: put all rows into a collection and call the insert with that collection:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">declare
+ type people_array is varray(12) of varchar(15);
+ people people_array := people_array( 'Marc', 'Bill', 'George', 'Eliot', 'Matt', 'Trey', 'Tracy','Greg', 'Steve', 'Kristina', 'Katie', 'Jeff' );
+ people_count number :=people.COUNT;
+ -- declare the collection
+ type DEMO_record_type is record ("user_id" number , "name" varchar2(15), "number" number) ;
+ type DEMO_collection_type is table of DEMO_record_type index by binary_integer;
+ DEMO_collection DEMO_collection_type;
+begin
+ -- fill the collection
+ for i in 1..1e6 loop
+  DEMO_collection(i)."user_id":=i;
+  DEMO_collection(i)."name":=people( dbms_random.value(1,people.count) );
+  DEMO_collection(i)."number":=trunc(dbms_random.value(0,10000));
+  null;
+ end loop;
+ -- call the insert
+ forall i in 1..DEMO_collection.count insert into DEMO values DEMO_collection(i);
+ commit;
+end;
+/
+</pre>
+<p>The result is obvious:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:00:06.55
+</pre>
+<p>And for the testcase without the primary key index:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:00:03.80
+</pre>
+<p>So bulk inserts here are 8x to 10x faster.</p>
+<h3>Conclusion</h3>
+<p>The immediate conclusion is that when you have lot of rows to insert and you don&#8217;t need to commit at each row, then you should do it in bulk. Here I made it from PL/SQL which run directly in the database. If you are inserting from an application server or a remote client, then the elimination of roundtrips will be a lot more important.</p>
+<p>In future posts we will see what happens when you need to commit for each row. And I will also run it with In-Memory database and with Database In-Memory. Don&#8217;t forget that if you are in Switzerland in June, our experts from Oracle, Microsoft, and SAP technologies will talk about In-Memory as implemented by SQL Server, Oracle and SAP HANA. All the same day. It&#8217;s free and you can register now: <a href="http://www.dbi-services.com/newsroom/events/">Event In-Memory: boost your IT performance!</a></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-19340"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

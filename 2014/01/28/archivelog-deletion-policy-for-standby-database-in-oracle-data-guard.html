@@ -1,0 +1,1352 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/archivelog-deletion-policy-for-standby-database-in-oracle-data-guard />
+<meta name=description content='A blog post from 2014 about Archivelog deletion policy for Standby Database in Oracle Data Guard'>
+<title>Archivelog deletion policy for Standby Database in Oracle Data Guard</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/archivelog-deletion-policy-for-standby-database-in-oracle-data-guard>https://blog.dbi-services.com/archivelog-deletion-policy-for-standby-database-in-oracle-data-guard</a> (2014-01-28), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Archivelog deletion policy for Standby Database in Oracle Data Guard</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Do you use ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY for your Oracle databases in Data Guard? Maybe you also use the Fast Recovery Area as archive log destination. That&#8217;s good practice! But did you ever check that it works as expected?</p>
+<p>What I mean is this:</p>
+<ul>
+<li>The archived logs that you don&#8217;t need are reclaimable by the FRA when space is needed</li>
+<li>And the archived logs that are required for availability (standby or backup) are not deleted.</li>
+</ul>
+<p>It&#8217;s not an easy thing to check because Oracle doesn&#8217;t show which archive log is reclaimable. Only the total reclaimable space is shown in v$recovery_area_usage. But that is not sufficient to validate which archivelog sequence is concerned. I&#8217;ll show you below a query that returns the reclaimable status from the archived logs. And you will see that until 12c the APPLIED ON ALL STANDBY does not work as expected. You&#8217;ve probably seen a FRA full at standby site and solved it by deleting archived logs. But this is not the right solution because the FRA is supposed to do that.</p>
+<p>Let&#8217;s look at an example I encountered recently. The archivelog deletion policy is set correctly:</p>
+<p><pre>RMAN&gt; show archivelog deletion policy;
+
+RMAN configuration parameters for database with db_unique_name DATABASE_SITE2 are:
+CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY;</pre></p>
+<p>This configuration, an 11g feature, allows to delete an archive log as soon as it is applied to all standby destinations. Note that it works if I manually do a &#8216;delete archivelog all;&#8217; but I expect that the archivelogs in the FRA becomes reclaimable automatically.</p>
+<p>Unfortunately, this is not the case and the FRA is growing:</p>
+<p><pre>
+SQL&gt; select * from v$recovery_area_usage where file_type='ARCHIVED LOG';
+
+FILE_TYPE            PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES
+-------------------- ------------------ ------------------------- ---------------
+ARCHIVED LOG                      61.11                     43.02             467
+</pre></p>
+<p>Let&#8217;s check everything. We are on the standby database:</p>
+<p><pre>
+SQL&gt; select open_mode,database_role from v$database;
+
+OPEN_MODE            DATABASE_ROLE
+-------------------- ----------------
+MOUNTED              PHYSICAL STANDBY
+</pre></p>
+<p>The archivelogs are going to the Fast Recovery Area:</p>
+<p><pre>
+SQL&gt; show parameter log_archive_dest_1
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+log_archive_dest_1                   string      location=USE_DB_RECOVERY_FILE_
+                                                 DEST, valid_for=(ALL_LOGFILES,
+                                                  ALL_ROLES)
+</pre></p>
+<p>All archived logs are applied (we are in SYNC AFFIRM):</p>
+<p><pre>
+DGMGRL&gt; show database 'DATABASE_SITE2';
+
+Database - DATABASE_SITE2
+
+  Role:            PHYSICAL STANDBY
+  Intended State:  APPLY-ON
+  Transport Lag:   0 seconds
+  Apply Lag:       0 seconds
+  Real Time Query: OFF
+  Instance(s):
+    DATABASE
+
+Database Status:
+SUCCESS
+</pre></p>
+<p>Well, with that configuration, I expect that all archivelogs are reclaimable &#8211; except the current one.</p>
+<p>Let&#8217;s investigate. V$RECOVERY_AREA_USAGE is an aggregate view. If we check its definition, we see that the reclaimable size comes from x$kccagf.rectype.</p>
+<p>So I&#8217;ll use it in in conjunction with v$archived_log in order to give the detail about which archived logs are reclaimable:</p>
+<p><pre>
+SQL&gt; select applied,deleted,decode(rectype,11,'YES','NO') reclaimable
+           ,count(*),min(sequence#),max(sequence#)
+     from v$archived_log left outer join sys.x$kccagf using(recid) 
+     where is_recovery_dest_file='YES' and name is not null
+     group by applied,deleted,decode(rectype,11,'YES','NO') order by 5
+/
+
+APPLIED   DELETED RECLAIMABLE   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+--------- ------- ----------- ---------- -------------- --------------
+YES       NO      YES                429           5938           6366
+YES       NO      NO                  37           6367           6403
+IN-MEMORY NO      NO                   1           6404           6404
+</pre></p>
+<p>The problem is there: Because of a bug (<a href="https://support.oracle.com/epmos/faces/BugDisplay?id=14227959">Bug 14227959 : STANDBY DID NOT RELEASE SPACE IN FRA</a>) the archivelogs are not marked as reclaimable when the database is in mount mode.</p>
+<p>The workaround is to execute dbms_backup_restore.refreshagedfiles. This is what must be scheduled (maybe daily) on the standby. It can be a good idea to do it at the same time as a daily &#8216;delete obsolete&#8217;, so here is the way to call it from RMAN:
+<pre>RMAN&gt; sql "begin dbms_backup_restore.refreshagedfiles; end;";</pre>
+But I&#8217;ve found another workaround: just run the CONFIGURE ARCHIVELOG POLICY from RMAN as it refreshes the reclaimable flag &#8211; even when there is no change.</p>
+<p>Then, you can run a daily job that does CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY on your database, whatever the role is.</p>
+<p>It&#8217;s different for the database where you do the backup, because you want to be sure that the backup is done before an archivelog is deleted: CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK;</p>
+<p>This is a good way to prevent anyone from changing the configuration and keep it close to the backup scripts. At <a href="http://www.dbi-services.com">dbi services</a>, we advise to keep the same configuration on all Data Guard sites for the same database so that a switchover can be done without any problem. For this reason, having a script that depends on the place where the backups are done is a better alternative than a configuration that depends on the database role.</p>
+<p>Finally, here is the state of our reclaimable archivelogs after any of these solutions:</p>
+<p><pre>
+APPLIED   DELETED RECLAIMABLE   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+--------- ------- ----------- ---------- -------------- --------------
+YES       NO      YES                466           5938           6403
+IN-MEMORY NO      NO                   1           6404           6404 </p>
+<p>FILE_TYPE            PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES
+-------------------- ------------------ ------------------------- ---------------
+ARCHIVED LOG                      61.11                     61.09             467
+</pre></p>
+<p>All applied archived logs are reclaimable and the FRA will never be full.
+You can check the primary as well. Are you sure that Oracle will never delete an archived log that has not been backed up ? Check your deletion policy.
+Here is the full query I use for that:</p>
+<p><pre>
+column deleted format a7
+column reclaimable format a11
+set linesize 120
+select applied,deleted,backup_count
+ ,decode(rectype,11,'YES','NO') reclaimable,count(*)
+ ,to_char(min(completion_time),'dd-mon hh24:mi') first_time
+ ,to_char(max(completion_time),'dd-mon hh24:mi') last_time
+ ,min(sequence#) first_seq,max(sequence#) last_seq
+from v$archived_log left outer join sys.x$kccagf using(recid)
+where is_recovery_dest_file='YES'
+group by applied,deleted,backup_count,decode(rectype,11,'YES','NO') order by min(sequence#)
+/
+</pre></p>
+<p>This is the result on primary where the last archivelog backup has run around 21:00</p>
+<p><pre>
+APPLIED   DELETED BACKUP_COUNT RECLAIMABLE COUNT(*) FIRST_TIME   LAST_TIME    FIRST_SEQ LAST_SEQ
+--------- ------- ------------ ----------- -------- ------------ ------------ --------- --------
+NO        YES                1 NO               277 15-jan 17:56 19-jan 09:49      5936     6212
+NO        NO                 1 YES              339 19-jan 10:09 22-jan 21:07      6213     6516
+NO        NO                 0 NO                33 22-jan 21:27 23-jan 07:57      6517     6549
+</pre></p>
+<p>That is fine according to my policy APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK
+And here is the result on standby where the workaround job has run around 06:00 and redo apply is in SYNC</p>
+<p><pre>
+APPLIED   DELETED BACKUP_COUNT RECLAIMABLE COUNT(*) FIRST_TIME   LAST_TIME    FIRST_SEQ LAST_SEQ
+--------- ------- ------------ ----------- -------- ------------ ------------ --------- --------
+YES       YES                0 NO               746 07-jan 13:27 17-jan 11:17      5320     6065
+YES       NO                 0 YES              477 17-jan 11:37 23-jan 05:37      6066     6542
+YES       NO                 0 NO                 8 23-jan 05:57 23-jan 08:14      6543     6550
+IN-MEMORY NO                 0 NO                 1 23-jan 08:15 23-jan 08:15      6551     6551
+</pre></p>
+<p style="padding-left: 00px">This is good for my policy APPLIED ON ALL STANDBY &#8211; except that because of the bug mentioned above, redo applied since 06:00 are not yet reclaimable.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4060"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 39 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1183">
+				<div id="div-comment-1183" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/0184285ab26b9780091a79a311bd304f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">jko</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1183">
+			March 14, 2014 at 21 h 11 min</a>		</div>
+
+		<p>Tested and validated:-)
+Cheers
+jko
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-11841"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1183' onclick='return addComment.moveForm( "div-comment-1183", "1183", "respond", "405" )' aria-label='Reply to jko to jko'>Reply to jko</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1198">
+				<div id="div-comment-1198" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/374a563eb9dd31e0b5b15ae5d98457ed?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">jun lu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1198">
+			May 30, 2014 at 7 h 17 min</a>		</div>
+
+		<p>&#8220;Then, you can run a daily job that does CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY on your database, whatever the role is.&#8221;
+how to do this? a shell script?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-11991"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1198' onclick='return addComment.moveForm( "div-comment-1198", "1198", "respond", "405" )' aria-label='Reply to jun to jun lu'>Reply to jun</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1199">
+				<div id="div-comment-1199" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1199">
+			May 30, 2014 at 8 h 25 min</a>		</div>
+
+		<p>jun lu,
+usually we have a job that check the database role, and do the backup depending on the role. Then when you do the backup you also do &#8216;APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK&#8217; and in the other cases you just do &#8216;CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY&#8217;
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12001"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1199' onclick='return addComment.moveForm( "div-comment-1199", "1199", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1278">
+				<div id="div-comment-1278" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick chen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1278">
+			November 17, 2014 at 1 h 41 min</a>		</div>
+
+		<p>if the daily database&#038;archivelog backup are executed on primary database, then on the standby site, just do &#8216;CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY&#8217; cannot remove the applied archivelog files on standby site. should any other delete operations be taken on standby site ?
+Thanks
+Rick
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12791"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1278' onclick='return addComment.moveForm( "div-comment-1278", "1278", "respond", "405" )' aria-label='Reply to Rick to Rick chen'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1279">
+				<div id="div-comment-1279" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1279">
+			November 17, 2014 at 6 h 47 min</a>		</div>
+
+		<p>Hi Rick,
+Yes. The archived logs should become &#8216;reclaimable&#8217; once applied. But you may encounter the bug above where the &#8216;reclaimable&#8217; status is not refreshed automatically on a database in mount. You have either to exec dbms_backup_restore.refreshagedfiles; or to run the &#8216;configure archivelog deletion policy&#8217; again.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12801"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1279' onclick='return addComment.moveForm( "div-comment-1279", "1279", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1281">
+				<div id="div-comment-1281" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick Chen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1281">
+			November 17, 2014 at 10 h 50 min</a>		</div>
+
+		<p>Thanks Franck,
+++1.My DG is in oracle12c(12.1.0.1), is this bug fixed in oracle12c ?
+++2.The daily backup is executed in primary site, there are many archive log files in standby site. I run &#8216;CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY&#8217; manually on standby site, no any archived log file being deleted. this is my problem. is there any other delete operation required on standby site?
+Regards and thanks,
+Rick
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12821"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1281' onclick='return addComment.moveForm( "div-comment-1281", "1281", "respond", "405" )' aria-label='Reply to Rick to Rick Chen'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1283">
+				<div id="div-comment-1283" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1283">
+			November 17, 2014 at 14 h 56 min</a>		</div>
+
+		<p>Hi rick,
+As far as i know that bug is fixed in 12c and with your configuration you should not need any delete operation on standby site. You can use my query above to check which files (and whether they were applied).
+you can have all detail with the query in: <a href="http://www.dbi-services.com/index.php/blog/entry/drilling-down-vrecoveryareausage" rel="nofollow">http://www.dbi-services.com/index.php/blog/entry/drilling-down-vrecoveryareausage</a>
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12841"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1283' onclick='return addComment.moveForm( "div-comment-1283", "1283", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1285">
+				<div id="div-comment-1285" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1285">
+			November 18, 2014 at 1 h 34 min</a>		</div>
+
+		<p>Thanks Franck,
+It doesnot work in my DG. Daily backup is on primary site. query on bote sites:
+&#8211;On Primary
+SQL> show parameter db_recover</p>
+<p>NAME                                 TYPE        VALUE
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;
+db_recovery_file_dest                string      /u01/app/oracle/fast_recovery_
+                                                 area
+db_recovery_file_dest_size           big integer 4800M
+SQL> select * from v$recovery_area_usage;</p>
+<p>FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES     CON_ID
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;-
+CONTROL FILE                           .21                         0               1          0
+REDO LOG                              7.29                         0               7          0
+ARCHIVED LOG                          1.81                      1.81              12          0
+BACKUP PIECE                           .43                       .22               2          0
+IMAGE COPY                               0                         0               0          0
+FLASHBACK LOG                            0                         0               0          0
+FOREIGN ARCHIVED LOG                     0                         0               0          0
+AUXILIARY DATAFILE COPY                  0                         0               0          0</p>
+<p>8 rows selected.</p>
+<p>SQL> select sequence#, name, applied, deleted, IS_RECOVERY_DEST_FILE, backup_count, standby_dest from v$archived_log where sequence# between 2005 and 2014;</p>
+<p> SEQUENCE# NAME                                                                                     APPLIED   DEL IS_ BACKUP_COUNT STA
+&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212; &#8212; &#8212; &#8212;&#8212;&#8212;&#8212; &#8212;
+      2005 sbdb                                                                                     YES       NO  NO             0 YES
+      2005                                                                                          NO        YES YES            0 NO
+      2006 sbdb                                                                                     YES       NO  NO             0 YES
+      2006                                                                                          NO        YES YES            0 NO
+      2007 sbdb                                                                                     YES       NO  NO             0 YES
+      2007                                                                                          NO        YES YES            0 NO
+      2008 sbdb                                                                                     YES       NO  NO             0 YES
+      2008                                                                                          NO        YES YES            0 NO
+      2009 sbdb                                                                                     YES       NO  NO             0 YES
+      2009                                                                                          NO        YES YES            0 NO
+      2010 sbdb                                                                                     YES       NO  NO             0 YES
+      2010 /u01/app/oracle/fast_recovery_area/PROD/archivelog/2014_11_18/o1_mf_1_2010_b6nbzjyq_.arc NO        NO  YES            1 NO
+      2011 sbdb                                                                                     YES       NO  NO             0 YES
+      2011 /u01/app/oracle/fast_recovery_area/PROD/archivelog/2014_11_18/o1_mf_1_2011_b6nc6mtq_.arc NO        NO  YES            1 NO
+      2012 sbdb                                                                                     YES       NO  NO             0 YES
+      2012 /u01/app/oracle/fast_recovery_area/PROD/archivelog/2014_11_18/o1_mf_1_2012_b6nc6n6c_.arc NO        NO  YES            1 NO
+      2013 sbdb                                                                                     YES       NO  NO             0 YES
+      2013 /u01/app/oracle/fast_recovery_area/PROD/archivelog/2014_11_18/o1_mf_1_2013_b6nc6s33_.arc NO        NO  YES            1 NO
+      2014 sbdb                                                                                     YES       NO  NO             0 YES
+      2014 /u01/app/oracle/fast_recovery_area/PROD/archivelog/2014_11_18/o1_mf_1_2014_b6nz59ml_.arc NO        NO  YES            0 NO</p>
+<p>20 rows selected.</p>
+<p>SQL> select database_role, open_mode, current_scn, db_unique_name from v$database;</p>
+<p>DATABASE_ROLE    OPEN_MODE            CURRENT_SCN DB_UNIQUE_NAME
+&#8212;&#8212;&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;
+PRIMARY          READ WRITE              32384354 prod</p>
+<p>SQL></p>
+<p>&#8211;On standby:
+SQL> show parameter db_recover</p>
+<p>NAME                                 TYPE        VALUE
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;
+db_recovery_file_dest                string      /home/oracle/fra
+db_recovery_file_dest_size           big integer 4800M
+SQL>  select * from v$recovery_area_usage;</p>
+<p>FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES     CON_ID
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;-
+CONTROL FILE                           .26                         0               1          0
+REDO LOG                              7.29                         0               7          0
+ARCHIVED LOG                          5.95                         0              54          0
+BACKUP PIECE                           .52                       .26               2          0
+IMAGE COPY                               0                         0               0          0
+FLASHBACK LOG                            0                         0               0          0
+FOREIGN ARCHIVED LOG                     0                         0               0          0
+AUXILIARY DATAFILE COPY                  0                         0               0          0</p>
+<p>8 rows selected.</p>
+<p>SQL> select sequence#, name, applied, deleted, IS_RECOVERY_DEST_FILE, backup_count, standby_dest from v$archived_log where sequence# between 2005 and 2014;</p>
+<p> SEQUENCE# NAME                                                                     APPLIED   DEL IS_ BACKUP_COUNT STA
+&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212; &#8212; &#8212; &#8212;&#8212;&#8212;&#8212; &#8212;
+      2005 /home/oracle/fra/SBDB/archivelog/2014_11_17/o1_mf_1_2005_b6mrj0xb_.arc   YES       NO  YES            0 NO
+      2006 /home/oracle/fra/SBDB/archivelog/2014_11_17/o1_mf_1_2006_b6mrv5wl_.arc   YES       NO  YES            0 NO
+      2007 /home/oracle/fra/SBDB/archivelog/2014_11_17/o1_mf_1_2007_b6mrxzl8_.arc   YES       NO  YES            0 NO
+      2008 /home/oracle/fra/SBDB/archivelog/2014_11_17/o1_mf_1_2008_b6ms1d1l_.arc   YES       NO  YES            0 NO
+      2009 /home/oracle/fra/SBDB/archivelog/2014_11_18/o1_mf_1_2009_b6nbzjp5_.arc   YES       NO  YES            0 NO
+      2010 /home/oracle/fra/SBDB/archivelog/2014_11_18/o1_mf_1_2010_b6nbzky2_.arc   YES       NO  YES            0 NO
+      2011 /home/oracle/fra/SBDB/archivelog/2014_11_18/o1_mf_1_2011_b6nc6nqn_.arc   YES       NO  YES            0 NO
+      2012 /home/oracle/fra/SBDB/archivelog/2014_11_18/o1_mf_1_2012_b6nc6o6b_.arc   YES       NO  YES            0 NO
+      2013 /home/oracle/fra/SBDB/archivelog/2014_11_18/o1_mf_1_2013_b6nc6t1j_.arc   YES       NO  YES            0 NO
+      2014 /home/oracle/fra/SBDB/archivelog/2014_11_18/o1_mf_1_2014_b6nz5bh1_.arc   YES       NO  YES            0 NO</p>
+<p>10 rows selected.</p>
+<p>SQL> select database_role, open_mode, current_scn, db_unique_name from v$database;</p>
+<p>DATABASE_ROLE    OPEN_MODE            CURRENT_SCN DB_UNIQUE_NAME
+&#8212;&#8212;&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;
+PHYSICAL STANDBY READ ONLY WITH APPLY    32384482 sbdb</p>
+<p>SQL>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12861"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1285' onclick='return addComment.moveForm( "div-comment-1285", "1285", "respond", "405" )' aria-label='Reply to Rick to Rick CHEN'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1286">
+				<div id="div-comment-1286" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1286">
+			November 18, 2014 at 1 h 39 min</a>		</div>
+
+		<p>Continued:
+After RMAN backup&#038;delete taken in primary site, all archived log files (applied on all standby) have been deleted, but those files on standby site havenot, still there. checked and confirmed on both DB and OS (on standby site).</p>
+<p>Regards,
+Rick CHEN
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12871"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1286' onclick='return addComment.moveForm( "div-comment-1286", "1286", "respond", "405" )' aria-label='Reply to Rick to Rick CHEN'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1287">
+				<div id="div-comment-1287" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1287">
+			November 18, 2014 at 1 h 48 min</a>		</div>
+
+		<p>&#8211;On Primary:
+SQL> select applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) reclaimable,
+       count(*),min(sequence#),max(sequence#)
+  2    3    from v$archived_log left outer join sys.x$kccagf using(recid)
+  4    where is_recovery_dest_file=&#8217;YES&#8217; and name is not null
+  5    group by applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) order by 5;</p>
+<p>APPLIED   DEL REC   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+&#8212;&#8212;&#8212; &#8212; &#8212; &#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8211;
+NO        NO  YES         11           2010           2020
+NO        NO  NO           1           2021           2021</p>
+<p>SQL></p>
+<p>&#8211;On Standby
+SQL> select applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) reclaimable,
+       count(*),min(sequence#),max(sequence#)
+  2    3    from v$archived_log left outer join sys.x$kccagf using(recid)
+  4    where is_recovery_dest_file=&#8217;YES&#8217; and name is not null
+  5    group by applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) order by 5;</p>
+<p>APPLIED   DEL REC   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+&#8212;&#8212;&#8212; &#8212; &#8212; &#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8211;
+YES       NO  NO          53           1968           2020
+IN-MEMORY NO  NO           1           2021           2021</p>
+<p>SQL>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12881"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1287' onclick='return addComment.moveForm( "div-comment-1287", "1287", "respond", "405" )' aria-label='Reply to Rick to Rick CHEN'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1288">
+				<div id="div-comment-1288" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1288">
+			November 18, 2014 at 5 h 35 min</a>		</div>
+
+		<p>Hi Rick,
+Thanks to have given all information.
+From that it seems that there is still a bug. Another bug because the one I was talking about is only when database is mount. Archivelog that have APPLIED=YES should become reclaimable when ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY. You have only one standby (no cascading), right? I think you can open a SR with that.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12891"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1288' onclick='return addComment.moveForm( "div-comment-1288", "1288", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1289">
+				<div id="div-comment-1289" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1289">
+			November 18, 2014 at 6 h 34 min</a>		</div>
+
+		<p>Thanks Franck,
+++1. Yes, only one standby standby site, and no any cascading standby site.
+++2. May I make it clear, is it on the standby site or primar site, to execute &#8220;CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY&#8221; ?
+++3. Let me change standby DB to mount status with MRP started, and check rectype of archived log files on standby site.
+Regards,
+Rick CHEN
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12901"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1289' onclick='return addComment.moveForm( "div-comment-1289", "1289", "respond", "405" )' aria-label='Reply to Rick to Rick CHEN'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1290">
+				<div id="div-comment-1290" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1290">
+			November 18, 2014 at 6 h 48 min</a>		</div>
+
+		<p>It&#8217;s on the standby site that you ever re-run the configure or executed the refreshagedfiles, as a workaround for the bug
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12911"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1290' onclick='return addComment.moveForm( "div-comment-1290", "1290", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1291">
+				<div id="div-comment-1291" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1291">
+			November 18, 2014 at 6 h 49 min</a>		</div>
+
+		<p>&#8211;On standby site:
+  restart standby database to mounted status and start MRP process
+&#8211;On primary site:
+  several archive log current operations.</p>
+<p>then check again:
+&#8211;Primary site:
+SQL> select applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) reclaimable,
+       count(*),min(sequence#),max(sequence#)
+  2    3    from v$archived_log left outer join sys.x$kccagf using(recid)
+  4    where is_recovery_dest_file=&#8217;YES&#8217; and name is not null
+  5    group by applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) order by 5;</p>
+<p>APPLIED   DEL REC   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+&#8212;&#8212;&#8212; &#8212; &#8212; &#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8211;
+NO        NO  YES         18           2010           2027
+NO        NO  NO           1           2028           2028</p>
+<p>SQL></p>
+<p>&#8211;standby site:
+SQL> select applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) reclaimable,
+  2         count(*),min(sequence#),max(sequence#)
+  3    from v$archived_log left outer join sys.x$kccagf using(recid)
+  4    where is_recovery_dest_file=&#8217;YES&#8217; and name is not null
+  5    group by applied,deleted,decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) order by 5;</p>
+<p>APPLIED   DEL REC   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+&#8212;&#8212;&#8212; &#8212; &#8212; &#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8211;
+YES       NO  NO          60           1968           2027
+IN-MEMORY NO  NO           1           2028           2028</p>
+<p>SQL>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12921"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1291' onclick='return addComment.moveForm( "div-comment-1291", "1291", "respond", "405" )' aria-label='Reply to Rick to Rick CHEN'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1296">
+				<div id="div-comment-1296" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1296">
+			November 18, 2014 at 23 h 43 min</a>		</div>
+
+		<p>Thanks Franck,
+On standby site re-run configure manually , it works.
+Now the question is how to delete all those applied&#038;reclaimable archived log files on standby site.
+When backup and delete archivelog all on primary, it seems no affact on standby site. Reclaimable archived log files have NOT been deleted on standby site.
+&#8211;On Primary Site:
+SQL> select applied,deleted, rectype, decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) reclaimable, count(*),min(sequence#),max(sequence#)
+  2    from v$archived_log left outer join sys.x$kccagf using(recid)
+  where is_recovery_dest_file=&#8217;YES&#8217; and name is not null
+  3    4    group by applied,deleted,rectype, decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;)
+  5    order by 6;</p>
+<p>APPLIED   DEL    RECTYPE REC   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+&#8212;&#8212;&#8212; &#8212; &#8212;&#8212;&#8212;- &#8212; &#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8211;
+NO        NO          11 YES          3           2079           2081
+NO        NO             NO           2           2082           2083</p>
+<p>SQL>
+&#8211;On Standby Site:
+SQL> select applied,deleted, rectype, decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) reclaimable, count(*),min(sequence#),max(sequence#)
+  2    from v$archived_log left outer join sys.x$kccagf using(recid)
+  3    where is_recovery_dest_file=&#8217;YES&#8217; and name is not null
+  4    group by applied,deleted,rectype, decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;)
+  5    order by 6;</p>
+<p>APPLIED   DEL    RECTYPE REC   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+&#8212;&#8212;&#8212; &#8212; &#8212;&#8212;&#8212;- &#8212; &#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8211;
+YES       NO          11 YES        113           1968           2080
+YES       NO             NO           2           2081           2082
+IN-MEMORY NO             NO           1           2083           2083</p>
+<p>SQL>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12971"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1296' onclick='return addComment.moveForm( "div-comment-1296", "1296", "respond", "405" )' aria-label='Reply to Rick to Rick CHEN'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1297">
+				<div id="div-comment-1297" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1297">
+			November 19, 2014 at 9 h 15 min</a>		</div>
+
+		<p>Hi, I&#8217;ve read only quickly and will come back on it (I&#8217;m currently attending DOAG) but it seems that it works. Once files are flagged as reclaimable then they will be deleted once oracle needs space on the FRA.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12981"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1297' onclick='return addComment.moveForm( "div-comment-1297", "1297", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1298">
+				<div id="div-comment-1298" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1298">
+			November 19, 2014 at 22 h 56 min</a>		</div>
+
+		<p>Yes, it does.
+Waiting for oracle delete once space needed on FRA is a passive solution.
+Is there any active solution to delete those reclaimable archived logs to release free space ? especially if it is on the primary site with RMAN backup.</p>
+<p>Regards,
+Rick
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12991"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1298' onclick='return addComment.moveForm( "div-comment-1298", "1298", "respond", "405" )' aria-label='Reply to Rick to Rick CHEN'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1300">
+				<div id="div-comment-1300" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1300">
+			November 20, 2014 at 9 h 34 min</a>		</div>
+
+		<p>Hi Rick,
+Yes there is. The delete archivelog (without FORCE) from rman should delete only the reclaimable archived logs. But you usually don&#8217;t need that. The big advantage of the Fast Recovery Area is that the files are managed by Oracle. You just have to adapt monitoring to monitor v$recovery_area_usage.
+Personally, I find the &#8216;passive solution&#8217; term a bit pejorative, as it is the exactly what&#8217;s cool in the feature: you keep files as long you don&#8217;t need to delete them. Then faster when you need to recover from them.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13011"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1300' onclick='return addComment.moveForm( "div-comment-1300", "1300", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1303">
+				<div id="div-comment-1303" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick Chen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1303">
+			November 21, 2014 at 0 h 45 min</a>		</div>
+
+		<p>Thanks Franck,
+Let&#8217;s change active/passive solution to other words. how about &#8220;RMAN script manual management&#8221; and &#8220;Oracle server automatic management&#8221;
+I wonder how we can delete those reclaimable archived logs of standby site by using &#8220;RMAN script management&#8221; on primary site ?
+You know, sometime we just want to manage archived logs on both sites, e.g. by &#8220;RMAN script&#8221; , what is the specific delete statement ?
+Regards and thanks,
+Rick Chen
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13041"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1303' onclick='return addComment.moveForm( "div-comment-1303", "1303", "respond", "405" )' aria-label='Reply to Rick to Rick Chen'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1304">
+				<div id="div-comment-1304" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rick Chen</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1304">
+			November 21, 2014 at 0 h 56 min</a>		</div>
+
+		<p>Sometimes with a group of transactions generating many archived logs, shipped and applied on standby site, and are reclaimable. With monitoring v$reocvery_area_usage most space are used, but we are not sure when those space will be reclaimed by oracle server.
+In the test DG testing environments, waiting more than  one hour, all reclaimable archived logs have not been deleted yet by oracle server automatically.
+SQL> select * from v$recovery_area_usage;</p>
+<p>FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES     CON_ID
+&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8212; &#8212;&#8212;&#8212;-
+CONTROL FILE                            .6                         0               1          0
+REDO LOG                             17.09                         0               7          0
+ARCHIVED LOG                         59.87                     59.87              44          0
+BACKUP PIECE                           .61                         0               1          0
+IMAGE COPY                               0                         0               0          0
+FLASHBACK LOG                            0                         0               0          0
+FOREIGN ARCHIVED LOG                     0                         0               0          0
+AUXILIARY DATAFILE COPY                  0                         0               0          0</p>
+<p>8 rows selected.</p>
+<p>SQL> select applied,deleted, rectype, decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;) reclaimable, count(*),min(sequence#),max(sequence#)
+  2    from v$archived_log left outer join sys.x$kccagf using(recid)
+  3    where is_recovery_dest_file=&#8217;YES&#8217; and name is not null
+  4    group by applied,deleted,rectype, decode(rectype,11,&#8217;YES&#8217;,&#8217;NO&#8217;)
+  5    order by 6;</p>
+<p>APPLIED   DEL    RECTYPE REC   COUNT(*) MIN(SEQUENCE#) MAX(SEQUENCE#)
+&#8212;&#8212;&#8212; &#8212; &#8212;&#8212;&#8212;- &#8212; &#8212;&#8212;&#8212;- &#8212;&#8212;&#8212;&#8212;&#8211; &#8212;&#8212;&#8212;&#8212;&#8211;
+YES       NO          11 YES         43           2120           2162
+NO        NO             NO           1           2163           2163</p>
+<p>SQL>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13051"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1304' onclick='return addComment.moveForm( "div-comment-1304", "1304", "respond", "405" )' aria-label='Reply to Rick to Rick Chen'>Reply to Rick</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1307">
+				<div id="div-comment-1307" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1307">
+			November 23, 2014 at 22 h 07 min</a>		</div>
+
+		<p>I still say that you don&#8217;t have to delete archivelogs because they are managed by oracle. That&#8217;s the reason for FRA and deletion policy.
+If you want to manage standby archived logs from the primary you have to use a rman catalog and play with the CHANGE ARCHIVELOG &#8230; DB_UNIQUE_NAME:
+<a href="https://docs.oracle.com/cd/B28359_01/backup.111/b28273/rcmsynta009.htm#sthref530" rel="nofollow">https://docs.oracle.com/cd/B28359_01/backup.111/b28273/rcmsynta009.htm#sthref530</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13081"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1307' onclick='return addComment.moveForm( "div-comment-1307", "1307", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1308">
+				<div id="div-comment-1308" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/25101cb4168ae776336552088aa4b1ad?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">RIck CHEN</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1308">
+			November 23, 2014 at 23 h 12 min</a>		</div>
+
+		<p>Thanks a lot Franck.
+I agree to use FRA and RMAN deletion policy to manage standby site archived logs automatically. On the other hand, &#8220;RMAN scripts management&#8221; is ready but will not been used in routine archived logs management.
+Really much appreciated.
+Regards,
+Rick
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13091"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1308' onclick='return addComment.moveForm( "div-comment-1308", "1308", "respond", "405" )' aria-label='Reply to RIck to RIck CHEN'>Reply to RIck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1423">
+				<div id="div-comment-1423" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/935496518830a81f393b8556a713f0a2?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Pankaj</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1423">
+			April 7, 2015 at 10 h 30 min</a>		</div>
+
+		<p>Hi
+I have 4 standby database in which if I had differed two standby database is it still delete archives on primary and two standby database is in sync.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14241"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1423' onclick='return addComment.moveForm( "div-comment-1423", "1423", "respond", "405" )' aria-label='Reply to Pankaj to Pankaj'>Reply to Pankaj</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1424">
+				<div id="div-comment-1424" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1424">
+			April 7, 2015 at 13 h 27 min</a>		</div>
+
+		<p>Hi Pankaj,
+You can have a standby and maintain a gap. Then deletion will depend on the policy which can be &#8216;shipped to all standby&#8217; &#8211; then archived logs can be deleted from primary even when not applied yet- or &#8216;applied to all standby&#8217;.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14251"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1424' onclick='return addComment.moveForm( "div-comment-1424", "1424", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1480">
+				<div id="div-comment-1480" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/c48d39ebc31e5b69865444f3964e4833?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Pravan</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1480">
+			June 11, 2015 at 22 h 27 min</a>		</div>
+
+		<p>Hi Frank,</p>
+<p>Has you tested this with Active Data Guard where the database is &#8220;READ ONLY WITH APPLY&#8221; instead of &#8220;mounted&#8221; ?</p>
+<p>Thanks
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14811"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1480' onclick='return addComment.moveForm( "div-comment-1480", "1480", "respond", "405" )' aria-label='Reply to Pravan to Pravan'>Reply to Pravan</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1481">
+				<div id="div-comment-1481" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1481">
+			June 12, 2015 at 4 h 57 min</a>		</div>
+
+		<p>Hi Pavan,
+Good question as MOS says it&#8217;s because of mount state. I&#8217;ve not nested and have no ADG in 11.2.0.3 currently to test. Let see if twitter can help:
+<a href="https://twitter.com/FranckPachot/status/609225513928949761" rel="nofollow">https://twitter.com/FranckPachot/status/609225513928949761</a>
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14821"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1481' onclick='return addComment.moveForm( "div-comment-1481", "1481", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-2890">
+				<div id="div-comment-2890" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/da96459ab63aeecd572bb5529a2bbd6d?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Sam</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2890">
+			February 25, 2016 at 8 h 42 min</a>		</div>
+
+		<p>I got the same archived log management problem in standby db.</p>
+<p>For executing the following statement at standby database &#8230;</p>
+<p>CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK;</p>
+<p>&#8230; we must set at least one of the standby databases to &#8216;mandatory&#8217;.  </p>
+<p>If it is mandatory, any connection problem between primary db and standby db may affect primary db operation!</p>
+<p>Is it true?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-28911"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2890' onclick='return addComment.moveForm( "div-comment-2890", "2890", "respond", "405" )' aria-label='Reply to Sam to Sam'>Reply to Sam</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-2896">
+				<div id="div-comment-2896" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2896">
+			February 25, 2016 at 22 h 55 min</a>		</div>
+
+		<p>Hi Sam,
+You don&#8217;t need to set the standby destination as mandatory. The protection mode (max performance/availability/protection), in addition to the timeout properties, will determine how the primary behaves when the standby is not available.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-28971"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2896' onclick='return addComment.moveForm( "div-comment-2896", "2896", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-3565">
+				<div id="div-comment-3565" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/f8e0bb2935751742e257e477c857eda2?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">venkateswarlu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3565">
+			May 20, 2016 at 12 h 03 min</a>		</div>
+
+		<p>hi frank,
+CONFIGURE ARCHIVELOG DELETION POLICY TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK;</p>
+<p>i have one standby database, plan to enable archive log deletion policy. i need one clarification is it mandate to use &#8220;BACKED UP 1 TIMES TO Disk&#8221; clause in standby database ?
+And after applying archive logs on standby, immediately it delete&#8217;s applied logs or not? if it is not when it will happen ?</p>
+<p>Thanks ,
+Venkat.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35661"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3565' onclick='return addComment.moveForm( "div-comment-3565", "3565", "respond", "405" )' aria-label='Reply to venkateswarlu to venkateswarlu'>Reply to venkateswarlu</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-3566">
+				<div id="div-comment-3566" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3566">
+			May 20, 2016 at 12 h 27 min</a>		</div>
+
+		<p>Hi Venkat,
+If you define APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK the archived logs will be reclaimable once they are applied and backed up from the Standby. So this is ok of you do the backups from the Standby. But backups done from the primary will not be seen there. They can be seen from RMAN connected to catalog only.
+When they become reclaimable, the are deleted only when space is needed, so you don&#8217;t see it. Check (and monitor) V$RECOVERY_AREA_USAGE to be sure that non-reclaimable files do not fill the FRA.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35671"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3566' onclick='return addComment.moveForm( "div-comment-3566", "3566", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-3589">
+				<div id="div-comment-3589" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1d78b5bae7e5de31c5ba854b99879f33?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Vasanth</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3589">
+			May 23, 2016 at 16 h 09 min</a>		</div>
+
+		<p>Hi Frank,</p>
+<p>First of all, thanks  much for posting this write up.</p>
+<p>If I understand correctly, configuring &#8220;CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED ON ALL STANDBY&#8221; will mark the archive logs in standby database as reclaimable &#8220;YES&#8221; once its applied.So FRA can delete those marked logs and reclaim space when required(FRA does this automatically in oracle 12c, I hope).</p>
+<p>My question is, how do we delete the archive logs in the active(primary) instance ? I want to delete the archive logs in the active once its copied to the standby server.
+Considering our application have quick db growth with restricted FRA size, we have clear archive logs every 2 hours. Currently we are doing like below:
+	find /opt/oracle/base/fast_recovery_area/$UPPER_DBID/archivelog -type f -mmin +120 -delete
+	crosscheck archivelog all;
+	delete noprompt expired archivelog all;
+So, we are seeing whether the &#8220;&#8221;CONFIGURE ARCHIVELOG DELETION POLICY&#8221; can be used in active instance as well.
+Please suggest.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35901"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3589' onclick='return addComment.moveForm( "div-comment-3589", "3589", "respond", "405" )' aria-label='Reply to Vasanth to Vasanth'>Reply to Vasanth</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment odd alt depth-2" id="comment-3590">
+				<div id="div-comment-3590" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1d78b5bae7e5de31c5ba854b99879f33?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Vasanth</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3590">
+			May 23, 2016 at 16 h 16 min</a>		</div>
+
+		<p>One correction, we are using &#8220;delete noprompt archivelog until time &#8220;sysdate-2/24&#8243;;&#8221; and not &#8220;delete noprompt expired archivelog all;&#8221; currently.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35911"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3590' onclick='return addComment.moveForm( "div-comment-3590", "3590", "respond", "405" )' aria-label='Reply to Vasanth to Vasanth'>Reply to Vasanth</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-odd thread-alt depth-1 parent" id="comment-3592">
+				<div id="div-comment-3592" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3592">
+			May 23, 2016 at 18 h 14 min</a>		</div>
+
+		<p>Hi Vasanth,
+Yes, you understand correctly about the standby.
+For the primary, you can do the same: CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED ON ALL STANDBY will mark them reclaimable as soon as they are applied on the standby.
+Then you don&#8217;t need to delete them.
+Note that it means that you are doing no backups at all, right?
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35931"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3592' onclick='return addComment.moveForm( "div-comment-3592", "3592", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment odd alt depth-2" id="comment-3593">
+				<div id="div-comment-3593" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1d78b5bae7e5de31c5ba854b99879f33?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Vasanth</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3593">
+			May 23, 2016 at 19 h 15 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>Thanks much for your quick response.
+Yes,  currently we dont do backup of these logs and I understand that, this is with no backups.</p>
+<p>Thanks,
+Vasanth
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35941"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3593' onclick='return addComment.moveForm( "div-comment-3593", "3593", "respond", "405" )' aria-label='Reply to Vasanth to Vasanth'>Reply to Vasanth</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-3606">
+				<div id="div-comment-3606" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/f8e0bb2935751742e257e477c857eda2?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">venkateswarlu</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3606">
+			May 26, 2016 at 9 h 01 min</a>		</div>
+
+		<p>Thanks for your response
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-36071"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3606' onclick='return addComment.moveForm( "div-comment-3606", "3606", "respond", "405" )' aria-label='Reply to venkateswarlu to venkateswarlu'>Reply to venkateswarlu</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-4221">
+				<div id="div-comment-4221" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1faaa92633aa5282db95e30f2cde9752?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Leo</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4221">
+			August 12, 2016 at 23 h 56 min</a>		</div>
+
+		<p>Nice post!
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-42221"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4221' onclick='return addComment.moveForm( "div-comment-4221", "4221", "respond", "405" )' aria-label='Reply to Leo to Leo'>Reply to Leo</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-7551">
+				<div id="div-comment-7551" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9a414d0e697ba6d4f6e1c08a8b0ed062?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Max</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7551">
+			May 25, 2017 at 13 h 33 min</a>		</div>
+
+		<p>Thanks. Very useful. Was about to write a scheduled job in EM to delete the archive logs .
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75521"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7551' onclick='return addComment.moveForm( "div-comment-7551", "7551", "respond", "405" )' aria-label='Reply to Max to Max'>Reply to Max</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-7946">
+				<div id="div-comment-7946" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a6b3067b584cb8b9306c943a08f96606?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Gerrit Haase</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7946">
+			July 26, 2017 at 16 h 37 min</a>		</div>
+
+		<p>Hello Franck,</p>
+<p>thanks, still a useful post.</p>
+<p>What I wonder about is, if you are not using RMAN at all, how is the FRA archivelog retention/deletion policy configured then? Is it really required to use RMAN for this, or can I do it with Data Guard as well?</p>
+<p>Regards,
+Gerrit
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-79471"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7946' onclick='return addComment.moveForm( "div-comment-7946", "7946", "respond", "405" )' aria-label='Reply to Gerrit to Gerrit Haase'>Reply to Gerrit</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-7957">
+				<div id="div-comment-7957" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7957">
+			July 28, 2017 at 15 h 37 min</a>		</div>
+
+		<p>Hi Gerrit,
+If you don&#8217;t backup your archived logs with RMAN, then you cannot use the &#8216;BACKED UP &#8230; TIMES TO &#8230;&#8217; part of the policy because Oracle does not know which you backed up. Using only the &#8216;&#8230; ON ALL STANDBY&#8217; policy risks to delete archived logs that are not backed up in case of space pressure in the FRA. Maybe you can have two destinations for archived logs: one to FRA managed by &#8216;&#8230; ON ALL STANDBY&#8217; policy and another one you manage yourself (backup with your tool, delete with rman command). Or better: use RMAN to backup archived logs elsewhere.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-79581"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7957' onclick='return addComment.moveForm( "div-comment-7957", "7957", "respond", "405" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

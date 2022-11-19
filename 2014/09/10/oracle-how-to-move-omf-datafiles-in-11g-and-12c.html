@@ -1,0 +1,162 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-how-to-move-omf-datafiles-in-11g-and-12c />
+<meta name=description content='A blog post from 2014 about Oracle: How to move OMF datafiles in 11g and 12c'>
+<title>Oracle: How to move OMF datafiles in 11g and 12c</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-how-to-move-omf-datafiles-in-11g-and-12c>https://blog.dbi-services.com/oracle-how-to-move-omf-datafiles-in-11g-and-12c</a> (2014-09-10), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle: How to move OMF datafiles in 11g and 12c</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>With OMF datafiles, you don&#8217;t manage the datafile names. But how do you set the destination when you want to move them to another mount point? Let&#8217;s see how easy (and online) it works in 12c. And how to do it with minimal downtime in 11g.</p>
+<h3>Testcase</h3>
+<p>Let&#8217;s create a tablespace with two datafiles. It&#8217;s OMF and goes into /u01:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter system set db_create_file_dest='/u01/app/oracle/oradata' scope=memory;
+System altered.
+
+SQL&gt; show parameter db_create_file_dest
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_create_file_dest                  string      /u01/app/oracle/oradata
+
+SQL&gt; create tablespace DEMO_OMF datafile size 5M;
+Tablespace created.
+
+SQL&gt; alter tablespace DEMO_OMF add datafile size 5M;
+Tablespace altered.
+</pre>
+<p>And I want to move those files in /u02.</p>
+<h3>12c online move</h3>
+<p>Here is how I generate my MOVE commands for all datafiles in /u01:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">set echo off linesize 1000 trimspool on pagesize 0 feedback off
+spool _move_omf.rcv
+prompt set echo on;;
+prompt report schema;;
+prompt alter session set db_create_file_dest='/u02/app/oracle/oradata';;
+select 'alter database move datafile '||file_id||';' from dba_data_files where file_name like '/u01/%' 
+/
+prompt report schema;;
+spool off
+</pre>
+<p>&nbsp;</p>
+<p>which generates the following:</p>
+<p>&nbsp;</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">set echo on;
+report schema;
+alter session set db_create_file_dest='/u02/app/oracle/oradata';
+alter database move datafile 7;
+alter database move datafile 2;
+report schema;
+</pre>
+<p>This works straightforward and online. That is the right solution if you are in 12c Enterprise Edition. The OMF destination is set at session level here. The move is done online, without any lock. The only overhead is that writes occured twice during the move operation. And in 12c we can run any SQL statement from RMAN, which is great.</p>
+<h3>11g backup as copy</h3>
+<p>How do you manage that in 11g? I like to do it with RMAN COPY. If you&#8217;re in ARCHIVELOG then you can copy the datafiles one by one: backup it as copy, offline it, recover it, switch to it, online it. This is the fastest way. You can avoid the recovery step by putting the tablespace offline but:</p>
+<ul>
+<li>you will have to wait that the earliest transaction finishes.</li>
+<li>your downtime includes the whole copy. When activity is low the recovery is probably faster.</li>
+</ul>
+<p>Here is how I generate my RMAN commands for all datafiles in /u01:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">set echo off linesize 1000 trimspool on pagesize 0 feedback off
+spool _move_omf.rcv
+prompt set echo on;;
+prompt report schema;;
+with files as (
+ select file_id , file_name , bytes from dba_data_files where file_name like '/u01/%' and online_status ='ONLINE' 
+)
+select stmt from (
+select 00,bytes,file_id,'# '||to_char(bytes/1024/1024,'999999999')||'M '||file_name||';' stmt from files
+union all
+select 10,bytes,file_id,'backup as copy datafile '||file_id||' to destination''/u02/app/oracle/oradata'';' stmt from files
+union all
+select 20,bytes,file_id,'sql "alter database datafile '||file_id||' offline";' from files
+union all
+select 30,bytes,file_id,'switch datafile '||file_id||' to copy;' from files
+union all
+select 40,bytes,file_id,'recover datafile '||file_id||' ;' from files
+union all
+select 50,bytes,file_id,'sql "alter database datafile '||file_id||' online";' from files
+union all
+select 60,bytes,file_id,'delete copy of datafile '||file_id||';' from files
+union all
+select 90,bytes,file_id,'report schema;' from files
+union all
+select 91,bytes,file_id,'' from files
+order by 2,3,1
+)
+/
+</pre>
+<p>which generates the following:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">set echo on;
+report schema;
+#          5M /u01/app/oracle/oradata/DEMO/datafile/o1_mf_demo_omf_b0vg07m8_.dbf;
+backup as copy datafile 2 to destination'/u02/app/oracle/oradata';
+sql "alter database datafile 2 offline";
+switch datafile 2 to copy;
+recover datafile 2 ;
+sql "alter database datafile 2 online";
+delete copy of datafile 2;
+report schema;
+</pre>
+<p>(I have reproduced the commands for one datafile only here.)</p>
+<p>And I can run it in RMAN. Run it as cmdfile or in a run block so that it stops if an error is encountered. Of course, it&#8217;s better to run them one by one and check that the datafiles are online at the end. Note that it does not concern SYSTEM tablespace for which the database must be closed.</p>
+<p>Online datafile move is my favorite Oracle 12c feature. And it&#8217;s the first new feature that you will practice if you come at our <a href="http://www.dbi-services.com/trainings/type/oracle-en/">12c new features workshop. And in any versions RMAN is my preferred way to manipulate database files.</a></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4860"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7471">
+				<div id="div-comment-7471" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/0ff0a669135a2bf3158e9223604e59d5?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://community.oracle.com/people/JuanM?customTheme=otn' rel='external nofollow' class='url'>Juan Manuel Cruz</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7471">
+			May 9, 2017 at 23 h 55 min</a>		</div>
+
+		<p>Nice article Franck!
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-74721"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7471' onclick='return addComment.moveForm( "div-comment-7471", "7471", "respond", "485" )' aria-label='Reply to Juan to Juan Manuel Cruz'>Reply to Juan</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

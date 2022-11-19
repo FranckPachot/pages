@@ -1,0 +1,85 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/12c-multitenant-internals-compiling-system-package-from-pdb />
+<meta name=description content='A blog post from 2017 about 12c Multitenant Internals: compiling system package from PDB'>
+<title>12c Multitenant Internals: compiling system package from PDB</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/12c-multitenant-internals-compiling-system-package-from-pdb>https://blog.dbi-services.com/12c-multitenant-internals-compiling-system-package-from-pdb</a> (2017-11-22), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">12c Multitenant Internals: compiling system package from PDB</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p><a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/11/DPKi1vxX0AAADLm.jpg" rel="lightbox[19684]"><img src="../wp-insides/uploads/sites/2/2017/11/DPKi1vxX0AAADLm-300x225.jpg" alt="DPKi1vxX0AAADLm" width="300" height="225" class="alignleft size-medium wp-image-19698" /></a>When I explain the multitenant internals, I show that all metadata about system procedures and packages are stored only in CDB$ROOT and are accessed from the PDBs through metadata links. I take an example with DBMS_SYSTEM that has nothing in SOURCE$ of the PDB. But I show that we can compile it from the PDB. This is my way to prove that the session can access the system objects, internally switching the session to the root container when it needs to read SOURCE$. At DOAG Conference I had a very interesting question about what happens exactly in CDB$ROOT: Is the session really executing all the DML on the internal tables storing the compiled code of the procedure?
+<span id="more-19684"></span>
+My first answer was something like &#8216;why not&#8217; because the session in a PDB can switch and do modifications into CDB$ROOT internally. For example, even a local PDB DBA can change some &#8216;spfile&#8217; parameters which are actually stored in the CDB$ROOT. But then I realized that the question goes further: is the PDB session really compiling the DBMS_SYSTEM package in the CDB$ROOT? Actually, there are some DDL that are transformed to &#8216;no-operation&#8217; when executed on the PDB.</p>
+<p>To see which ones are concerned, the best is to trace:
+<pre>
+SQL&gt; alter session set events='10046 trace name context forever, level 4';
+Session altered.
+SQL&gt; alter session set container=PDB1;
+Session altered.
+SQL&gt; alter package dbms_system compile;
+Package altered.
+SQL&gt; alter session set events='10046 trace name context off';
+Session altered.
+</pre></p>
+<p>I&#8217;ll not show the whole trace here. For sure I can see that the session switches to CDB$ROOT to read the source code of the package:
+<pre>
+*** 2017-11-22T08:36:01.963680+01:00 (CDB$ROOT(1))
+=====================
+PARSING IN CURSOR #140650193204552 len=54 dep=1 uid=0 oct=3 lid=0 tim=5178881528 hv=696375357 ad='7bafeab8' sqlid='9gq78x8ns3q1x'
+select source from source$ where obj#=:1 order by line
+END OF STMT
+PARSE #140650193204552:c=0,e=290,p=0,cr=0,cu=0,mis=1,r=0,dep=1,og=4,plh=0,tim=5178881527
+EXEC #140650295606992:c=1000,e=287,p=0,cr=0,cu=0,mis=0,r=0,dep=2,og=4,plh=813480514,tim=5178881999
+FETCH #140650295606992:c=0,e=35,p=0,cr=4,cu=0,mis=0,r=1,dep=2,og=4,plh=813480514,tim=5178882057
+CLOSE #140650295606992:c=0,e=12,dep=2,type=3,tim=5178882104
+</pre></p>
+<p>That was my point about metadata links. But now about modifications.</p>
+<p>As I need to see only the statements, I can use TKPROF to get them aggregated, but then the container switch &#8211; like (CDB$ROOT(1)) here &#8211; is ignored. </p>
+<p>Here is a small AWK script I use to add the Container ID to the SQL ID so that it is visible and detailed into TKPROF output:
+<pre>
+awk '/^[*]{3}/{con=$3}/^PARSING IN/{sub(/sqlid=./,"&amp;"con" ")}{print &gt; "con_"FILENAME }'
+</pre></p>
+<p>Then I run TKPROF on the resulting file, with &#8216;sort=(execu)&#8217; so that I have the modifications (insert/delete/update) first. The result starts with something like this:
+<pre>
+SQL ID: (PDB1(3)) 1gfaj4z5hn1kf Plan Hash: 1110520934
+
+delete from dependency$
+where
+ d_obj#=:1
+</pre></p>
+<p>I know that dependencies are replicated into all containers (because table metadata is replicated into all containers) so I see following tables modified in the PDB:  DEPENDENCY$, ACCESS$, DIANA_VERSION$, and of course OBJ$.</p>
+<p>But to answer the initial question, there are no modifications done in the CDB$ROOT. Only SELECT statements there, on SOURCE$, SETTINGS$, CODEAUTH$, WARNING_SETTINGS$</p>
+<p>So, probably, the updates have been transformed to no-op operations once the session is aware that the source is the same (same signature) and it just reads the compilation status.</p>
+<p>Just as a comparison, tracing the same compilation when done on the CDB$ROOT will show inserts/delete/update on ARGUMENT$, PROCEDUREINFO$, SETTINGS$, PROCEDUREPLSQL$, IDL_UB1$, IDL_SB4$, IDL_UB2$, IDL_CHAR$, &#8230; all those tables sorting the compiled code.</p>
+<p>So basically, when running DDL on metadata links in a PDB, not all the work is done in the CDB, especially not writing again what is already there (because you always upgrade the CDB$ROOT first). However, up to 12.2 we don&#8217;t see a big difference in time. This should change in 18<em>c</em> where the set of DDL to be run on the PDB will be pre-processed to avoid unnecessary operations. </p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-196850" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/11/DPKi1vxX0AAADLm-300x225.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

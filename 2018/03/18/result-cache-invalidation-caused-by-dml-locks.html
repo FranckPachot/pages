@@ -1,0 +1,241 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/result-cache-invalidation-caused-by-dml-locks />
+<meta name=description content='A blog post from 2018 about Result cache invalidation caused by DML locks'>
+<title>Result cache invalidation caused by DML locks</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/result-cache-invalidation-caused-by-dml-locks>https://blog.dbi-services.com/result-cache-invalidation-caused-by-dml-locks</a> (2018-03-18), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Result cache invalidation caused by DML locks</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a <a href="https://blog.dbi-services.com/resultcache-hint-expiration-options/" target="_blank">previous post</a> about Result Cache, I was using &#8216;set autotrace on&#8217; in my session to see when the result cache hit saves the logical reads. I got a comment, by e-mail and with full test case, mentioning that the invalidation I had when doing some DML does not occur when autotrace is set to off. I reproduced the problem, on 18c because I use my cloud services to do my tests, but it works the same way in 12c.
+<span id="more-21826"></span>
+I&#8217;ll focus here on DML which does not modify any rows from the table the result depends on, because this is the case that  depends on the session transaction context. When rows are modified, the result is always invalidated.</p>
+<p>For each test here I&#8217;ll flush the result cache:
+<pre>
+SQL&gt; exec if dbms_result_cache.flush then dbms_output.put_line('Flushed.'); end if;
+PL/SQL procedure successfully completed.
+
+SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id
+no rows selected
+</pre>
+And I begin each test with the result cache loaded by a query.</p>
+<h3>DML on the dependent table</h3>
+<p>The result or the query is loaded into the cache, with a dependency on the SCOTT.DEPT table:
+<pre>
+SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id
+
+  ID TYPE         STATUS      NAME                                            CACHE_ID                       INVALIDATIONS
+  -- ----         ------      ----                                            --------                       -------------
+   0 Dependency   Published   SCOTT.DEPT                                      SCOTT.DEPT                                 0
+   1 Result       Published   select /*+ result_cache */ count(*) from DEPT   50vtzqa5u0xcy4bnh6z600nj1u                 0
+</pre></p>
+<p>Now, I&#8217;m executing some DML on this DEPT table:
+<pre>
+SQL&gt; connect scott/tiger@//localhost/PDB1
+Connected.
+SQL&gt; delete from DEPT where DEPTNO&gt;40;
+0 rows deleted.
+</pre>
+This delete does not touch any row, but declares the intention to modify the table with a Row eXclusive lock (TM mode=3):
+<pre>
+SQL&gt; select * from v$locked_object natural join (select object_id,object_name from user_objects)
+
+  OBJECT_ID   XIDUSN   XIDSLOT   XIDSQN   SESSION_ID ORACLE_USERNAME   OS_USER_NAME   PROCESS     LOCKED_MODE   CON_ID OBJECT_NAME
+  ---------   ------   -------   ------   ---------- ---------------   ------------   -------     -----------   ------ -----------
+      73376        0         0        0           21 SCOTT             oracle         7772                  3        5 DEPT
+</pre>
+Note that the transaction ID is all zeros. Logically, we are in a transaction, as we have a lock that will be released only at the end of the transaction (commit or rollback). But, as we didn&#8217;t modify any block yet, there is no entry in the transaction table:
+<pre>
+SQL&gt; select xidusn,xidslot,xidsqn,start_time,used_urec from v$transaction
+no rows selected
+</pre>
+I commit this transaction:
+<pre>
+SQL&gt; commit;
+Commit complete.
+</pre>
+and check the result cache objects:
+<pre>
+SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id
+
+  ID TYPE         STATUS      NAME                                            CACHE_ID                       INVALIDATIONS
+  -- ----         ------      ----                                            --------                       -------------
+   0 Dependency   Published   SCOTT.DEPT                                      SCOTT.DEPT                                 0
+   1 Result       Published   select /*+ result_cache */ count(*) from DEPT   50vtzqa5u0xcy4bnh6z600nj1u                 0
+</pre></p>
+<p>This look good: nothing was modified so there is no reason to invalidate the result. However, in the previous post I referenced, a similar test invalidated the cache even when no rows were touched. And a reader remarked that this occured only when I previously run a query with &#8216;autotrace on&#8217;. Without autotrace, the behaviour is like what I show here above: no invalidation when no rows is modified.</p>
+<h3>Same in an already started transaction</h3>
+<p>The difference is that the &#8216;autotrace on&#8217; runs an &#8216;explain plan&#8217;, filling the plan table, which means that a transaction was already started. Here I run autotrace on a completely different query:
+<pre>
+SQL&gt; set autotrace on explain
+Autotrace Enabled
+Displays the execution plan only.
+SQL&gt; select * from dual;
+DUMMY
+-----
+X
+
+Explain Plan
+-----------------------------------------------------------
+PLAN_TABLE_OUTPUT
+Plan hash value: 272002086
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |     1 |     2 |     2   (0)| 00:00:01 |
+|   1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+SQL&gt; set autotrace off;
+Autotrace Disabled
+</pre></p>
+<p>Following this, I have no locked objects, but a transaction has been initiated:
+<pre>
+SQL&gt; select * from v$locked_object natural join (select object_id,object_name from user_objects)
+no rows selected
+
+SQL&gt; select xidusn,xidslot,xidsqn,start_time,used_urec from v$transaction
+  XIDUSN   XIDSLOT   XIDSQN START_TIME            USED_UREC
+  ------   -------   ------ ----------            ---------
+       9        18      709 03/18/18 20:30:09             2
+</pre></p>
+<p>Here is the big difference: I have a transaction ID here.
+Now doing the same as before, a delete touching no rows:
+<pre>
+SQL&gt; delete from DEPT where DEPTNO&gt;40;
+0 rows deleted.
+</pre></p>
+<p>When I query the lock objects, they are now associated to a non-zero transaction ID:
+<pre>
+SQL&gt; select * from v$locked_object natural join (select object_id,object_name from user_objects)
+
+  OBJECT_ID   XIDUSN   XIDSLOT   XIDSQN   SESSION_ID ORACLE_USERNAME   OS_USER_NAME   PROCESS     LOCKED_MODE   CON_ID OBJECT_NAME
+  ---------   ------   -------   ------   ---------- ---------------   ------------   -------     -----------   ------ -----------
+      73376        9        18      709           21 SCOTT             oracle         7772                  3        5 DEPT
+</pre></p>
+<p>Here is the difference, now the result cache has been invalidated:
+<pre>
+SQL&gt; commit;
+Commit complete.
+
+SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id
+
+  ID TYPE         STATUS      NAME                                            CACHE_ID                       INVALIDATIONS
+  -- ----         ------      ----                                            --------                       -------------
+   0 Dependency   Published   SCOTT.DEPT                                      SCOTT.DEPT                                 1
+   1 Result       Invalid     select /*+ result_cache */ count(*) from DEPT   50vtzqa5u0xcy4bnh6z600nj1u                 0
+</pre></p>
+<h3>DML on another table &#8211; RS though referential integrity</h3>
+<p><a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2018/03/CaptureLocks.png" rel="lightbox[21826]"><img src="../wp-insides/uploads/sites/2/2018/03/CaptureLocks-300x169.png" alt="CaptureLocks" width="300" height="169" class="alignright size-medium wp-image-21830" /></a>This gives the idea that the invalidation is not really triggered by actual modifications, but at commit time from the DML locks when associated with a transaction.
+And some DML on tables may acquire a Row-S or Row-X lock on the tables linked by referential integrity. This has changed a lot though versions &#8211; look at the slide on the right.</p>
+<p>I start in the same situation, with the result cache loaded, no locked objects, but a transaction that has started:
+<pre>
+SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id
+
+  ID TYPE         STATUS      NAME                                            CACHE_ID                       INVALIDATIONS
+  -- ----         ------      ----                                            --------                       -------------
+   0 Dependency   Published   SCOTT.DEPT                                      SCOTT.DEPT                                 0
+   1 Result       Published   select /*+ result_cache */ count(*) from DEPT   50vtzqa5u0xcy4bnh6z600nj1u                 0
+
+SQL&gt; select * from v$locked_object natural join (select object_id,object_name from user_objects)
+no rows selected
+
+SQL&gt; select xidusn,xidslot,xidsqn,start_time,used_urec from v$transaction
+
+  XIDUSN   XIDSLOT   XIDSQN START_TIME            USED_UREC
+  ------   -------   ------ ----------            ---------
+       8        31      766 03/18/18 20:30:10             2
+</pre></p>
+<p>I delete from the EMP table and if you are familiar with the SCOTT schema, you know that it has a foreign key to DEPT.
+<pre>
+SQL&gt; delete from EMP where DEPTNO&gt;=40;
+0 rows deleted.
+</pre></p>
+<p>The delete acquires a Row eXclusive lock on EMP even when there are no rows deleted (DML locks are about the intention to modify rows). And from the table above, it acquires a Row Share (mode=2) on the parent table:
+<pre>
+SQL&gt; select * from v$locked_object natural join (select object_id,object_name from user_objects)
+
+  OBJECT_ID   XIDUSN   XIDSLOT   XIDSQN   SESSION_ID ORACLE_USERNAME   OS_USER_NAME   PROCESS     LOCKED_MODE   CON_ID OBJECT_NAME
+  ---------   ------   -------   ------   ---------- ---------------   ------------   -------     -----------   ------ -----------
+      73376        8        31      766           21 SCOTT             oracle         7772                  2        5 DEPT
+      73378        8        31      766           21 SCOTT             oracle         7772                  3        5 EMP
+</pre>
+I commit and check the result cache:
+<pre>
+SQL&gt; commit;
+Commit complete.
+
+SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id
+
+  ID TYPE         STATUS      NAME                                            CACHE_ID                       INVALIDATIONS
+  -- ----         ------      ----                                            --------                       -------------
+   0 Dependency   Published   SCOTT.DEPT                                      SCOTT.DEPT                                 0
+   1 Result       Published   select /*+ result_cache */ count(*) from DEPT   50vtzqa5u0xcy4bnh6z600nj1u                 0
+</pre></p>
+<p>No invalidation here, which makes sense because Row Share is not an intention to write.</p>
+<h3>DML on another table &#8211; RX though referential integrity</h3>
+<p>I do the same here, but with an insert on EMP which acquires a Row eXclusive on the parent table.
+<pre>
+SQL&gt; insert into EMP(EMPNO,DEPTNO)values(9999,40);
+1 row inserted.
+
+SQL&gt; select * from v$locked_object natural join (select object_id,object_name from user_objects)
+
+  OBJECT_ID   XIDUSN   XIDSLOT   XIDSQN   SESSION_ID ORACLE_USERNAME   OS_USER_NAME   PROCESS     LOCKED_MODE   CON_ID OBJECT_NAME
+  ---------   ------   -------   ------   ---------- ---------------   ------------   -------     -----------   ------ -----------
+      73376       10        32      560           21 SCOTT             oracle         7772                  3        5 DEPT
+      73378       10        32      560           21 SCOTT             oracle         7772                  3        5 EMP
+
+SQL&gt; select xidusn,xidslot,xidsqn,start_time,used_urec from v$transaction
+
+  XIDUSN   XIDSLOT   XIDSQN START_TIME            USED_UREC
+  ------   -------   ------ ----------            ---------
+      10        32      560 03/18/18 20:30:10             4
+
+SQL&gt; commit;
+Commit complete.
+
+SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id
+---- ------ ------------------------------------------ ---- ---------------------- ----- -- --
+  ID TYPE         STATUS      NAME                                            CACHE_ID                       INVALIDATIONS
+   0 Dependency   Published   SCOTT.DEPT                                      SCOTT.DEPT                                 1
+   1 Result       Invalid     select /*+ result_cache */ count(*) from DEPT   50vtzqa5u0xcy4bnh6z600nj1u                 0
+</pre></p>
+<p>Here, DEPT has been invalidated after the insert on EMP. There were no modifications on DEPT, but the result cache is not directly tracking the modifications, but rather the intention of modification. And then, the implementation of the result cache invalidation tracks, at commit, the Row eXclusive locks when they are related to a know transaction. You can have the same result if, from a transaction that has already started, you run a simple:
+<pre>
+SQL&gt; lock table DEPT in row exclusive mode;
+Lock succeeded.
+</pre></p>
+<p>This means that there are many reasons why the result cache may be invalid even when the objects in the &#8216;Dependency&#8217; are not modified. Be careful, invalidations and cache misses are expensive and do not scale on high load. And because of locks through referential integrity, this can happen even on static tables. Let&#8217;s take an example. in an order entry system, you may think that the &#8216;products&#8217; table is a good candidate for result cache &#8211; updated twice a year but read all the times. But now that you know that inserts on child tables, such as the order table, will invalidate this cache, you may think again about it.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-218270" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2018/03/CaptureLocks-300x169.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

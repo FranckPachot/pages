@@ -1,0 +1,263 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/12cr2-dml-monitoring-and-statistics-advisor />
+<meta name=description content='A blog post from 2017 about 12cR2 DML monitoring and Statistics Advisor'>
+<title>12cR2 DML monitoring and Statistics Advisor</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/12cr2-dml-monitoring-and-statistics-advisor>https://blog.dbi-services.com/12cr2-dml-monitoring-and-statistics-advisor</a> (2017-04-06), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">12cR2 DML monitoring and Statistics Advisor</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Monitoring DML to get an idea of the activity on our tables is not new. The number of insert/delete/update/truncate since last stats gathering is tracked automatically. The statistics gathering job use it to list and prioritize tables that need fresh statistics. This is for slow changes on tables. In 12.2 we have the statistics advisor that goes further, with a rule that detects volatile tables:</p>
+<p><pre>SQL&gt; select * from V$STATS_ADVISOR_RULES where rule_id=14;
+
+RULE_ID  NAME               RULE_TYPE  DESCRIPTION                                                 CON_ID
+-------  ----               ---------  -----------                                                 ------
+14       LockVolatileTable  OBJECT     Statistics for objects with volatile data should be locked  0</pre></p>
+<p>But to detect volatile tables, you need to track DML frequency with finer grain. Let&#8217;s investigate what is new here in 12.2
+<span id="more-15682"></span></p>
+<h3>Statistics Advisor tracing</h3>
+<p>DBMS_STATS has its trace mode enabled as a global preference. It is not documented, but it works with powers of two. 12.1.0.2 introduced 262144 to trace system statistics gathering, so let&#8217;s try the next one: 524288</p>
+<p><pre>SQL&gt; exec dbms_stats.set_global_prefs('TRACE',0+524288)
+PL/SQL procedure successfully completed.</pre></p>
+<p>After a while, I grepped my trace directory for DBMS_STATS and found the MMON slave trace (ORCLA_m001_30694.trc here):</p>
+<p><pre>*** 2017-04-06T14:10:11.979283+02:00
+*** SESSION ID:(81.2340) 2017-04-06T14:10:11.979302+02:00
+*** CLIENT ID:() 2017-04-06T14:10:11.979306+02:00
+*** SERVICE NAME:(SYS$BACKGROUND) 2017-04-06T14:10:11.979309+02:00
+*** MODULE NAME:(MMON_SLAVE) 2017-04-06T14:10:11.979313+02:00
+*** ACTION NAME:(Flush KSXM hash table action) 2017-04-06T14:10:11.979317+02:00
+*** CLIENT DRIVER:() 2017-04-06T14:10:11.979320+02:00
+
+...
+
+DBMS_STATS: compute_volatile_flag: objn=74843, flag=0, new_flag=0, inserts_new=619, updates_new=0, deletes_new=0, inserts_old=619, updates_old=0, deletes_old=0, rowcnt=, rowcnt_loc=, stale_pcnt=10, gather=NO_GATHER, flag_result=0
+DBMS_STATS: compute_volatile_flag: objn=74862, flag=0, new_flag=0, inserts_new=4393, updates_new=0, deletes_new=0, inserts_old=4393, updates_old=0, deletes_old=0, rowcnt=, rowcnt_loc=, stale_pcnt=10, gather=NO_GATHER, flag_result=0
+DBMS_STATS: compute_volatile_flag: objn=74867, flag=1, new_flag=0, inserts_new=4861477, updates_new=584000, deletes_new=13475192, inserts_old=3681477, updates_old=466000, deletes_old=12885192, rowcnt=, rowcnt_loc=, stale_pcnt=10, gather=NO_GATHER, flag_result=1</pre></p>
+<p>Those entries appear every hour. Obviously, they are looking at some table (by their object_id) and computes a new flag from an existing flag and statistics about new and old DML (insert, update, delete). There&#8217;s a mention or row count and stale percentage. Obviously, the volatility of tables est computed every hour (mentions gather=NO_GATHER) or when we gather statistics (gather=GATHER). This goes beyond the DML monitoring from previous release, but is probably based on it.</p>
+<h3>Testing some DML</h3>
+<p><pre>SQL&gt; delete from DEMO;
+10000 rows deleted.
+
+SQL&gt; insert into DEMO select rownum from xmltable('1 to 10000');
+10000 rows created.
+
+SQL&gt; commit;
+Commit complete.
+
+SQL&gt; select count(*) numrows from DEMO;
+   NUMROWS
+----------
+     10000
+
+SQL&gt; update demo set n=n+1 where rownum lt;= 2000;
+
+2000 rows updated.
+
+SQL&gt; insert into DEMO select rownum from xmltable('1 to 10000');
+
+10000 rows created.
+</pre></p>
+<p>I deleted 10000 rows and inserted 10000, with a commit at the end. I updated 2000 ones and inserted 10000 again, without commit.</p>
+<h3>x$ksxmme</h3>
+<p>DML monitoring is done in memory, I order to see the changes in DBA_TAB_MODIFICATIONS, we need to flush it. But this in-memory information is visible in X$ fixed view:</p>
+<p><pre>SQL&gt; select * from X$KSXMME where objn=&amp;object_id;
+old   1: select * from X$KSXMME where objn=&amp;object_id
+new   1: select * from X$KSXMME where objn=     74867
+
+ADDR                   INDX    INST_ID     CON_ID     CHUNKN      SLOTN       OBJN        INS        UPD        DEL    DROPSEG    CURROWS    PAROBJN   LASTUSED      FLAGS
+---------------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ----------
+00007F526E0B81F0          0          1          0         64        256      74867      20000       2000      10000          0    2350000          0 1491467123        128
+</pre></p>
+<p>Here are my 10000 deletes + 10000 inserts + 2000 updates + 10000 inserts. Of course the uncommitted ones are there because DML tracking do not keep the numbers for each transaction in order to update later what is committed or not.</p>
+<p>The proof is that when I rollback, the numbers do not change:</p>
+<p><pre>SQL&gt; rollback;
+Rollback complete.
+
+SQL&gt; select * from X$KSXMME where objn=&amp;object_id;
+old   1: select * from X$KSXMME where objn=&amp;object_id
+new   1: select * from X$KSXMME where objn=     74867
+
+ADDR                   INDX    INST_ID     CON_ID     CHUNKN      SLOTN       OBJN        INS        UPD        DEL    DROPSEG    CURROWS    PAROBJN   LASTUSED      FLAGS
+---------------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ---------- ----------
+00007F526DDF47F8          0          1          0         64        256      74867      20000       2000      10000          0    2350000          0 1491467123        128</pre></p>
+<p>Yes, there is an estimation of the current number of rows here, in real-time. This is used to compare the changes with the total number, but you can use it to see the progress of a big transaction, giving a view of uncommitted changes.</p>
+<h3>sys.mon_mods_all$</h3>
+<p>The table sys.mon_mods_all$ is what is behind DBA_TAB_MODIFICATIONS (not exactly, but that will be for another blog post) and you have to flush what&#8217;s in memory to see the latest changes there:</p>
+<p><pre>SQL&gt; exec dbms_stats.flush_database_monitoring_info;
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from sys.mon_mods_all$ where obj#=&amp;object_id;
+old   1: select * from sys.mon_mods_all$ where obj#=&amp;object_id
+new   1: select * from sys.mon_mods_all$ where obj#=     74867
+
+      OBJ#    INSERTS    UPDATES    DELETES TIMESTAMP               FLAGS DROP_SEGMENTS
+---------- ---------- ---------- ---------- ------------------ ---------- -------------
+     74867    5581477     656000   13835192 06-APR 15:10:53             1             0
+</pre></p>
+<p>The flag 1 means that the table has been truncated since the latest stats gathering.</p>
+<p>This is what we already know from previous release. Nothing to do with the trace we see every hour in MMON slave.</p>
+<h3>sys.optstat_snapshot$</h3>
+<p>What happens every hour is that a snapshot of sys.mon_mods_all$ is stored in sys.optstat_snapshot$:</p>
+<p><pre>SQL&gt; select * from sys.optstat_snapshot$ where obj#=&amp;object_id order by timestamp;
+old   1: select * from sys.optstat_snapshot$ where obj#=&amp;object_id order by timestamp
+new   1: select * from sys.optstat_snapshot$ where obj#=     74867 order by timestamp
+
+      OBJ#    INSERTS    UPDATES    DELETES      FLAGS TIMESTAMP
+---------- ---------- ---------- ---------- ---------- ------------------
+     74867        999          0          0         32 05-APR-17 17:27:01
+     74867       1997          0          0         32 05-APR-17 17:33:25
+     74867       1997          0          0         32 05-APR-17 17:33:31
+     74867       1997          0          0         32 05-APR-17 17:33:32
+     74867      80878          0        160          0 05-APR-17 18:59:37
+     74867      90863          0        210          0 05-APR-17 20:53:07
+     74867   10597135          0        410          0 05-APR-17 21:53:13
+     74867   10598134          0        410         32 05-APR-17 22:02:38
+     74867      38861          0   10603745          1 06-APR-17 08:17:58
+     74867      38861          0   10603745          1 06-APR-17 09:18:04
+     74867     581477     124000   11175192          1 06-APR-17 10:11:27
+     74867    1321477     230000   11705192          1 06-APR-17 11:09:50
+     74867    2481477     346000   12285192          1 06-APR-17 12:09:56
+     74867    3681477     466000   12885192          1 06-APR-17 01:10:04
+     74867    4861477     584000   13475192          1 06-APR-17 02:10:11
+     74867    5561477     654000   13825192          1 06-APR-17 03:10:19</pre></p>
+<p>You see snapshots every hour, the latest being 03:10, 02:10, 01.10, 12:09, 11:09, &#8230;
+You see additional snapshots at each statistics gathering. I&#8217;ve run dbms_stats.gather_table_stats at 17:27 and 17:33 several times the day before. Those snapshots are flagged 32.
+The statistics was gathered again at 20:02 (the auto job) and I&#8217;ve truncated the table after that which is why the flag is 1.</p>
+<h3>dbms_stats_advisor.compute_volatile_flag</h3>
+<p>My guess is that there should be a flag for volatile tables here, because I&#8217;ve seen a trace for compute_volatile_flag in MMON trace, so I&#8217;ve enabled sql_trace for the MMON slave, and here is the query which takes the snapshot:</p>
+<p><pre>insert /* KSXM:TAKE_SNPSHOT */ into sys.optstat_snapshot$ (obj#, inserts, updates, deletes, timestamp, flags) (select m.obj#, m.inserts, m.updates, m.deletes, systimestamp,  dbms_stats_advisor.compute_volatile_flag(    m.obj#, m.flags, :flags, m.inserts, m.updates, m.deletes,    s.inserts, s.updates, s.deletes, null,    nvl(to_number(p.valchar), :global_stale_pcnt), s.gather) flags from sys.mon_mods_all$ m, (select si.obj#, max(si.inserts) inserts, max(si.updates) updates,    max(si.deletes) deletes, decode(bitand(max(si.flags), :gather_flag), 0,                               'NO_GATHER', 'GATHER') gather,    max(si.timestamp) timestamp  from sys.optstat_snapshot$ si,  (select obj#, max(timestamp) ts from sys.optstat_snapshot$   group by obj#) sm  where si.obj# = sm.obj# and si.timestamp = sm.ts  group by si.obj#) s, sys.optstat_user_prefs$ p where m.obj# = s.obj#(+)  and m.obj# = p.obj#(+) and pname(+) = 'STALE_PERCENT'  and dbms_stats_advisor.check_mmon_policy_violation(rownum, 6, 2) = 0)</pre></p>
+<p>It reads the current values (from sys.mon_mods_all$) and the last values (from sys.optstat_snapshot$), reads the stale percentage parameter, and calls the dbms_stats_advisor.compute_volatile_flag function that updates the flag with one passed as :flag, probably adding the value 64 (see below) when table is volatile (probably when sum of DML is over the row count + stale percentage). The function is probably different when the snapshots comes from statistics gathering (&#8216;GATHER&#8217;) or from DML monitoring (&#8216;NO_GATHER&#8217;) because the number of rows is absolute or relative to the previous one.</p>
+<p>From the trace of bind variables, or simply from the dbms_stats trace, I can see all values:
+<pre>DBMS_STATS: compute_volatile_flag: objn=74867, flag=1, new_flag=0, inserts_new=5701477, updates_new=668000, deletes_new=13895192, inserts_old=5701477, updates_old=668000, deletes_old=13895192, rowcnt=, rowcnt_loc=, stale_pcnt=10, gather=NO_GATHER, flag_result=1
+DBMS_STATS: compute_volatile_flag: objn=74867, flag=1, new_flag=0, inserts_new=4861477, updates_new=584000, deletes_new=13475192, inserts_old=3681477, updates_old=466000, deletes_old=12885192, rowcnt=, rowcnt_loc=, stale_pcnt=10, gather=NO_GATHER, flag_result=1
+DBMS_STATS: compute_volatile_flag: objn=74867, flag=1, new_flag=0, inserts_new=5561477, updates_new=654000, deletes_new=13825192, inserts_old=4861477, updates_old=584000, deletes_old=13475192, rowcnt=, rowcnt_loc=, stale_pcnt=10, gather=NO_GATHER, flag_result=1
+</pre>
+The input flag is 1 and the output flag is 1. And I think that, whatever the number of DML we have, this is because the new_flag=0</p>
+<p>This explains why I was not able to have snapshots flagged as volatile even when changing a lot of rows. Then How can the statistics advisor detect my volatile table?</p>
+<h3>Statistics Advisor</h3>
+<p>I&#8217;ve traced the statistics advisor</p>
+<p><pre>set long 100000 longc 10000
+variable t varchar2(30)
+variable e varchar2(30)
+variable r clob
+exec :t:= DBMS_STATS.CREATE_ADVISOR_TASK('my_task');
+exec :e:= DBMS_STATS.EXECUTE_ADVISOR_TASK('my_task');
+exec :r:= DBMS_STATS.REPORT_ADVISOR_TASK('my_task');
+print r</pre></p>
+<p>No &#8216;LockVolatileTable&#8217; rule has raised a recommendation, but I&#8217;ve seen a call to the DBMS_STATS.CHECK_VOLATILE function with an object_id as parameter.</p>
+<h3>dbms_stats_internal.check_volatile</h3>
+<p>In order to understand what are the criteria, I&#8217;ve run (with sql_trace) the function on my table:</p>
+<p><pre>SQL&gt; select dbms_stats_internal.check_volatile(&amp;object_id) from dual;
+old   1: select dbms_stats_internal.check_volatile(&amp;object_id) from dual
+new   1: select dbms_stats_internal.check_volatile(     74867) from dual
+
+DBMS_STATS_INTERNAL.CHECK_VOLATILE(74867)
+------------------------------------------
+F</pre></p>
+<p>I suppose &#8216;F&#8217; is false, which explains why my table was not considered as volatile.</p>
+<p>Here is the trace with binds:</p>
+<p><pre>PARSING IN CURSOR #140478915921360 len=191 dep=1 uid=0 oct=3 lid=0 tim=99947151021 hv=976524548 ad='739cb468' sqlid='1r3ujfwx39584'
+SELECT SUM(CASE WHEN ISVOLATILE &gt; 0 THEN 1 ELSE 0 END) FROM (SELECT OBJ#, BITAND(FLAGS, :B2 ) ISVOLATILE FROM OPTSTAT_SNAPSHOT$ WHERE OBJ# = :B1 ORDER BY TIMESTAMP DESC) O WHERE ROWNUM &lt; :B3
+END OF STMT
+...
+BINDS #140478915921360:
+
+ Bind#0
+  oacdty=02 mxl=22(22) mxlc=00 mal=00 scl=00 pre=00
+  oacflg=03 fl2=1206001 frm=00 csi=00 siz=72 off=0
+  kxsbbbfp=7fc3cbe1c158  bln=22  avl=02  flg=05
+  value=64
+ Bind#1
+  oacdty=02 mxl=22(21) mxlc=00 mal=00 scl=00 pre=00
+  oacflg=03 fl2=1206001 frm=00 csi=00 siz=0 off=24
+  kxsbbbfp=7fc3cbe1c170  bln=22  avl=04  flg=01
+  value=74867
+ Bind#2
+  oacdty=02 mxl=22(22) mxlc=00 mal=00 scl=00 pre=00
+  oacflg=03 fl2=1206001 frm=00 csi=00 siz=0 off=48
+  kxsbbbfp=7fc3cbe1c188  bln=22  avl=02  flg=01
+  value=24
+</pre></p>
+<p>So, here is what the algorithm looks like:</p>
+<ol>
+<li>sys.opstat_snapshot$ is read for the latest 24 snapshots (remember that we have snapshots every hour + at each statistics gathering)
+</li>
+<li>&#8216;ISVOLATILE&#8217; is 1 when the flags from the snapshots has flag 64. This is how I guessed that snapshots should me flagged with 64 by compute_volatile_flag.
+</li>
+<li>And finally, the number of &#8216;ISVOLATILE&#8217; ones is summed.
+</li>
+</ol>
+<p>So, it seems that the Statistics Advisor will raise a recommendation when the table has been flagged as volatile multiple times over the last 24 hour. How many? let&#8217;s guess:</p>
+<p><pre>SQL&gt; insert into sys.optstat_snapshot$ select &amp;object_id,0,0,0,64,sysdate from xmltable('1 to 12');
+old   1: insert into sys.optstat_snapshot$ select &amp;object_id,0,0,0,64,sysdate from xmltable('1 to 12')
+new   1: insert into sys.optstat_snapshot$ select      74867,0,0,0,64,sysdate from xmltable('1 to 12')
+
+12 rows created.
+
+SQL&gt; select dbms_stats_internal.check_volatile(&amp;object_id) from dual;
+old   1: select dbms_stats_internal.check_volatile(&amp;object_id) from dual
+new   1: select dbms_stats_internal.check_volatile(     74867) from dual
+
+DBMS_STATS_INTERNAL.CHECK_VOLATILE(74867)
+-----------------------------------------
+F
+
+SQL&gt; rollback;
+
+Rollback complete.</pre></p>
+<p>I&#8217;ve called the function after inserting various number of lines with flag=63 into sys.optstat_snapshot$ and up to 12 snapshots, it is still not considered as volatile.
+<em>Please remember that this is a lab, we are not expected to update the internal dictionary tables ourselves.</em></p>
+<p>Now inserting one more:</p>
+<p><pre>SQL&gt; insert into sys.optstat_snapshot$ select &amp;object_id,0,0,0,64,sysdate from xmltable('1 to 13');
+old   1: insert into sys.optstat_snapshot$ select &amp;object_id,0,0,0,64,sysdate from xmltable('1 to 13')
+new   1: insert into sys.optstat_snapshot$ select      74867,0,0,0,64,sysdate from xmltable('1 to 13')
+
+13 rows created.
+
+SQL&gt; select dbms_stats_internal.check_volatile(&amp;object_id) from dual;
+old   1: select dbms_stats_internal.check_volatile(&amp;object_id) from dual
+new   1: select dbms_stats_internal.check_volatile(     74867) from dual
+
+DBMS_STATS_INTERNAL.CHECK_VOLATILE(74867)
+-----------------------------------------
+T
+
+SQL&gt; rollback;
+
+Rollback complete.</pre></p>
+<p>Good I have a &#8216;T&#8217; here for &#8216;true. I conclude that the Statistics Advisor recommends to lock the stats on tables when half of the last 24h hours snapshots have encountered more than STALE_PERCENT modifications.</p>
+<h3>So what?</h3>
+<p>My table was not considered as volatile. None of the snapshots have been flagged as volatile. I&#8217;m quite sure that the number of DML is sufficient, so I suppose that this is disabled by default and I don&#8217;t know how to enable it. What I want to see is the compute_volatile_flag called with new_flag=64 so that snapshots are flagged when a large percentage or rows have been modified, so that enough snapshots have been flagged to be considered by the the check_volatile function.
+Even if it is enabled, I think that there are more cases where tables should have statistics locked. Even if a table is empty for 5 minutes per day, we must be sure that the statistics are not gathered at that time. And looking at the Statistics Advisor thresholds, this case is far from being detected.
+Final thought here: do you realize that you buy an expensive software to detect the changes happening on your tables, guess how the tables are updated, and recommend (and even implement) a general best practice? Does it mean that, today, we put in production some applications where we have no idea about what it does? Aren&#8217;t we supposed to design the application, document which tables are volatile and when they are loaded in bulk, and when to gather stats and lock them?</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-156830"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

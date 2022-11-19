@@ -1,0 +1,302 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-vi />
+<meta name=description content='A blog post from 2017 about Postgres vs. Oracle access paths VI &#8211; Index Scan'>
+<title>Postgres vs. Oracle access paths VI &#8211; Index Scan</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-vi>https://blog.dbi-services.com/postgres-vs-oracle-access-paths-vi</a> (2017-08-09), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Postgres vs. Oracle access paths VI &#8211; Index Scan</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="../postgres-vs-oracle-access-paths-v/index.html" target="_blank">previous post</a> my queries were still reading the indexed column only, from a table which had no modifications since the last vacuum, and then didn&#8217;t need to read table pages: it was Index Only Scan. However, we often need more columns than the ones that are in the index. Here is the Index Scan access path.
+<span id="more-17810"></span></p>
+<p>I&#8217;m continuing on the table that I&#8217;ve created in the <a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-i" target="_blank">first post</a> of the series. I&#8217;ve run VACUUM (the lazy one, not the full one) and did not do any modification after that, as we have seen that Index Only Access is efficient only when there are no modifications.
+<pre>
+create table demo1 as select generate_series n , 1 a , lpad('x',1000,'x') x from generate_series(1,10000);
+SELECT 10000
+create unique index demo1_n on demo1(n);
+CREATE INDEX
+vacuum demo1;
+VACUUM
+</pre></p>
+<p>I have 10000 rows, a unique column N with decimal numbers, indexed and another column A which is not indexed.</p>
+<h3>Index Only Scan</h3>
+<p>I&#8217;ll now query one row, the one with N=1000.
+<pre>
+explain (analyze,verbose,costs,buffers) select  n from demo1  where n=1000 ;
+                                                        QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_n on public.demo1  (cost=0.29..4.30 rows=1 width=4) (actual time=0.123..0.124 rows=1 loops=1)
+   Output: n
+   Index Cond: (demo1.n = 1000)
+   Heap Fetches: 0
+   Buffers: shared hit=3
+ Planning time: 0.625 ms
+ Execution time: 0.137 ms
+</pre></p>
+<p>It seems that the query planner estimates to read one block:</p>
+<ul>
+<li>The startup cost of 0.29 as we have seen before</li>
+<li>Read one index page, cost=4 (random_page_cost=4)</li>
+<li>1 result row to process, estimated at cpu_tuple_cost=0.01</li>
+</ul>
+<p>As the index is a B*Tree with 30 pages, I expect to read at least one branch in addition to the leaf block. The execution has actually read 3 blocks (Buffers: shared hit=3). Here it seems that Postgres decides to ignore the branches and count only the leaf blocks.</p>
+<p>In Oracle, the estimation cost=1 and execution has read 2 blocks:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  gusay436hpzck, child number 0
+-------------------------------------
+select /*+  */  n from demo1  where n=1000
+----------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |         |      1 |        |     1 (100)|      1 |00:00:00.01 |       2 |
+|*  1 |  INDEX UNIQUE SCAN| DEMO1_N |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       2 |
+----------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - access("N"=1000)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<p>Both Oracle and Postgres read only the index here. This is the fastest access to one indexed column: no need to read the table because the column is in the index. The use-case is quite limited here: just testing the existence of the column. I will now select another column than the one used in the where clause.</p>
+<h3>Select another column</h3>
+<p>I filter on N but now query the column A which is not in the index. The Index Only Scan changes to an Index Scan:
+<pre>
+explain (analyze,verbose,costs,buffers) select  a from demo1  where n=1000 ;
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Index Scan using demo1_n on public.demo1  (cost=0.29..8.30 rows=1 width=4) (actual time=0.010..0.010 rows=1 loops=1)
+   Output: a
+   Index Cond: (demo1.n = 1000)
+   Buffers: shared hit=3
+ Planning time: 0.639 ms
+ Execution time: 0.030 ms
+</pre></p>
+<p>The cost is the same except that there is one additional page to read, which pushes it to cost=8.30:</p>
+<ul>
+<li>The startup cost of 0.29 as we have seen before</li>
+<li>Read one index page, and one table page: cost=8 (random_page_cost=4)</li>
+<li>1 result row to process, estimated at cpu_tuple_cost=0.01</li>
+</ul>
+<p>In Oracle it is not a different operation. We still have the INDEX UNIQUE SCAN, but in addition to it, an additional operation to read the table: TABLE ACCESS BY INDEX ROWID. The index entry returns the ROWID (physical address of the table block, equivalent to the Postgres TID). And then we have the detail of the cost, and execution buffer reads: one more block.
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  8q4tcxgk1n1vn, child number 0
+-------------------------------------
+select /*+  */  a from demo1  where n=1000
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |         |      1 |        |     2 (100)|      1 |00:00:00.01 |       3 |
+|   1 |  TABLE ACCESS BY INDEX ROWID| DEMO1   |      1 |      1 |     2   (0)|      1 |00:00:00.01 |       3 |
+|*  2 |   INDEX UNIQUE SCAN         | DEMO1_N |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       2 |
+--------------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - access("N"=1000)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "A"[NUMBER,22]
+   2 - "DEMO1".ROWID[ROWID,10]
+</pre></p>
+<p>The important thing here is within the predicate information where we see the part of the where clause which is not a filter applied after the scan, but is used for optimal access by the index. It is displayed as access() in Oracle execution plan:
+<pre>
+access("N"=1000)
+</pre></p>
+<p>In PostgreSQL execution plan, the same information is displayed as &#8216;Index Cond':
+<pre>
+Index Cond: (demo1.n = 1000)
+</pre></p>
+<h3>Postgres Range Scan</h4>
+<p>That was retrieving only one row with an equality predicate on a unique index column. The index scan helps to get directly to the value because of the B*Tree structure. As the index is sorted, an inequality predicate can also use the index to find the rows in a range of values.</p>
+<p>The Postgres plan looks the same, with Index Scan:
+<pre>
+explain (analyze,verbose,costs,buffers) select  a from demo1  where n&lt;=1000 ;
+                                                          QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using demo1_n on public.demo1  (cost=0.29..175.78 rows=1000 width=4) (actual time=0.029..0.780 rows=1000 loops=1)
+   Output: a
+   Index Cond: (demo1.n &lt;= 1000)
+   Buffers: shared hit=147
+ Planning time: 1.019 ms
+ Execution time: 0.884 ms
+</pre></p>
+<p>Same plan but of course we have more index blocks to scan, and more rows to fetch from the table, which is why the cost is higher.</p>
+<p>In order to understand the cost, I&#8217;ve changed the query planner constants one by one. Here is what I got:</p>
+<ul>
+<li>(cost=0.29..33.78 rows=1000 width=4) when seq_page_cost=0 instead of 1, which means that it estimates (175.78-33.78)/1=142 sequential reads</li>
+<li>(cost=0.29..159.78 rows=1000 width=4) when random_page_cost=0 instead of 4, which means that it estimates (175.78-159.78)/4=4 random reads</li>
+<li>(cost=0.29..165.78 rows=1000 width=4) when cpu_tuple_cost=0 instead of 0.01, which means that it estimates (175.78-165.78)/0.01=1000 rows</li>
+<li>(cost=0.29..170.78 rows=1000 width=4) when cpu_index_tuple_cost=0 instead of 0.005, which means that it estimates (175.78-170.78)/0.005=1000 index entries</li>
+<li>(cost=0.00..173.00 rows=1000 width=4) when cpu_operator_cost=0 instead of 0.0025, which means that it estimates (175.78-173.00)/0.0025=1112 cpu operations (116 for initial cost + 996 to get all rows)</li>
+</ul>
+<p>I understand the 4 random reads from the index pages. However, I expected random reads, and not sequential reads, to fetch the rows from the table. But this is a case where the clustering factor is very good: the rows have been inserted in the same order as the indexed column, and this means that those reads from table probably read consecutive pages.</p>
+<p>In order to validate this guess, I&#8217;ve traced the system calls on Linux
+<pre>
+25734 open("base/12924/42427", O_RDWR)  = 42
+25734 lseek(42, 0, SEEK_END)            = 11706368
+25734 open("base/12924/42433", O_RDWR)  = 43
+25734 lseek(43, 0, SEEK_END)            = 245760
+</pre>
+The file descriptor 42 is my table (demo1) and the descriptor 43 is the index (demo1_n). The file name is in the open() call and it includes the file id:
+<pre>
+select relname,relfilenode from pg_class where relname='demo1';
+-[ RECORD 1 ]--+------
+relname        | demo1
+relfilenode    | 42427
+
+select relname,relfilenode from pg_class where relname='demo1_n';
+-[ RECORD 1 ]--+--------
+relname        | demo1_n
+relfilenode    | 42433
+</pre></p>
+<p>Then we see some random reads from the index (branches and first leaf):
+<pre>
+25734 lseek(43, 0, SEEK_SET)            = 0
+25734 read(43, "100036037360374 b152"..., 8192) = 8192
+25734 lseek(43, 24576, SEEK_SET)        = 24576
+25734 read(43, "121000836360374 35023720330237 "..., 8192) = 8192
+25734 lseek(43, 8192, SEEK_SET)         = 8192
+25734 read(43, "13245t360374 211 340237 "..., 8192) = 8192
+</pre></p>
+<p>Then we see 53 reads from the table:
+<pre>
+25734 lseek(42, 0, SEEK_SET)            = 0
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+...
+</pre></p>
+<p>Only one lseek. The other reads are all single block (8k) I/O calls but without seek, which means that they are sequential. When relying on filesystem prefetching, this may avoid the latency for each I/O call.</p>
+<p>Then the next leaf block from the index is read, and then 52 reads from the table (no lseek):
+<pre>
+25734 read(43, "13245t360374 211 340237 "..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+...
+</pre></p>
+<p>And again, one index block and 38 contiguous table blocks:
+<pre>
+25734 lseek(43, 32768, SEEK_SET)        = 32768
+25734 read(43, "13245t360374 211 340237 "..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+25734 read(42, "40042203 4 36023330103402273010"..., 8192) = 8192
+...
+</pre></p>
+<p>Here is the summary of the cost 175.78</p>
+<ul>
+<li>The startup cost of 0.29 as we have seen before</li>
+<li>Estimates 4 random reads (reading 1000 rows from a 30 pages index which contains 10000 rows): cost=16 (random_page_cost=4)</li>
+<li>Estimates 142 sequential reads: cost=142 (seq_page_cost=1)</li>
+<li>1000 index entries to process, estimated at cost=5 (cpu_index_tuple_cost=0.005)</li>
+<li>1000 result row to process, estimated at cost=10 (cpu_tuple_cost=0.01)</li>
+<li>about 1000 operators or functions estimated at cpu_operator_cost=0.0025</li>
+</ul>
+<p>The very interesting thing here is that the query planner is totally aware of the clustering factor and uses sequential read estimation.</p>
+<h3>Oracle Range Scan</h3>
+<p>Here is the same query on the similar table on Oracle:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  a3gqx19xs9wxq, child number 0
+-------------------------------------
+select /*+  */  a from demo1  where n&lt;=1000
+----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                           | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                    |         |      1 |        |   147 (100)|   1000 |00:00:00.01 |     148 |
+|   1 |  TABLE ACCESS BY INDEX ROWID BATCHED| DEMO1   |      1 |   1000 |   147   (0)|   1000 |00:00:00.01 |     148 |
+|*  2 |   INDEX RANGE SCAN                  | DEMO1_N |      1 |   1000 |     4   (0)|   1000 |00:00:00.01 |       4 |
+----------------------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - access(&quot;N&quot;&lt;=1000)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - &quot;A&quot;[NUMBER,22]
+   2 - &quot;DEMO1&quot;.ROWID[ROWID,10]
+</pre></p>
+<p>The straces shows calls to pread:
+<pre>
+open("/u01/oradata/CDB1A/PDB/users01.dbf", O_RDWR|O_DSYNC) = 7
+fcntl(7, F_SETFD, FD_CLOEXEC)           = 0
+fcntl(7, F_DUPFD, 256)                  = 258
+fcntl(258, F_SETFD, FD_CLOEXEC)         = 0
+close(7)                                = 0
+pread(258, "62422313G275"142532'!1?275""..., 8192, 2252800 ) = 8192
+pread(258, "62422413C275"14x2432'!1?275""..., 8192, 2260992 ) = 8192
+pread(258, "6242313v3362274"24b+1&amp;!1354274""..., 8192, 24731648 ) = 8192
+pread(258, "6242314v3362274"24e*1&amp;!1354274""..., 8192, 24739840 ) = 8192
+pread(258, "6242315v3362274"24d51&amp;!1354274""..., 8192, 24748032 ) = 8192
+pread(258, "6242316v3362274"24g41&amp;!1354274""..., 8192, 24756224 ) = 8192
+pread(258, "6242317v3362274"24f71&amp;!1354274""..., 8192, 24764416 ) = 8192
+pread(258, "6242320v3362274"24y71&amp;!1354274""..., 8192, 24772608 ) = 8192
+</pre></p>
+<p>pread is similar to lseek()+read() here and, as far as I know, Linux detects when there is no need to seek, and this allows prefetching as well. Oracle has also its own prefetching but I&#8217;ll not go into the detail here (read Timur Akhmadeev on Pythian blog about <a href="https://www.pythian.com/blog/batched-table-access/" target="_blank">this</a>).</p>
+<p>With Oracle, there is no need to run strace because all system calls are instrumented as &#8216;wait events&#8217; and here is a trace:
+<pre>
+PARSE #140375247563104:c=2000,e=1872,p=0,cr=0,cu=0,mis=1,r=0,dep=0,og=1,plh=187737470,tim=53267437268
+EXEC #140375247563104:c=0,e=147,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=187737470,tim=53267437481
+WAIT #140375247563104: nam='SQL*Net message to client' ela= 4 driver id=1413697536 #bytes=1 p3=0 obj#=74022 tim=53267437532
+WAIT #140375247563104: nam='db file sequential read' ela= 8 file#=12 block#=275 blocks=1 obj#=74023 tim=53267437679
+WAIT #140375247563104: nam='db file sequential read' ela= 5 file#=12 block#=276 blocks=1 obj#=74023 tim=53267437785
+WAIT #140375247563104: nam='db file sequential read' ela= 5 file#=12 block#=3019 blocks=1 obj#=74022 tim=53267437902
+FETCH #140375247563104:c=0,e=368,p=3,cr=3,cu=0,mis=0,r=1,dep=0,og=1,plh=187737470,tim=53267437977
+WAIT #140375247563104: nam='PGA memory operation' ela= 14 p1=0 p2=0 p3=0 obj#=74022 tim=53267438017
+WAIT #140375247563104: nam='SQL*Net message from client' ela= 280 driver id=1413697536 #bytes=1 p3=0 obj#=74022 tim=53267438385
+WAIT #140375247563104: nam='SQL*Net message to client' ela= 1 driver id=1413697536 #bytes=1 p3=0 obj#=74022 tim=53267438419
+WAIT #140375247563104: nam='db file sequential read' ela= 3 file#=12 block#=3020 blocks=1 obj#=74022 tim=53267438443
+WAIT #140375247563104: nam='PGA memory operation' ela= 7 p1=1114112 p2=2 p3=0 obj#=74022 tim=53267438475
+WAIT #140375247563104: nam='db file sequential read' ela= 5 file#=12 block#=3021 blocks=1 obj#=74022 tim=53267438504
+WAIT #140375247563104: nam='db file sequential read' ela= 3 file#=12 block#=3022 blocks=1 obj#=74022 tim=53267438532
+WAIT #140375247563104: nam='db file sequential read' ela= 2 file#=12 block#=3023 blocks=1 obj#=74022 tim=53267438552
+WAIT #140375247563104: nam='db file sequential read' ela= 3 file#=12 block#=3024 blocks=1 obj#=74022 tim=53267438576
+WAIT #140375247563104: nam='db file sequential read' ela= 4 file#=12 block#=3025 blocks=1 obj#=74022 tim=53267438603
+WAIT #140375247563104: nam='db file sequential read' ela= 26 file#=12 block#=3026 blocks=1 obj#=74022 tim=53267438647
+WAIT #140375247563104: nam='db file sequential read' ela= 4 file#=12 block#=3027 blocks=1 obj#=74022 tim=53267438680
+WAIT #140375247563104: nam='db file sequential read' ela= 2 file#=12 block#=3028 blocks=1 obj#=74022 tim=53267438699
+WAIT #140375247563104: nam='db file sequential read' ela= 4 file#=12 block#=3029 blocks=1 obj#=74022 tim=53267438781
+WAIT #140375247563104: nam='db file sequential read' ela= 3 file#=12 block#=3030 blocks=1 obj#=74022 tim=53267438807
+WAIT #140375247563104: nam='db file sequential read' ela= 28 file#=12 block#=3031 blocks=1 obj#=74022 tim=53267438878
+...
+</pre></p>
+<p>The name &#8216;sequential read&#8217; does not mean the same as the Postgres &#8216;sequential read&#8217;. It only means single-block reads that are done one after the other, but they are actually random reads. However, looking at the block# they appear as reading contiguous blocks.</p>
+<p>At the end, because I have an index with good clustering factor, and because I&#8217;m using the defaults on Linux without direct read and asynchronous I/O, the execution is very similar to the postgres one: read the few index blocks and follow the pointer to the 140 blocks of the table.</p>
+<p>The cost estimation looks similar (same number) between Postgres and Oracle but it is not the same unit. Postgres estimates the cost with sequential reads, but Oracle estimates the cost as random reads. In addition to that, Postgres, with its default planner parameters, gives more importance than Oracle to the CPU usage.</p>
+<p>This is the good case of Index Access where we have a good clustering/correlation factor between the physical order of the table and the logical order of the index. The random reads are finally behaving as sequential read because there is no seek() between them. You can imagine that in the <a href="../postgres-vs-oracle-access-paths-vii/index.html" target="_blank">next post</a> I&#8217;ll try the same with a very bad clustering factor.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-178110"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>

@@ -1,0 +1,198 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-em-agent-12c-thread-leak-on-rac />
+<meta name=description content='A blog post from 2014 about Oracle EM agent 12c thread leak on RAC'>
+<title>Oracle EM agent 12c thread leak on RAC</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-em-agent-12c-thread-leak-on-rac>https://blog.dbi-services.com/oracle-em-agent-12c-thread-leak-on-rac</a> (2014-07-18), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle EM agent 12c thread leak on RAC</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a previous post about <a href="https://blog.dbi-services.com/linux-how-to-monitor-the-nproc-limit-1">nproc limit</a>, I wrote that I had to investigate the nproc limit with the number of threads because my Oracle 12c EM agent was having thousands of threads. This post is a short feedback about this issue and the way I have found the root cause. It concerns the enterprise manager agent 12c on Grid Infrasctructure &gt;= 11.2.0.2</p>
+<h3>NLWP</h3>
+<p>The issue was:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">ps -o nlwp,pid,lwp,args -u oracle | sort -n
+NLWP   PID   LWP COMMAND
+   1  8444  8444 oracleOPRODP3 (LOCAL=NO)
+   1  9397  9397 oracleOPRODP3 (LOCAL=NO)
+   1  9542  9542 oracleOPRODP3 (LOCAL=NO)
+   1  9803  9803 /u00/app/oracle/product/agent12c/core/12.1.0.3.0/perl/bin/perl /u00/app/oracle/product/agent12c/core/12.1.0.3.0/bin/emwd.pl agent /u00/app/oracle/product/agent12c/agent_inst/sysman/log/emagent.nohup
+  19 11966 11966 /u00/app/11.2.0/grid/bin/oraagent.bin
+1114  9963  9963 /u00/app/oracle/product/agent12c/core/12.1.0.3.0/jdk/bin/java ... emagentSDK.jar oracle.sysman.gcagent.tmmain.TMMain
+</pre>
+<p>By default ps has only one entry per process, but each processes can have several threads &#8211; implemented on linux as light-weight process (LWP). Here, the NLWP column shows that I have 1114 threads for my EM 12c agent &#8211; and it was increasing every day until it reached the limit and the node failed (&#8216;Resource temporarily unavailable&#8217;).</p>
+<p>The first thing to do is to know what those threads are. The ps entries do not have a lot of information, but I discovered <strong>jstack</strong> which every java developer should know, I presume. You probably know that java has very verbose (lengthy) stack traces. Jstack was able to show me thousands of them in only one command:</p>
+<h3>Jstack</h3>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">$ jstack 9963
+2014-06-03 13:29:04
+Full thread dump Java HotSpot(TM) 64-Bit Server VM (20.14-b01 mixed mode):
+
+"Attach Listener" daemon prio=10 tid=0x00007f3368002000 nid=0x4c9b waiting on condition [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"CRSeOns" prio=10 tid=0x00007f32c80b6800 nid=0x3863 in Object.wait() [0x00007f31fe11f000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at oracle.eons.impl.NotificationQueue.internalDequeue(NotificationQueue.java:278)
+	- locked  (a java.lang.Object)
+	at oracle.eons.impl.NotificationQueue.dequeue(NotificationQueue.java:255)
+	at oracle.eons.proxy.impl.client.base.SubscriberImpl.receive(SubscriberImpl.java:98)
+	at oracle.eons.proxy.impl.client.base.SubscriberImpl.receive(SubscriberImpl.java:79)
+	at oracle.eons.proxy.impl.client.ProxySubscriber.receive(ProxySubscriber.java:29)
+	at oracle.sysman.db.receivelet.eons.EonsMetric.beginSubscription(EonsMetric.java:872)
+	at oracle.sysman.db.receivelet.eons.EonsMetricWlm.run(EonsMetricWlm.java:139)
+	at oracle.sysman.gcagent.target.interaction.execution.ReceiveletInteractionMgr$3$1.run(ReceiveletInteractionMgr.java:1401)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.runTask(ThreadPoolExecutor.java:895)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:918)
+	at oracle.sysman.gcagent.util.system.GCAThread$RunnableWrapper.run(GCAThread.java:184)
+	at java.lang.Thread.run(Thread.java:662)
+...
+</pre>
+<h3>CRSeOns</h3>
+<p>I don&#8217;t paste all of them here. We have the &#8216;main&#8217;, we have a few GCs and &#8216;Gang workers&#8217; which are present in all JVMs and we have a few enterprise manager threads. And what was interesting was that I had thousands of &#8220;CRSeOns&#8221; that seemed to be increasing.</p>
+<p>Some guesses: I&#8217;m on RAC, and I have a &#8216;ons&#8217; resource and the EM agent tries to subscribe to it. Goggle search returned nothing, and that&#8217;s the reason I put that in a blog post now. Then I searched MOS, and bingo, there is a note: <a href="https://support.oracle.com/epmos/faces/DocContentDisplay?id=1486626.1">Doc ID 1486626.1</a>. It has nothing to do with my issue, but has an interesting comment in it:</p>
+<p>In cluster version 11.2.0.2 and higher, the ora.eons resource functionality has been moved to EVM. Because of this the ora.eons resource no longer exists or is controlled by crsctl.</p>
+<p>It also explains how to disable EM agent subscription:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">emctl setproperty agent -name disableEonsRcvlet -value true</pre>
+<p>I&#8217;m in 11.2.0.3 and I have thousands of threads related to a functionality that doesn&#8217;t exist anymore. And that leads to some failures in my 4 nodes cluster.</p>
+<p>The solution was simple: disable it.</p>
+<p>For a long time I have seen a lot of memory leaks or CPU usage leaks related to the enterprise manager agent. With this new issue, I discovered a thread leak and I also faced a SR leak when trying to get support for the &#8216;Resource temporarily unavailable&#8217; error, going back and forth between OS, Database, Cluster and EM support teams&#8230;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-1170"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1213">
+				<div id="div-comment-1213" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/7b0006ca32c7d9de2c9729823cae5daf?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Martin Decker</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1213">
+			July 26, 2014 at 14 h 21 min</a>		</div>
+
+		<p>Did you succeed in getting support to open a bug for this? Which agent versions are affected?</p>
+<p>Best regards,
+Martin
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12141"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1213' onclick='return addComment.moveForm( "div-comment-1213", "1213", "respond", "116" )' aria-label='Reply to Martin to Martin Decker'>Reply to Martin</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1214">
+				<div id="div-comment-1214" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1214">
+			July 27, 2014 at 20 h 43 min</a>		</div>
+
+		<p>Hi Martin,
+No unfortunately I&#8217;ve no bug opened. SR were closed as resolved by customer.
+Increasing nproc and deactivating subscription to the ora.eons is probably considered as the right fix. My agent was 12.1.0.1.0
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12151"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1214' onclick='return addComment.moveForm( "div-comment-1214", "1214", "respond", "116" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-6158">
+				<div id="div-comment-6158" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/53aa94d4c77db7bc0caa5fdf652935ba?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.grepora.com' rel='external nofollow' class='url'>MATHEUS BOESING</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6158">
+			January 10, 2017 at 21 h 57 min</a>		</div>
+
+		<p>Hello Frank,
+About the &#8220;Bug&#8221;question, just found the same issue and opened a SR for investigation. Oracle mentioned Bug 21459792 : EM 12.1.0.3 Agent creating many threads during conversation.</p>
+<p>It was created Jul/15, after your last comment. <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" />
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-61591"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6158' onclick='return addComment.moveForm( "div-comment-6158", "6158", "respond", "116" )' aria-label='Reply to MATHEUS to MATHEUS BOESING'>Reply to MATHEUS</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-6164">
+				<div id="div-comment-6164" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6164">
+			January 11, 2017 at 18 h 44 min</a>		</div>
+
+		<p>Hi Matheus, thanks good to know.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-61651"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6164' onclick='return addComment.moveForm( "div-comment-6164", "6164", "respond", "116" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

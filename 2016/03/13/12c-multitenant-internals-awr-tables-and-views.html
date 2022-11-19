@@ -1,0 +1,161 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/12c-multitenant-internals-awr-tables-and-views />
+<meta name=description content='A blog post from 2016 about 12c Multitenant internals: AWR tables and views'>
+<title>12c Multitenant internals: AWR tables and views</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/12c-multitenant-internals-awr-tables-and-views>https://blog.dbi-services.com/12c-multitenant-internals-awr-tables-and-views</a> (2016-03-13), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">12c Multitenant internals: AWR tables and views</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I received a question about multitenant. AWR tables are often raised as an example of Object Links because automatic workload repository is stored only in CDB$ROOT. However, neither the views DBA_HIST&#8230; nor the tables WRH$_&#8230; are defined as Object Link.
+Let&#8217;s explain on an example: DBA_HIST_SYSSTAT
+<span id="more-7466"></span>
+I&#8217;ll talk about all those multitenant internals in <a href="http://datenbank.doag.org/de/home/" target="_blank">DOAG 2016 DATENBANK Am 10. und 11. Mai 2016 in Düsseldorf #DOAGDB16</a> and that question was the occasion to prepare the following draft slide for it:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CaptureAWRObjectLink.png" rel="lightbox[7466]"><img src="../wp-insides/uploads/sites/2/2016/03/CaptureAWRObjectLink.png" alt="CaptureAWRObjectLink" width="886" height="559" class="alignnone size-full wp-image-7467" /></a></p>
+<p>Since 12.1.0.2 the AWR views are a bit more complex and the switch to CDB$ROOT is done by the Object Link intermediate view: INT$DBA_HIST_SYSSTAT</p>
+<p>Let&#8217;s show it. When you query DBA_HIST_SYSSTAT, if you&#8217;re not from SYS, you query the synonym:</p>
+<p><pre>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where object_name='DBA_HIST_SYSSTAT';
+
+OWNER      OBJECT_NAME          OBJECT_TYPE          SHARING
+---------- -------------------- -------------------- -------------
+SYS        DBA_HIST_SYSSTAT     VIEW                 METADATA LINK
+PUBLIC     DBA_HIST_SYSSTAT     SYNONYM              METADATA LINK
+
+SQL&gt; select owner,synonym_name,table_owner,table_name from dba_synonyms where synonym_name='DBA_HIST_SYSSTAT';
+
+OWNER      SYNONYM_NAME         TABLE_OWNE TABLE_NAME
+---------- -------------------- ---------- --------------------
+PUBLIC     DBA_HIST_SYSSTAT     SYS        DBA_HIST_SYSSTAT
+</pre></p>
+<p>Both the synonym and the view are metadata link: we stay in our pluggable database.</p>
+<p>Let&#8217;s check the definition of the view:</p>
+<p><pre>
+SQL&gt; select owner,name,type,referenced_owner,referenced_name,referenced_type from dba_dependencies where name='INT$DBA_HIST_SYSSTAT';
+
+OWNER      NAME                 TYPE               REFERENCED REFERENCED_NAME      REFERENCED_TYPE
+---------- -------------------- ------------------ ---------- -------------------- --------------------
+SYS        INT$DBA_HIST_SYSSTAT VIEW               SYS        WRH$_SYSSTAT         TABLE
+SYS        INT$DBA_HIST_SYSSTAT VIEW               SYS        WRH$_STAT_NAME       TABLE
+SYS        INT$DBA_HIST_SYSSTAT VIEW               SYS        DBA_HIST_SNAPSHOT    VIEW
+
+SQL&gt; select text from dba_views where view_name='DBA_HIST_SYSSTAT';
+
+TEXT
+--------------------------------------------------------------------------------
+select "SNAP_ID","DBID","INSTANCE_NUMBER","STAT_ID","STAT_NAME","VALUE","CON_DBI
+D","CON_ID" from INT$DBA_HIST_SYSSTAT
+</pre></p>
+<p>For each DBA_HIST view there is an underlying INT$DBA_HIST one, and this one is an Object Link:</p>
+<p><pre>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where object_name='INT$DBA_HIST_SYSSTAT';
+
+OWNER      OBJECT_NAME          OBJECT_TYPE          SHARING
+---------- -------------------- -------------------- -------------
+SYS        INT$DBA_HIST_SYSSTAT VIEW                 OBJECT LINK
+</pre></p>
+<p>This is where the query switches to the CDB$ROOT to query data because of the Object Link.
+This view reads the WRH$ table stored in the CDB$ROOT even when the query is run from a pluggable database.</p>
+<p><pre>
+SQL&gt; select owner,name,type,referenced_owner,referenced_name,referenced_type from dba_dependencies where name='INT$DBA_HIST_SYSSTAT';
+
+OWNER      NAME                 TYPE               REFERENCED REFERENCED_NAME      REFERENCED_TYPE
+---------- -------------------- ------------------ ---------- -------------------- --------------------
+SYS        INT$DBA_HIST_SYSSTAT VIEW               SYS        WRH$_SYSSTAT         TABLE
+SYS        INT$DBA_HIST_SYSSTAT VIEW               SYS        WRH$_STAT_NAME       TABLE
+SYS        INT$DBA_HIST_SYSSTAT VIEW               SYS        DBA_HIST_SNAPSHOT    VIEW
+
+SQL&gt; select text from dba_views where view_name='INT$DBA_HIST_SYSSTAT';
+
+TEXT
+--------------------------------------------------------------------------------
+select s.snap_id, s.dbid, s.instance_number,
+       s.stat_id, nm.stat_name, value,
+       decode(s.con_dbid, 0, s.dbid, s.con_dbid),
+       0 con_id
+from DBA_HIST_SNAPSHOT sn, WRH$_SYSSTAT s, WRH$_STAT_NAME nm
+where      s.stat_id          = nm.stat_id
+      and  s.dbid             = nm.dbid
+      and  s.snap_id          = sn.snap_id
+      and  s.dbid             = sn.dbid
+      and  s.instance_number  = sn.instance_number
+</pre></p>
+<p>This table is defined as Metadata Link. No need to have it as an Object Link because nobody is supposed to query it directly.</p>
+<p><pre>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where object_name='WRH$_SYSSTAT';
+
+OWNER      OBJECT_NAME          OBJECT_TYPE          SHARING
+---------- -------------------- -------------------- -------------
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE PARTITION      NONE
+SYS        WRH$_SYSSTAT         TABLE                METADATA LINK
+</pre></p>
+<p>The multitenant dictionary may appear complex, but the basic mechanisms are simple and reliable. Think of Metadata Link and Object Link as flags that tells your session to switch to CDB$ROOT when getting metadata or data. The term &#8216;link&#8217; is misleading in my opinion. It&#8217;s not a link. Just a runtime directive.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-74670" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/03/CaptureAWRObjectLink.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3021">
+				<div id="div-comment-3021" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a2a19e1fb1fdd173d1a39b0e73390c09?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Foued</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3021">
+			March 16, 2016 at 0 h 10 min</a>		</div>
+
+		<p>Thanks   Franck for the post.
+Foued
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-30221"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3021' onclick='return addComment.moveForm( "div-comment-3021", "3021", "respond", "7466" )' aria-label='Reply to Foued to Foued'>Reply to Foued</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

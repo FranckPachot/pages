@@ -1,0 +1,335 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/oracle-system-statistics-display-auxstats-with-calculated-values-and-formulas />
+<meta name=description content='A blog post from 2014 about Oracle system statistics: Display AUX_STATS$ with calculated values and formulas'>
+<title>Oracle system statistics: Display AUX_STATS$ with calculated values and formulas</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/oracle-system-statistics-display-auxstats-with-calculated-values-and-formulas>https://blog.dbi-services.com/oracle-system-statistics-display-auxstats-with-calculated-values-and-formulas</a> (2014-10-15), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">Oracle system statistics: Display AUX_STATS$ with calculated values and formulas</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>System statistics can be gathered in NOWORKLOAD or WORKLOAD mode. Different values will be set depending on that and the others will be calculated &#8211; derived from them. We can see defined values from SYS.AUX_STATS$ but here is a script that shows the calculated ones as well.</p>
+<p>With no system statistics or NOWORKLOAD the values of IOSEEKTIM (latency in ms) and IOTFRSPEED (transfer in bytes/ms) are set and the SREADTIM (time to read 1 block in ms) and MREADTIM (for multiblock read) are calculated from them. MBRC depends on the defaults or the db_file_multiblock_read_count settings.</p>
+<p>With WORKLOAD statistics, the SREADTIM and MREADTIM as well as MBRC are measured and those are the ones that are used by the optimizer.</p>
+<p>Here is my script:
+<pre>set echo off
+set linesize 200 pagesize 1000
+column pname format a30
+column sname format a20
+column pval2 format a20
+select pname,pval2 from sys.aux_stats$ where sname='SYSSTATS_INFO';
+select pname,pval1,calculated,formula from sys.aux_stats$ where sname='SYSSTATS_MAIN'
+model
+  reference sga on (
+    select name,value from v$sga
+        ) dimension by (name) measures(value)
+  reference parameter on (
+    select name,decode(type,3,to_number(value)) value from v$parameter where name='db_file_multiblock_read_count' and ismodified!='FALSE'
+    union all
+    select name,decode(type,3,to_number(value)) value from v$parameter where name='sessions'
+    union all
+    select name,decode(type,3,to_number(value)) value from v$parameter where name='db_block_size'
+        ) dimension by (name) measures(value)
+partition by (sname) dimension by (pname) measures (pval1,pval2,cast(null as number) as calculated,cast(null as varchar2(60)) as formula) rules(
+  calculated['MBRC']=coalesce(pval1['MBRC'],parameter.value['db_file_multiblock_read_count'],parameter.value['_db_file_optimizer_read_count'],8),
+  calculated['MREADTIM']=coalesce(pval1['MREADTIM'],pval1['IOSEEKTIM'] + (parameter.value['db_block_size'] * calculated['MBRC'] ) / pval1['IOTFRSPEED']),
+  calculated['SREADTIM']=coalesce(pval1['SREADTIM'],pval1['IOSEEKTIM'] + parameter.value['db_block_size'] / pval1['IOTFRSPEED']),
+  calculated['   multi block Cost per block']=round(1/calculated['MBRC']*calculated['MREADTIM']/calculated['SREADTIM'],4),
+  calculated['   single block Cost per block']=1,
+  formula['MBRC']=case when pval1['MBRC'] is not null then 'MBRC' when parameter.value['db_file_multiblock_read_count'] is not null then 'db_file_multiblock_read_count' when parameter.value['_db_file_optimizer_read_count'] is not null then '_db_file_optimizer_read_count' else '= _db_file_optimizer_read_count' end,
+  formula['MREADTIM']=case when pval1['MREADTIM'] is null then '= IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED' end,
+  formula['SREADTIM']=case when pval1['SREADTIM'] is null then '= IOSEEKTIM + db_block_size        / IOTFRSPEED' end,
+  formula['   multi block Cost per block']='= 1/MBRC * MREADTIM/SREADTIM',
+  formula['   single block Cost per block']='by definition',
+  calculated['   maximum mbrc']=sga.value['Database Buffers']/(parameter.value['db_block_size']*parameter.value['sessions']),
+  formula['   maximum mbrc']='= buffer cache size in blocks / sessions'
+);
+set echo on</pre></p>
+<p>Here is an exemple with <strong>default statistics</strong>:</p>
+<p><pre>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1519
+IOSEEKTIM                              10
+IOTFRSPEED                           4096
+SREADTIM                                          12 = IOSEEKTIM + db_block_size        / IOTFRSPEED
+MREADTIM                                          26 = IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED
+CPUSPEED
+MBRC                                               8 = _db_file_optimizer_read_count
+MAXTHR
+SLAVETHR
+   maximum mbrc                           117.152542 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                  .2708 = 1/MBRC * MREADTIM/SREADTIM
+</pre>
+You see the calculated values for everything. Note the &#8216;maximum mbrc&#8217; which limits the multiblock reads when the buffer cache is small. It divides the buffer cache size (at startup &#8211; can depend on ASMM and AMM settings) by the sessions parameter.</p>
+<p>Here is an example with <strong>workload system statistics</strong> gathering:
+<pre>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1511
+IOSEEKTIM                              15
+IOTFRSPEED                           4096
+SREADTIM                            1.178      1.178
+MREADTIM                              .03        .03
+CPUSPEED                             3004
+MBRC                                    8          8 MBRC
+MAXTHR                            6861824
+SLAVETHR
+   maximum mbrc                           114.983051 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                  .0032 = 1/MBRC * MREADTIM/SREADTIM
+</pre>
+here all values are explicitely set</p>
+<p>And an example with <strong>exadata system statistics</strong> that defines noworkload values and sets also the MBRC (see <a href="http://antognini.ch/2013/10/system-statistics-gathered-in-exadata-mode-when-are-they-relevant/#trackback">Chris Antognini post</a> about it)
+<pre>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1539
+IOSEEKTIM                              16
+IOTFRSPEED                         204800
+SREADTIM                                       16.04 = IOSEEKTIM + db_block_size        / IOTFRSPEED
+MREADTIM                                       18.28 = IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED
+CPUSPEED
+MBRC                                   57         57 MBRC
+MAXTHR
+SLAVETHR
+   maximum mbrc                           114.983051 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                    .02 = 1/MBRC * MREADTIM/SREADTIM
+</pre>
+And finally here is a <strong>workload system statistics </strong>result but with explicitly setting the db_file_multiblock_read_count to 128:
+<pre>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1539
+IOSEEKTIM                              15
+IOTFRSPEED                           4096
+SREADTIM                                          17 = IOSEEKTIM + db_block_size        / IOTFRSPEED
+MREADTIM                                         271 = IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED
+CPUSPEED
+MBRC                                             128 db_file_multiblock_read_count
+MAXTHR
+SLAVETHR
+   maximum mbrc                           114.983051 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                  .1245 = 1/MBRC * MREADTIM/SREADTIM
+</pre>
+Here you see that the MBRC in noworkload is coming from the value which is set by the db_file_multiblock_read_count rather from the value 8 which is used by default by the optimizer when it is not set. And the MREADTIM is calculated from that i/o size</p>
+<p>For more historical information about system statistics and how multiblock reads are costed (index vs. full table scan choice) see my article on latest <a href="http://viewer.zmags.com/publication/a8a4c4aa#/a8a4c4aa/62#54">OracleScene</a></p>
+<p>As usual if you find anything to improve in that script, please share.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5100"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 7 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1246">
+				<div id="div-comment-1246" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/41829d08a5b3cdfe64c569fc11cda3f8?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Lauri</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1246">
+			October 15, 2014 at 18 h 41 min</a>		</div>
+
+		<p>Hi Frank,</p>
+<p>Interesant article. But what does db_file_multiblock_read_count has to do with Exadata? As I understood, that the &#8220;smart scans&#8221; mechanism does not use the multi-blocks read.
+What do mean the parameters CPUSPEEDNW,&#8230; and how to determine if they are correctly sized?</p>
+<p>Kind Regards
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12471"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1246' onclick='return addComment.moveForm( "div-comment-1246", "1246", "respond", "509" )' aria-label='Reply to Lauri to Lauri'>Reply to Lauri</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1247">
+				<div id="div-comment-1247" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1247">
+			October 15, 2014 at 18 h 54 min</a>		</div>
+
+		<p>Hi lauri,
+db_file_multiblock_read_count is still used in exadata smartscan because it defines the size of the direct path reads. But here it is only about the optimizer. The MBRC is used by the optimizer to cost the full table scan.
+chris Antognini blog details that but I see that the link has disappeared. I&#8217;ll fix that.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-12481"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1247' onclick='return addComment.moveForm( "div-comment-1247", "1247", "respond", "509" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-2624">
+				<div id="div-comment-2624" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/5c3446eb51f4d0f7ad14cdc32cf1af87?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Dean</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2624">
+			January 21, 2016 at 9 h 50 min</a>		</div>
+
+		<p>Hi Franck</p>
+<p>How important is gathering System Stats, seems we have been using default values from year dot?</p>
+<p>Dean
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-26251"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2624' onclick='return addComment.moveForm( "div-comment-2624", "2624", "respond", "509" )' aria-label='Reply to Dean to Dean'>Reply to Dean</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-2626">
+				<div id="div-comment-2626" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2626">
+			January 21, 2016 at 10 h 47 min</a>		</div>
+
+		<p>Hi Dean,
+The most important thing is that the ratio between single block read and multiblock read is ok, because the choice between full scan and index access is based on that.
+Defaults are usually ok. They cost single block reads to 12 milliseconds and multi-block reads to 26, which is probably fine.
+If you have a storage with very low latency but same bandwidth (SSD for example) then accurate system statistics may be better and favor index access over full table scans because this storage is optimal for that.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-26271"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2626' onclick='return addComment.moveForm( "div-comment-2626", "2626", "respond", "509" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-3013">
+				<div id="div-comment-3013" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/688dee05dc3f6c573c0f78a6e5c8bfcd?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dba-scripts.com' rel='external nofollow' class='url'>Cyrille</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3013">
+			March 14, 2016 at 21 h 05 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>My db_file_multiblock_read_count is currently at 128, I gathered a system workload statistics which indicates
+MBRC=49
+Should I set my parameter to this value?</p>
+<p>Thanks</p>
+<p>Cyrille
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-30141"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3013' onclick='return addComment.moveForm( "div-comment-3013", "3013", "respond", "509" )' aria-label='Reply to Cyrille to Cyrille'>Reply to Cyrille</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7225">
+				<div id="div-comment-7225" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7225">
+			March 29, 2017 at 10 h 01 min</a>		</div>
+
+		<p>Hi Cyrille,
+Sorry for the late reply&#8230;
+There is no reason to set db_file_multiblock_read_count there. Just keep the default. You will be able to do up to 1MB reads. But optimizer will count on 49 which is the observed average.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-72261"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7225' onclick='return addComment.moveForm( "div-comment-7225", "7225", "respond", "509" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="pingback even thread-odd thread-alt depth-1" id="comment-4111">
+				<div id="div-comment-4111" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://leonotes.wordpress.com/2016/07/28/workload-mode-table-full-scan-cost/' rel='external nofollow' class='url'>workload mode table full scan cost | LEO Notes</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4111">
+			July 28, 2016 at 8 h 33 min</a>		</div>
+
+		<p>[&#8230;] Franck Pachot 写了一个很好的脚本来获取workload模式的信息,附在文章末尾 [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41121"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4111' onclick='return addComment.moveForm( "div-comment-4111", "4111", "respond", "509" )' aria-label='Reply to workload to workload mode table full scan cost | LEO Notes'>Reply to workload</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
+</body></html>

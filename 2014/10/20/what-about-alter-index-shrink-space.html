@@ -1,0 +1,232 @@
+<html><head>
+<link rel=canonical href=https://blog.dbi-services.com/what-about-alter-index-shrink-space />
+<meta name=description content='A blog post from 2014 about What about ALTER INDEX &#8230; SHRINK SPACE ?'>
+<title>What about ALTER INDEX &#8230; SHRINK SPACE ?</title>
+<link rel=stylesheet href=../../../style.css media=all>   
+
+</head><body>
+
+<p class=aboutme>
+<br/>
+<table width=100%>
+<tr>
+<td>
+<a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+</td><td>
+<img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
+</td>
+</tr>
+</table>
+<br/>
+</p>
+
+<p class=firstpub>This was first published on <a href=https://blog.dbi-services.com/what-about-alter-index-shrink-space>https://blog.dbi-services.com/what-about-alter-index-shrink-space</a> (2014-10-20), republishing for new followers. The content is related to the the versions available at the publication date</p>
+								<h1 class="entry-title">What about ALTER INDEX &#8230; SHRINK SPACE ?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I have <a href="https://blog.dbi-services.com/how-i-measure-oracle-index-fragmentation">recently</a> published a script to check index fragmentation. But then, do you COALESCE or REBUILD? Well, there also is another option: ALTER INDEX SHRINK SPACE. Let&#8217;s compare all those index defragmentation operations.</p>
+<h3>Fragmented index</h3>
+<p>I have an index created when the table had 1 million rows. Then, I deleted 90% of the rows. Here is the index state from:</p>
+<ul>
+<li>dbms_space.space_usage</li>
+<li>index_stats after an analyze index validate structure</li>
+<li>my index fragmentation checking script with 4 buckets</li>
+</ul>
+<p>and here are the results:</p>
+<p><pre>      :UNF       :FS1       :FS2       :FS3       :FS4      :FULL  BLOCKS
+---------- ---------- ---------- ---------- ---------- ---------- -------
+         0          0          1          0          0       2230    2304
+
+ HEIGHT  BLOCKS    LF_ROWS  LF_BLKS  BR_ROWS  BR_BLKS DEL_LF_ROWS USED_SPACE PCT_USED
+------- ------- ---------- -------- -------- -------- ----------- ---------- --------
+      3    2304     100404     2226     2225        5         404    1622013       10
+
+         N to          N rows/block bytes/block %free space  blocks free
+---------- -- ---------- ---------- ----------- ----------- ------- -----
+        10 -&gt;     250280         45         714          91     557 oooo
+    250730 -&gt;     500370         45         714          91     557 oooo
+    500820 -&gt;     750010         45         714          91     556 oooo
+    750460 -&gt;     999660         45         714          91     556 oooo
+</pre></p>
+<p>I have 2226 leaf blocks, the index height is 3 with 5 branch blocks. The leaves are only 91.
+However dbms_space shows only full blocks: the deleted entries are still there, just marked as deleted, and the blocks are still seen as full.</p>
+<h3>COALESCE</h3>
+<p>Now let&#8217;s COALESCE:
+<pre>SQL&gt; alter index DEMO_N coalesce;
+</pre>
+And before checking the same values about the index space I measure the amount of work that has been done by the operation (from v$mystat):</p>
+<p><pre>NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+redo entries                                                          22067
+db block gets                                                         32818
+session logical reads                                                 32886
+db block changes                                                      40601
+undo change vector size                                            35199264
+redo size                                                          47878800
+
+      :UNF       :FS1       :FS2       :FS3       :FS4      :FULL  BLOCKS
+---------- ---------- ---------- ---------- ---------- ---------- -------
+         0          0       2004          0          0        227    2304
+
+ HEIGHT  BLOCKS    LF_ROWS  LF_BLKS  BR_ROWS  BR_BLKS DEL_LF_ROWS USED_SPACE PCT_USED
+------- ------- ---------- -------- -------- -------- ----------- ---------- --------
+      3    2304     100000      223      222        5           0    1591530       88
+
+         N to          N rows/block bytes/block %free space  blocks free
+---------- -- ---------- ---------- ----------- ----------- ------- -----
+        10 -&gt;     248690        452        7170          11      56
+    253200 -&gt;     500800        450        7158          11      56
+    505310 -&gt;     752020        449        7132          11      56
+    756530 -&gt;     998730        443        7038          12      55
+</pre>
+&nbsp;</p>
+<p>COALESCE is an online operation that defragments the leaf blocks. We have now only 223 leaf blocks that are 90% full (because my pctfree is the default 10%). But the index stil has the same height and still has 2300 blocks. Where are the reclaimed 2000 blocks? They are available if the index need a new block (for a block split). They are seen as FS2 (at least 25 to 50% free space) by dbms_space because they still contain the deleted rows, but they are fully reclaimable anyway.</p>
+<h3>SHRINK SPACE COMPACT</h3>
+<p>Back with the same table, and doing a SHRINK SPACE COMPACT instead of COALESCE:</p>
+<p><pre>NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+redo entries                                                          28794
+db block gets                                                         40940
+session logical reads                                                 41527
+db block changes                                                      49387
+undo change vector size                                            36990460
+redo size                                                          51848880
+
+      :UNF       :FS1       :FS2       :FS3       :FS4      :FULL  BLOCKS
+---------- ---------- ---------- ---------- ---------- ---------- -------
+         0          0          1          0       2003        227    2304
+
+ HEIGHT  BLOCKS    LF_ROWS  LF_BLKS  BR_ROWS  BR_BLKS DEL_LF_ROWS USED_SPACE PCT_USED
+------- ------- ---------- -------- -------- -------- ----------- ---------- --------
+      3    2304     100000      223      222        5           0    1591530       88
+
+         N to          N rows/block bytes/block %free space  blocks free
+---------- -- ---------- ---------- ----------- ----------- ------- -----
+        10 -&gt;     248690        452        7170          11      56
+    253200 -&gt;     500800        450        7158          11      56
+    505310 -&gt;     752020        449        7132          11      56
+    756530 -&gt;     998730        443        7038          12      55
+</pre>
+&nbsp;</p>
+<p>So what is the difference? Slightly more work (about 20% more logical reads and block changes) for the same result. Except that now the reclaimed blocks are in FS4 (75 to 100% free space).</p>
+<p>&nbsp;</p>
+<h3>SHRINK SPACE</h3>
+<p>What if we use SHRINK SPACE instead of SHRINK SPACE COMPACT?</p>
+<p>
+<pre>NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+redo entries                                                          29352
+db block gets                                                         45496
+session logical reads                                                 46190
+db block changes                                                      50032
+undo change vector size                                            36981524
+redo size                                                          51901500
+
+      :UNF       :FS1       :FS2       :FS3       :FS4      :FULL  BLOCKS
+---------- ---------- ---------- ---------- ---------- ---------- -------
+         0          0          1          0          0        227     240
+
+ HEIGHT  BLOCKS    LF_ROWS  LF_BLKS  BR_ROWS  BR_BLKS DEL_LF_ROWS USED_SPACE PCT_USED
+------- ------- ---------- -------- -------- -------- ----------- ---------- --------
+      3     240     100000      223      222        5           0    1591530       88
+
+         N to          N rows/block bytes/block %free space  blocks free
+---------- -- ---------- ---------- ----------- ----------- ------- -----
+        10 -&gt;     248690        452        7170          11      56
+    253200 -&gt;     500800        450        7158          11      56
+    505310 -&gt;     752020        449        7132          11      56
+    756530 -&gt;     998730        443        7038          12      55
+</pre></p>
+<p>With tables, the shrink space lowers the high water mark. Here it is the same idea: in addition to the shrink space the reclaimed blocks are no more allocated to the index, so it can be used for other segments in the tablespace. We see that from dbms_space: the index is now 240 blocks only.</p>
+<h3>REBUILD</h3>
+<p>The previous requires a lock only for a short duration (according that we did the shrink space compact before). The rebuild needs a Share lock on the table during the whole operation, blocking concurrent DML.</p>
+<p><pre>NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+db block gets                                                           953
+redo entries                                                           1832
+db block changes                                                       1906
+session logical reads                                                  4019
+undo change vector size                                                9152
+redo size                                                            173732
+
+      :UNF       :FS1       :FS2       :FS3       :FS4      :FULL  BLOCKS
+---------- ---------- ---------- ---------- ---------- ---------- -------
+         0          0          1          0          0        222     256
+
+ HEIGHT  BLOCKS    LF_ROWS  LF_BLKS  BR_ROWS  BR_BLKS DEL_LF_ROWS USED_SPACE PCT_USED
+------- ------- ---------- -------- -------- -------- ----------- ---------- --------
+      2     256     100000      222      221        1           0    1591520       90
+
+         N to          N rows/block bytes/block %free space  blocks free
+---------- -- ---------- ---------- ----------- ----------- ------- -----
+        10 -&gt;     248690        452        7170          11      56
+    253200 -&gt;     501250        451        7170          11      56
+    505760 -&gt;     749300        451        7170          11      55
+    753810 -&gt;     997350        448        7117          11      55
+</pre></p>
+<p>The result is the same as the previous operation (SHRINK SPACE) except that the index height has decreased. A rebuild is the right operation if the index blevel has become too high. And we did that offline but with much less work. Minimal undo and redo. And small blocks to read (when the index is still usable the rebuild can use the current index to rebuild the new segment).</p>
+<p>&nbsp;</p>
+<h3>REBUILD ONLINE</h3>
+<p>Last operation, possible only in Enterprise Edition, is the rebuild online which doesn&#8217;t need to lock the table.</p>
+<p>
+<pre>NAME                                                                  VALUE
+---------------------------------------------------------------- ----------
+redo entries                                                            660
+db block changes                                                        876
+db block gets                                                          1419
+session logical reads                                                  4989
+undo change vector size                                               24932
+redo size                                                            114924
+
+      :UNF       :FS1       :FS2       :FS3       :FS4      :FULL  BLOCKS
+---------- ---------- ---------- ---------- ---------- ---------- -------
+         0          0          1          0          0        222     256
+
+ HEIGHT  BLOCKS    LF_ROWS  LF_BLKS  BR_ROWS  BR_BLKS DEL_LF_ROWS USED_SPACE PCT_USED
+------- ------- ---------- -------- -------- -------- ----------- ---------- --------
+      2     256     100000      222      221        1           0    1591520       90
+
+         N to          N rows/block bytes/block %free space  blocks free
+---------- -- ---------- ---------- ----------- ----------- ------- -----
+        10 -&gt;     248690        452        7170          11      56
+    253200 -&gt;     501250        451        7170          11      56
+    505760 -&gt;     749300        451        7170          11      55
+    753810 -&gt;     997350        448        7117          11      55
+</pre></p>
+<p>Here we don&#8217;t see an overhead to do it online. This is because my table is small (my testcase has only one column which is the indexed one). On a real table you will probably see that the online rebuild takes longer than the offline one, because it cannot use the current index. But anyway, the fact that it is online means that the duration is not a big issue.</p>
+<h3>Conclusion</h3>
+<p>This is an example on a table that had a massive purge: all blocks were touched. In that case the REBUILD is the right solution. However if you are in Standard Edition and cannot do it online, then you will probably do a SHRINK SPACE COMPACT because it lets you do a SHRINK SPACE (need a quick locks but for a very short duration &#8211; to do on a period of low activity).
+COALESCE will make sense here only if you know you will insert back a lot of rows, so that you don&#8217;t need to deallocate the blocks from the index.</p>
+<p>Now, what to do if the free space to reclaim is only on small part of the index blocks? As in the following case:</p>
+<p><pre>         N to          N rows/block bytes/block %free space  blocks free
+---------- -- ---------- ---------- ----------- ----------- ------- -----
+        10 -&gt;      50468        374        5974          26     112 o
+     50917 -&gt;     100756        449        7179          11     112
+    101205 -&gt;     151044        449        7179          11     112
+    151493 -&gt;     201332        449        7179          11     112
+    201781 -&gt;     251620        449        7179          11     112
+    252069 -&gt;     301908        449        7179          11     112
+    302357 -&gt;     351747        449        7179          11     111
+    352196 -&gt;     401586        449        7179          11     111
+    402035 -&gt;     451425        449        7179          11     111
+    451874 -&gt;     501264        449        7179          11     111
+    501713 -&gt;     551103        449        7179          11     111
+</pre></p>
+<p>In that case a COALESCE is probably the best because you keep the blocks allocated to the index for future growth. And the few blocks reclaimed will probably not change the index height anyway. However, if you did a small purge that concern only a small part of the index and want to reclaim the space for other segments, then the SHRINK SPACE is the right solution. But do you really need to reclaim space in that case?</p>
+<p>Now you see the usage for my index fragmentation script: I don&#8217;t need only the average free space. I need to have a clear picture of the fragmentation in order to decide what to do and how.</p>
+<h3>Update Jan. 23th 2015</h3>
+<p>There is something else important in the INDEX SHRINK vs. COALESCE when there are concurrent DML activity. COALESCE just skip the blocks where some index entries are locked. SHRINK will wait on them.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4750"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
+</body></html>
