@@ -1,0 +1,511 @@
+This was first published on <a href=https://blog.dbi-services.com/resultcache-hint-expiration-options>https://blog.dbi-services.com/resultcache-hint-expiration-options</a> (2015-07-05)
+								<h1 class="entry-title">RESULT_CACHE hint expiration options</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The result cache is very nice when base tables are static: get the result without any buffer get, without any join or sorts. But as soon as any DML occurs on one of the tables the result is based on, then result cache is invalidated. And cache misses are quite expensive. You can think of it as a materialized view in memory. But with materialized views, you can accept to see stale results in order to avoid frequent refreshes. Let&#8217;s see how we can control stale results with undocumented options.</p>
+<h3>Test case</h3>
+<p>I&#8217;m creating a basic table.
+<pre>22:30:44 SQL&gt; create table DEMO as select rownum id from xmltable('1 to 100000');
+Table created.
+
+22:30:44 SQL&gt; exec if dbms_result_cache.flush then dbms_output.put_line('Flushed.'); end if;
+PL/SQL procedure successfully completed.
+</pre></p>
+<h3>RESULT_CACHE</h3>
+<p>On that table, I&#8217;ll do a simple select with the RESULT_CACHE hint.
+<pre>22:30:44 SQL&gt; set autotrace on
+22:30:44 SQL&gt; select /*+ <b>result_cache</b> */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+    100000
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name                       | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                            |     1 |    46   (0)| 00:00:01 |
+|   1 |  RESULT CACHE       | 2x5f91pfn5p6882f6szxj50jwf |       |            |          |
+|   2 |   SORT AGGREGATE    |                            |     1 |            |          |
+|   3 |    TABLE ACCESS FULL| DEMO                       |   100K|    46   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+
+   1 - column-count=1; dependencies=(DEMO.DEMO); attributes=(single-row); name="select /*+ result_cache */ count(*) from DEMO"
+
+Statistics
+----------------------------------------------------------
+          5  recursive calls
+          0  db block gets
+        159  consistent gets
+        153  physical reads
+          0  redo size
+        358  bytes sent via SQL*Net to client
+        499  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+</pre>
+We have read the 150 blocks of the DEMO table. The result cache has been loaded. Here are the objects and dependency:
+<pre>22:30:44 SQL&gt; set autotrace off
+22:30:44 SQL&gt; select * from v$result_cache_dependency;
+
+ RESULT_ID  DEPEND_ID  OBJECT_NO     CON_ID
+---------- ---------- ---------- ----------
+         1          0     112463          0
+
+22:30:44 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      0
+  1 Result     Published select /*+ result_cache */ cou 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+We can read it as: the query result (id=1) depends on the table (id=0).</p>
+<p>If I run it another time:
+<pre>22:30:45 SQL&gt; select /*+ result_cache */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+    100000
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name                       | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                            |     1 |    46   (0)| 00:00:01 |
+|   1 |  RESULT CACHE       | 2x5f91pfn5p6882f6szxj50jwf |       |            |          |
+|   2 |   SORT AGGREGATE    |                            |     1 |            |          |
+|   3 |    TABLE ACCESS FULL| DEMO                       |   100K|    46   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+
+   1 - column-count=1; dependencies=(DEMO.DEMO); attributes=(single-row); name="select /*+ result_cache */ count(*) from DEMO"
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+          0  consistent gets
+          0  physical reads
+          0  redo size
+        358  bytes sent via SQL*Net to client
+        499  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed</pre>
+No block get at all. The result was in cache.</p>
+<h3>dependencies</h3>
+<p>If we do any kind of DML on the tables the result cache depends on:
+<pre>22:30:45 SQL&gt; delete from DEMO where null is not null;
+0 rows deleted.
+
+22:30:45 SQL&gt; commit;
+Commit complete.</pre>
+Then the cache is invalidated:
+<pre>22:30:45 SQL&gt; select * from v$result_cache_dependency;
+no rows selected
+
+22:30:45 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      1
+  1 Result     Invalid   select /*+ result_cache */ cou 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+and another run will have to load the cache again:
+<pre>22:30:45 SQL&gt; set autotrace on
+22:30:45 SQL&gt; select /*+ result_cache */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+    100000
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name                       | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                            |     1 |    46   (0)| 00:00:01 |
+|   1 |  RESULT CACHE       | 2x5f91pfn5p6882f6szxj50jwf |       |            |          |
+|   2 |   SORT AGGREGATE    |                            |     1 |            |          |
+|   3 |    TABLE ACCESS FULL| DEMO                       |   100K|    46   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+
+   1 - column-count=1; dependencies=(DEMO.DEMO); attributes=(single-row); name="select /*+ result_cache */ count(*) from DEMO"
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+        157  consistent gets
+          0  physical reads
+          0  redo size
+        358  bytes sent via SQL*Net to client
+        499  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+
+22:30:46 SQL&gt; set autotrace off
+22:30:46 SQL&gt; select * from v$result_cache_dependency;
+
+ RESULT_ID  DEPEND_ID  OBJECT_NO     CON_ID
+---------- ---------- ---------- ----------
+         2          0     112463          0
+
+22:30:46 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      1
+  1 Result     Invalid   select /*+ result_cache */ cou 2x5f91pfn5p6882f6szxj50jwf     0
+  2 Result     Published select /*+ result_cache */ cou 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+This is the only documented behaviour: the cache is invalidated if and only if there has been some DML on the tables it depends on.</p>
+<h3>RESULT_CACHE(SHELFLIFE=seconds)</h3>
+<p>I flush the cache and run the same with the undocumented result cache hint option: SHELFLIFE=10 seconds:
+<pre>22:30:46 SQL&gt; exec if dbms_result_cache.flush then dbms_output.put_line('Flushed.'); end if;
+PL/SQL procedure successfully completed.
+
+22:30:46 SQL&gt; set autotrace on
+22:30:46 SQL&gt; select /*+ result_cache(shelflife=10) */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+    100000
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name                       | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                            |     1 |    46   (0)| 00:00:01 |
+|   1 |  RESULT CACHE       | 2x5f91pfn5p6882f6szxj50jwf |       |            |          |
+|   2 |   SORT AGGREGATE    |                            |     1 |            |          |
+|   3 |    TABLE ACCESS FULL| DEMO                       |   100K|    46   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+
+   1 - column-count=1; dependencies=(DEMO.DEMO); attributes=(single-row, shelflife=10); name="select /*+ result_cache(shelflife=10) */ count(*) from DEMO"</pre>
+we see the &#8216;shelflife&#8217; attribute but the dependency is the same as without the option:
+<pre>22:30:46 SQL&gt; set autotrace off
+22:30:46 SQL&gt; select * from v$result_cache_dependency;
+
+ RESULT_ID  DEPEND_ID  OBJECT_NO     CON_ID
+---------- ---------- ---------- ----------
+         1          0     112463          0
+
+22:30:46 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      0
+  1 Result     Published select /*+ result_cache(shelfl 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+I run the query again 5 seconds later:
+<pre>22:30:51 SQL&gt; set autotrace on
+22:30:51 SQL&gt; select /*+ result_cache(shelflife=10) */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+    100000
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name                       | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                            |     1 |    46   (0)| 00:00:01 |
+|   1 |  RESULT CACHE       | 2x5f91pfn5p6882f6szxj50jwf |       |            |          |
+|   2 |   SORT AGGREGATE    |                            |     1 |            |          |
+|   3 |    TABLE ACCESS FULL| DEMO                       |   100K|    46   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+
+   1 - column-count=1; dependencies=(DEMO.DEMO); attributes=(single-row, shelflife=10); name="select /*+ result_cache(shelflife=10) */ count(*) from DEMO"
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+          0  consistent gets
+          0  physical reads
+          0  redo size
+        358  bytes sent via SQL*Net to client
+        499  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+
+22:30:51 SQL&gt; set autotrace off
+22:30:51 SQL&gt; select * from v$result_cache_dependency;
+
+ RESULT_ID  DEPEND_ID  OBJECT_NO     CON_ID
+---------- ---------- ---------- ----------
+         1          0     112463          0
+
+22:30:51 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      0
+  1 Result     Published select /*+ result_cache(shelfl 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+Nothing special here. No DML occured so the result is still valid (&#8216;published&#8217;)</p>
+<h3>expiration</h3>
+<p>But let&#8217;s wait 5 more seconds and run it again:
+<pre>22:30:56 SQL&gt; select * from v$result_cache_dependency;
+
+ RESULT_ID  DEPEND_ID  OBJECT_NO     CON_ID
+---------- ---------- ---------- ----------
+         1          0     112463          0
+
+22:30:56 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      0
+  1 Result     Expired   select /*+ result_cache(shelfl 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+The status has changed, it&#8217;s not EXPIRED because the 10 seconds shelflife has passed on since the cache was loaded.
+<pre>22:30:56 SQL&gt;
+22:30:56 SQL&gt; set autotrace on
+22:30:56 SQL&gt; select /*+ result_cache(shelflife=10) */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+    100000
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name                       | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                            |     1 |    46   (0)| 00:00:01 |
+|   1 |  RESULT CACHE       | 2x5f91pfn5p6882f6szxj50jwf |       |            |          |
+|   2 |   SORT AGGREGATE    |                            |     1 |            |          |
+|   3 |    TABLE ACCESS FULL| DEMO                       |   100K|    46   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+
+   1 - column-count=1; dependencies=(DEMO.DEMO); attributes=(single-row, shelflife=10); name="select /*+ result_cache(shelflife=10) */ count(*) from DEMO"
+
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+        157  consistent gets
+          0  physical reads
+          0  redo size
+        358  bytes sent via SQL*Net to client
+        499  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed</pre>
+here I have a cache miss even if no DML occured on the tables it depends on.
+<pre>22:30:56 SQL&gt; select * from v$result_cache_dependency;
+
+ RESULT_ID  DEPEND_ID  OBJECT_NO     CON_ID
+---------- ---------- ---------- ----------
+         2          0     112463          0
+
+22:30:56 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      0
+  1 Result     Invalid   select /*+ result_cache(shelfl 2x5f91pfn5p6882f6szxj50jwf     0
+  2 Result     Published select /*+ result_cache(shelfl 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+When I run a query using an expired result cache, that cache becomes invalid, the query is fully run (150 block gets) and new result cache populated.</p>
+<p>Note that in addition to the shelflife expiration, the dependency on DML is still invalidating the result cache:
+<pre>22:30:56 SQL&gt; delete from DEMO where null is not null;
+0 rows deleted.
+
+22:30:56 SQL&gt; commit;
+Commit complete.
+
+22:30:56 SQL&gt; select * from v$result_cache_dependency;
+no rows selected
+
+22:30:56 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Dependency Published DEMO.DEMO                      DEMO.DEMO                      1
+  1 Result     Invalid   select /*+ result_cache(shelfl 2x5f91pfn5p6882f6szxj50jwf     0
+  2 Result     Invalid   select /*+ result_cache(shelfl 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+So with SHELFLIFE we have two reasons for invalidations: dependency and expiration.</p>
+<h3>RESULT_CACHE(SNAPSHOT=seconds)</h3>
+<p>There is another undocumented option for the result cache hint: SNAPSHOT which also taked a number of seconds. Let&#8217;s try it:
+<pre>22:30:56 SQL&gt; exec if dbms_result_cache.flush then dbms_output.put_line('Flushed.'); end if;
+PL/SQL procedure successfully completed.
+
+22:30:56 SQL&gt; set autotrace on
+22:30:56 SQL&gt; select /*+ result_cache(snapshot=10) */ count(*) from DEMO;
+
+  COUNT(*)
+----------
+    100000
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+
+------------------------------------------------------------------------------------------
+| Id  | Operation           | Name                       | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |                            |     1 |    46   (0)| 00:00:01 |
+|   1 |  RESULT CACHE       | 2x5f91pfn5p6882f6szxj50jwf |       |            |          |
+|   2 |   SORT AGGREGATE    |                            |     1 |            |          |
+|   3 |    TABLE ACCESS FULL| DEMO                       |   100K|    46   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+
+   1 - column-count=1; attributes=(single-row, snapshot=10); name="select /*+ result_cache(snapshot=10) */ count(*) from DEMO"
+
+Statistics
+----------------------------------------------------------
+          1  recursive calls
+          0  db block gets
+        157  consistent gets
+          0  physical reads
+          0  redo size
+        358  bytes sent via SQL*Net to client
+        499  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+
+22:30:56 SQL&gt; set autotrace off
+22:30:56 SQL&gt; select * from v$result_cache_dependency;
+no rows selected
+
+22:30:56 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Result     Published select /*+ result_cache(snapsh 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+The cache has been populated here, but there is no dependency. Let&#8217;s try DML on base table:
+<pre>22:30:56 SQL&gt; delete from DEMO where null is not null;
+0 rows deleted.
+
+22:30:56 SQL&gt; commit;
+Commit complete.
+
+22:30:56 SQL&gt; select * from v$result_cache_dependency;
+no rows selected
+
+22:30:56 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Result     Published select /*+ result_cache(snapsh 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+A SNAPSHOT result cache is not invalidated by DML on base tables.</p>
+<p>But if we wait 10 seconds:
+<pre>22:31:06 SQL&gt; select id,type,status,name,cache_id,invalidations from v$result_cache_objects order by id;
+
+ ID TYPE       STATUS    NAME                           CACHE_ID                     INV
+--- ---------- --------- ------------------------------ --------------------------- ----
+  0 Result     Expired   select /*+ result_cache(snapsh 2x5f91pfn5p6882f6szxj50jwf     0</pre>
+The status is expired, as with the shelflife. Next execution will invalidate it.</p>
+<h3>Conclusion</h3>
+<p>There are two reasons to invalidate a result cache: DML on dependency, or expiration after a number of seconds. And we can use any combination of them with undocumented hints. Oracle itself uses them internally. SNAPSHOT is used by Active Dynamic Sampling: stale result are acceptable for one hour. SHELFLIFE is used on dictionary views bases on X$ tables where dependency cannot be tracked.</p>
+<p>I hope it will get documented in future releases. There are some cases where we can accept stale results in order to get better performance. We already do that with materialized views, so why not do it with result cache?</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-24440"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1555">
+				<div id="div-comment-1555" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/ef648de0cb208a353f17b5b0f62214fa?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Machine Vision Lenses</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1555">
+			July 23, 2015 at 6 h 46 min</a>		</div>
+
+		<p>I read your blog. Thanks for sharing your blog.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-15561"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1555' onclick='return addComment.moveForm( "div-comment-1555", "1555", "respond", "2443" )' aria-label='Reply to Machine to Machine Vision Lenses'>Reply to Machine</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1582">
+				<div id="div-comment-1582" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/f72c41a3ff54423293bdb68ae747aa44?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Kais</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1582">
+			October 27, 2015 at 5 h 59 min</a>		</div>
+
+		<p>Good post !
+Thanks Franck.
+Kais
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-15831"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1582' onclick='return addComment.moveForm( "div-comment-1582", "1582", "respond", "2443" )' aria-label='Reply to Kais to Kais'>Reply to Kais</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

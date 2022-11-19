@@ -1,0 +1,96 @@
+This was first published on <a href=https://blog.dbi-services.com/12cr2-needs-to-connect-with-password-for-cross-pdb-dml>https://blog.dbi-services.com/12cr2-needs-to-connect-with-password-for-cross-pdb-dml</a> (2017-05-26)
+								<h1 class="entry-title">12cR2 needs to connect with password for Cross-PDB DML</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In a <a href="../12cr2-cross-container-dml-insert-into-container/index.html" target="_blank">previous post</a>, I explained that Cross-PDB DML, executing an update/delete/insert with the CONTAINERS() clause, seems to be implemented with implicit database links. Connecting through a database link requires a password and this blog post is about an error you may encounter: ORA-01017: invalid username/password; logon denied</p>
+<p>This blog post also explains a consequence of this implementation, the big inconsistency of CONTAINERS() function because the implementation is completely different for queries (select) and for insert/delete/update, and you may finally write and read from different schemas.
+<span id="more-16843"></span>
+We do not need Application Container for Cross-PDB DML and we don&#8217;t even need metadata link tables. Just tables with same columns. Here I have a DEMO table which is just a copy of DUAL, and it is created in CDB$ROOT and in PDB1 (CON_ID=3), owned by SYS.</p>
+<h3>Implicit database link</h3>
+<p>I&#8217;m connecting to CDB$ROOT with user, password and service name:
+<pre>
+SQL&gt; connect sys/oracle@//localhost/CDB1A as sysdba
+Connected.
+</pre>
+I insert a row into the DEMO table in the PDB1, which is CON_ID=3:
+<pre>
+SQL&gt; insert into containers(DEMO) (con_id,dummy) values (3,'Y');
+1 row created.
+</pre>
+This works in 12.2, is documented, and is an alternative way to switching to the container.</p>
+<p>But now, let&#8217;s try to do the same when connecting with &#8216;/ as sysdba':
+<pre>
+SQL&gt; connect / as sysdba
+Connected.
+SQL&gt; insert into containers(DEMO) (con_id,dummy) values (3,'Y');
+
+insert into containers(DEMO) (con_id,dummy) values (3,'Y')
+*
+ERROR at line 1:
+ORA-01017: invalid username/password; logon denied
+ORA-02063: preceding line from PDB1
+</pre></p>
+<p>The first message mentions invalid user/password, and the second one mentions a database link having the same name as the container.
+As I described in the <a href="../12cr2-cross-container-dml-insert-into-container/index.html" target="_blank">previous post</a> the CONTAINERS() opens an implicit database link when doing some modifications to another container. But a database link requires a connection and no user/password has been provided. It seems that it tries to connect with the same user and password as the one provided to connect to the root.</p>
+<p>Then, I provide the user/password but with local connection (no service name):</p>
+<p><pre>
+SQL&gt; connect sys/oracle as sysdba
+Connected.
+SQL&gt; insert into containers(DEMO) (con_id,dummy) values (3,'Y');
+insert into containers(DEMO) (con_id,dummy) values (3,'Y')
+*
+ERROR at line 1:
+ORA-01017: invalid username/password; logon denied
+</pre></p>
+<p>There is no mention of a database link here, but still impossible to connect. Then it seems that the session needs our connection string to find out how to connect to the PDB.</p>
+<h3>Explicit database link</h3>
+<p>There is an alternative. You can create the database link explicitly and then it will be used by the container(), having all information required password and service. But the risk is that you define this database link to connect to another user. </p>
+<p>Here I have also a DEMO table created in SCOTT:
+<pre>
+SQL&gt; create database link PDB1 connect to scott identified by tiger using '//localhost/PDB1';
+Database link created.
+
+SQL&gt; select * from DEMO@PDB1;
+
+D
+-
+X
+</pre>
+From the root I insert with CONTAINERS() without mentioning the schema:
+<pre>
+SQL&gt; insert into containers(DEMO) (con_id,dummy) values (3,'S');
+1 row created.
+</pre>
+I have no errors here (I&#8217;m still connected / as sysdba) because I have a database link with the same name as the one it tries to use implicitly. So it works without any error or warning. But my database link does not connect to the same schema (SYS) but to SCOTT. And because a DEMO table was there with same columns, the row was actually inserted into the SCOTT schema:
+<pre>
+SQL&gt; select * from DEMO@PDB1;
+
+D
+-
+X
+S
+</pre>
+The big problem here is that when doing a select through the same CONTAINER() function, a different mechanism is used, not using the database link but session switching to the other container, in same schema, so the row inserted through INSERT INTO CONTAINER() is not displayed by SELECT FROM CONTAINER():
+<pre>SQL&gt; select * from containers(DEMO);
+
+D     CON_ID
+- ----------
+X          1
+X          3
+Y          3
+</pre></p>
+<h3>So what?</h3>
+<p>I don&#8217;t know if the first problem (invalid user/password) will be qualified as a bug but I hope the second one will. Cross-PDB DML will be an important component of Application Containers, and having a completely different implementation for SELECT and for INSERT/UPDATE/DELETE may be a source of problems. In my opinion, both should use container switch within the same session, but that means that a transaction should be able to write in multiple containers, which is not possible currently.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-168440"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

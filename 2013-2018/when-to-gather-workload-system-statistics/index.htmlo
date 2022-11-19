@@ -1,0 +1,160 @@
+This was first published on <a href=https://blog.dbi-services.com/when-to-gather-workload-system-statistics>https://blog.dbi-services.com/when-to-gather-workload-system-statistics</a> (2015-01-23)
+								<h1 class="entry-title">When to gather workload system statistics?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This month we started to give our <a href="https://blog.dbi-services.com/when-to-gather-workload-system-statistics/index.php/products/dbi-insite-workshops/oracle-performance-tuning-training">Oracle Tuning Workshop</a>. And with a new workshop comes new questions. We advise to give to the optimizer the most accurate statsistics that we can have. That suggests that WORKLOAD statistics are better than NOWORKLOAD ones because they gather the average number of blocks read in multiblock read, rather than using default values. But then, the question is: which time period do you choose to gather workload statistics, and with which interval duration?</p>
+<p>The best answer we can give is probably Chris Antognini&#8217;s one (<a href="http://antognini.ch/top/">TOP</a> Edition 2 &#8211; Chapter 7 &#8211; Workload Statistics). Either you gather them over several days, or you build a chart from short periodes and you set manually the average values that seem to be relevant.</p>
+<p>The point is that the gathered values may be very irregular. I&#8217;ve always seen very irregular values.
+In order to illustrate the problem I&#8217;ll show the graph about a production databases over 8 days. It&#8217;s a typical OLTP database with an average load.</p>
+<h3>get statistics from AWR</h3>
+<p>I&#8217;ll not run dbms_stats but I will get the same statistics from AWR. And this post is the occasion to share the query I use for that. I&#8217;ll not detail here how the WORKLOAD statistics are gathered, and how I&#8217;ve figured out the formulas. That&#8217;s for a longer article.</p>
+<p>Just the summary:</p>
+<ul>
+<li>SREADTIM and MREADTIM comes from V$FILESTAT. And they are set only when more than 10 i/o calls are done.</li>
+<li>MBRC don&#8217;t use only V$FILESTAT but also the &#8216;physical read&#8217; and &#8216;physical read direct&#8217; from V$SYSSTAT. Yes, direct-path reads are not counted as multiblock reads for the MBRC system statistic.</li>
+<li>It&#8217;s from V$ views and not GV$, so the workload of one instance will set system statistics for the whole database.</li>
+</ul>
+<p>However the example below comes from a 4 nodes RAC and my query sums all instances.
+Ok, here is the query which show the estimated values on 1 hour intervals from AWR.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">select to_char(begin_interval_time,'dd-mon') DAY,to_char(begin_interval_time,'hh24:mi')||'-'||to_char(end_interval_time,'hh24:mi') INTERVAL
+ -- don't count the time when we have less than 10 i/o calls
+ , round(case when SBLKRDS&gt;10 then SBLKRDTIM/SBLKRDS end,3) SREADTIM
+ , round(case when MBLKRDS&gt;10 then MBLKRDTIM/MBLKRDS end,3) MREADTIM
+ -- don't count the MBRC when we have less that 1000 blocks read
+ , round(case when (MBRTOTAL-SBLKRDS)&gt;100 and MBLKRDS&gt;10 then (MBRTOTAL-SBLKRDS)/MBLKRDS end,2) MBRC
+ , round(case when MBLKBLKS&gt;100 and MBLKRDS&gt;10 then MBLKBLKS/MBLKRDS end,3) "MBRC-incl-direct-path"
+from
+(
+  select 
+     trunc(begin_interval_time,'hh24') begin_interval_time,trunc(end_interval_time,'hh24') end_interval_time,
+     sum(singleblkrds) SBLKRDS,10*sum(singleblkrdtim) SBLKRDTIM, -- in milliseconds
+     sum(phyrds-singleblkrds) MBLKRDS,10*sum(readtim-singleblkrdtim) MBLKRDTIM,  -- in milliseconds
+     sum(phyblkrd-singleblkrds) MBLKBLKS,
+     sum(physical_read-physical_read_direct) MBRTOTAL
+  from ( 
+    select dbid,instance_number,snap_id,begin_interval_time,end_interval_time
+     ,singleblkrds-lag(singleblkrds)over(partition by dbid,instance_number,startup_time order by snap_id) singleblkrds
+     ,singleblkrdtim-lag(singleblkrdtim)over(partition by dbid,instance_number,startup_time order by snap_id) singleblkrdtim
+     ,phyrds-lag(phyrds)over(partition by dbid,instance_number,startup_time order by snap_id) phyrds
+     ,readtim-lag(readtim)over(partition by dbid,instance_number,startup_time order by snap_id) readtim
+     ,phyblkrd-lag(phyblkrd)over(partition by dbid,instance_number,startup_time order by snap_id) phyblkrd
+     ,physical_read-lag(physical_read)over(partition by dbid,instance_number,startup_time order by snap_id) physical_read
+     ,physical_read_direct-lag(physical_read_direct)over(partition by dbid,instance_number,startup_time order by snap_id) physical_read_direct
+    from ( 
+     -- file stats summed
+     select dbid,instance_number,snap_id
+      ,sum(singleblkrds) singleblkrds
+      ,sum(singleblkrdtim) singleblkrdtim
+      ,sum(phyrds) phyrds
+      ,sum(readtim) readtim
+      ,sum(phyblkrd) phyblkrd
+     from dba_hist_filestatxs where dbid=(select dbid from v$database) 
+     group by dbid,instance_number,snap_id
+    )
+    join (select dbid,instance_number,snap_id,value physical_read from dba_hist_sysstat where stat_name='physical reads' and dbid=(select dbid from v$database) ) using(dbid,instance_number,snap_id)
+    join (select dbid,instance_number,snap_id,value physical_read_direct from dba_hist_sysstat where stat_name='physical reads direct' and dbid=(select dbid from v$database) ) using(dbid,instance_number,snap_id)
+    join dba_hist_snapshot using(dbid,instance_number,snap_id)
+  )
+  where begin_interval_time&gt;sysdate-8
+  group by 
+   dbid,snap_id,trunc(begin_interval_time,'hh24'),trunc(end_interval_time,'hh24')
+) s
+;</pre>
+<p>The output shows exactly what would have been gathered by dbms_stats except that I&#8217;ve summed all instances. I&#8217;ve verified that it matches what dbms_stats collects in 11.2.0.3 and 12.1.0.2.
+I&#8217;ve put the result in excel in order to show the following graphs.</p>
+<h3>Database load over the week</h3>
+<p>Here is the load over the week (displayed with Orachrome Lighty &#8211; my favorite tool for that). You can note that I&#8217;ve some periods of time without any i/o (in blue), so it will be interresting to see which i/o statistics will be calculated.</p>
+<p><a class="easyblog-thumb-preview" title="ASH_Response_TimeOLTP.jpg" href="http://blog.dbi-services.com/images/easyblog_images/139/ASH_Response_TimeOLTP.jpg" rel="lightbox[559]"><img title="b2ap3_thumbnail_ASH_Response_TimeOLTP.jpg" src="../images/easyblog_images/139/b2ap3_thumbnail_ASH_Response_TimeOLTP.jpg" alt="b2ap3_thumbnail_ASH_Response_TimeOLTP.jpg" /></a></p>
+<h3>SREADTIM and MREADTIM</h3>
+<p>Here is the graph about the SREADTIM and MREADTIM output of my query above.</p>
+<p><a class="easyblog-thumb-preview" title="statoltptim.png" href="http://blog.dbi-services.com/images/easyblog_images/139/statoltptim.png" rel="lightbox[559]"><img title="statoltptim.png" src="../images/easyblog_images/139/statoltptim.png" alt="statoltptim.png" /></a></p>
+<p>The first observation is the irregularity. Single block reads (SREADTIM) take between 4 and 30 milliseconds. The multiblock reads (MREADTIM) can go up to 100 milliseconds, but are some times very low.</p>
+<p>Another observation is that sometimes the MREADTIM is lower than SREADTIM. That makes no sense. It cannot be faster to do larger i/o. This is a side effect of something.</p>
+<p>Probably, some large direct-path reads are more subject to caching at filesystem or storage level. Especially for the blocks that were in the buffer cache and have been checkpointed just before the serial direct-path read. However the small reads are issued only when the block is not found in buffer cache, because they have not been read recently, then there is a low probability to find them in other caches. And in addition to that, when tempfiles are used for sorts or hash joins, they are probably cached at lower level as well.</p>
+<p>But direct-path reads is a major partof multiblock reads i/o since the introduciton of serial direct-path read in 11g.
+When you see that graph, you realize that you can&#8217;t run dbms_stats workload statistics just once because there is no relevant single period that is representative of the i/o workload.</p>
+<h3>MBRC</h3>
+<p>Here is the graph about the MBRC output of my query above. The orange value is the one calculated with the same formula as dbms_stats &#8211; not counting the blocks from direct.path reads.
+And I&#8217;ve added the blue includes the direct-path reads, just to compare. You see that most of the time the actual number of block read is the maximum size set by db_file_multiblock_read_count:</p>
+<p><a class="easyblog-thumb-preview" title="statoltpmbrc.png" href="http://blog.dbi-services.com/images/easyblog_images/139/statoltpmbrc.png" rel="lightbox[559]"><img title="statoltpmbrc.png" src="../images/easyblog_images/139/statoltpmbrc.png" alt="statoltpmbrc.png" /></a></p>
+<p>We immediately notice that the value that will comes from the dbms_stats formula and will be used by the optimizer is very small. And the value that measures all multiblock reads is high and reaches the maximum set by db_file_multiblock_read_count.</p>
+<p>Which one is good then? Do you want that the CBO costs full table scan with that small value that is acurate only for buffered reads?</p>
+<p>There are good reasons for it. Afterall, the CBO costs execution plan with a model that do not include several parameters such as the fact that blocks may be in cache, or that because of concurrency some blocks bust have lot of undo applied. So we can accept that the model do not include the fact that we can do serial direct path reads &#8211; which is a decision that depends on the same parameters (blocks in buffer cache and blocks modified).</p>
+<p>And, by the way, all the physical reads done to tempfiles must not me accounted into the average MBRC because they have nothing to do with full table scans. They count to evaluate MREADTIM but not for MBRC. This is probably the main reason why dbms_stats do not consider &#8216;physical direct path read&#8217;.</p>
+<h3>Conclusion</h3>
+<p>What I wanted to proove here is that the SREADTIM, MREADTIM and MBRC, as they are gathered by dbms_stats WORKLOAD statistics, is not constant at all and depend a lot on the kind of workload that is occuring. Then you must at least check the value that were gathered. And better: check from the AWR history and set a relevant value manually. And keep in mind that there are a lot of improvements for multiblock reads that the CBO is not aware of: serial direct-path reads and &#8211; when in exadata &#8211; smart scans.</p>
+<p>This is all about costing full table scans (and index fast full scans) vs. index access. That has always been difficult to handle (see my opinion about <a href="http://viewer.zmags.com/publication/a8a4c4aa#/a8a4c4aa/62">optimizer_index_cost_adj</a>). Having relevant system statistics is of major importance.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5600" data-img="http://blog.dbi-services.com/images/easyblog_images/139/b2ap3_thumbnail_ASH_Response_TimeOLTP.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1364">
+				<div id="div-comment-1364" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/d6a7d28aa19fb14f867461a3dad72978?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Nikolay Savvinov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1364">
+			January 27, 2015 at 8 h 00 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>there are several reasons why some of the results aren&#8217;t making much sense (like multiblock reads being faster than single-block ones):</p>
+<p>1) a multiblock read is typically a &#8220;continued read&#8221;, i.e. it doesn&#8217;t include time for seek; a single-block read typically does
+2) asynchronous I/O makes screws up many I/O metrics &#8212; see blogs by Frits Hoogland (where Oracle Wait Interface is not enough and others)
+3) hardware has become smarter so it&#8217;s doing a lot of work behind the scene to make I/O faster. it&#8217;s not just caching, it&#8217;s also read-ahead optimizations, the elevator optimization etc. As it always happens, while improving performance, such optimizations make it much harder to make any sense out of it.</p>
+<p>So picking the right mbrc has become a more difficult job these days. The only good news is that in most cases it doesn&#8217;t matter as much as it used to matter before (because of the listed optimizations).</p>
+<p>Best regards,
+  Nikolay
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13651"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1364' onclick='return addComment.moveForm( "div-comment-1364", "1364", "respond", "559" )' aria-label='Reply to Nikolay to Nikolay Savvinov'>Reply to Nikolay</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1366">
+				<div id="div-comment-1366" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1366">
+			January 28, 2015 at 7 h 53 min</a>		</div>
+
+		<p>Hi Nikolay,
+Thanks for your comment. I&#8217;m not sure I totally agree with the &#8216;doesn&#8217;t matter as much&#8217;. But, yes, when the database design is good, then the choice between full table scan vs. index would be obvious enough for the CBO so that it does no rely on small variations of MBRC.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13671"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1366' onclick='return addComment.moveForm( "div-comment-1366", "1366", "respond", "559" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

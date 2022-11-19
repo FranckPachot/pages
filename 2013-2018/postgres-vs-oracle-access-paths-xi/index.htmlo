@@ -1,0 +1,106 @@
+This was first published on <a href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-xi>https://blog.dbi-services.com/postgres-vs-oracle-access-paths-xi</a> (2017-08-26)
+								<h1 class="entry-title">Postgres vs. Oracle access paths XI &#8211; Sample Scan</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I was going to end this series with the <a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-x/" target="_blank">previous post</a> because the last access path available in Postgres is a bit special: a Seq Scan that returns only a sample of the rows, at random. However, it is the occasion to come back to the difference between random and sequential reads.
+<span id="more-18396"></span></p>
+<p>I&#8217;m still working on the same table as in the previous posts, with 10000 rows in 1429 pages. 5% of rows is 500 rows and 5% of blocks is about 72 pages.</p>
+<h3>Rows</h3>
+<p>Sometimes, you can answer your business question on a sample of rows, when you need an approximate result, trend or pattern Let&#8217;s say that you want to sum() on only 5 percent of rows:
+<pre>explain (analyze,verbose,costs,buffers) select  sum(a) from demo1 tablesample bernoulli(5) ;
+                                                      QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=1435.25..1435.26 rows=1 width=8) (actual time=1.940..1.940 rows=1 loops=1)
+   Output: sum(a)
+   Buffers: shared hit=1429
+   -&gt;  Sample Scan on public.demo1  (cost=0.00..1434.00 rows=500 width=4) (actual time=0.007..1.890 rows=509 loops=1)
+         Output: n, a, x
+         Sampling: bernoulli ('5'::real)
+         Buffers: shared hit=1429
+ Planning time: 0.373 ms
+ Execution time: 1.956 ms</pre></p>
+<p>This row sampling reads all rows and picks a sample of them at random. Unfortunately, it reads all blocks because you cannot get a good sample if you don&#8217;t know how many rows you have in each block. Working on a sample can make sense if you want to apply complex operations on the result. Here the cost in the database is similar to a Seq Scan: 1429 blocks read at seq_page_cost=1, but the sum() applied on 500 rows (cpu_operator_cost=0.0025) and 500 tuples from the scan and 1 tuple for the result, with cpu_tuple_cost=0.01</p>
+<p>From execution statistics, you can see that the result is exactly what we asked: 500 rows returned.</p>
+<p>Oracle has a different syntax and different algorithm:
+<pre>PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1tsadjdd9ddam, child number 0
+-------------------------------------
+select /*+  */  sum(a) from demo1 sample(5)
+-----------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |       |      1 |        |   397 (100)|      1 |00:00:00.01 |     581 |
+|   1 |  SORT AGGREGATE      |       |      1 |      1 |            |      1 |00:00:00.01 |     581 |
+|   2 |   TABLE ACCESS SAMPLE| DEMO1 |      1 |    500 |   397   (0)|    478 |00:00:00.01 |     581 |
+-----------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - (#keys=0) SUM("A")[22]
+   2 - (rowset=256) "A"[NUMBER,22]</pre></p>
+<p>Here we have not read all the blocks. Only 40% of them. This is faster than the Postgres approach, but the drawback is that the result is not exact: 478 rows were returned here.</p>
+<h3>Blocks</h3>
+<p>When we can afford an approximate sampling, we can sample on blocks rather than on rows:
+<pre>explain (analyze,verbose,costs,buffers) select  sum(a) from demo1 tablesample system(5) ;
+                                                     QUERY PLAN
+---------------------------------------------------------------------------------------------------------------------
+ Aggregate  (cost=290.25..290.26 rows=1 width=8) (actual time=0.479..0.480 rows=1 loops=1)
+   Output: sum(a)
+   Buffers: shared hit=73
+   -&gt;  Sample Scan on public.demo1  (cost=0.00..289.00 rows=500 width=4) (actual time=0.016..0.377 rows=511 loops=1)
+         Output: n, a, x
+         Sampling: system ('5'::real)
+         Buffers: shared hit=73
+ Planning time: 0.698 ms
+ Execution time: 0.509 ms</pre></p>
+<p>The number of rows is still good here, but the result may depend on the blocks sampled. Only 73 blocks were read, which is exactly 5% and of course, the rows may be distributed differently within the blocks. However, the advantage is that it is faster as it reads less blocks. But those blocks being picked at random, they are by definition random reads: 71 pages read at random_page_cost=0:4 and, as in the previous case, 501 cpu_tuple_cost and 500 cpu_operator_cost</p>
+<p>With block sampling, Oracle reads a smaller number of blocks than with row sampling, but still more than 5%, and the number of rows is not exact: 798 rows here:
+<pre>PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  fqgbwqfavgdrn, child number 0
+-------------------------------------
+select /*+  */  sum(a) from demo1 sample block(5)
+-----------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |       |      1 |        |    22 (100)|      1 |00:00:00.01 |     134 |
+|   1 |  SORT AGGREGATE      |       |      1 |      1 |            |      1 |00:00:00.01 |     134 |
+|   2 |   TABLE ACCESS SAMPLE| DEMO1 |      1 |    500 |    22   (0)|    798 |00:00:00.01 |     134 |
+-----------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - (#keys=0) SUM("A")[22]
+   2 - (rowset=256) "A"[NUMBER,22]
+</pre></p>
+<p>Again, as for the previous access paths: same concepts and different implementation between Postgres and Oracle. Everything looks similar and easily portable from a far overview, but going into details you see all those little differences which make it no so easy to be database agnostic or easily portable.</p>
+<h3>Summary</h3>
+<p>This is the end of this series comparing Postgres access path with Oracle ones. The goal is not to tell you that one is better than the other. They have a different approach, different targets, different price, different history and probably future. But understanding how they work and how they estimate the cost is a good way to learn. I&#8217;m myself learning a lot about Postgres while writing those posts, matching things I discover on Postgres with those I know for a while in Oracle.</p>
+<p>Here is the list of posts on Access Path:</p>
+<ol>
+<li><a href="../postgres-vs-oracle-access-paths-0/index.html" target="_blank">Postgres vs. Oracle access paths – intro</a></li>
+<li><a href="../postgres-vs-oracle-access-paths-i/index.html" target="_blank">Postgres vs. Oracle access paths I – Seq Scan</a></li>
+<li><a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-ii" target="_blank">Postgres vs. Oracle access paths II – Index Only Scan</a></li>
+<li><a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-iii" target="_blank">Postgres vs. Oracle access paths III &#8211; Partial Index</a></li>
+<li><a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-iv" target="_blank">Postgres vs. Oracle access paths IV – Order By and Index</a></li>
+<li><a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-v" target="_blank">Postgres vs. Oracle access paths V – FIRST ROWS and MIN/MAX</a></li>
+<li><a href="../postgres-vs-oracle-access-paths-vi/index.html" target="_blank">Postgres vs. Oracle access paths VI – Index Scan</a></li>
+<li><a href="../postgres-vs-oracle-access-paths-vii/index.html" target="_blank">Postgres vs. Oracle access paths VII – Bitmap Index Scan</a></li>
+<li><a href="../postgres-vs-oracle-access-paths-viii/index.html" target="_blank">Postgres vs. Oracle access paths VIII – Index Scan and Filter</a></li>
+<li><a href="../postgres-vs-oracle-access-paths-ix/index.html" target="_blank">Postgres vs. Oracle access paths IX – Tid Scan</a></li>
+<li><a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-x/" target="_blank">Postgres vs. Oracle access paths X – Update</a></li>
+<li><a href="index.html" target="_blank">Postgres vs. Oracle access paths XI – Sample Scan</a></li>
+</ol>
+<p>I think my next series will be on Join methods.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-183970"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

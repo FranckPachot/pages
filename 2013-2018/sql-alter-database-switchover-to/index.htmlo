@@ -1,0 +1,228 @@
+This was first published on <a href=https://blog.dbi-services.com/sql-alter-database-switchover-to>https://blog.dbi-services.com/sql-alter-database-switchover-to</a> (2015-10-21)
+								<h1 class="entry-title">SQL&gt; alter database switchover to &#8230;</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In 12c the manual switchover to physical standby requires only one command (ALTER DATABASE SWITCHOVER) instead of two (ALTER DATABASE COMMIT TO SWITCHOVER on each database). We usually recommend to use the broker and I wanted to see if the broker uses that new command or not. Let&#8217;s compare the alert.log for both manual and broker switchover.</p>
+<h3>One simple command</h3>
+<p>I have the broker configured, but try a manual switchover with that simple command:
+<pre>
+SQL&gt;  alter database switchover to demo12;
+Database altered.
+</pre></p>
+<p>then let&#8217;s look at he alert.log on primary and standby. I put only the minimum I want to show here.</p>
+<h3>alert.log on primary</h3>
+<p>Here is the initialisation (I&#8217;ve run the ALTER DATABASE SWITCHOVER on the primary):
+<pre>
+Wed Oct 21 22:57:10 2015
+ alter database switchover to demo12
+Wed Oct 21 22:57:10 2015
+Starting switchover [Process ID: 24349]
+Wed Oct 21 22:57:10 2015
+ALTER DATABASE COMMIT TO SWITCHOVER TO PHYSICAL STANDBY [Process Id: 24349] (DEMO11)
+Waiting for target standby to receive all redo
+</pre></p>
+<p>then after a few seconds:
+<pre>
+Switchover: Primary controlfile converted to standby controlfile succesfully.
+Switchover: Complete - Database shutdown required
+Sending request(convert to primary database) to switchover target DEMO12
+Switchover complete. Database shutdown required
+USER (ospid: 24349): terminating the instance
+Wed Oct 21 22:57:17 2015
+Instance terminated by USER, pid = 24349
+Completed:  alter database switchover to demo12
+Shutting down instance (abort)
+License high water mark = 9
+Wed Oct 21 22:57:17 2015
+Instance shutdown complete
+</pre></p>
+<p>The minimum is done there on the primary: role is changed to STANDBY and instance is terminated (shutdown abort)</p>
+<h3>alert.log on standby</h3>
+<p>Nothing to run on the second database, the switchover request has been sent to it:
+<pre>
+Wed Oct 21 22:57:13 2015
+SWITCHOVER: received request 'ALTER DTABASE COMMIT TO SWITCHOVER  TO PRIMARY' from primary database.
+Wed Oct 21 22:57:13 2015
+ALTER DATABASE SWITCHOVER TO PRIMARY (DEMO12)
+</pre>
+(the typo in DTABASE  is not mine)</p>
+<p>and the role is changed to PRIMARY:
+<pre>
+CLOSE: killing server sessions.
+CLOSE: all sessions shutdown successfully.
+SwitchOver after complete recovery through change 6571015
+Standby became primary SCN: 6571013
+Switchover: Complete - Database mounted as primary
+SWITCHOVER: completed request from primary database.
+</pre></p>
+<p>At that point, the primary is available, but it is not protected anymore: the new standby is down and the log shipping is not configured.</p>
+<h3>But if you used the broker</h3>
+<p>So I did a manual switchover but I had a broker configuration, so it is totally messed up. Let&#8217;s check it.</p>
+<p><pre>
+[oracle@VM111 trace]$ dgmgrl sys/oracle
+DGMGRL for Linux: Version 12.1.0.2.0 - 64bit Production
+
+Copyright (c) 2000, 2013, Oracle. All rights reserved.
+
+Welcome to DGMGRL, type "help" for information.
+Connected as SYSDG.
+DGMGRL&gt; show configuration
+ORA-01034: ORACLE not available
+Process ID: 0
+Session ID: 0 Serial number: 0
+
+Configuration details cannot be determined by DGMGRL
+</pre>
+Yes, of course, the new standby has to be restarted. In 12c I can do it from dgmgrl:
+<pre>
+DGMGRL&gt; startup
+ORACLE instance started.
+Database mounted.
+Database opened.
+DGMGRL&gt;
+</pre>
+then check the configuration again:
+<pre>
+DGMGRL&gt; show configuration
+
+Configuration - demo11
+
+  Protection Mode: MaxPerformance
+  Members:
+  demo11 - Primary database
+    demo12 - Physical standby database
+
+Fast-Start Failover: DISABLED
+
+Configuration Status:
+SUCCESS   (status updated 12 seconds ago)
+</pre>
+Humm&#8230; SUCESS, but totally messed-up. The broker still think that DEMO11 is the primary and DEMO12 the standby&#8230;
+<pre>
+DGMGRL&gt; show database demo12
+
+Database - demo12
+
+  Role:               PHYSICAL STANDBY
+  Intended State:     APPLY-ON
+  Transport Lag:      (unknown)
+  Apply Lag:          (unknown)
+  Average Apply Rate: 6.00 KByte/s
+  Real Time Query:    OFF
+  Instance(s):
+    DEMO12
+
+  Database Error(s):
+    ORA-16816: incorrect database role
+
+Database Status:
+ERROR
+</pre>
+When connecting to what is supposed to be the standby, the broker sees it&#8217;s actually a primary, this the &#8216;incorrect role&#8217; error.</p>
+<p>Two solutions to that: recreate the broker configuration, or switchover to the other way.
+But for the seconds solution, you need to finish some configuration:
+<pre>
+SQL&gt; alter database switchover to demo11;
+alter database switchover to demo11
+*
+ERROR at line 1:
+ORA-16474: target_db_name not found in the LOG_ARCHIVE_DEST_n parameter
+</pre>
+don&#8217;t think you can do it with the old syntax:
+<pre>
+SQL&gt;  ALTER DATABASE COMMIT TO SWITCHOVER TO PHYSICAL STANDBY;
+ ALTER DATABASE COMMIT TO SWITCHOVER TO PHYSICAL STANDBY
+*
+ERROR at line 1:
+ORA-16416: No viable Physical Standby switchover targets available
+</pre>
+You need to set LOG_ARCHIVE_DEST_n or the instance does not know where the current standby is.</p>
+<h3>what does the broker in addition to that</h3>
+<p>In order to compare, I did before a switchover with the broker, and I&#8217;ll show what differs in the alert logs between broker and manual switchover.</p>
+<p>Before the switchover, the broker does some verifications.
+On the primary:
+<pre>
+SWITCHOVER VERIFY: Send VERIFY request to switchover target demo12
+SWITCHOVER VERIFY COMPLETE
+</pre>
+On the standby:
+<pre>
+SWITCHOVER VERIFY BEGIN
+SWITCHOVER VERIFY COMPLETE
+SWITCHOVER: received request 'ALTER DTABASE COMMIT TO SWITCHOVER  TO PRIMARY' from primary database.
+</pre></p>
+<p>After the switchover (&#8216;Completed: ALTER DATABASE SWITCHOVER&#8217;) the primary is only stopped when switchover is initiated from sqlplus:
+<pre>
+Shutting down instance (abort)
+Instance shutdown complete
+</pre></p>
+<p>but now the broker restarts it :
+<pre>
+Data Guard Broker operation requires restart; shutting down instance now
+Starting ORACLE instance (normal) (OS id: 24088)
+Physical Standby Database mounted.
+Completed: alter database mount
+alter database open
+Data Guard Broker initializing...
+Beginning Standby Crash Recovery.
+Completed Standby Crash Recovery.
+</pre>
+and then the properties of the new primary are applied (no log shipping here as it is the standby):
+<pre>
+ALTER SYSTEM SET log_archive_dest_2='' SCOPE=BOTH;
+ALTER SYSTEM SET log_archive_dest_state_2='ENABLE' SCOPE=BOTH;
+ALTER SYSTEM SET log_archive_trace=0 SCOPE=BOTH SID='DEMO11';
+ALTER SYSTEM SET log_archive_format='%t_%s_%r.dbf' SCOPE=SPFILE SID='DEMO11';
+</pre>
+and it enters recovery mode:
+<pre>
+ALTER DATABASE RECOVER MANAGED STANDBY DATABASE DISCONNECT  NODELAY
+</pre></p>
+<p>On the new primary, the broker set all the properties for log shipping: ALTER SYSTEM SET&#8230;</p>
+<h3>Conclusion</h3>
+<p>What I wanted to show you here is that even if the new 12c syntax is very similar to the dgmgrl command, it does nothing more than before.
+Except if you want to make things complex (and who want to do that on a HA configuration?) you should use the broker.
+When all the properties are set in the broker, and once you&#8217;ve validated it by a switchover test, you can rely on it with no stress.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-45990"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7543">
+				<div id="div-comment-7543" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/d16287e0fcc9f7ebe4823310a541d799?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">khaled</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7543">
+			May 20, 2017 at 10 h 58 min</a>		</div>
+
+		<p>good post..
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75441"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7543' onclick='return addComment.moveForm( "div-comment-7543", "7543", "respond", "4598" )' aria-label='Reply to khaled to khaled'>Reply to khaled</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

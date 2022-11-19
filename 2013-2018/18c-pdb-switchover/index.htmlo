@@ -1,0 +1,467 @@
+This was first published on <a href=https://blog.dbi-services.com/18c-pdb-switchover>https://blog.dbi-services.com/18c-pdb-switchover</a> (2018-03-11)
+								<h1 class="entry-title">18c PDB switchover</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In multitenant, the recovery and availability are at CDB level. But customers asked for a switchover at PDB level so Oracle has done that in 18c, based on refreshable PDBs.</p>
+<p>For this test I have two multitenant database on an Oracle Cloud service in 18c: CDB1 and CDB2. The only special thing I did was disable the mandatory TDE encryption, because I was not able to have the switchover working. With TDE encryption, I got the &#8220;ORA-46697: Keystore password required&#8221;. But there is no &#8216;keystore identified by&#8217; option in the &#8216;alter pluggable database&#8217;. Then If you came upon this post from a search on this error, I&#8217;ve no solution yet (SR 3-17001228251 opened on the Oracle Cloud Support &#8211; see update at the end of the post when solved).
+<span id="more-21509"></span></p>
+<h3>Creating the source PDB</h3>
+<p>In CDB1 I create CDB1DEMO pluggable database:
+<pre>
+21:06:06 //localhost/CDB1 SQL&gt;create pluggable database CDB1DEMO admin user admin identified by oracle file_name_convert=('/pdbseed/','/CDB1DEMO/');
+Pluggable database CDB1DEMO created.
+</pre></p>
+<p>I could use &#8216;show pdb&#8217; but I use SQLcl and the current version (17.4) does not recognize Oracle 18c as a container database, so I&#8217;ve created my own alias to run a query onV$PDBS and DBA_PDBS:
+<pre>
+21:06:12 //localhost/CDB1 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right outer join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id;
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL              1214140                2 12:43:46        NONE                                                   944121613       1524290
+       3 CDB1DEMO   MOUNTED                  NEW               944121613                2 21:06:06        NONE                                                   944121613       1524290
+</pre></p>
+<p>CDB1DEMO is in mount state in V$PDBS and status is NEW because just created. You may wonder why I &#8216;right join&#8217; here as PDBs known by the database should always be known by the instance. But I said that I opened a SR for switchover with TDE and here I got an inconsistency between V$PDBS and DBA_PDBS.</p>
+<p><pre>
+21:06:12 //localhost/CDB1 SQL&gt;alter pluggable database CDB1DEMO open;
+Pluggable database CDB1DEMO altered.
+21:06:14 //localhost/CDB1 SQL&gt;select * from pdb_plug_in_violations;
+no rows selected
+
+21:06:15 //localhost/CDB1 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE    RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------    ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY    NO           NORMAL              1214140                2 12:43:46        NONE                                                   944121613       1524741
+       3 CDB1DEMO   READ WRITE   NO           NORMAL            944121613                2 21:06:06        NONE                                                   944121613       1524741
+</pre></p>
+<p>The CDB1DEMO PDB is opened READ WRITE. As my goal is to show refreshes, I need to have database with updates. To do it autonomously <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /> I create a materialized view refreshing its timestamp every second.</p>
+<p><pre>
+21:06:15 //localhost/CDB1 SQL&gt;create materialized view DEMO refresh complete start with (sysdate) next (sysdate+1/24/60/60) as select current_timestamp "refresh timestamp",current_scn "refresh scn" from v$database;
+Materialized view DEMO created.
+</pre></p>
+<p>Here is how I&#8217;ll query this autonomous <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /> materialized view, comparing the timestamp and SCN at the time of refresh with the current ones:
+<pre>
+21:06:16 //localhost/CDB1 SQL&gt;select demo.*,ora_rowscn,current_timestamp,(select current_scn from v$database) current_scn from demo;
+
+refresh timestamp                                 refresh scn   ORA_ROWSCN CURRENT_TIMESTAMP                                 CURRENT_SCN
+------- ---------                                 ------- ---   ---------- -----------------                                 -----------
+10-MAR-18 09.06.16.010529000 PM EUROPE/ZURICH         1524747      1524749 10-MAR-18 09.06.16.560146000 PM EUROPE/ZURICH         1524848
+</pre></p>
+<h3>Refreshable PDB refreshing every minute</h3>
+<p>On CDB1 I create the user I&#8217;ll use for the remote clone: C##SYSOPER which needs either SYSOPER or CREATE PLUGGABLE DATABASE privilege.
+<pre>
+21:06:17 //localhost/CDB1 SQL&gt;connect sys/oracle@//localhost/CDB1 as sysdba
+Connected.
+21:06:17 //localhost/CDB1 SQL&gt;grant create session, sysoper to C##SYSOPER identified by oracle1 container=all;
+Grant succeeded.
+
+21:06:18 //localhost/CDB1 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE    RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------    ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY    NO           NORMAL              1214140                2 12:43:46        NONE                                                   944121613       1524907
+       3 CDB1DEMO   READ WRITE   NO           NORMAL            944121613                2 21:06:06        NONE                                                   944121613       1524907
+</pre></p>
+<p>On CDB2 I create a database link to connect to this CDB1 user.
+<pre>
+21:06:18 //localhost/CDB1 SQL&gt;connect sys/oracle@//localhost/CDB2 as sysdba
+Connected.
+21:06:18 //localhost/CDB2 SQL&gt;create database link CDB1@SYSOPER connect to C##SYSOPER identified by oracle1 using '//localhost/CDB1'
+Database link CDB1@SYSOPER created.
+
+21:06:18 //localhost/CDB2 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL              1214140                2 12:53:21        NONE                                                   717451787       1522015
+</pre></p>
+<p>Here is the remote clone creating CDB2DEMO from CDB1DEMO, as a refreshable PDB, automatically refreshed every 1 minute (when it is in MOUNT):
+<pre>
+21:06:18 //localhost/CDB2 SQL&gt;create pluggable database CDB2DEMO from CDB1DEMO@CDB1@SYSOPER file_name_convert=('/CDB1/','/CDB2/','/CDB1DEMO/','/CDB2DEMO/') refresh mode every 1 minutes;
+Pluggable database CDB2DEMO created.
+</pre></p>
+<p>This is not new, we got it in 12cR2 and If you go to Collaborate 18 in Las Vegas next month I&#8217;ll demo it: <a href="https://app.attendcollaborate.com/event/member/448410" target="_blank">https://app.attendcollaborate.com/event/member/448410</a> , with all transportable tablespace and pluggable databases data movement.</p>
+<p>From the alert.log you can see the clone and one first refresh:
+<pre>
+21:06:28 //localhost/CDB2 SQL&gt;host ssh oracle@localhost 'ORACLE_HOME=/u01/app/oracle/product/18.0.0/dbhome_1 /u01/app/oracle/product/18.0.0/dbhome_1/bin/adrci exec="set home diag/rdbms/cdb2/CDB2; show alert -tail 30" '| grep --color -E "(^Completed:|^alter pluggable.*|^create pluggable.*|Media Recovery|onlined Undo|KILL|^Pluggable.*|^)"
+2018-03-10 21:06:18.317000 +01:00
+create pluggable database CDB2DEMO from CDB1DEMO@CDB1@SYSOPER file_name_convert=('/CDB1/','/CDB2/','/CDB1DEMO/','/CDB2DEMO/') refresh mode every 1 minutes keystore identified by *
+Opatch validation is skipped for PDB CDB2DEMO (con_id=4)
+2018-03-10 21:06:25.942000 +01:00
+Endian type of dictionary set to little
+****************************************************************
+Pluggable Database CDB2DEMO with pdb id - 4 is created as UNUSABLE.
+If any errors are encountered before the pdb is marked as NEW,
+then the pdb must be dropped
+local undo-1, localundoscn-0x00000000000000fb
+****************************************************************
+2018-03-10 21:06:27.413000 +01:00
+Applying media recovery for pdb-4099 from SCN 1524926 to SCN 1525064
+Remote log information: count-1
+thr-1, seq-2, logfile-/u01/fast_recovery_area/CDB1/foreign_archivelog/CDB1DEMO/2018_03_10/o1_mf_1_2_212315018_.arc, los-1497297, nxs-18446744073709551615
+Media Recovery Start
+Serial Media Recovery started
+max_pdb is 4
+Media Recovery Log /u01/fast_recovery_area/CDB1/foreign_archivelog/CDB1DEMO/2018_03_10/o1_mf_1_2_212315018_.arc
+Incomplete Recovery applied until change 1525064 time 03/10/2018 21:06:26
+Media Recovery Complete (CDB2)
+Completed: create pluggable database CDB2DEMO from CDB1DEMO@CDB1@SYSOPER file_name_convert=('/CDB1/','/CDB2/','/CDB1DEMO/','/CDB2DEMO/') refresh mode every 1 minutes keystore identified by *
+alter pluggable database refresh
+</pre></p>
+<p>You can&#8217;t open this one in READ WRITE as it is refreshed with the redo from the source, as you see in the alert.log, but you can open it in READ ONLY to query it or to clone it further:
+<pre>
+21:06:28 //localhost/CDB2 SQL&gt;alter pluggable database CDB2DEMO open read only;
+Pluggable database CDB2DEMO altered.
+
+21:06:32 //localhost/CDB2 SQL&gt;alter session set container=CDB2DEMO;
+Session altered.
+
+21:06:32 //localhost/CDB2 SQL&gt;select demo.*,ora_rowscn,current_timestamp,(select current_scn from v$database) current_scn from demo;
+
+refresh timestamp                          refresh scn   ORA_ROWSCN CURRENT_TIMESTAMP                                 CURRENT_SCN
+------- ---------                          ------- ---   ---------- -----------------                                 -----------
+10-MAR-18 09.06.27.140229000 PM +01:00         1525071      1525072 10-MAR-18 09.06.32.565600000 PM EUROPE/ZURICH         1525100
+</pre></p>
+<p>if you look at the timestamps, you can see that it is in sync from the source as of the time of the end of creation. The alert.log shows that a refresh happened just after the creation completion.
+<pre>
+21:06:39 //localhost/CDB2 SQL&gt;host ssh oracle@localhost 'ORACLE_HOME=/u01/app/oracle/product/18.0.0/dbhome_1 /u01/app/oracle/product/18.0.0/dbhome_1/bin/adrci exec="set home diag/rdbms/cdb2/CDB2; show alert -tail 30" '| grep --color -E "(^Completed:|^alter pluggable.*|^create pluggable.*|Media Recovery|onlined Undo|KILL|^Pluggable.*|^)"
+2018-03-10 21:06:28.674000 +01:00
+alter pluggable database CDB2DEMO open read only
+Applying media recovery for pdb-4099 from SCN 1525064 to SCN 1525083
+Remote log information: count-1
+thr-1, seq-2, logfile-/u01/fast_recovery_area/CDB1/foreign_archivelog/CDB1DEMO/2018_03_10/o1_mf_1_2_212315018_.arc, los-1497297, nxs-18446744073709551615
+Media Recovery Start
+Serial Media Recovery started
+2018-03-10 21:06:29.721000 +01:00
+max_pdb is 4
+Media Recovery Log /u01/fast_recovery_area/CDB1/foreign_archivelog/CDB1DEMO/2018_03_10/o1_mf_1_2_212315018_.arc
+Incomplete Recovery applied until change 1525083 time 03/10/2018 21:06:28
+Media Recovery Complete (CDB2)
+Completed: alter pluggable database refresh
+Autotune of undo retention is turned on.
+2018-03-10 21:06:30.880000 +01:00
+Undo initialization finished serial:0 start:4386360 end:4386360 diff:0 ms (0.0 seconds)
+Database Characterset for CDB2DEMO is AL32UTF8
+2018-03-10 21:06:32.305000 +01:00
+Opening pdb with no Resource Manager plan active
+Pluggable database CDB2DEMO opened read only
+Completed: alter pluggable database CDB2DEMO open read only
+</pre></p>
+<p>The refresh can happen only when the PDB is in MOUNT. If it was opened (READ ONLY) for a long time, it will have to retreive some archive logs. This is why you can see FOREIGN ARCHIVED LOG in your recovery area in 12cR2.</p>
+<p>So, basically here you have a kind of standby database at PDB level refreshed asynchonously, that you can open when you want:
+<pre>
+21:06:32 //localhost/CDB2 SQL&gt;alter session set container=CDB$ROOT;
+Session altered.
+21:06:32 //localhost/CDB2 SQL&gt;alter pluggable database CDB2DEMO close;
+Pluggable database CDB2DEMO altered.
+21:06:39 //localhost/CDB2 SQL&gt;alter pluggable database CDB2DEMO open read only;
+Pluggable database CDB2DEMO altered.
+21:06:40 //localhost/CDB2 SQL&gt;alter session set container=CDB2DEMO;
+Session altered.
+21:06:40 //localhost/CDB2 SQL&gt;select demo.*,ora_rowscn,current_timestamp,(select current_scn from v$database) current_scn from demo;
+
+refresh timestamp                          refresh scn   ORA_ROWSCN CURRENT_TIMESTAMP                                 CURRENT_SCN
+------- ---------                          ------- ---   ---------- -----------------                                 -----------
+10-MAR-18 09.06.27.140229000 PM +01:00         1525071      1525072 10-MAR-18 09.06.40.159432000 PM EUROPE/ZURICH         1525117
+
+21:06:40 //localhost/CDB2 SQL&gt;alter session set container=CDB$ROOT;
+Session altered.
+</pre></p>
+<p>You will probably do a last refresh before opening it, but I left it on purpose to show that the switchover will ensure that they are in sync.</p>
+<p>In 12cR2 if you want to &#8216;switchover&#8217;, you need to stop modifications to CDB1DEMO, alter CDB2DEMO in REFRESH NONE, then open it READ WRITE to be the new &#8216;primary&#8217; after a last refresh, and drop CDB1DEMO to create it as a refreshable clone from CDB2DEMO. And this is where comes the new 18c PDB Switchover: one command to do all this.</p>
+<p>Note that I leave the CDB2DEMO in opened (READ ONLY) or the switchover will fail with ORA-17628: Oracle error 65036 returned by remote Oracle server, ORA-65036: pluggable database  not open in required mode.</p>
+<p><pre>
+21:06:40 //localhost/CDB2 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS         FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------         ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL                  1214140                2 12:53:21        NONE                                                   717451787       1525131
+       4 CDB2DEMO   READ ONLY   NO           REFRESHING            944121613                3 21:06:18        AUTO                            1            1525083   717451787       1525131
+</pre></p>
+<h3>PDB Switchover</h3>
+<p>As the goal is to change roles, I need a SYSOPER user and a database link on the other sides:</p>
+<p>A user to connect to CDB2 which is the source we will refresh from after the switchover:
+<pre>
+21:06:40 //localhost/CDB2 SQL&gt;connect sys/oracle@//localhost/CDB2 as sysdba
+Connected.
+21:06:40 //localhost/CDB2 SQL&gt;grant create session, sysoper to C##SYSOPER identified by oracle2 container=all;
+Grant succeeded.
+</pre></p>
+<p>A database link from the CDB1 which will become the refreshing side:
+<pre>
+21:06:41 //localhost/CDB2 SQL&gt;connect sys/oracle@//localhost/CDB1 as sysdba
+Connected.
+21:06:41 //localhost/CDB1 SQL&gt; create database link CDB2@SYSOPER connect to C##SYSOPER identified by oracle2 using '//localhost/CDB2'
+Database link CDB2@SYSOPER created.
+</pre></p>
+<p>For the moment this side is in READ WRITE as it is the current &#8216;primary&#8217;
+<pre>
+21:06:41 //localhost/CDB1 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE    RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------    ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY    NO           NORMAL              1214140                2 12:43:46        NONE                                                   944121613       1525456
+       3 CDB1DEMO   READ WRITE   NO           NORMAL            944121613                2 21:06:06        NONE                                                   944121613       1525456
+</pre></p>
+<p>Here is the one-command refresh in 18c. We alter CDB1DEMO to be refreshable from CDB2DEMO, and we add &#8216;switchover&#8217; to stop refreshing the remote PDB as it will be now the &#8216;primary&#8217;.
+<pre>
+21:06:41 //localhost/CDB1 SQL&gt;alter pluggable database CDB1DEMO refresh mode every 1 minutes from CDB2DEMO@CDB2@SYSOPER switchover;
+Pluggable database CDB1DEMO altered.
+</pre></p>
+<p>The alert.log here from CDB1 shows &#8216;Deleted file&#8217; as in a DROP PLUGGABLE DATABASE, then &#8216;created as UNUSABLE&#8217; as in CREATE PLUGGABLE DATABASE, then &#8216;Applying media recovery&#8217; as in refreshable clone:
+<pre>
+21:06:59 //localhost/CDB1 SQL&gt;host ssh oracle@localhost 'ORACLE_HOME=/u01/app/oracle/product/18.0.0/dbhome_1 /u01/app/oracle/product/18.0.0/dbhome_1/bin/adrci exec="set home diag/rdbms/cdb1/CDB1; show alert -tail 30" '| grep --color -E "(^Completed:|^alter pluggable.*|^create pluggable.*|Media Recovery|onlined Undo|KILL|^Pluggable.*|^)"
+2018-03-10 21:06:41.354000 +01:00
+alter pluggable database CDB1DEMO refresh mode every 1 minutes from CDB2DEMO@CDB2@SYSOPER switchover
+JIT: pid 11896 requesting stop
+Buffer Cache flush started: 3
+Buffer Cache flush finished: 3
+While transitioning the pdb 3 to clean state, clearing all its abort bits in the control file.
+Pluggable database CDB1DEMO closed
+2018-03-10 21:06:45.734000 +01:00
+Deleted file /u01/oradata/CDB1/CDB1DEMO/temp012018-03-10_12-43-46-436-PM.dbf
+Deleted file /u01/oradata/CDB1/CDB1DEMO/undotbs01.dbf
+Deleted file /u01/oradata/CDB1/CDB1DEMO/sysaux01.dbf
+Deleted file /u01/oradata/CDB1/CDB1DEMO/system01.dbf
+2018-03-10 21:06:48.199000 +01:00
+Opatch validation is skipped for PDB CDB1DEMO (con_id=3)
+2018-03-10 21:06:55.321000 +01:00
+Endian type of dictionary set to little
+****************************************************************
+Pluggable Database CDB1DEMO with pdb id - 3 is created as UNUSABLE.
+If any errors are encountered before the pdb is marked as NEW,
+then the pdb must be dropped
+local undo-1, localundoscn-0x00000000000000fb
+****************************************************************
+2018-03-10 21:06:59.142000 +01:00
+Applying media recovery for pdb-4099 from SCN 1526441 to SCN 1526451
+Remote log information: count-1
+thr-1, seq-2, logfile-/u01/fast_recovery_area/CDB2/foreign_archivelog/CDB2DEMO/2018_03_10/o1_mf_1_2_2195948769_.arc, los-1497207, nxs-18446744073709551615
+Media Recovery Start
+Serial Media Recovery started
+max_pdb is 4
+Media Recovery Log /u01/fast_recovery_area/CDB2/foreign_archivelog/CDB2DEMO/2018_03_10/o1_mf_1_2_2195948769_.arc
+Incomplete Recovery applied until change 1526451 time 03/10/2018 21:06:55
+Media Recovery Complete (CDB1)
+Completed: alter pluggable database CDB1DEMO refresh mode every 1 minutes from CDB2DEMO@CDB2@SYSOPER switchover
+alter pluggable database refresh
+</pre></p>
+<p>The CDB1DEMO which was the &#8216;primary&#8217; in READ WRITE is now the &#8216;standby&#8217; in MOUNT, automatically refreshing every minute as mentioned in the switchover command:
+<pre>
+21:07:00 //localhost/CDB1 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS         FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------         ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL                  1214140                2 12:43:46        NONE                                                   944121613       1526489
+       3 CDB1DEMO   MOUNTED                  REFRESHING            717451787                4 21:06:06        AUTO                            1            1526451   944121613       1526489
+</pre></p>
+<p>As any refreshable clone, I can open it READ ONLY and query it:
+<pre>
+21:07:00 //localhost/CDB1 SQL&gt;alter pluggable database CDB1DEMO open read only;
+Pluggable database CDB1DEMO altered.
+
+21:07:02 //localhost/CDB1 SQL&gt;alter session set container=CDB1DEMO;
+Session altered.
+
+21:07:02 //localhost/CDB1 SQL&gt;select demo.*,ora_rowscn,current_timestamp,(select current_scn from v$database) current_scn from demo;
+
+refresh timestamp                          refresh scn   ORA_ROWSCN CURRENT_TIMESTAMP                                 CURRENT_SCN
+------- ---------                          ------- ---   ---------- -----------------                                 -----------
+10-MAR-18 09.06.41.175918000 PM +01:00         1525436      1525594 10-MAR-18 09.07.02.875782000 PM EUROPE/ZURICH         1526520
+</pre></p>
+<p>Look at the timestamp: the data is freshed as of the switchover. No data is lost: the transactions that were committed on the source at the time of switchover are applied on the clone.</p>
+<h3>Another switchover</h3>
+<p>I&#8217;m now doing a switchover on the opposite way. Same as before: the destination is READ ONLY and the source is READ WRITE:
+<pre>
+21:07:20 //localhost/CDB1 SQL&gt;connect sys/oracle@//localhost/CDB2 as sysdba
+Connected.
+21:07:20 //localhost/CDB2 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE    RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------    ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY    NO           NORMAL              1214140                2 12:53:21        NONE                                                   717451787       1526851
+       4 CDB2DEMO   READ WRITE   NO           NORMAL            944121613                3 21:06:18        NONE                                                   717451787       1526851
+</pre></p>
+<p>Here is the switchover
+<pre>
+21:07:20 //localhost/CDB2 SQL&gt;alter pluggable database CDB2DEMO refresh mode every 1 minutes from CDB1DEMO@CDB1@SYSOPER switchover;
+Pluggable database CDB2DEMO altered.
+</pre></p>
+<p>The alert.log shows an error at the end on the last refresh after the switchover:
+<pre>
+21:07:33 //localhost/CDB2 SQL&gt;host ssh oracle@localhost 'ORACLE_HOME=/u01/app/oracle/product/18.0.0/dbhome_1 /u01/app/oracle/product/18.0.0/dbhome_1/bin/adrci exec="set home diag/rdbms/cdb2/CDB2; show alert -tail 30" '| grep --color -E "(^Completed:|^alter pluggable.*|^create pluggable.*|Media Recovery|onlined Undo|KILL|^Pluggable.*|^)"
+2018-03-10 21:07:32.707000 +01:00
+Incomplete Recovery applied until change 1527253 time 03/10/2018 21:07:31
+Media Recovery Complete (CDB2)
+Completed: alter pluggable database CDB2DEMO refresh mode every 1 minutes from CDB1DEMO@CDB1@SYSOPER switchover
+alter pluggable database refresh
+ORA-65376 signalled during: alter pluggable database refresh...
+Errors in file /u01/app/oracle/diag/rdbms/cdb2/CDB2/trace/CDB2_j000_12081.trc:
+ORA-12012: error on auto execute of job "SYS"."CDB2DEMO_510111146_REFRESH"
+ORA-65376: unable to refresh the PDB
+ORA-06512: at "SYS.DBMS_SQL", line 2995
+ORA-06512: at line 1
+</pre></p>
+<p>The content of the tracefile doesn&#8217;t tell a lot more:
+<pre>
+ORA-12012: error on auto execute of job "SYS"."CDB2DEMO_510111146_REFRESH"
+ at 0x7ffd3c59af38 placed jslv.c@1659
+ORA-65376: unable to refresh the PDB
+ORA-06512: at "SYS.DBMS_SQL", line 2995
+ORA-06512: at line 1
+</pre></p>
+<p>However, the switchover was ok, so nothing was lost and I&#8217;ll be able to run new refreshes later.</p>
+<p>The CDB2DEMO is now the &#8216;standby&#8217; again:
+<pre>
+21:07:33 //localhost/CDB2 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS         FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------         ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL                  1214140                2 12:53:21        NONE                                                   717451787       1527275
+       4 CDB2DEMO   MOUNTED                  REFRESHING            944121613                3 21:06:18        AUTO                            1            1527253   717451787       1527275
+</pre></p>
+<p>The CDB1 DEMO is now the &#8216;primary&#8217; in READ WRITE':
+<pre>
+21:07:34 //localhost/CDB2 SQL&gt;connect sys/oracle@//localhost/CDB1 as sysdba
+Connected.
+21:07:34 //localhost/CDB1 SQL&gt;pdbs
+21:07:34 //localhost/CDB1 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE    RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------    ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY    NO           NORMAL              1214140                2 12:43:46        NONE                                                   944121613       1527257
+       3 CDB1DEMO   READ WRITE   NO           NORMAL            717451787                4 21:06:06        NONE                                                   944121613       1527257
+</pre></p>
+<p>The standby is refreshing, containing the data as-of the time of switchover, until ne next refresh:
+<pre>
+21:07:34 //localhost/CDB1 SQL&gt;connect sys/oracle@//localhost/CDB2 as sysdba
+Connected.
+21:07:35 //localhost/CDB2 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS         FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------         ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL                  1214140                2 12:53:21        NONE                                                   717451787       1527276
+       4 CDB2DEMO   MOUNTED                  REFRESHING            944121613                3 21:06:18        AUTO                            1            1527253   717451787       1527276
+
+21:07:35 //localhost/CDB2 SQL&gt;alter session set container=CDB2DEMO;
+Session altered.
+
+21:07:36 //localhost/CDB2 SQL&gt;select demo.*,ora_rowscn,current_timestamp,(select current_scn from v$database) current_scn from demo;
+
+refresh timestamp                          refresh scn   ORA_ROWSCN CURRENT_TIMESTAMP                                 CURRENT_SCN
+------- ---------                          ------- ---   ---------- -----------------                                 -----------
+10-MAR-18 09.07.20.108426000 PM +01:00         1526838      1526839 10-MAR-18 09.07.36.114424000 PM EUROPE/ZURICH         1527282
+</pre></p>
+<p>I&#8217;ve checked the state the next day. The &#8216;primary&#8217; PDB had its materlialized view still refreshing every second:
+<pre>
+12:44:48 //localhost/CDB2 SQL&gt;connect sys/oracle@//localhost/CDB1 as sysdba
+Connected.
+12:44:48 //localhost/CDB1 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE    RESTRICTED   STATUS     FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------    ----------   ------     ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY    NO           NORMAL              1214140                2 12:43:46        NONE                                                   944121613       1767409
+       4 CDB1DEMO   READ WRITE   NO           NORMAL            717451787                3 12:43:31        NONE                                                   944121613       1767409
+
+12:44:48 //localhost/CDB1 SQL&gt;alter session set container=CDB1DEMO;
+Session altered.
+
+12:44:49 //localhost/CDB1 SQL&gt;select demo.*,ora_rowscn,current_timestamp,(select current_scn from v$database) current_scn from demo;
+
+refresh timestamp                          refresh scn   ORA_ROWSCN CURRENT_TIMESTAMP                                 CURRENT_SCN
+------- ---------                          ------- ---   ---------- -----------------                                 -----------
+11-MAR-18 12.44.33.078430000 PM +01:00         1766975      1766976 11-MAR-18 12.44.49.085200000 PM EUROPE/ZURICH         1767410
+</pre></p>
+<p>And the &#8216;standby&#8217; PDB is updating every minute:
+<pre>
+12:44:49 //localhost/CDB1 SQL&gt;connect sys/oracle@//localhost/CDB2 as sysdba
+Connected.
+
+12:44:49 //localhost/CDB2 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS         FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------         ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL                  1214140                2 12:53:21        NONE                                                   717451787       1767422
+       3 CDB2DEMO   MOUNTED                  REFRESHING            944121613                4 12:43:42        AUTO                            1            1767399   717451787       1767422
+
+12:44:49 //localhost/CDB2 SQL&gt;alter session set container=CDB2DEMO;
+Session altered.
+
+12:44:49 //localhost/CDB2 SQL&gt;alter pluggable database open read only;
+Pluggable database OPEN altered.
+
+12:44:50 //localhost/CDB2 SQL&gt;select demo.*,ora_rowscn,current_timestamp,(select current_scn from v$database) current_scn from demo;
+
+refresh timestamp                          refresh scn   ORA_ROWSCN CURRENT_TIMESTAMP                                 CURRENT_SCN
+------- ---------                          ------- ---   ---------- -----------------                                 -----------
+11-MAR-18 12.44.33.078430000 PM +01:00         1766975      1766976 11-MAR-18 12.44.50.205050000 PM EUROPE/ZURICH         1767432
+</pre></p>
+<h3>But no failover</h3>
+<p>When we are talking about &#8216;standby&#8217; at PDB level, we want to be able to do a failover. Of course, we accept to loose some transactions as the refresh is every minutes, but 1 minute RPO is still an interesting solution for a feature that is available in all editions.</p>
+<p>However, as in 12.2.0.1, this doesn&#8217;t work because you cannot alter &#8216;standby&#8217; PDB to REFRESH MODE NONE when the &#8216;primary&#8217; is not available.</p>
+<p>Here is my &#8216;standby&#8217; PDB CDB2DEMO:
+<pre>
+12:44:50 //localhost/CDB2 SQL&gt;connect sys/oracle@//localhost/CDB2 as sysdba
+Connected.
+
+12:44:50 //localhost/CDB2 SQL&gt;select con_id,name con_name,open_mode,restricted,status,foreign_cdb_dbid,foreign_pdb_id,to_char(creation_time, 'hh24:mi:ss') creation_time,refresh_mode,refresh_interval,last_refresh_scn,cdb_dbid,current_scn from v$pdbs right join dba_pdbs using(con_id,creation_time,dbid) cross join (select dbid cdb_dbid,current_scn from v$database)  order by pdb_id
+
+  CON_ID CON_NAME   OPEN_MODE   RESTRICTED   STATUS         FOREIGN_CDB_DBID   FOREIGN_PDB_ID CREATION_TIME   REFRESH_MODE     REFRESH_INTERVAL   LAST_REFRESH_SCN    CDB_DBID   CURRENT_SCN
+  ------ --------   ---------   ----------   ------         ----------------   -------------- -------------   ------------     ----------------   ----------------    --------   -----------
+       2 PDB$SEED   READ ONLY   NO           NORMAL                  1214140                2 12:53:21        NONE                                                   717451787       1767433
+       3 CDB2DEMO   READ ONLY   NO           REFRESHING            944121613                4 12:43:42        AUTO                            1            1767405   717451787       1767433
+</pre></p>
+<p>I stop the listener which listens for the &#8216;primary&#8217; CDB1DEMO:
+<pre>
+12:44:50 //localhost/CDB2 SQL&gt;host lsnrctl stop
+
+LSNRCTL for Linux: Version 18.0.0.0.0 - Production on 11-MAR-2018 12:44:50
+
+Copyright (c) 1991, 2017, Oracle.  All rights reserved.
+
+Connecting to (ADDRESS=(PROTOCOL=tcp)(HOST=)(PORT=1521))
+The command completed successfully
+</pre></p>
+<p>You can see in the alert.log that the refresh fails (it is running from a scheduler job):
+<pre>
+Errors in file /u01/app/oracle/diag/rdbms/cdb2/CDB2/trace/CDB2_j000_25443.trc:
+ORA-12012: error on auto execute of job "SYS"."CDB2DEMO_1159316120_REFRESH"
+ORA-17627: ORA-12514: TNS:listener does not currently know of service requested in connect descriptor
+ORA-17629: Cannot connect to the remote database server
+ORA-06512: at "SYS.DBMS_SQL", line 2995
+ORA-06512: at line 1
+</pre></p>
+<p>Then, an attempt to stop the refreshing mode of the &#8216;standby&#8217; fails with &#8216;Cannot connect to the remote database server':
+<pre>
+12:44:50 //localhost/CDB2 SQL&gt;alter pluggable database CDB2DEMO close;
+Pluggable database CDB2DEMO altered.
+
+12:44:50 //localhost/CDB2 SQL&gt;alter pluggable database CDB2DEMO refresh mode none;
+
+Error starting at line : 180 File @ ~/PDB-switchover.sql
+In command -
+alter pluggable database CDB2DEMO refresh mode none
+Error report -
+ORA-17627: ORA-12541: TNS:no listener
+ORA-17629: Cannot connect to the remote database server
+17627. 00000 -  "%s"
+*Cause:    An error returned by OCI while sending/receiving message from remote instance
+*Action:   Look at error message and take appropriate action or contact Oracle Support Services for further assistance
+</pre></p>
+<p>So nothing new here about failover. I already explained how to do something like a failover by cloning the standby, which can be a snapshot clone to be faster: <a href="../12cr2-pdb-refresh-as-a-poor-man-standby/index.html" target="_blank">https://blog.dbi-services.com/12cr2-pdb-refresh-as-a-poor-man-standby/</a>.</p>
+<p>Note that this new feature is leashed to specific platforms only &#8211;  Oracle Cloud PaaS and Oracle Exadata machine, so most of Oracle customers paying for software update will not be able to use it. However, Don&#8217;t worry, you can do the same with a few commands, as in 12cR2.</p>
+<h3>Update APR-2018</h3>
+<p>The answer from support is that this feature is currently only supported with auto-login wallet. Oracle DBaaS is created with an auto-login wallet. In my test, I did not because having the wallet in the same filesystem defeats the purpose of encryption, but database created with the Oracle DBaaS are created with an autologin wallet, when is where this feature can be used.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-215100"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,274 @@
+This was first published on <a href=https://blog.dbi-services.com/purging-unified-audit-trail-in-12cr2>https://blog.dbi-services.com/purging-unified-audit-trail-in-12cr2</a> (2017-03-19)
+								<h1 class="entry-title">Purging Unified Audit Trail in 12cR2</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>A good thing from 12.2 is that the implementation of Unified Audit Trail has changed a little. It was stored in a weird CLI_SWP$ table but now we have a normal partitioned table named AUD$UNIFIED. In a <a href="../purging-unified-audit-trail-in-12cr1/index.html" target="_blank">previous post</a> I traced the two purge method: purge all before a timestamp, or purge all. Here is the same in 12.2
+<span id="more-15077"></span></p>
+<h3>Purge old</h3>
+<p>I have quite a few record in Unified Audit Trail here.</p>
+<p><pre>
+SQL&gt; select unified_audit_policies,action_name,count(*) from unified_audit_trail group by unified_audit_policies,action_name;
+
+UNIFIED_AUDIT_POLICIES                   ACTION_NAME            COUNT(*)
+---------------------------------------- -------------------- ----------
+                                         EXECUTE                       3
+ORA_LOGON_FAILURES                       LOGON                    408275
+</pre></p>
+<p>I set the timestamp to 6 hours before now
+<pre>SQL&gt; exec dbms_audit_mgmt.set_last_archive_timestamp(audit_trail_type=&gt;dbms_audit_mgmt.audit_trail_unified
+,last_archive_time=&gt;sysdate-6/24);
+PL/SQL procedure successfully completed.</pre>
+And call the clean procedure:
+<pre>SQL&gt; exec dbms_audit_mgmt.clean_audit_trail(audit_trail_type=&gt;dbms_audit_mgmt.audit_trail_unified
+,use_last_arch_timestamp=&gt;TRUE);
+PL/SQL procedure successfully completed.</pre></p>
+<p>Here is what I see in the trace:</p>
+<p><pre>select sys.dbms_audit_mgmt.is_droppable_partition(:1, :2)
+from
+ dual</pre></p>
+<p>This is interesting. The Unified Audit Trail is partitioned on timestamp and the purge procedure checks it the partition can be dropped instead of running a long delete statement.</p>
+<p>Here is the documentation we have about it in ?/rdbms/admin/dbmsamgt.sql</p>
+<p><pre>  -- is_droppable_partition - IS aud$unified table PARTITION DROPPABLE?
+  --
+  --
+  -- INPUT PARAMETERS
+  -- partname - aud$unified table's Partition Name
+  -- lat      - Last Archive Timestamp mentioned during cleanup
+</pre></p>
+<p>In my case, I traced the bind variables and the is_droppable_partition procedure was run only once with partname=&gt;'&#8221;SYS_P348&#8243;&#8216; and lat=&gt;&#8217;03-MAR-17 03.07.56 PM&#8217;. The timestamp is the &#8216;last timestamp&#8217; I&#8217;ve set, and I have only one partition here because my database was created recently.</p>
+<p>As we can guess, this checks the high value of the partition:</p>
+<p><pre>select high_value
+from
+ dba_tab_partitions where table_owner = 'AUDSYS' and table_name =
+  'AUD$UNIFIED' and partition_name = :1</pre></p>
+<p>Because I have only one partition, which is the current one, my &#8216;last timestamp&#8217; is below the high_value so it is not possible to truncate this partition and keep the records from after the &#8216;last timestamp&#8217;.</p>
+<p>Then a delete is run, which deletes all rows from before my last timestamp (bind variable :1 is &#8217;03-MAR-17 03.07.56 PM&#8217;). Note that I don&#8217;t know (yet) why we can have DBID=0.</p>
+<p><pre>delete from audsys.aud$unified
+where
+ event_timestamp &lt; :1 and  (dbid = :2 or dbid = 0)
+
+call     count       cpu    elapsed       disk      query    current        rows
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+Parse        1      0.00       0.00          0          0          0           0
+Execute      2     10.68      31.25      16885      24367     437518      346517
+Fetch        0      0.00       0.00          0          0          0           0
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+total        3     10.68      31.25      16885      24367     437518      346517
+
+Misses in library cache during parse: 1
+Misses in library cache during execute: 1
+Optimizer mode: ALL_ROWS
+Parsing user id: SYS   (recursive depth: 1)
+Number of plan statistics captured: 1
+
+Rows (1st) Rows (avg) Rows (max)  Row Source Operation
+---------- ---------- ----------  ---------------------------------------------------
+         0          0          0  DELETE  AUD$UNIFIED (cr=12219 pr=16885 pw=0 time=31219023 us starts=1)
+    346517     346517     346517   PARTITION RANGE ITERATOR PARTITION: 1 KEY (cr=12148 pr=0 pw=0 time=1161311 us starts=1 cost=547 size=1231218 card=68401)
+    346517     346517     346517    TABLE ACCESS FULL AUD$UNIFIED PARTITION: 1 KEY (cr=12148 pr=0 pw=0 time=788043 us starts=1 cost=547 size=1231218 card=68401)
+
+Elapsed times include waiting on following events:
+  Event waited on                             Times   Max. Wait  Total Waited
+  ----------------------------------------   Waited  ----------  ------------
+  PGA memory operation                            5        0.00          0.00
+  db file sequential read                     16885        0.03         21.03
+</pre></p>
+<p>All my rows are deleted with conventional updates here. I had 400000 rows, deleted 340000 so 60000 remains.</p>
+<h3>Purge old with old partitions</h3>
+<p>I had only one partition here but AUDSYS.AUD$UNIFIED is partitioned by month. Here is what I can see in my alert.log about the creation of this partition:
+<pre>TABLE AUDSYS.AUD$UNIFIED: ADDED INTERVAL PARTITION SYS_P348 (33) VALUES LESS THAN (TIMESTAMP' 2017-04-01 00:00:00')</pre></p>
+<p>Actually, this is automatically partitioned by months. Here is an excerpt of the table&#8217;s DDL as displayed by dbms_metadata:
+<pre>  PARTITION BY RANGE ("EVENT_TIMESTAMP") INTERVAL (INTERVAL '1' MONTH)
+ (PARTITION "SYS_P348"  VALUES LESS THAN (TIMESTAMP' 2017-04-01 00:00:00') SEGMENT CREATION IMMEDIATE</pre></p>
+<p>When running the same as before but on a database with few older partitions (because there were no scheduled purge) I can see that the &#8216;is_droppable_partition&#8217; and the related query is run 4 times:</p>
+<p><pre>select high_value
+from
+ dba_tab_partitions where table_owner = 'AUDSYS' and table_name =
+  'AUD$UNIFIED' and partition_name = :1
+
+call     count       cpu    elapsed       disk      query    current        rows
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+Parse        1      0.00       0.00          0          0          0           0
+Execute      4      0.05       0.05          0          0          0           0
+Fetch        4      0.00       0.00          0        143          0           4
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+total        9      0.05       0.06          0        143          0           4</pre></p>
+<p>and I see a drop partition for the 3 old partitions:</p>
+<p><pre>ALTER TABLE AUDSYS.AUD$UNIFIED DROP PARTITION AUD_UNIFIED_P0
+ALTER TABLE AUDSYS.AUD$UNIFIED DROP PARTITION SYS_P221
+ALTER TABLE AUDSYS.AUD$UNIFIED DROP PARTITION SYS_P781</pre></p>
+<p>Note that this is called by:
+<pre>CALL DBMS_PDB_EXEC_SQL('ALTER TABLE AUDSYS.AUD$UNIFIED DROP PARTITION SYS_P781')</pre>
+which runs it internally as an oracle script because this DDL is not allowed otherwise.</p>
+<p>In summary, purging with a timestamp is optimized to run conventional deletes only on latest partition. Older partitions are dropped. If you schedule a job to regularly set the timestamp and then have the purge job doing the cleaning, then better to set a timestamp at the beginning of the month. If you have to purge a large audit trail, then better to wait the beginning of the next month.</p>
+<h3>Purge all</h3>
+<p>If you don&#8217;t need to keep recent records and want to truncate all, then just call the purge without timestamp.</p>
+<p>Here I have about 60000 rows remaining from the previous test, all in the current partition.</p>
+<p><pre>SQL&gt; select unified_audit_policies,action_name,count(*) from unified_audit_trail group by unified_audit_policies,action_name;
+
+UNIFIED_AUDIT_POLICIES                   ACTION_NAME            COUNT(*)
+---------------------------------------- -------------------- ----------
+                                         EXECUTE                       6
+ORA_LOGON_FAILURES                       LOGON                     62152
+</pre></p>
+<p>I call the clean</p>
+<p><pre>SQL&gt; exec dbms_audit_mgmt.clean_audit_trail(audit_trail_type=&gt;dbms_audit_mgmt.audit_trail_unified
+,use_last_arch_timestamp=&gt;FALSE);
+PL/SQL procedure successfully completed.</pre></p>
+<p>And I can see directly in the trace a truncate of the whole table:</p>
+<p><pre>TRUNCATE TABLE AUDSYS.AUD$UNIFIED
+
+call     count       cpu    elapsed       disk      query    current        rows
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+Parse        1      0.00       0.00          0          0          0           0
+Execute      1      0.04       4.42         67          6        919           0
+Fetch        0      0.00       0.00          0          0          0           0
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+total        2      0.04       4.42         67          6        919           0
+
+Misses in library cache during parse: 1
+Optimizer mode: ALL_ROWS
+Parsing user id: SYS   (recursive depth: 1)
+
+Elapsed times include waiting on following events:
+  Event waited on                             Times   Max. Wait  Total Waited
+  ----------------------------------------   Waited  ----------  ------------
+  db file sequential read                        67        0.00          0.07
+  enq: RO - fast object reuse                     5        0.94          1.76
+  local write wait                               36        0.14          2.54</pre></p>
+<p>This is the fastest way to empty the Unified Audit Trail.</p>
+<h3>So what?</h3>
+<p>We don&#8217;t have long experience on 12.2 production yet, but from what I see here, this new implementation is a good thing. There were many problems with the 12.1 implementations that are probably solved by having a normal table with normal interval partitioning, purged with normal deletes and normal truncates.
+Of course, the next question is what happens when you upgrade a 12.1 database with a huge audit trail? That&#8217;s for a future post.
+And don&#8217;t forget that by default you are in mixed mode. More info <a href="../12c-unified-auditing-and-audit_traildb-in-mixed-mode/index.html" target="_blank">here</a>.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-150780"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-7158">
+				<div id="div-comment-7158" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/0908b6561e88e4d921496dd81127be53?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://oracle.ninja' rel='external nofollow' class='url'>Dejan Topalovic</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7158">
+			March 20, 2017 at 0 h 48 min</a>		</div>
+
+		<p>Hi Franck,
+thanks for this article &#8211; great as always! <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":)" class="wp-smiley" /></p>
+<p>Is the parameter AUDIT_TRAIL set to NONE or to some other value?
+I stumbled upon a bug &#8216;Bug 19383839 – “Logon” and “Failed Logon” not recorded by Unified Audit if AUDIT_TRAIL=NONE (Doc ID 19383839.8)&#8217;? I still didn&#8217;t check, if this bug is solved in the new 12.2 or not &#8211; please, could you give it a try? <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":)" class="wp-smiley" /></p>
+<p>Kind regards
+Dejan
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-71591"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7158' onclick='return addComment.moveForm( "div-comment-7158", "7158", "respond", "15077" )' aria-label='Reply to Dejan to Dejan Topalovic'>Reply to Dejan</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7159">
+				<div id="div-comment-7159" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7159">
+			March 20, 2017 at 9 h 24 min</a>		</div>
+
+		<p>Hi Dejan,
+Yes good remark. Yes this bug is fixed in 12.2 because I did my tests for <a href="../12c-unified-auditing-and-audit_traildb-in-mixed-mode/index.html" rel="nofollow">https://blog.dbi-services.com/12c-unified-auditing-and-audit_traildb-in-mixed-mode/</a> in 12.2 and audit_trail is ignored with pure mode of Unified Auditing,
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-71601"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7159' onclick='return addComment.moveForm( "div-comment-7159", "7159", "respond", "15077" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1 parent" id="comment-7790">
+				<div id="div-comment-7790" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/77ce4b271aa244566166473fa55b9c69?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.muniqsoft.de' rel='external nofollow' class='url'>Marco Patzwahl</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7790">
+			July 4, 2017 at 16 h 49 min</a>		</div>
+
+		<p>Very good Post. Thanks !
+Small Typo in Clean proc:
+wrong: use_last_arch_timestamp=TRUE
+correct: use_last_arch_timestamp=&gt;TRUE</p>
+<p>Kind Regards
+Marco
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-77911"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7790' onclick='return addComment.moveForm( "div-comment-7790", "7790", "respond", "15077" )' aria-label='Reply to Marco to Marco Patzwahl'>Reply to Marco</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7791">
+				<div id="div-comment-7791" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7791">
+			July 4, 2017 at 17 h 01 min</a>		</div>
+
+		<p>Thanks, Marco I&#8217;ve fixed it.
+Kind regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-77921"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7791' onclick='return addComment.moveForm( "div-comment-7791", "7791", "respond", "15077" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

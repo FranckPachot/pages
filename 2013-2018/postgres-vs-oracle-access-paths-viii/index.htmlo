@@ -1,0 +1,190 @@
+This was first published on <a href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-viii>https://blog.dbi-services.com/postgres-vs-oracle-access-paths-viii</a> (2017-08-20)
+								<h1 class="entry-title">Postgres vs. Oracle access paths VIII &#8211; Index Scan and Filter</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="../postgres-vs-oracle-access-paths-vii/index.html" target="_blank">previous post</a> we have seen a nice optimization to lower the consequences of bad correlation between the index and the table physical order: a bitmap, which may include false positives and then requires a &#8216;recheck&#8217; of the condition, but with the goal to read each page only once. Now we are back to the well-clustered table where we have seen two possible access paths: IndexOnlyScan when all columns we need are in the index, and IndexScan when we select additional columns. Here is a case in the middle: the index does not have all the columns required by the select, but can eliminate all rows.
+<span id="more-17957"></span>
+The table created is:
+<pre>
+create table demo1 as select generate_series n , 1 a , lpad('x',1000,'x') x from generate_series(1,10000);
+SELECT 10000
+create unique index demo1_n on demo1(n);
+CREATE INDEX
+vacuum demo1;
+VACUUM
+</pre></p>
+<h3>Index Only Scan and Filter</h3>
+<p>I use only one column (N), which is indexed, in the SELECT clause and the WHERE clause. And this WHERE clause is silly: in addition to the n&lt;=1000 I&#039;ve used in previous post to focus on 10% of rows, I add a condition which is always false: mod(n,100)=1000
+<pre>
+explain (analyze,verbose,costs,buffers) select  n from demo1  where n&lt;=1000 and mod(n,100)=1000 ;
+                                                         QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_n on public.demo1  (cost=0.29..38.78 rows=5 width=4) (actual time=0.276..0.276 rows=0 loops=1)
+   Output: n
+   Index Cond: (demo1.n &lt;= 1000)
+   Filter: (mod(demo1.n, 100) = 1000)
+   Rows Removed by Filter: 1000
+   Heap Fetches: 0
+   Buffers: shared hit=5
+ Planning time: 0.454 ms
+ Execution time: 0.291 ms
+</pre></p>
+<p>Index Only Scan is used here because no other columns are used. The n&lt;=1000 is the access condition (Index Cond.) doing a range scan on the index structure. The mod(n,100)=1000 is a filter predicate which is applied to the result of the index access (Filter) and we have additional information that the 1000 rows selected by the access predicate have been filtered out (Rows Removed by Filter). During the execution, 5 index buffers have been read for the range scan (branches + leaves). Because I vacuumed any changes, the visibility map knows that all rows can be displayed and there are no blocks to read from the table (Heap Fetches).</p>
+<p>Now I&#8217;ll select another column in order to see an Index Scan. We have seen in the previous post that the huge cost of index access is the access to the table. Filtering most of the rows from the index entries is the most common recommendation to optimize a query. And my example here is running the extreme case: a predicate on the indexed column removes all rows.</p>
+<h3>Index Scan and Filter</h3>
+<p>I&#8217;ve just changed the &#8216;select n&#8217; to &#8216;select a':</p>
+<p><pre>
+explain (analyze,verbose,costs,buffers) select  a from demo1  where n&lt;=1000 and mod(n,100)=1000 ;
+                                                       QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------
+ Index Scan using demo1_n on public.demo1  (cost=0.29..184.78 rows=5 width=4) (actual time=0.427..0.427 rows=0 loops=1)
+   Output: a
+   Index Cond: (demo1.n &lt;= 1000)
+   Filter: (mod(demo1.n, 100) = 1000)
+   Rows Removed by Filter: 1000
+   Buffers: shared hit=147
+ Planning time: 0.434 ms
+ Execution time: 0.440 ms
+</pre></p>
+<p>I can understand that the cost is higher. The optimizer may not know that mod(n,100) will never be equal to 1000. Estimating 5 rows, as in the previous case, is ok for me. We see different Output (different SELECT clause) but same information about Index Cond, Filter, and Rows Removed (same WHERE clause). The estimation part looks good.</p>
+<p>However, there&#8217;s something that I can&#8217;t understand. At execution, we know that all rows can be removed before going to the table. We go to the table to get the value from A but all rows were filtered out from the index. At least it was the case with the Index Only Scan, and we know that the filter condition has all values from the index.</p>
+<p>However, 147 blocks were read here. We have seen that the index scan reads 5 index pages, and then we can guess that 142 table pages have been read, exactly 10% of the pages from my correlated table. It seems that all rows have been read from the table before being filtered out. The Index Scan being one operation, the filter occurs at the end only. This is only my guess and I hope to get comments about that.</p>
+<h3>Oracle</h3>
+<p>With Oracle, the first query, selecting only indexed columns is an INDEX RANGE SCAN similar to the Postgres one.
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  fj36y2vph9u8f, child number 0
+-------------------------------------
+select /*+  */  n from demo1  where n&lt;=1000 and mod(n,100)=1000
+---------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |         |      1 |        |     4 (100)|      0 |00:00:00.01 |       3 |
+|*  1 |  INDEX RANGE SCAN| DEMO1_N |      1 |     10 |     4   (0)|      0 |00:00:00.01 |       3 |
+---------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - access(&quot;N&quot;&lt;=1000)
+       filter(MOD(&quot;N&quot;,100)=1000)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - &quot;N&quot;[NUMBER,22]
+</pre>
+Oracle does not know either that the filter predicate mod(n,100)=1000 eliminates all rows and estimates this kind of predicate to 10% of rows (a generic value) after the access predicate returning 10% (this one is calculated from statistics). 3 blocks were read: index branch + leaves.</p>
+<p>Reading an additional table from the column does not change this INDEX RANGE SCAN operation but just adds one step to go to the table:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1rpmvq3jj8hgq, child number 0
+-------------------------------------
+select /*+  */  a from demo1  where n&lt;=1000 and mod(n,100)=1000
+----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                           | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                    |         |      1 |        |     6 (100)|      0 |00:00:00.01 |       3 |
+|   1 |  TABLE ACCESS BY INDEX ROWID BATCHED| DEMO1   |      1 |     10 |     6   (0)|      0 |00:00:00.01 |       3 |
+|*  2 |   INDEX RANGE SCAN                  | DEMO1_N |      1 |     10 |     4   (0)|      0 |00:00:00.01 |       3 |
+----------------------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - access(&quot;N&quot;&lt;=1000)
+       filter(MOD(&quot;N&quot;,100)=1000)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - &quot;A&quot;[NUMBER,22]
+   2 - &quot;DEMO1&quot;.ROWID[ROWID,10]
+</pre></p>
+<p>Having two operations, the filter removes the rows on the output of the index range scan on line 2 and then has to go to the table only for rows that remain. No additional buffer reads on this step 1 when there are no rows. With Oracle, we build indexes to optimize the access predicates and we add columns to optimize the filter predicate. We can go further by adding all projections and avoid completely the access to the table, but that is not always needed. If we can apply all where clause filters on the indexed columns, then the access to the table remains proportional to the result. And the end-user usually accept longer response time for long results. And index access response time is proportional to the result.</p>
+<p>The decomposition in two operations is also convenient to see which columns projection is done for the index result or the table result. Here the only output of the index range scan at line 2 is the ROWID and the output from the table access at line 1 is the column we select. So, we have two operations here. We have seen that INDEX RANGE SCAN can run alone. And we will see in the next post that the TABLE ACCESS BY INDEX ROWID can also run alone.</p>
+<h3>So what?</h3>
+<p>I hope that Postgres experts will comment about the need to read the table pages even when we can filter all rows from the index scan. We can do something similar by re-writing the query where we can see that the access to the table is never executed:
+<pre>
+explain (analyze,verbose,costs,buffers) select  a from demo1 where n in (select n from demo1  where n&lt;=1000 and mod(n,100)=1000 ) ;
+                                                                QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop  (cost=0.57..76.35 rows=5 width=4) (actual time=0.285..0.285 rows=0 loops=1)
+   Output: demo1.a
+   Buffers: shared hit=5
+   -&gt;  Index Only Scan using demo1_n on public.demo1 demo1_1  (cost=0.29..34.78 rows=5 width=4) (actual time=0.284..0.284 rows=0 loops=1)
+         Output: demo1_1.n
+         Index Cond: (demo1_1.n &lt;= 1000)
+         Filter: (mod(demo1_1.n, 100) = 1000)
+         Rows Removed by Filter: 1000
+         Heap Fetches: 0
+         Buffers: shared hit=5
+   -&gt;  Index Scan using demo1_n on public.demo1  (cost=0.29..8.30 rows=1 width=8) (never executed)
+         Output: demo1.n, demo1.a, demo1.x
+         Index Cond: (demo1.n = demo1_1.n)
+</pre></p>
+<p>But this involves a join, and join methods will deserve another series of blog posts. The <a href="../postgres-vs-oracle-access-paths-ix/index.html" target="_blank">next one</a> on access paths will show the TABLE ACCESS BY INDEX ROWID equivalent, Tid Scan. Then I&#8217;ll have covered all access paths.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-179580"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-8184">
+				<div id="div-comment-8184" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/212115a31533862673813157bcfdd033?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://twitter.com/VladimirSitnikv' rel='external nofollow' class='url'>Vladimir Sitnikov</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-8184">
+			August 21, 2017 at 11 h 06 min</a>		</div>
+
+		<p>Hi,</p>
+<p>Would you please try applying this patch and retest?
+<a href="https://www.postgresql.org/message-id/5d6769ab-215d-d71f-c02f-7541663783ec%40postgrespro.ru" rel="nofollow">https://www.postgresql.org/message-id/5d6769ab-215d-d71f-c02f-7541663783ec%40postgrespro.ru</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-81851"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-8184' onclick='return addComment.moveForm( "div-comment-8184", "8184", "respond", "17957" )' aria-label='Reply to Vladimir to Vladimir Sitnikov'>Reply to Vladimir</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-8206">
+				<div id="div-comment-8206" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-8206">
+			August 23, 2017 at 22 h 27 min</a>		</div>
+
+		<p>Thanks, Vladimir. Good to see that the problem has been raised. I&#8217;ll way to see if volunteers test the patch.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-82071"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-8206' onclick='return addComment.moveForm( "div-comment-8206", "8206", "respond", "17957" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

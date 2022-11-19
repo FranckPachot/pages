@@ -1,0 +1,168 @@
+This was first published on <a href=https://blog.dbi-services.com/unplugged-pluggable-databases>https://blog.dbi-services.com/unplugged-pluggable-databases</a> (2016-08-15)
+								<h1 class="entry-title">Unplugged pluggable databases</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When Oracle Multitenant came out in 12<em>c</em>, with pluggable databases, it was easy to draw them as USB sticks that you can plug and unplug to/from your Container Database (CDB). I don&#8217;t like this because it gives the false idea that an unplugged database is detached from the container.
+<span id="more-9928"></span></p>
+<h3>Containers</h3>
+<p>In the Oracle documentation, the <a href="https://docs.oracle.com/database/121/CNCPT/cdbovrvw.htm#CNCPT89235" target="_blank">Concept book</a>, the description of the multitenant architecture starts with an illustration of a CDB.
+<img src="https://docs.oracle.com/database/121/CNCPT/img/GUID-BC43D44A-C696-4216-9D9A-F34FD1F8D709-default.png" alt="CDB with two PDBs" /> where the text description starts like:
+<em>This graphic depicts a CDB as a cylinder. Inside the CDB is a box labeled &#8220;Root (CDB$ROOT).&#8221; Plugged into the box is the Seed (CDB$SEED), hrpdb, and salespdb. </em></p>
+<p>Let me list what I don&#8217;t like with this description:</p>
+<ol>
+<li>There are 5 containers here but 3 ways to draw them. The CDB itself is a container (CDB_ID=0) and is a cylinder. The CDB$ROOT (CON_ID=1) is a container and is a box. The PDB$SEED, and the user PDBs are cylinders with USB plug.</li>
+<li>The CDB$ROOT do not look like a database (cylinder). However, physically it&#8217;s the same: SYSTEM, SYSAUX, UNDO, TEMP tablepsaces</li>
+<li>The PDB$SEED (CON_ID=1) looks like it is pluggable (USB stick) but you never unplug the PDB$SEED</li>
+<li>The USB plug is plugged inside the CDB$ROOT. That&#8217;s wrong. All containers inside a CDB are at the same level and are &#8216;plugged&#8217; in the CDB (CON_ID=0) and not the CDB$ROOT(CON_ID=1). They are contained by the CDB and if they are plugged somewhere, it&#8217;s in the CDB controlfile. The root is a root for metadata and object links, not for the whole PDBs.
+</li>
+</ol>
+<p>If I had to show pluggable databases as USB sticks it would be like that:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/08/CaptureUSBStick.png" rel="lightbox[9928]"><img src="../wp-insides/uploads/sites/2/2016/08/CaptureUSBStick.png" alt="CaptureUSBStick" width="762" height="446" class="alignnone size-full wp-image-10174" /></a></p>
+<p>Here CDB$ROOT is a container like the pluggable databases, except that you cannot unplug it. PDB$SEED is a pluggable database but that you don&#8217;t unplug. The CDB is a container but do not look like a database. It&#8217;s the controlfile and the instance, but there&#8217;s no datafiles directly attached to the CDB.</p>
+<h3>Unplugged</h3>
+<p>However with this illustration, we can think that an unplugged pluggable database is detached from the CDB, which is wrong.
+<pre>
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB                            READ WRITE NO
+SQL&gt; alter pluggable database PDB close;
+Pluggable database altered.
+
+SQL&gt; alter pluggable database PDB unplug into '/tmp/PDB.xml';
+Pluggable database altered.
+
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB                            MOUNTED
+</pre>
+Here PDB is unplugged, but still pertains to the CDB.</p>
+<p>The CDB controlfile still addresses all the PDB datafiles:
+<pre>
+RMAN&gt; report schema;
+
+using target database control file instead of recovery catalog
+Report of database schema for database with db_unique_name CDB
+
+List of Permanent Datafiles
+===========================
+File Size(MB) Tablespace           RB segs Datafile Name
+---- -------- -------------------- ------- ------------------------
+1    829      SYSTEM               YES     /u02/app/oracle/oradata/CDB/system01.dbf
+3    1390     SYSAUX               NO      /u02/app/oracle/oradata/CDB/sysaux01.dbf
+4    4771     UNDOTBS1             YES     /u02/app/oracle/oradata/CDB/undotbs01.dbf
+5    270      PDB$SEED:SYSTEM      NO      /u02/app/oracle/oradata/CDB/pdbseed/system01.dbf
+6    2        USERS                NO      /u02/app/oracle/oradata/CDB/users01.dbf
+7    540      PDB$SEED:SYSAUX      NO      /u02/app/oracle/oradata/CDB/pdbseed/sysaux01.dbf
+12   280      PDB:SYSTEM           NO      /u02/app/oracle/oradata/CDB/3969397A986337DCE053B6CDC40AC61C/datafile/o1_mf_system_ctcxz29m_.dbf
+13   570      PDB:SYSAUX           NO      /u02/app/oracle/oradata/CDB/3969397A986337DCE053B6CDC40AC61C/datafile/o1_mf_sysaux_ctcxz2bb_.dbf
+</pre></p>
+<p>The datafiles 12 and 13 are the ones from my unplugged PDB, still known and managed by the CDB.</p>
+<h3>Backup</h3>
+<p>An unplugged PDB has data, and data should have backups. Who is responsible for the unplugged PDB backups? It&#8217;s still the CDB:
+<pre>
+RMAN&gt; backup database;
+
+...
+channel ORA_DISK_1: starting full datafile backup set
+channel ORA_DISK_1: specifying datafile(s) in backup set
+input datafile file number=00013 name=/u02/app/oracle/oradata/CDB/3969397A986337DCE053B6CDC40AC61C/datafile/o1_mf_sysaux_ctcxz2bb_.dbf
+input datafile file number=00012 name=/u02/app/oracle/oradata/CDB/3969397A986337DCE053B6CDC40AC61C/datafile/o1_mf_system_ctcxz29m_.dbf
+...
+</pre></p>
+<p>The unplugged CDB is not detached at all and the CDB is still referencing its files and is responsible for them. This is very different from an unplugged USB stick which has no link anymore with the hosts it was plugged-in before.</p>
+<h3>Backup optimization</h3>
+<p>If you wonderwhether it&#8217;s good to backup an unplugged PDB with each CDB backup, don&#8217;t worry. RMAN knows that it is in a state where it cannot be modified (like read-only tablespaces) and do not backup it each time. Of course, you need to have BACKUP OPTIMIZATION is configured to ON:</p>
+<p><pre>RMAN&gt; backup database;
+
+Starting backup at 15-AUG-16
+using channel ORA_DISK_1
+skipping datafile 12; already backed up 2 time(s)
+skipping datafile 13; already backed up 2 time(s)
+channel ORA_DISK_1: starting full datafile backup set
+channel ORA_DISK_1: specifying datafile(s) in backup set</pre></p>
+<h3>Unplug and DROP</h3>
+<p>From what we have seen, an unplugged PDB is like a closed PDB. There&#8217;s a difference through: an unplugged PDB is closed forever. You cannot open it again:
+<pre>
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB                            MOUNTED
+SQL&gt; alter pluggable database PDB open;
+alter pluggable database PDB open
+*
+ERROR at line 1:
+ORA-65086: cannot open/close the pluggable database
+
+SQL&gt; host oerr ora 65086
+65086, 00000, "cannot open/close the pluggable database"
+// *Cause:  The pluggable database has been unplugged.
+// *Action: The pluggable database can only be dropped.
+</pre></p>
+<p>So, if you want to keep the USB stick analogy, unplugged do not mean &#8216;physically unplugged&#8217; but something like what you should do before removing a USB stick:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/08/Screenshot-2016-08-15-10.44.46.png" rel="lightbox[9928]"><img src="../wp-insides/uploads/sites/2/2016/08/Screenshot-2016-08-15-10.44.46.png" alt="Screenshot 2016-08-15 10.44.46" width="359" height="91" class="alignnone size-full wp-image-10179" /></a></p>
+<p>In summary:</p>
+<p>ALTER PLUGGABLE DATABASE &#8230; UNPLUG is like the logical &#8216;eject&#8217; you do to be sure that what you will remove physically was closed forever.
+ALTER PLUGGABLE DATABASE &#8230; DROP &#8230; KEEP DATAFILES is the physical removal from the CDB</p>
+<p>Because DROP is the only thing that can be done on an unplugged PDB, SQL Developer do the both when you click on &#8216;unplug':
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/08/CaptureUNPLUGDROP.png" rel="lightbox[9928]"><img src="../wp-insides/uploads/sites/2/2016/08/CaptureUNPLUGDROP.png" alt="CaptureUNPLUGDROP" width="613" height="226" class="alignnone size-full wp-image-10180" /></a></p>
+<p>The idea to drop it just after the unplug is probably there to prevent the risk to drop it &#8216;including datafiles&#8217; after it has been plugged into another CDB. Because then it is lost.
+However, keep in mind that when unplugged and dropped, nobody will backup the PDB datafiles until it is plugged into a new CDB.</p>
+<h3>Read-Only</h3>
+<p>There&#8217;s a last one more difference. A USB stick can be read-only. A plugged PDB cannot. You may want to share a database from a read-only filesystem, like you can do with transportable tablespaces. but you can&#8217;t:
+<pre>
+SQL&gt; drop pluggable database PDB keep datafiles;
+Pluggable database dropped.
+
+SQL&gt; create pluggable database PDB using '/tmp/PDB.xml';
+Pluggable database created.
+
+SQL&gt; alter pluggable database PDB open read only;
+alter pluggable database PDB open read only
+*
+ERROR at line 1:
+ORA-65085: cannot open pluggable database in read-only mode
+</pre></p>
+<p>The plugged PDB must be opened in read/write mode at least once:
+<pre>SQL&gt; host oerr ora 65085
+65085, 00000, "cannot open pluggable database in read-only mode"
+// *Cause:  The pluggable database has been created and not opened.
+// *Action: The pluggable database needs to be opened in read/write or
+//          restricted mode first.</pre></p>
+<p>And only then, it can be opened read-only:
+<pre>
+SQL&gt; alter pluggable database PDB open;
+Pluggable database altered.
+
+SQL&gt; alter pluggable database PDB close;
+Pluggable database altered.
+
+SQL&gt; alter pluggable database PDB open read only;
+Pluggable database altered.
+</pre></p>
+<h3>So what&#8230;</h3>
+<p>Here is the way I visualize pluggable databases:</p>
+<p><a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2016/08/CaptureCON_ID.png" rel="lightbox[9928]"><img src="../wp-insides/uploads/sites/2/2016/08/CaptureCON_ID.png" alt="CaptureCON_ID" width="803" height="518" class="alignnone size-full wp-image-10182" /></a></p>
+<p>Just a bunch of tablespaces, referenced by the CDB controlfile and grouped by self-contained containers. CDB$ROOT cannot be cloned nor unplugged. PDB$SEED can be cloned but not unplugged (but it&#8217;s a PDB). Other PDBs can be cloned and unplugged.</p>
+<p>I&#8217;ll talk about multitenant at Oracle Open World, DOAG Conference and UKOUG TECH16.
+There&#8217;s also a <a href="https://www.amazon.com/Oracle-Database-Release-Multitenant-Press/dp/1259836096">book</a> coming, probably early 2017 (depends on 12.2 availability)</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-99290" data-img="https://docs.oracle.com/database/121/CNCPT/img/GUID-BC43D44A-C696-4216-9D9A-F34FD1F8D709-default.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

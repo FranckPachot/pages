@@ -1,0 +1,91 @@
+This was first published on <a href=https://blog.dbi-services.com/unstructed-vs-structured>https://blog.dbi-services.com/unstructed-vs-structured</a> (2017-11-18)
+								<h1 class="entry-title">Unstructured vs. structured</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The title of this blog post was: &#8220;Tracing DBMS_RCVMAN for reclaimable archivelogs&#8221; until I started to write the conclusion&#8230;</p>
+<p>In a <a href="../archivelog-deletion-policy-on-data-guard-configuration/index.html" target="_blank">previous post</a> I mentioned that there&#8217;s a bug with archivelog deletion policy when you want to mention both the &#8216;BACKED UP &#8230; TIMES TO &#8230;&#8217; and &#8216;APPLIED&#8217; or &#8216;SHIPPED&#8217; as conditions for archived logs to be reclaimable. I opened a SR, they didn&#8217;t even try to reproduce it (and I can guarantee you can reproduce it in 2 minutes on any currently supported version) so I traced it myself to understand the bug and suggest the fix.
+<span id="more-19634"></span>
+I traced the DBMS_RCVMAN with Kernel Recovery Area function SQL Tracing:
+<pre>
+SQL&gt; alter session set events 'trace[kra_sql] disk high, memory disable';
+SQL&gt; exec dbms_backup_restore.refreshAgedFiles;
+SQL&gt; alter session set events 'trace[kra_sql] off';
+</pre>
+I know refreshAgedFiles checks for reclaimable file in FRA since it was an <a href="https://blog.dbi-services.com/archivelog-deletion-policy-for-standby-database-in-oracle-data-guard/" target="_blank">old bug</a> where we had to run it manually on databases in mount.</p>
+<p>I compared the traces when changing the order of &#8216;APPLIED&#8217; and &#8216;BACKED UP&#8217; and found the following:
+<pre>
+&lt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: setRedoLogDeletionPolicy with policy = TO BACKED UP 1 TIMES TO DISK APPLIED ON ALL STANDBY
+---
+&gt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: setRedoLogDeletionPolicy with policy = TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK
+5340c5340
+&lt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: policy = TO BACKED UP 1 TIMES TO DISK APPLIED ON ALL STANDBY
+---
+&gt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: policy = TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK
+5343c5343
+&lt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: EXITING setRedoLogDeletionPolicy with policy = TO BACKED UP 1 TIMES TO DISK APPLIED ON ALL STANDBY with alldest = 1
+---
+&gt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: EXITING setRedoLogDeletionPolicy with policy = TO APPLIED ON ALL STANDBY BACKED UP 1 TIMES TO DISK with alldest = 1
+5350,5351c5350,5351
+&lt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: parseBackedUpOption devtype=DISK
+&lt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: parseBackedUpOption backed up conf - devtype=DISK , backups=1
+---
+&gt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: parseBackedUpOption devtype=DISK
+&gt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: parseBackedUpOption backed up conf - devtype=DISK, backups=1
+5363c5363
+&lt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: EXITING getBackedUpAl with TRUE
+---
+&gt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: EXITING getBackedUpAl with key = 128 stamp = 958068130
+5367c5367
+&lt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: EXITING getBackedUpFiles with: no_data_found
+---
+&gt; *:KRA_SQL:kraq.c@1035:kraqgdbg(): DBGRCVMAN: EXITING getBackedUpFiles
+</pre>
+You see at the top the difference in the way I mentioned the deletion policy. You see at the bottom that the first one (starting with &#8216;BACKED UP&#8217;) didn&#8217;t find archivelogs being backed up (no_data_found). But the second one (starting with &#8216;APPLIED&#8217;) mentioned the sequence# 128.</p>
+<p>But if you look carefully, you see another difference in the middle: the &#8220;devtype=DISK&#8221; has an additional space before the comma in the first case.</p>
+<p>So I traced a bit further, including SQL_TRACE and I found that the deletion policy is just using some INSTR and SUBSTR parsing on the deletion policy text to find the policy, the backup times, and the device type. For sure, looking for backups with DEVICE_TYPE=&#8217;DISK &#8216; instead of &#8216;DISK&#8217; will not find anything and this is the reason for the bug: no archived logs backed up means no archived log reclaimable.</p>
+<p>If you look closer at DBMS_RCVMAN you will find that the device type is extracted with SUBSTR(:1, 1, INSTR(:1, &#8216; &#8216;)) when the device type is followed by a space, which is the reason of this additional space. The correct extraction should be SUBSTR(:1, 1, INSTR(:1, &#8216; &#8216;)-1) and this is what I suggested on the SR.</p>
+<h3>So what?</h3>
+<p>Writing the conclusion made me change the title. Currently, a lot of people are advocating for unstructured data. Because it is easy (which rhymes with &#8216;lazy&#8217;). Store information as it comes and postpone the parsing to a more structured data type until you need to process it. This seems to be how the RMAN configuration is stored: as the text we entered. And it is parsed later with simple text function as INSTR(), SUBSTR(), and LIKE. But you can see how a little bug, such as reading an additional character, has big consequences. If you look at the archivelog deletion policy <a href="https://docs.oracle.com/database/122/RCMRF/img_text/GUID-122A51BB-C97D-440D-8843-ACEE0FE1A9C4-print.htm" target="_blank">syntax</a>, you have 50% chances to run into this bug on a Data Guard configuration. The Recovery Area will fill up and your database will be blocked. The controlfile grows. Or you noticed it before and you run a &#8216;delete archivelog&#8217; statement without knowing the reason. You waste space, removing some recovery files from local storage, which could have been kept for longer. If the deletion policy was parsed immediately when entered, like SQL DDL or PL/SQL APIs, the issue would have been detected a long time ago. Structure and strong typing is the way to build robust applications.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-196350"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-9408">
+				<div id="div-comment-9408" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/93e1432e6c88032b3c661da30d669266?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://Community.oracle.com/blogs/dearDBA' rel='external nofollow' class='url'>Frank Dernoncourt</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-9408">
+			November 23, 2017 at 15 h 52 min</a>		</div>
+
+		<p>Good investigative job Franck. Make sure Oracle Support reads your blog post.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-94091"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-9408' onclick='return addComment.moveForm( "div-comment-9408", "9408", "respond", "19634" )' aria-label='Reply to Frank to Frank Dernoncourt'>Reply to Frank</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

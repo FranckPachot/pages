@@ -1,0 +1,210 @@
+This was first published on <a href=https://blog.dbi-services.com/12c-nologging-and-data-guard>https://blog.dbi-services.com/12c-nologging-and-data-guard</a> (2017-05-03)
+								<h1 class="entry-title">12c nologging and Data Guard</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>The title sounds weird because Data Guard synchronisation is based on the redo stream, so it makes no sense to do nologging operations on the primary. And this is the reason why we set FORCE LOGGING on a Data Guard configuration. However, to lower the downtime of a migration done with Data Pump, you may want to import with minimal logging and then re-synchronize the standby. This post is about the re-synchronisation in 12.1
+<span id="more-16146"></span></p>
+<h3>Nologging Data Pump</h3>
+<p>When you want to lower the downtime for a migration, you can disable force logging (alter database no force logging), and run impdp with the following: <pre>transform=disable_archive_logging:y</pre>
+Don&#8217;t forget to re-enable force_logging at the end and to re-synchronize the standby.</p>
+<h3>nonlogged (aka unrecoverable)</h3>
+<p>So, you have nonlogged blocks, we also call that unrecoverable because it cannot be recovered with the redo stream. If you are in 12.2 then everything is easy with <pre>recover database nonlogged block;</pre> and I explained that in a previous post: <a href="../12cr2-recover-nonlogged-blocks-after-nologging-in-data-guard/index.html" target="_blank">https://blog.dbi-services.com/12cr2-recover-nonlogged-blocks-after-nologging-in-data-guard/</a></p>
+<p>If you are in 12.2 then it is half easy only. You can see where you have nonlogged blocks:
+<pre>RMAN&gt; select file#,reason,count(*) from v$nonlogged_block group by file#,reason;
+&amp;bsp;
+     FILE# REASON    COUNT(*)
+---------- ------- ----------
+         5 UNKNOWN        158
+         6 UNKNOWN        159
+         7 UNKNOWN        336
+         8 UNKNOWN         94
+         9 UNKNOWN         16
+        10 UNKNOWN         14</pre>
+and this is the right way to query them. If you use RMAN &#8216;report unrecoverable&#8217; it will not display the datafiles that had nologging operations on the primary.</p>
+<p>In 12.1 you can RESTORE FROM SERVICE to recover from the primary rather than from a backup. It is straightforward. I&#8217;m just writing this blog post in case you see the following when you try to do this because the message can be misinterpreted:</p>
+<p><pre>
+RMAN&gt; restore database from service 'MYDB_SITE1_dgmgrl';
+
+Starting restore at 03-MAY-2017 13:22:12
+using channel ORA_DISK_1
+
+skipping datafile 1; already restored to SCN 3849354
+skipping datafile 2; already restored to SCN 3849356
+skipping datafile 3; already restored to SCN 3849358
+skipping datafile 4; already restored to SCN 3849360
+skipping datafile 5; already restored to SCN 3849365
+skipping datafile 6; already restored to SCN 3849372
+skipping datafile 7; already restored to SCN 3849382
+skipping datafile 8; already restored to SCN 3849389
+skipping datafile 9; already restored to SCN 3849395
+skipping datafile 10; already restored to SCN 3849398
+restore not done; all files read only, offline, or already restored
+Finished restore at 03-MAY-2017 13:22:12
+</pre></p>
+<p>RMAN is clever enough: the data files are ok, according to their header and it skipped the restore. But you know that they are not ok, because some blocks are marked as corrupt because of nologging operations. Then what to do? There is a FORCE option in the restore command. But you probably don&#8217;t need it. If you get the previous message, it means that the datafiles are synchronized, which means that the APPLY is running. And, anyway, in order to restore you need to stop the APPLY.</p>
+<p><pre>
+DGMGRL&gt; edit database orclb set state=apply-off;
+</pre></p>
+<p>Of course, once you stopped the apply, you run your RESTORE DATABASE FORCE. But you probably don&#8217;t need it. Now, the datafiles are stale and RMAN will not skip them even without the FORCE keyword.</p>
+<p><pre>
+RMAN&gt; restore database from service 'MYDB_SITE1_dgmgrl';
+
+Starting restore at 03-MAY-2017 13:22:37
+using channel ORA_DISK_1
+
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: using network backup set from service MYDB_SITE1_dgmgrl
+channel ORA_DISK_1: specifying datafile(s) to restore from backup set
+channel ORA_DISK_1: restoring datafile 00001 to /media/raid-db/MYDB/system01.dbf
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:07
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: using network backup set from service MYDB_SITE1_dgmgrl
+...
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:07
+Finished restore at 03-MAY-2017 13:25:30
+RMAN&gt; exit
+</pre></p>
+<p>Don&#8217;t forget to re-enable the Data Guard Apply at the end.</p>
+<h3>So what?</h3>
+<p>When you see all datafiles skipped, that probably means that you didn&#8217;t stop the APPLY. With APPLY stopped, and you probably stop it before the import as you plan to restore the standby later, then you probably don&#8217;t need the FORCE command. However, I&#8217;ll always recommend using the FORCE in this case because RMAN will skip the files without looking at the unlogged blocks. Imagine that you put a tablespace in read-only after the non-logged import but before stopping the apply. Then this one will be skipped. </p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-161470"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-7442">
+				<div id="div-comment-7442" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/30b4f1d09bb741616aee04cddbd07846?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Freek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7442">
+			May 4, 2017 at 7 h 27 min</a>		</div>
+
+		<p>But will this not restore the entire datafile containing the unrecoverable blocks?</p>
+<p>It could maybe be better to use the &#8220;recover from service&#8221; to roll forward the standby. But you would also need to restore a new standby controlfile, which (if I remember correctly) could give some problems with omf when not having a rman catalog
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-74431"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7442' onclick='return addComment.moveForm( "div-comment-7442", "7442", "respond", "16146" )' aria-label='Reply to Freek to Freek'>Reply to Freek</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2 parent" id="comment-7443">
+				<div id="div-comment-7443" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7443">
+			May 4, 2017 at 8 h 18 min</a>		</div>
+
+		<p>Hi Freek, yes the goal is to restore the datafiles because you know there are some blocks marked corrupt. If you don&#8217;t sue FORCE then RMAN compares the SCN and may decide there is nothing to restore. Same with RECOVER, it will ship an incremental backup starting at the SCN from the datafiles headers. I&#8217;ve not tested (yet) whether we can use RECOVER FROM CORRUPTION LIST for that. In 12c there is the RECOVER NONLOGGED
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-74441"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7443' onclick='return addComment.moveForm( "div-comment-7443", "7443", "respond", "16146" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment even depth-3" id="comment-7450">
+				<div id="div-comment-7450" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/30b4f1d09bb741616aee04cddbd07846?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Freek</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7450">
+			May 5, 2017 at 14 h 42 min</a>		</div>
+
+		<p>Ah yes, of course
+The redo is already send to the standby in this cause.</p>
+<p>You would need to stop the apply before the nologging operation for the recover method to work
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-74511"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7450' onclick='return addComment.moveForm( "div-comment-7450", "7450", "respond", "16146" )' aria-label='Reply to Freek to Freek'>Reply to Freek</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-10749">
+				<div id="div-comment-10749" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/e896fa7aeae1e1807d148b50210a9f24?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Chris Taylor</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10749">
+			April 9, 2018 at 17 h 22 min</a>		</div>
+
+		<p>Great, great help Franck.  Here are the issues I ran into in case anyone else has the same:</p>
+<p>1. RMAN restore from service requires a sqlnet connection (at least on 12.1.0.2) so you need to connect to target (standby) as rman sys/[password]@standby_db on standby host server.  I had to specify the sys password on the command line as well as it wouldn&#8217;t connect to the source db correctly. </p>
+<p>2. Verify orapwd files are the same between primary and standby (one of our dbas had added himself to sysdba privs on primary and the password file was out of sync).  You can use md5sum on source and target to verify the pwd files are identical.</p>
+<p>This error is returned:
+<pre>
+RMAN-00571: ===========================================================
+RMAN-00569: =============== ERROR MESSAGE STACK FOLLOWS ===============
+RMAN-00571: ===========================================================
+RMAN-03002: failure of restore command at 04/09/2018 09:47:31
+ORA-17629: Cannot connect to the remote database server
+ORA-17627: ORA-01017: invalid username/password; logon denied
+ORA-17629: Cannot connect to the remote database server
+</pre></p>
+<p>3. On a busy system the standby db has to be in mount mode, otherwise you get this error during the restore (note: 1987763.1)
+<pre>
+ORA-19849: error while reading backup piece from service dwp01_mia
+ORA-19573: cannot obtain exclusive enqueue for datafile 1
+ORA-19660: some files in the backup set could not be verified
+ORA-19661: datafile 1 could not be verified
+ORA-19849: error while reading backup piece from service dwp01_mia
+ORA-19573: cannot obtain exclusive enqueue for datafile 1
+</pre>
+After fixing the above it seems to be restoring correctly.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107501"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10749' onclick='return addComment.moveForm( "div-comment-10749", "10749", "respond", "16146" )' aria-label='Reply to Chris to Chris Taylor'>Reply to Chris</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

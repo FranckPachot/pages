@@ -1,0 +1,213 @@
+This was first published on <a href=https://blog.dbi-services.com/transparently-externalize-blob-to-bfile>https://blog.dbi-services.com/transparently-externalize-blob-to-bfile</a> (2016-04-12)
+								<h1 class="entry-title">Transparently externalize BLOB to BFILE</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Storing documents within the database is the easiest, especially because you get them consistent with the metadata stored in the database. If you store them externally, then you need to manage their backup, their synchronization to standby site, the consistency in case of flashback or PITR, etc. However, documents grow (in number and in size thanks to better resolution of scan) and you don&#8217;t want a database where half of the size are documents in read only. If you have no option (partitioning, compression, etc) then you may choose to store the documents externally. This is usually a complete re-design of the application.
+In this blog post, I&#8217;ve done a quick test I&#8217;ve done to transform some BLOB into External LOB (aka BFILE) and make it transparent to the application.
+<span id="more-8101"></span>
+It&#8217;s just a test of concept. Any comments are welcome if you think something is wrong here.</p>
+<p>Some display settings
+<pre>
+SQL&gt; set linesize 220 pagesize 1000 echo on
+SQL&gt; column filename format a20
+SQL&gt; column doc format a80 trunc
+SQL&gt; column external_doc format a40 trunc
+SQL&gt; whenever sqlerror exit failure;
+SQL&gt; connect demo/demo@//localhost/pdb
+Connected.
+</pre>
+First, I create a table with BLOB
+<pre>
+SQL&gt; create table DEMOTAB ( id number, filename varchar2(255),doc blob );
+Table created.
+</pre>
+And I will fill it with the content of 3 binary files. Let&#8217;s take them in $ORACLE_HOME/bin just for the fun of it:
+<pre>
+SQL&gt; host ls $ORACLE_HOME/bin | nl | head -3 &gt; /tmp/files.txt
+SQL&gt; host cat /tmp/files.txt
+     1  acfsroot
+     2  adapters
+     3  adrci
+</pre>
+I&#8217;m using SQL*Loader to load them to the BLOB:
+<pre>
+SQL&gt; host echo "load data infile '/tmp/files.txt' into table DEMOTAB fields terminated by '     ' ( id char(10),filename char(255),doc lobfile(filename) terminated by EOF)" &gt; /tmp/sqlldr.ctl
+SQL&gt; host cat /tmp/sqlldr.ctl
+load data infile '/tmp/files.txt' into table DEMOTAB fields terminated by '     ' ( id char(10),filename char(255),doc lobfile(filename) terminated by EOF)
+
+SQL&gt; host cd $ORACLE_HOME/bin ; sqlldr demo/demo@//localhost/pdb control=/tmp/sqlldr.ctl
+
+SQL*Loader: Release 12.1.0.2.0 on Tue Apr 12 21:03:22 2016
+Copyright (c) 1982, 2016, Oracle and/or its affiliates.  All rights reserved.
+
+Path used:      Conventional
+Commit point reached - logical record count 3
+
+Table DEMOTAB:
+  3 Rows successfully loaded.
+
+Check the log file:
+  sqlldr.log
+for more information about the load.
+
+</pre>
+They are loaded, I can query my table:
+<pre>
+SQL&gt; select DEMOTAB.*,dbms_lob.getlength(doc) from DEMOTAB;
+
+        ID FILENAME             DOC                                                                              DBMS_LOB.GETLENGTH(DOC)
+---------- -------------------- -------------------------------------------------------------------------------- -----------------------
+         1 acfsroot             23212F62696E2F7368200A230A230A232061636673726F6F740A23200A2320436F70797269676874                     945
+         2 adapters             3A0A230A2320244865616465723A206E6574776F726B5F7372632F75746C2F61646170746572732E                   13360
+         3 adrci                7F454C4602010100000000000000000002003E000100000000124000000000004000000000000000                   46156</p>
+<p></pre></p>
+<p>I&#8217;m creating a folder to store the files externally, and create a DIRECTORY for it:
+<pre>
+SQL&gt; host rm -rf /tmp/files ; mkdir /tmp/files
+SQL&gt; create directory DEMODIR as '/tmp/files';
+Directory created.
+</pre></p>
+<p>Now I add a BFILE column to my table:
+<pre>
+SQL&gt; alter table DEMOTAB add ( external_doc bfile );
+Table altered.
+</pre></p>
+<p>My idea is not to move all BLOB to External LOB, but only part of them. For example, old documents can be externalized whereas current ones stay in the database. That helps to control the database size without taking any risk about consistency in case of PITR.</p>
+<p>I&#8217;ve there an inline procedure &#8216;lob_to_file&#8217; that reads a LOB and writes it to a file. In the body of the PL/SQL block I call the procedure for the 2 first rows of my table, and once the files are externalized, I empty the DOC column (the BLOB) and set the EXTERNAL_DOC one (the BFILE):
+<pre>
+SQL&gt; set serveroutput on
+SQL&gt; declare
+    tmp_blob blob default empty_blob();
+    procedure lob_to_file(input_blob in BLOB, file_path in varchar2, file_name in varchar2) as
+     buffer raw(32767);
+     buffer_size number:=32767;
+     amount number;
+     offset number;
+     filehandle utl_file.file_type;
+     blob_size number;
+    begin
+     filehandle := utl_file.fopen(file_path, file_name,'wb', 1024);
+     blob_size:=dbms_lob.getlength(input_blob);
+     offset:=1;
+     amount:=32767;
+     while offset &lt; blob_size loop
+      dbms_lob.read(input_blob, amount, offset, buffer);
+      utl_file.put_raw(filehandle, buffer,true);
+      offset := offset + buffer_size;
+      buffer := null;
+     end loop;
+    exception when others then
+     utl_file.fclose(filehandle);
+     raise;
+    end;
+   begin
+    for c in ( select * from DEMOTAB where id &lt;=2 ) loop
+     lob_to_file (c.doc, &#039;DEMODIR&#039;,c.filename);
+     update DEMOTAB set doc=null,external_doc=bfilename(&#039;DEMODIR&#039;,c.filename) where id=c.id;
+    end loop;
+   end;
+/
+PL/SQL procedure successfully completed.
+</pre>
+Note: don&#8217;t take my code as an example. I did it quickly. You should know that best place for code examples is Tim Hall <a href="https://oracle-base.com/misc/search-results?cx=partner-pub-9901106718381505%3A8435801439&amp;cof=FORID%3A10&amp;ie=UTF-8&amp;q=BLOB&amp;sa=&amp;siteurl=" target="_blank">www.oracle-base.com</a></p>
+<p>I can check that I have the two files in my directory
+<pre>
+SQL&gt; host ls -l /tmp/files
+total 128
+-rw-r--r--. 1 oracle oinstall   945 Apr 12 21:03 acfsroot
+-rw-r--r--. 1 oracle oinstall 13360 Apr 12 21:03 adapters
+</pre>
+and compare it to the size of original file:
+<pre>
+SQL&gt; host ls -l $ORACLE_HOME/bin | head -4
+total 644308
+-rwxr-xr-x. 1 oracle oinstall       945 May 24  2014 acfsroot
+-rwxr-xr-x. 1 oracle oinstall     13360 Mar 23  2015 adapters
+-rwxr-x--x. 1 oracle oinstall     46156 Mar 25 17:20 adrci
+</pre></p>
+<p>And here is my table:
+<pre>
+SQL&gt; select id,filename,dbms_lob.getlength(doc),external_doc from DEMOTAB;
+
+        ID FILENAME             DBMS_LOB.GETLENGTH(DOC) EXTERNAL_DOC
+---------- -------------------- ----------------------- ----------------------------------------
+         1 acfsroot                                     bfilename('DEMODIR', 'acfsroot')
+         2 adapters                                     bfilename('DEMODIR', 'adapters')
+         3 adrci                                  46156 bfilename(NULL)
+</pre>
+You see that first two rows have empty BLOB but a BFILE addressing the files in DEMODIR
+The third row is untouched.</p>
+<p>Now, my idea is to make it transparent for the application, so I create a view on it which transparently retrieves the External LOB when LOB is null:
+<pre>
+SQL&gt; create view DEMOVIEW as select id,filename,nvl(doc,external_doc) doc from DEMOTAB;
+View created.
+</pre></p>
+<p>And now time to query. The application does a select into a BLOB so let&#8217;s do the same:
+<pre>
+SQL&gt; variable doc blob;
+SQL&gt; exec select doc into :doc from DEMOVIEW where id=1;
+PL/SQL procedure successfully completed.
+SQL&gt; print doc
+
+DOC
+--------------------------------------------------------------------------------
+23212F62696E2F7368200A230A230A232061636673726F6F740A23200A2320436F70797269676874
+</pre>
+This is the LOB coming from the external file. I get it as a BLOB when I query the view.</p>
+<p>And now querying the one that is still stored in the database:
+<pre>
+SQL&gt; exec select doc into :doc from DEMOVIEW where id=3;
+PL/SQL procedure successfully completed.
+SQL&gt; print doc
+
+DOC
+--------------------------------------------------------------------------------
+7F454C4602010100000000000000000002003E000100000000124000000000004000000000000000
+</pre></p>
+<p>Querying the view instead of the table (and you can play with synonyms for that) the application get the document without knowing wheter it comes from the database or the external directory. It seems that externalizing binary documents do not require a re-design of the application.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-81020"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-4071">
+				<div id="div-comment-4071" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/d440e310649df7a978e1d3a65e3223cb?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rainer Stenzel</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4071">
+			July 24, 2016 at 9 h 29 min</a>		</div>
+
+		<p>Hello Franck,
+do you know whether there are already BFILE cloud adapters available or ahead to take this approach one step further?
+Best regards,
+Rainer Stenzel
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-40721"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4071' onclick='return addComment.moveForm( "div-comment-4071", "4071", "respond", "8101" )' aria-label='Reply to Rainer to Rainer Stenzel'>Reply to Rainer</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

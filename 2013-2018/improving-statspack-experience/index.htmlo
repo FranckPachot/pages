@@ -1,0 +1,110 @@
+This was first published on <a href=https://blog.dbi-services.com/improving-statspack-experience>https://blog.dbi-services.com/improving-statspack-experience</a> (2017-08-23)
+								<h1 class="entry-title">Improving Statspack Experience</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I&#8217;ve published a few month ago an article in the UKOUG OracleScene magazine on <a href="http://viewer.zmags.com/publication/dd9ed62b#/dd9ed62b/36" target="_blank">Improving Statspack Experience</a>: quick setup script, changing settings, filling Idle Events,etc. In the article, I used dbms_job to schedule the snapshots, because I have this script for years and never took the time to do it with dbms_scheduler. Thanks to <a href="https://www.dbi-services.com/on-the-company-and-its-associates/our-associates-and-certified-experts/nicolas-jardot/" target="_blank">Nicolas Jardot</a> here is the equivalent script using dbms_scheduler.
+<span id="more-18433"></span>
+The idea is to have a script to run on each instance (when in RAC) in order to have a job calling statspack.snap and statspack.purge on each instance.
+<pre>
+DECLARE
+    instno NUMBER;
+    snapjob VARCHAR2(30);
+    purgejob VARCHAR2(30);
+BEGIN
+    select instance_number into instno from v$instance;
+    snapjob  := 'PERFSTAT.STATSPACK_SNAP_' || instno;
+    purgejob := 'PERFSTAT.STATSPACK_PURGE_' || instno;
+
+    DBMS_SCHEDULER.CREATE_JOB (
+       job_name =&gt; snapjob,
+       job_type =&gt; 'PLSQL_BLOCK',
+       job_action =&gt; 'statspack.snap;',
+       number_of_arguments =&gt; 0,
+       start_date =&gt; systimestamp,
+       repeat_interval =&gt; 'FREQ=HOURLY;BYTIME=0000;BYDAY=MON,TUE,WED,THU,FRI,SAT,SUN',
+       end_date =&gt; NULL,
+       enabled =&gt; TRUE,
+       auto_drop =&gt; FALSE,
+       comments =&gt; 'Take hourly Statspack snapshot');
+
+    DBMS_SCHEDULER.CREATE_JOB (
+       job_name =&gt; purgejob,
+       job_type =&gt; 'PLSQL_BLOCK',
+       job_action =&gt; 'statspack.purge(i_num_days=&gt;31,i_extended_purge=&gt;true);',
+       number_of_arguments =&gt; 0,
+       start_date =&gt; systimestamp,
+       repeat_interval =&gt; 'FREQ=WEEKLY;BYTIME=120000;BYDAY=SUN',
+       end_date =&gt; NULL,
+       enabled =&gt; TRUE,
+       auto_drop =&gt; FALSE,
+       comments =&gt; 'Weekly purge Statspack snapshot');
+
+    DBMS_SCHEDULER.SET_ATTRIBUTE( name =&gt; snapjob, attribute =&gt; 'logging_level', value =&gt; DBMS_SCHEDULER.LOGGING_OFF );
+    DBMS_SCHEDULER.SET_ATTRIBUTE( name =&gt; snapjob, attribute =&gt; 'INSTANCE_ID', value=&gt;instno);
+    DBMS_SCHEDULER.SET_ATTRIBUTE( name =&gt; snapjob, attribute =&gt; 'INSTANCE_STICKINESS', value=&gt;TRUE);
+
+    DBMS_SCHEDULER.SET_ATTRIBUTE( name =&gt; purgejob, attribute =&gt; 'logging_level', value =&gt; DBMS_SCHEDULER.LOGGING_OFF );
+    DBMS_SCHEDULER.SET_ATTRIBUTE( name =&gt; purgejob, attribute =&gt; 'INSTANCE_ID', value=&gt;instno);
+    DBMS_SCHEDULER.SET_ATTRIBUTE( name =&gt; purgejob, attribute =&gt; 'INSTANCE_STICKINESS', value=&gt;TRUE);
+END;
+/
+</pre></p>
+<p>I used the Oracle Cloud Service to provision quickly a two nodes RAC database to validate, and I&#8217;ll check the scheduling:
+<pre>
+[oracle@rac-dg01-1 admin]$ alias sql='JAVA_HOME=$ORACLE_HOME/jdk bash $ORACLE_HOME/sqldeveloper/sqlcl/bin/sql'
+[oracle@rac-dg01-1 admin]$ TWO_TASK=//10.31.143.86/pdb1.a511644.oraclecloud.internal sql sys/"Ach1z0#d" as sysdba
+
+SQLcl: Release 12.2.0.1.0 RC on Wed Aug 23 18:57:12 2017
+
+Copyright (c) 1982, 2017, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 12c EE Extreme Perf Release 12.2.0.1.0 - 64bit Production
+
+SQL&gt; set sqlformat ansiconsole
+SQL&gt; select job_name, state, enabled, next_run_date, instance_stickiness, instance_id from dba_scheduler_jobs where owner='PERFSTAT';
+JOB_NAME           STATE      ENABLED  NEXT_RUN_DATE                           INSTANCE_STICKINESS  INSTANCE_ID
+--------           -----      -------  -------------                           -------------------  -----------
+STATSPACK_SNAP_1   SCHEDULED  TRUE     23-AUG-17 07.00.00.981193000 PM +00:00  TRUE                 1
+STATSPACK_PURGE_1  SCHEDULED  TRUE     27-AUG-17 12.00.00.074939000 PM +00:00  TRUE                 1
+STATSPACK_SNAP_2   SCHEDULED  TRUE     23-AUG-17 07.00.00.644681000 PM +00:00  TRUE                 2
+STATSPACK_PURGE_2  SCHEDULED  TRUE     27-AUG-17 12.00.00.755685000 PM +00:00  TRUE                 2
+</pre></p>
+<p>One hour later, the job has run on each instance:
+<pre>
+JOB_NAME           STATE      ENABLED  NEXT_RUN_DATE                           INSTANCE_STICKINESS  INSTANCE_ID
+--------           -----      -------  -------------                           -------------------  -----------
+STATSPACK_SNAP_1   SCHEDULED  TRUE     23-AUG-17 08.00.00.325755000 PM +00:00  TRUE                 1
+STATSPACK_PURGE_1  SCHEDULED  TRUE     27-AUG-17 12.00.00.074939000 PM +00:00  TRUE                 1
+STATSPACK_SNAP_2   SCHEDULED  TRUE     23-AUG-17 08.00.00.644681000 PM +00:00  TRUE                 2
+STATSPACK_PURGE_2  SCHEDULED  TRUE     27-AUG-17 12.00.00.755685000 PM +00:00  TRUE                 2
+</pre></p>
+<p>Now running a spreport to see the instances having snapshots:
+<pre>
+[oracle@rac-dg01-1 admin]$ TWO_TASK=//10.31.143.86/pdb1.a511644.oraclecloud.internal/cdb12 sqlplus sys/"Ach1z0#d" as sysdba @ spreport
+
+Instances in this Statspack schema
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+   DB Id    Inst Num DB Name      Instance     Host
+----------- -------- ------------ ------------ ------------
+  924704606        2 CDB1         cdb12        rac-dg01-2
+  924704606        1 CDB1         cdb11        rac-dg01-1
+
+Using  924704606 for database Id
+Using          2 for instance number
+</pre></p>
+<p>Here it is. dbms_job is deprecated. Let&#8217;s use dbms_scheduler.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-184340"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

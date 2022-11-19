@@ -1,0 +1,583 @@
+This was first published on <a href=https://blog.dbi-services.com/result-cache-and-12c-fetch-first-n-rows>https://blog.dbi-services.com/result-cache-and-12c-fetch-first-n-rows</a> (2015-10-04)
+								<h1 class="entry-title">Result Cache and 12c &#8216;fetch first n rows&#8217;</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p><img style="float:right" src="../wp-insides/uploads/sites/2/2015/10/2015-10-02-16.45.51-300x149.jpg" alt="2015-10-02 16.45.51" width="300" height="149" class="alignnone size-medium wp-image-4169" /> At our bi-annual dbiXchange I was talking with <a href="http://blog.dbi-services.com/author/nicolas-jardot/">Nicolas Jardot</a> about his presentation on Result Cache (don&#8217;t forget <a href="http://blog.dbi-services.com/author/jerome-witt/">Jérome witt</a> session about RC at <a href="https://www.doag.org/konferenz/konferenzplaner/b.php?id=473721&amp;locS=1&amp;q=jerome">DOAG</a>) where he has shown an unexpected behavior on &#8216;fetch first n rows queries&#8217;.
+That behavior &#8211; if it is not a bug &#8211; can also be a good thing when using offset queries.
+<span id="more-4168"></span></p>
+<h3>The case</h3>
+<p>Everything is in the execution plan:
+<pre>
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  799vsxdg75sm6, child number 0
+-------------------------------------
+select /*+ result_cache */ * from DEMO order by n fetch first 5 rows only
+
+Plan hash value: 896528075
+
+--------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                      | Name                       | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+--------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT               |                            |      1 |        |      5 |00:00:02.49 |     376 |    207 |
+|*  1 |  VIEW                          |                            |      1 |    100K|      5 |00:00:02.49 |     376 |    207 |
+|   2 |   RESULT CACHE                 | aanuwt05phj34078f253ht7x0x |      1 |        |    100K|00:00:02.25 |     376 |    207 |
+|   3 |    WINDOW NOSORT               |                            |      1 |    100K|    100K|00:00:01.72 |     376 |    207 |
+|   4 |     TABLE ACCESS BY INDEX ROWID| DEMO                       |      1 |    100K|    100K|00:00:00.99 |     376 |    207 |
+|   5 |      INDEX FULL SCAN           | DEMO_PK                    |      1 |    100K|    100K|00:00:00.25 |     210 |    207 |
+--------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter("from$_subquery$_002"."rowlimit_$$_rownumber"&lt;=5)
+
+Result Cache Information (identified by operation id):
+------------------------------------------------------
+   2 - column-count=4; dependencies=(DEMO.DEMO); attributes=(ordered); name=&quot;select /*+ result_cache */ * from DEMO &quot;
+</pre>
+I want to fetch only the first 5 rows, I access through an index scan so that I don&#8217;t need a sort. Then I expect to read only the 5 first entrie in the index &#8211; only a few blocks.
+I want to use the result cache in case I run my query again. That should increase the performance of subsequent runs, but should not decrease the performance of the first run &#8211; except the small overhead to put 5 rows into the result cache.</p>
+<p>But look at it again: I&#8217;ve read 100000 rows. The whole table. And 100000 have gone to the result cache:
+<pre>
+SQL&gt; select id,type,status,cache_id,row_count,name from v$result_cache_objects;
+
+        ID TYPE       STATUS    CACHE_ID                        ROW_COUNT NAME
+---------- ---------- --------- ------------------------------ ---------- ----------------------
+         0 Dependency Published DEMO.DEMO                               0 DEMO.DEMO
+         1 Result     Published a46rp35xsfhzg6ukq622ax96xh         100000 select /*+ result_cach
+</pre></p>
+<h3>Good or bad?</h3>
+<p>My first idea is that it is a bug. When I put a &#8216;result_cache&#8217; hint, I expect the final result to go to result cache. Not an intermediate one. If I want an intermediate one, I can put the hint in a subquery. Of course, it&#8217;s bad to read all table rows when I explicitly want only 5 ones.</p>
+<p>I addition to that, I expected that the behavior here would be the same as when forcing the table result cache mode. But it&#8217;s not the case. Setting &#8216;result_cache (mode force)&#8217; instead of using the result_cache hint caches the final result &#8211; the 5 rows.
+Look, when setting both, I&#8217;ve two results going to the cache:
+<pre>
+SQL&gt; alter table DEMO result_cache (mode force);
+Table altered.
+
+SQL&gt; select /*+ result_cache */ * from DEMO order by n fetch first 5 rows only;
+
+         N          X
+---------- ----------
+         1          1
+         2         .5
+         3         .3
+         4         .3
+         5         .2
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  799vsxdg75sm6, child number 0
+-------------------------------------
+select /*+ result_cache */ * from DEMO order by n fetch first 5 rows only
+
+Plan hash value: 896528075
+
+------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                       | Name                       | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                |                            |      1 |        |      5 |00:00:02.46 |     376 |
+|   1 |  RESULT CACHE                   | 2j3s6quuam85248yh8458tcprb |      1 |        |      5 |00:00:02.46 |     376 |
+|*  2 |   VIEW                          |                            |      1 |    100K|      5 |00:00:02.46 |     376 |
+|   3 |    RESULT CACHE                 | ch5d2dt62d5n485utqj03pftw2 |      1 |        |    100K|00:00:02.22 |     376 |
+|   4 |     WINDOW NOSORT               |                            |      1 |    100K|    100K|00:00:01.70 |     376 |
+|   5 |      TABLE ACCESS BY INDEX ROWID| DEMO                       |      1 |    100K|    100K|00:00:00.97 |     376 |
+|   6 |       INDEX FULL SCAN           | DEMO_PK                    |      1 |    100K|    100K|00:00:00.24 |     210 |
+------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - filter("from$_subquery$_002"."rowlimit_$$_rownumber" select id,type,status,cache_id,row_count,name from v$result_cache_objects;
+
+        ID TYPE       STATUS    CACHE_ID                        ROW_COUNT NAME
+---------- ---------- --------- ------------------------------ ---------- ----------------------
+         0 Dependency Published DEMO.DEMO                               0 DEMO.DEMO
+      1769 Result     Published 9jdwtku77k9ap60x1anfqsd2ny         100000 select /*+ result_cach
+      1768 Result     Published b4aa0hncfmd7bcdxnwf4mdyyj0              5 select /*+ result_cach
+</pre></p>
+<p>It think it&#8217;s bad. I&#8217;ll open a SR about it.</p>
+<h3>Pagination queries and Offset</h3>
+<p>When you have hundreds of lines to display to the user, you use pagination: display the first 15 lines with a &#8216;next&#8217; button. Then the user can display the 15 next lines with the &#8216;next&#8217; button, etc.
+<img style="float:left;margin-right:20px" src="../wp-insides/uploads/sites/2/2015/10/Terminal-ibm3486-150x150.jpg" alt="Terminal-ibm3486" width="150" height="150" class="alignnone size-thumbnail wp-image-4182" />
+In the days where a user had only one screen, that was easy. You run the query, get a cursor, fetch 15 lines from it. When the user press &#8216;next&#8217; function we fetch 15 more lines. Exactly as when you use &#8216;set pause on&#8217; in sqlplus.
+That was perfect. But that changed. Still in client/server but on Windows, the users were able to run several applications at a time. They can open a cursor, and let it open for hours or even days. Then a new requirement came: a transaction must match the user interaction, or we leave too many resources idle.
+It was even worse with web applications where you can start a use case and never finish it. Or use the &#8216;back&#8217; button the the browser and break the flow of the application. The solution is stateless sessions. But then you can leave the cursor open. Or timeouts, but the user don&#8217;t like to re-start from begining because he has an urgent phone call.
+<a href="http://use-the-index-luke.com/no-offset" target="use-the-index-luke.com"><img style="float:left;margin-right:20px" src="../wp-insides/uploads/sites/2/2015/10/no-offset-banner-180x150.white_.png" alt="Do not use offset for pagination. Learn why." width="180" height="150" class="alignnone size-full wp-image-4176" /></a>
+With stateless sessions, you have to re-run the query. Whether you use rownum, row_number() or &#8216;fetch first &#8230; rows&#8217; (see when you need the first_rows() hint in a <a href="http://blog.dbi-services.com/oracle-rownum-vs-rownumber-and-12c-fetch-first/">previous blog post</a>) the problem is that the query for the second fetch will need to read 30 lines and skip the first 15 ones. This is not optimal. More info from Markups Winand at <a href="http://use-the-index-luke.com/no-offset" target="use-the-index-luke.com">http://use-the-index-luke.com/no-offset</a>.
+So the basic advice is: don&#8217;t use offset.</p>
+<h3>Result Cache</h3>
+<p>However, we can take an advantage of the fact that result cache stores all the rows. The first run will put all rows in result cache and display only the first page. The second run will get the next rows from the result set without the need to re-run the query.
+Here is the first page:
+<pre>
+SQL&gt; variable next number
+SQL&gt; variable offset number
+SQL&gt; exec :offset := 0 ; :next:=5
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select /*+ result_cache */ * from DEMO order by n offset :offset rows fetch next :next rows only;
+
+         N          X
+---------- ----------
+         1          1
+         2         .5
+         3         .3
+         4         .3
+         5         .2
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  36gjax1bq229s, child number 0
+-------------------------------------
+select /*+ result_cache */ * from DEMO order by n offset :offset rows
+fetch next :next rows only
+
+Plan hash value: 1397896352
+
+---------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                       | Name                       | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+---------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                |                            |      1 |        |      5 |00:00:02.51 |     376 |    208 |
+|*  1 |  FILTER                         |                            |      1 |        |      5 |00:00:02.51 |     376 |    208 |
+|*  2 |   VIEW                          |                            |      1 |    100K|      5 |00:00:02.51 |     376 |    208 |
+|   3 |    RESULT CACHE                 | 18fnpv7tfn444bghaxs5mb20kk |      1 |        |    100K|00:00:02.26 |     376 |    208 |
+|   4 |     WINDOW NOSORT               |                            |      1 |    100K|    100K|00:00:01.74 |     376 |    208 |
+|   5 |      TABLE ACCESS BY INDEX ROWID| DEMO                       |      1 |    100K|    100K|00:00:01.00 |     376 |    208 |
+|   6 |       INDEX FULL SCAN           | DEMO_PK                    |      1 |    100K|    100K|00:00:00.25 |     210 |    208 |
+---------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(:OFFSET=0) THEN FLOOR(TO_NUMBER(TO_CHAR(:OFFSET))) ELSE 0 END +:NEXT)
+   2 - filter(("from$_subquery$_002"."rowlimit_$$_rownumber"=0) THEN
+              FLOOR(TO_NUMBER(TO_CHAR(:OFFSET))) ELSE 0 END +:NEXT AND "from$_subquery$_002"."rowlimit_$$_rownumber"&gt;:OFFSET))
+</pre>
+Here is the second page:
+<pre>
+SQL&gt; exec :offset := 5 ; :next:=5
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select /*+ result_cache */ * from DEMO order by n offset :offset rows fetch next :next rows only;
+
+         N          X
+---------- ----------
+         6         .2
+         7         .1
+         8         .1
+         9         .1
+        10         .1
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  36gjax1bq229s, child number 0
+-------------------------------------
+select /*+ result_cache */ * from DEMO order by n offset :offset rows
+fetch next :next rows only
+
+Plan hash value: 1397896352
+
+--------------------------------------------------------------------------------------------------------------
+| Id  | Operation                       | Name                       | Starts | E-Rows | A-Rows |   A-Time   |
+--------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                |                            |      1 |        |      5 |00:00:00.48 |
+|*  1 |  FILTER                         |                            |      1 |        |      5 |00:00:00.48 |
+|*  2 |   VIEW                          |                            |      1 |    100K|      5 |00:00:00.48 |
+|   3 |    RESULT CACHE                 | 18fnpv7tfn444bghaxs5mb20kk |      1 |        |    100K|00:00:00.24 |
+|   4 |     WINDOW NOSORT               |                            |      0 |    100K|      0 |00:00:00.01 |
+|   5 |      TABLE ACCESS BY INDEX ROWID| DEMO                       |      0 |    100K|      0 |00:00:00.01 |
+|   6 |       INDEX FULL SCAN           | DEMO_PK                    |      0 |    100K|      0 |00:00:00.01 |
+--------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(:OFFSET=0) THEN FLOOR(TO_NUMBER(TO_CHAR(:OFFSET))) ELSE 0 END +:NEXT)
+   2 - filter(("from$_subquery$_002"."rowlimit_$$_rownumber"=0) THEN
+              FLOOR(TO_NUMBER(TO_CHAR(:OFFSET))) ELSE 0 END +:NEXT AND
+              "from$_subquery$_002"."rowlimit_$$_rownumber"&gt;:OFFSET))
+</pre>
+The second run had no rows to read from the table.</p>
+<p>If we know that the user will never go further than a few pages, the we can add a subquery with rownum.</p>
+<p>Here is a pagination query that get at maximum 30 rows paged 5 by 5:
+<pre>
+SQL&gt; variable next number
+SQL&gt; variable offset number
+SQL&gt; exec :offset := 0 ; :next:=5
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from (
+  2   select /*+ result_cache */ * from (
+  3    select * from DEMO order by n fetch first 30 rows only
+  4   ) order by n offset :offset rows fetch next :next rows only
+  5  )
+  6  /
+         N          X
+---------- ----------
+         1          1
+         2         .5
+         3         .3
+         4         .3
+         5         .2
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1yubnzwpd2z2g, child number 0
+-------------------------------------
+select * from (  select /*+ result_cache */ * from (   select * from
+DEMO order by n fetch first 30 rows only  ) order by n offset :offset
+rows fetch next :next rows only )
+
+------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                          | Name                       | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                   |                            |      1 |        |      5 |00:00:00.01 |       5 |      1 |
+|*  1 |  FILTER                            |                            |      1 |        |      5 |00:00:00.01 |       5 |      1 |
+|*  2 |   VIEW                             |                            |      1 |     30 |      5 |00:00:00.01 |       5 |      1 |
+|   3 |    RESULT CACHE                    | gbwdtyz67n3kk0qkgw86s4jk67 |      1 |        |     30 |00:00:00.01 |       5 |      1 |
+|   4 |     WINDOW NOSORT                  |                            |      1 |     30 |     30 |00:00:00.01 |       5 |      1 |
+|   5 |      VIEW                          |                            |      1 |     30 |     30 |00:00:00.01 |       5 |      1 |
+|*  6 |       VIEW                         |                            |      1 |     30 |     30 |00:00:00.01 |       5 |      1 |
+|*  7 |        WINDOW NOSORT STOPKEY       |                            |      1 |    100K|     30 |00:00:00.01 |       5 |      1 |
+|   8 |         TABLE ACCESS BY INDEX ROWID| DEMO                       |      1 |    100K|     31 |00:00:00.01 |       5 |      1 |
+|   9 |          INDEX FULL SCAN           | DEMO_PK                    |      1 |    100K|     31 |00:00:00.01 |       3 |      1 |
+------------------------------------------------------------------------------------------------------------------------------------
+
+SQL&gt; exec :offset := 5 ; :next:=5
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from (
+  2   select /*+ result_cache */ * from (
+  3    select * from DEMO order by n fetch first 30 rows only
+  4   ) order by n offset :offset rows fetch next :next rows only
+  5  )
+  6  /
+         N          X
+---------- ----------
+         6         .2
+         7         .1
+         8         .1
+         9         .1
+        10         .1
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1yubnzwpd2z2g, child number 0
+-------------------------------------
+select * from (  select /*+ result_cache */ * from (   select * from
+DEMO order by n fetch first 30 rows only  ) order by n offset :offset
+rows fetch next :next rows only )
+
+-----------------------------------------------------------------------------------------------------------------
+| Id  | Operation                          | Name                       | Starts | E-Rows | A-Rows |   A-Time   |
+-----------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                   |                            |      1 |        |      5 |00:00:00.01 |
+|*  1 |  FILTER                            |                            |      1 |        |      5 |00:00:00.01 |
+|*  2 |   VIEW                             |                            |      1 |     30 |      5 |00:00:00.01 |
+|   3 |    RESULT CACHE                    | gbwdtyz67n3kk0qkgw86s4jk67 |      1 |        |     30 |00:00:00.01 |
+|   4 |     WINDOW NOSORT                  |                            |      0 |     30 |      0 |00:00:00.01 |
+|   5 |      VIEW                          |                            |      0 |     30 |      0 |00:00:00.01 |
+|*  6 |       VIEW                         |                            |      0 |     30 |      0 |00:00:00.01 |
+|*  7 |        WINDOW NOSORT STOPKEY       |                            |      0 |    100K|      0 |00:00:00.01 |
+|   8 |         TABLE ACCESS BY INDEX ROWID| DEMO                       |      0 |    100K|      0 |00:00:00.01 |
+|   9 |          INDEX FULL SCAN           | DEMO_PK                    |      0 |    100K|      0 |00:00:00.01 |
+-----------------------------------------------------------------------------------------------------------------
+</pre>
+The first run reads 30 rows, put them into the result cache and returns the first 5. The second run get the first 10 rows from result cache, skips the first 5 and returns next 5 ones.</p>
+<h3>So what?</h3>
+<p>We have a solution to use offset in an optimal way, but I don&#8217;t know if is an expected behavior, bug or side effect. The same idea can be done with rownum and subqueries. You have also to think about how static the base tables are. the &#8216;snapshot&#8217; hint may be use to allow stale results (see <a href="http://blog.dbi-services.com/resultcache-hint-expiration-options/">previous blog post</a>) but not documented yet.</p>
+<p>We know a lot of bugs and side effects about result cache. We know a lot of unexpected behavior and performance issue about first rows. Search &#8220;first rows&#8221; or &#8220;result cache&#8221; on this blog, or Jonathan Lewis blog, or on MOS and you will see that you can use it only when you have tested the cases where you use it.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-41690" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/10/2015-10-02-16.45.51-300x149.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 6 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-3974">
+				<div id="div-comment-3974" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/37c521a2bf0b9151534b08d6240578fa?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Oleg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3974">
+			July 12, 2016 at 15 h 10 min</a>		</div>
+
+		<p>Franck</p>
+<p>is it expected behavior of Oracle 12.1.0.2 to  read a whole table/index to fetch first 5 rows only?</p>
+<p>We have an issue with degradation of queries performance after upgrading to 12c. Our application uses Entity Framework and the provider generates queries automatically (the architecture is not a topic of this discussion). So the former top n query select from (select &#8230; order) where rownum
+<pre>
+select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));</p>
+<p>----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT         |      |      1 |        |      5 |00:00:00.14 |    1199 |       |    |             |
+|*  1 |  VIEW                    |      |      1 |      5 |      5 |00:00:00.14 |    1199 |       |    |             |
+|*  2 |   WINDOW SORT PUSHED RANK|      |      1 |  76388 |      5 |00:00:00.14 |    1199 |  4096 |  4096 | 4096  (0)|
+|   3 |    TABLE ACCESS FULL     | T    |      1 |  76388 |  76388 |00:00:00.07 |    1199 |       |    |             |
+----------------------------------------------------------------------------------------------------------------------</p>
+<p>Predicate Information (identified by operation id):
+---------------------------------------------------</p>
+<p>   1 - filter("from$_subquery$_002"."rowlimit_$$_rownumber"&lt;=5)
+   2 - filter(ROW_NUMBER() OVER ( ORDER BY &quot;OWNER&quot;,&quot;OBJECT_NAME&quot;)&lt;=5)</p>
+<p>22 rows selected.</p>
+<p>select owner, object_name, object_id from
+(select owner, object_name, object_id
+     from t
+  order by owner, object_name)
+where rownum  select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));</p>
+<p>Plan hash value: 3993548034</p>
+<p>-------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |       |      1 |        |      5 |00:00:00.01 |       6 |
+|*  1 |  COUNT STOPKEY                |       |      1 |        |      5 |00:00:00.01 |       6 |
+|   2 |   VIEW                        |       |      1 |      5 |      5 |00:00:00.01 |       6 |
+|   3 |    TABLE ACCESS BY INDEX ROWID| T     |      1 |  76388 |      5 |00:00:00.01 |       6 |
+|   4 |     INDEX FULL SCAN           | T_IDX |      1 |      5 |      5 |00:00:00.01 |       4 |
+-------------------------------------------------------------------------------------------------</p>
+<p>Predicate Information (identified by operation id):
+---------------------------------------------------</p>
+<p>   1 - filter(ROWNUM&lt;=5)
+</pre>
+Why Oracle need to read the whole table (and a-rows show it really do this) just to discard them later? And why so huge costs estimations.</p>
+<p>In the original post of Tom, the autotrace output shows
+<pre>
+——————————————————————————————————————————————————————————————————————————————
+| Id |Operation                     | Name|Rows  |Bytes |Cost (%CPU)|Time    |
+——————————————————————————————————————————————————————————————————————————————
+|   0|SELECT STATEMENT              |     |    5 | 1450 |    7   (0)|00:00:01|
+|*  1| VIEW                         |     |    5 | 1450 |    7   (0)|00:00:01|
+|*  2|  WINDOW NOSORT STOPKEY       |     |    5 |  180 |    7   (0)|00:00:01|
+|   3|   TABLE ACCESS BY INDEX ROWID|T    |87310 | 3069K|    7   (0)|00:00:01|
+|   4|    INDEX FULL SCAN           |T_IDX|    5 |      |    3   (0)|00:00:01|
+——————————————————————————————————————————————————————————————————————————————
+</pre>
+for the same setup.</p>
+<p>On my test system, the 10053 trace shows that Optimizer evaluated the cost of access via full index scan to something like 1500 and chosen the full table scan with the costs of ca. 1000
+<pre>
+-----------------------------------------------------------------------------------------
+| Id  | Operation                | Name | Rows  | Bytes |TempSpc| Cost (%CPU)| Time     |
+-----------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT         |      |     5 |  1450 |       |  1027   (1)| 00:00:01 |
+|*  1 |  VIEW                    |      |     5 |  1450 |       |  1027   (1)| 00:00:01 |
+|*  2 |   WINDOW SORT PUSHED RANK|      | 76388 |  2760K|  3608K|  1027   (1)| 00:00:01 |
+|   3 |    TABLE ACCESS FULL     | T    | 76388 |  2760K|       |   308   (1)| 00:00:01 |
+-----------------------------------------------------------------------------------------
+</pre>
+Why autotrace on the tom example and on my test env. so different (actually I reproduced his setup)?</p>
+<p>And of course, any idea how we can mitigate this issue after migration (again, the queries are generated during runtime by Entity Framework provider).</p>
+<p>I would really appreciate your answer</p>
+<p>Best regards</p>
+<p>Oleg
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39751"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3974' onclick='return addComment.moveForm( "div-comment-3974", "3974", "respond", "4168" )' aria-label='Reply to Oleg to Oleg'>Reply to Oleg</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-3975">
+				<div id="div-comment-3975" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/37c521a2bf0b9151534b08d6240578fa?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Oleg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3975">
+			July 12, 2016 at 15 h 14 min</a>		</div>
+
+		<p>Franck,</p>
+<p>my I sent you the question per E-Mail? If I try to copy/paste to the blog window &#8211; the result loose the original format.</p>
+<p>Sorry for this</p>
+<p>Oleg
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39761"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3975' onclick='return addComment.moveForm( "div-comment-3975", "3975", "respond", "4168" )' aria-label='Reply to Oleg to Oleg'>Reply to Oleg</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-3977">
+				<div id="div-comment-3977" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3977">
+			July 12, 2016 at 15 h 33 min</a>		</div>
+
+		<p>Hi Oleg, I&#8217;ve added the &lt;code&gt; and &lt;/code&gt; tags and formatting is ok.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39781"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3977' onclick='return addComment.moveForm( "div-comment-3977", "3977", "respond", "4168" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-3978">
+				<div id="div-comment-3978" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/37c521a2bf0b9151534b08d6240578fa?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Oleg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3978">
+			July 12, 2016 at 15 h 53 min</a>		</div>
+
+		<p>Thanks Franck,</p>
+<p>I thinks as I tried to edit unformatted output I deleted one of the query. So below are the queries again &#8211; I would really appreciate you input. I can sent you the output of bothe 10053 traces &#8211; a bit different set up, but the point is a huge costs and actually Oracle will change to full index scan at some point but only due to the huge cost of sorting &#8211; so if I do select * instead of select object_id, created &#8211; the cost of sorting is more than 2000 and Oracle change to full index scan, but this is still unexpected &#8211; we expect the cost something comparable to either ones of select &#8230;. where rownum &lt;= or costs of Toms example (probably tom used 12.1.0.1?)</p>
+<p>I was comparing the original query of Tom, with HIS output of the execution plan</p>
+<p><pre></p>
+<p>Case1 "Tom's Ouptup"</p>
+<p>select owner, object_name, object_id from t
+order by owner, object_name
+FETCH FIRST 5 ROWS ONLY;</p>
+<p>——————————————————————————————————————————————————————————————————————————————
+| Id |Operation                     | Name|Rows  |Bytes |Cost (%CPU)|Time    |
+——————————————————————————————————————————————————————————————————————————————
+|   0|SELECT STATEMENT              |     |    5 | 1450 |    7   (0)|00:00:01|
+|*  1| VIEW                         |     |    5 | 1450 |    7   (0)|00:00:01|
+|*  2|  WINDOW NOSORT STOPKEY       |     |    5 |  180 |    7   (0)|00:00:01|
+|   3|   TABLE ACCESS BY INDEX ROWID|T    |87310 | 3069K|    7   (0)|00:00:01|
+|   4|    INDEX FULL SCAN           |T_IDX|    5 |      |    3   (0)|00:00:01|
+——————————————————————————————————————————————————————————————————————————————</p>
+<p>Case 2 "Tom's setup reproduced on my test database" (See the different costs and different execution plan)</p>
+<p>select owner, object_name, object_id from t
+order by owner, object_name
+FETCH FIRST 5 ROWS ONLY;</p>
+<p>-----------------------------------------------------------------------------------------
+| Id  | Operation                | Name | Rows  | Bytes |TempSpc| Cost (%CPU)| Time     |
+-----------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT         |      |     5 |  1450 |       |  1027   (1)| 00:00:01 |
+|*  1 |  VIEW                    |      |     5 |  1450 |       |  1027   (1)| 00:00:01 |
+|*  2 |   WINDOW SORT PUSHED RANK|      | 76388 |  2760K|  3608K|  1027   (1)| 00:00:01 |
+|   3 |    TABLE ACCESS FULL     | T    | 76388 |  2760K|       |   308   (1)| 00:00:01 |
+-----------------------------------------------------------------------------------------</p>
+<p>Case 3 "Original 11g query" </p>
+<p>select owner, object_name, object_id from
+(select owner, object_name, object_id from t
+order by owner, object_name)
+where rownum &lt;=5</p>
+<p>---------------------------------------------------------------------------------------
+| Id  | Operation                     | Name  | Rows  | Bytes | Cost (%CPU)| Time     |
+---------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |       |     5 |   725 |     7   (0)| 00:00:01 |
+|*  1 |  COUNT STOPKEY                |       |       |       |            |          |
+|   2 |   VIEW                        |       |     5 |   725 |     7   (0)| 00:00:01 |
+|   3 |    TABLE ACCESS BY INDEX ROWID| T     | 76388 |  2760K|     7   (0)| 00:00:01 |
+|   4 |     INDEX FULL SCAN           | T_IDX |     5 |       |     3   (0)| 00:00:01 |
+---------------------------------------------------------------------------------------</p>
+<p>Predicate Information (identified by operation id):
+---------------------------------------------------</p>
+<p>   1 - filter(ROWNUM&lt;=5)</p>
+<p></pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39791"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3978' onclick='return addComment.moveForm( "div-comment-3978", "3978", "respond", "4168" )' aria-label='Reply to Oleg to Oleg'>Reply to Oleg</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-4003">
+				<div id="div-comment-4003" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/37c521a2bf0b9151534b08d6240578fa?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Oleg</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4003">
+			July 14, 2016 at 10 h 34 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>I found your blog entry searching for this completely unexpected behavior &#8211; instead of eliminating (5) rows  with stop key,  oracle scans the whole table/index/result cache first &#8211; which in my opinion is very inefficient. Oracle does not do this for the old version of the query &#8211; when I manually select then sort then select where rownum &lt;=5 &#8211; in this case Oracle correctly uses stop key operation. It seams that in the Tom&#039;s post at least during cost estimation Oracle uses 5 rows and not the all rows in the target table.</p>
+<p>I just wonder, you definitely saw this behavior as you wrote this post and explicitly pointed at it. Aside from the fact if Oracle  caches all this rows or not &#8211; was you not wondering why oracle simple does not eliminate all rows earlier ?</p>
+<p>Best regards</p>
+<p>Oleg
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-40041"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4003' onclick='return addComment.moveForm( "div-comment-4003", "4003", "respond", "4168" )' aria-label='Reply to Oleg to Oleg'>Reply to Oleg</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-even depth-1" id="comment-4027">
+				<div id="div-comment-4027" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4027">
+			July 18, 2016 at 10 h 06 min</a>		</div>
+
+		<p>Hi Oleg,
+I don&#8217;t know which &#8216;Tom post&#8217; you refer to.
+You are talking about &#8216;autotrace&#8217; but be careful with autotrace as it may show different plan that the one that is actually used.
+About &#8220;oracle scans the whole table/index/result cache first – which in my opinion is very inefficient&#8221; this is a cost based decision. With high latency disks but large PGA, it may be faster to do a table full scan (or index fast full scan) which is multiblock I/O and sort it later rather than an index range scan which is done row by row.  But for sure, the ptimizer mode should be first rows there.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-40281"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4027' onclick='return addComment.moveForm( "div-comment-4027", "4027", "respond", "4168" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

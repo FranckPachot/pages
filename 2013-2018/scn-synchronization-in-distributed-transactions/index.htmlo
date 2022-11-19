@@ -1,0 +1,153 @@
+This was first published on <a href=https://blog.dbi-services.com/scn-synchronization-in-distributed-transactions>https://blog.dbi-services.com/scn-synchronization-in-distributed-transactions</a> (2015-08-27)
+								<h1 class="entry-title">SCN synchronization in distributed transactions</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>You have lot of db links between two databases, you think they are not used but want to be sure. It&#8217;s not difficult. When doing distributed transactions (which means running a transaction that involves remote databases through db links) the SCN of the database is synchronized. Comparing them can help. But let&#8217;s explain that.
+<span id="more-3220"></span></p>
+<h1>SCN synchronization</h1>
+<p>Why is SCN synchronized? The SCN (System Change number) is there to identify a specific point-in-time for the version of the data. It is incremented at each commit so that it can identify exactly a version of your data. Oracle does not use a timestamp for several reasons. First, because you can have very frequent commits, so the timestamp precision may not identify those changes. And timestamp is subject to system time changes (daylight saving for example).
+When you restore your database to a specific point in time, you restore and recover it to get the data at a specific SCN, for the whole database, so that everything is consistent. But if your application is doing changes in several databases you should consider all databases. If you restore one you must restore the others to the same point-in-time.
+If you do that from the application using different connections, then you have to manage the synchronization, or accept inconsistencies.
+If you do that &#8211; distributed transactions &#8211; from the same session using db links, then Oracle manages that itself: it synchronizes the SCN of the databases at each commit by advancing the smallest ones to the highest one.</p>
+<h1>example</h1>
+<p>I have two databases. the local one (called CDB) has a database link (called REMOTEDB) to the remote one (called SLOB &#8211; don&#8217;t ask why).
+Here is the setup in local database:
+<pre>
+07:31:03 SQL&gt; connect demo/demo@//dbi-cdb/pdb1.dbitrial1.oraclecloud.internal
+Connected.
+07:31:04 SQL&gt; create table T1 as select * from dual;
+Table created.
+07:31:04 SQL&gt; create database link REMOTEDB connect to demo identified by demo using '//dbi-cdb/SLOB';
+Database link created.
+07:31:04 SQL&gt; select current_scn from v$database;
+CURRENT_SCN
+-----------
+   13044181
+</pre>
+and in remote
+<pre>
+07:31:04 SQL&gt; connect demo/demo@//dbi-cdb/SLOB
+Connected.
+07:31:06 SQL&gt; drop table T2;
+Table dropped.
+07:31:10 SQL&gt; create table T2 as select * from dual;
+Table created.
+07:31:12 SQL&gt; select current_scn from v$database;
+CURRENT_SCN
+-----------
+    6479885
+</pre>
+Two databases with very different SCN (they had their own life). Table T2 in remote, table T2 in local, and a db link REMOTEDB to remote.</p>
+<p>I check the SCN and current timestamp from the local database:
+<pre>
+07:31:12 SQL&gt; connect demo/demo@//dbi-cdb/SLOB
+Connected.
+07:31:13 SQL&gt; column GET_SYSTEM_CHANGE_NUMBER new_value remote_scn
+07:31:13 SQL&gt; select instance_name,current_timestamp,dbms_flashback.get_system_change_number from v$instance;
+
+INSTANCE_NAME CURRENT_TIMESTAMP                        GET_SYSTEM_CHANGE_NUMBER
+------------- ---------------------------------------- ------------------------
+SLOB          27-AUG-15 07.31.13.432962 AM +00:00                       6480023
+</pre>
+I check the same in the remote database:
+<pre>
+07:31:13 SQL&gt; connect demo/demo@//dbi-cdb/pdb1.dbitrial1.oraclecloud.internal
+Connected.
+07:31:13 SQL&gt; column GET_SYSTEM_CHANGE_NUMBER new_value local_scn
+07:31:13 SQL&gt; select instance_name,current_timestamp,dbms_flashback.get_system_change_number from v$instance;
+
+INSTANCE_NAME CURRENT_TIMESTAMP                        GET_SYSTEM_CHANGE_NUMBER
+------------- ---------------------------------------- ------------------------
+CDB           27-AUG-15 07.31.13.879165 AM +00:00                      13045154
+</pre></p>
+<p>If I want to know which timestamp the local SCN coressponds to in the remote database, it&#8217;s a totally different time:
+<pre>
+07:31:13 SQL&gt; select instance_name,scn_to_timestamp(&amp;remote_scn) from v$instance;
+old   1: select instance_name,scn_to_timestamp(&amp;remote_scn) from v$instance
+new   1: select instance_name,scn_to_timestamp(   6480023) from v$instance
+
+INSTANCE_NAME SCN_TO_TIMESTAMP(6480023)
+------------- ---------------------------------------------------------------------------
+CDB           26-AUG-15 09.27.41.000000000 PM
+</pre>
+Not so far here because I tested that the day before. You may also get a &#8216;ORA-08181: specified number is not a valid system change number&#8217; because the SCN for one database has no meaning in the other one.</p>
+<h1>Distributed transaction</h1>
+<p>I&#8217;ll do a transaction involving local and remote database
+<pre>
+07:31:17 SQL&gt; select * from T1;
+
+D
+-
+X
+
+07:31:17 SQL&gt; select * from T2@REMOTEDB;
+
+D
+-
+X
+
+07:31:17 SQL&gt; commit;
+Commit complete.
+</pre>
+Do you think it&#8217;s not a transaction because it&#8217;s only select? Well, that&#8217;s true and false. There is no changes, so no need for a transaction. But if we do some DML later we will need a transaction. In the local session, the transaction starts there. But in the remote session, a transaction is started from the first remote access even if it is a select. </p>
+<h1>SCN</h1>
+<p>Now let&#8217;s check the SCNs in the same way as before.
+<pre>
+07:31:17 SQL&gt; connect demo/demo@//dbi-cdb/SLOB
+Connected.
+07:31:18 SQL&gt; column GET_SYSTEM_CHANGE_NUMBER new_value remote_scn
+07:31:18 SQL&gt; select instance_name,current_timestamp,dbms_flashback.get_system_change_number from v$instance;
+
+INSTANCE_NAME CURRENT_TIMESTAMP                        GET_SYSTEM_CHANGE_NUMBER
+------------- ---------------------------------------- ------------------------
+SLOB          27-AUG-15 07.31.18.378737 AM +00:00                      13045598
+
+07:31:18 SQL&gt; connect demo/demo@//dbi-cdb/pdb1.dbitrial1.oraclecloud.internal
+Connected.
+07:31:18 SQL&gt; column GET_SYSTEM_CHANGE_NUMBER new_value local_scn
+07:31:18 SQL&gt; select instance_name,current_timestamp,dbms_flashback.get_system_change_number from v$instance;
+
+INSTANCE_NAME CURRENT_TIMESTAMP                        GET_SYSTEM_CHANGE_NUMBER
+------------- ---------------------------------------- ------------------------
+CDB           27-AUG-15 07.31.18.794605 AM +00:00                      13045600
+</pre>
+The SCN numbers are now very close. Let&#8217;s see the meaning of the local SCN in the remote database:
+<pre>
+07:31:18 SQL&gt; select instance_name,scn_to_timestamp(&amp;remote_scn) from v$instance;
+old   1: select instance_name,scn_to_timestamp(&amp;remote_scn) from v$instance
+new   1: select instance_name,scn_to_timestamp(  13045598) from v$instance
+
+INSTANCE_NAME SCN_TO_TIMESTAMP(13045598)
+------------- ---------------------------------------------------------------------------
+CDB           27-AUG-15 07:31:16.000000000 AM
+</pre>
+The remote SCN (13045598) at 07.31.18 corresponds to 07.31.16 in the local database.
+You should remember that there can be a 3 seconds gap when using SCN_TO_TIMESTAMP because not all SCN are recorded in SMON_SCN_TIME table.
+If we do the opposite check in the remote database:
+<pre>
+SQL&gt; select instance_name,scn_to_timestamp(&amp;remote_scn) from v$instance;
+
+INSTANCE_NAME SCN_TO_TIMESTAMP(13045600)
+------------- ---------------------------------------------------------------------------
+SLOB          27-AUG-15 07.31.18.000000000 AM
+</pre>
+The local SCN (13045600) at 07:31:18 corresponds to the same timestamp in the remote database.</p>
+<h1>So what?</h1>
+<p>There are several reasons to know that behavior.</p>
+<p>First, its a good way to verify if databases that are linked by db links are actually using them or not. If the SCN gap is huge (in the number, and the timestamp correspondence in the other database), then you can be confident that there were no distributed transactions for a long time.</p>
+<p>Second, it&#8217;s good to know that the synchronization happens even when you commit a transaction that has not changed anything. When you are sure that your transaction will read only, the it&#8217;s better to set the transaction read only.</p>
+<p>Third, that synchronization is a good thing: you can do a point-in-time restore or duplicate of several databases and get a consistent state for the whole. You should use distributed transactions (for example pl/sql call through db link) when one database has to synchronize with an other one. </p>
+<p>But there are cases where you don&#8217;t want that synchronization. In the past, I had to check if an electronic voting machine keeps privacy of votes or not. You have to store the vote choice, and the voting people in different databases, so that it&#8217;s impossible to mach a vote with a name. But if you do that with distributed transaction from oracle then, because of the SCN synchronization, it&#8217;s easy to use log miner and join the redo from both databases.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-32210"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

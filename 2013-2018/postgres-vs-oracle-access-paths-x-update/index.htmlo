@@ -1,0 +1,212 @@
+This was first published on <a href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-x-update>https://blog.dbi-services.com/postgres-vs-oracle-access-paths-x-update</a> (2017-08-24)
+								<h1 class="entry-title">Postgres vs. Oracle access paths X &#8211; Update</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="../postgres-vs-oracle-access-paths-ix/index.html" target="_blank">previous post</a> we have seen the cheapest way to get one row, reading only one block from its physical location. But that&#8217;s the optimal case where the row has not moved. I&#8217;ll (nearly) conclude this series about access path with an update.
+<span id="more-18357"></span></p>
+<h3>ROWID in Oracle</h3>
+<p>Here is the ROWID of one row in Oracle:
+<pre>
+select rowid from demo1  where n=1000;
+ROWID
+------------------
+AAAR4WAAMAAAAEaAAF
+</pre>
+There&#8217;s enough information here to get directly to the block with file_name and offset:
+<pre>select file_name,dbms_rowid.rowid_block_number('AAAR4WAAMAAAAEaAAF')*block_size offset
+   from dba_data_files join dba_tablespaces using(tablespace_name)
+   where file_id=dbms_rowid.rowid_to_absolute_fno('AAAR4WAAMAAAAEaAAF','DEMO','DEMO1');
+
+FILE_NAME                                    OFFSET
+---------------------------------------- ----------
+/u01/oradata/CDB1A/PDB/users01.dbf          2310144
+</pre>
+The ROWID also contains the index of the row within the block&#8217;s row directory:
+<pre>
+select dbms_rowid.rowid_row_number('AAAR4WAAMAAAAEaAAF') from dual;
+
+DBMS_ROWID.ROWID_ROW_NUMBER('AAAR4WAAMAAAAEAAAF')
+-------------------------------------------------
+                                                5
+</pre></p>
+<h3>TID in Postgres</h3>
+<p>And the TID of similar row in Postgres:
+<pre>
+select ctid from demo1  where n=1000;
+  ctid
+---------
+ (142,6)
+</pre>
+The file is known from the table, as there is only one file per table:
+<pre>
+show data_directory;
+       data_directory
+----------------------------
+ /usr/share/postgresql/data
+
+select pg_relation_filepath('demo1');
+ pg_relation_filepath
+----------------------
+ base/16437/125852
+</pre>
+The blocksize is common for the whole database:
+<pre>
+show block_size;
+ block_size
+------------
+ 8192
+</pre>
+Then the block is at offset 142+8192=8334.
+Within the block, the row is at index 6.</p>
+<h3>SELECT</h3>
+<p>We have seen in the previous post that we can select using the ROWID/TID and Oracle and Postgres behave the same: only one block to read, cost estimation based on one random read:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  8mj3ms08x0sfh, child number 0
+-------------------------------------
+select /*+  */  a from demo1  where rowid='AAAR4WAAMAAAAEaAAF'
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |       |      1 |        |     1 (100)|      1 |00:00:00.01 |       1 |
+|   1 |  TABLE ACCESS BY USER ROWID| DEMO1 |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       1 |
+-----------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "A"[NUMBER,22]
+</pre></p>
+<p>Different units but same signification: cost=1 for Oracle is for random reads, cost=1 for Postgres is for sequential reads and random reads are estimated to cost=4:
+<pre>
+explain (analyze,verbose,costs,buffers) select  a from demo1  where ctid='(142,6)' ;
+                                              QUERY PLAN
+------------------------------------------------------------------------------------------------------
+ Tid Scan on public.demo1  (cost=0.00..4.01 rows=1 width=4) (actual time=0.007..0.007 rows=1 loops=1)
+   Output: a
+   TID Cond: (demo1.ctid = '(142,6)'::tid)
+   Buffers: shared hit=1
+ Planning time: 0.358 ms
+ Execution time: 0.016 ms
+</pre></p>
+<h3>Oracle UPDATE</h3>
+<p>Now I&#8217;m updating this row, changing the column X which contains 1000 &#8216;x&#8217; characters to 1000 &#8216;y&#8217; characters:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  gpqv4k6m1q20y, child number 0
+-------------------------------------
+update /*+  */  demo1 set x=lpad('y',1000,'y') where rowid='AAAR4WAAMAAAAEaAAF'
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------------------
+|   0 | UPDATE STATEMENT            |       |      1 |        |     1 (100)|      0 |00:00:00.01 |       4 |
+|   1 |  UPDATE                     | DEMO1 |      1 |        |            |      0 |00:00:00.01 |       4 |
+|   2 |   TABLE ACCESS BY USER ROWID| DEMO1 |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       1 |
+------------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   2 - (upd=2) ROWID[ROWID,10], "X"[VARCHAR2,1000]
+</pre></p>
+<p>In addition to the access to the block (1 buffer) the update had to read 3 additional buffers. There are no indexes on this updated column and then Oracle has no additional maintenance to do. One buffer is the table block to update (the TABLE ACCESS BY USER ROWID was a consistent get, the update needs the current version of the block). </p>
+<p>Additional buffers are from the UNDO tablespace for MVCC (Multi Version Concurrency Control). It is the first modification in my transaction and then has to update the transaction table and undo segment, which is why we see 2 additional buffers. Another update within the same transaction reads only two buffers in total:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  gpqv4k6m1q20y, child number 0
+-------------------------------------
+update /*+  */  demo1 set x=lpad('z',1000,'z') where rowid='AAAR4WAAMAAAAEaAAF'
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------------------
+|   0 | UPDATE STATEMENT            |       |      1 |        |     1 (100)|      0 |00:00:00.01 |       2 |
+|   1 |  UPDATE                     | DEMO1 |      1 |        |            |      0 |00:00:00.01 |       2 |
+|   2 |   TABLE ACCESS BY USER ROWID| DEMO1 |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       1 |
+------------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   2 - (upd=2) ROWID[ROWID,10], "X"[VARCHAR2,1000]
+</pre></p>
+<p>Only the table blocks are read: one consistent read as of the beginning of the query (or the transaction if in serializable isolation level) and one for the current block. Oracle has an optimization called In-Memory UNDO to avoid frequent access undo blocks.</p>
+<p>There are no further re-visits needed. Oracle may choose to come back at commit if it can be done quickly (few blocks still in buffer cache) but that&#8217;s not required. The block can stay like this for years without the need to read it again for cleanup. If another session has to read it, then cleanup may be done by this session.</p>
+<h3>Postgres UPDATE</h3>
+<p>Here is the same update in Postgres:
+<pre>
+explain (analyze,verbose,costs,buffers) update  demo1 set x=lpad('y',1000,'y') where ctid='(142,6)' ;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  QUERY PLAN
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public.demo1  (cost=0.00..4.01 rows=1 width=46) (actual time=0.214..0.214 rows=0 loops=1)
+   Buffers: shared hit=6 dirtied=3
+   -&gt;  Tid Scan on public.demo1  (cost=0.00..4.01 rows=1 width=46) (actual time=0.009..0.009 rows=1 loops=1)
+         Output: n, a, 'yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy'::text, ctid
+         TID Cond: (demo1.ctid = '(142,6)'::tid)
+         Buffers: shared hit=1
+ Planning time: 0.405 ms
+ Execution time: 0.232 ms
+</pre></p>
+<p>The Tid Scan is the same as for the select. Then the update has read 5 blocks and modified 3 of them. The update in Postgres is processed as a delete+insert. Here is my guess about those numbers. The new version is inserted, in a new block if there is no free space in the same block. The old version is updated. And the index must be maintained. Those are 3 blocks to modify. Here, the row was directly accessed through its TID. But we must find the index entry. The row contains the index value, and then an index scan is possible: two block reads for this small index having one branch only.</p>
+<h3>SELECT again</h3>
+<p>I said that with Oracle the row is updated in-place and doesn&#8217;t need further cleanup. If I run the same SELECT as the one I did before the UPDATE, I still have only one block to read:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  8mj3ms08x0sfh, child number 0
+-------------------------------------
+select /*+  */  a from demo1  where rowid='AAAR4WAAMAAAAEaAAF'
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |       |      1 |        |     1 (100)|      1 |00:00:00.01 |       1 |
+|   1 |  TABLE ACCESS BY USER ROWID| DEMO1 |      1 |      1 |     1   (0)|      1 |00:00:00.01 |       1 |
+-----------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "A"[NUMBER,22]
+</pre></p>
+<p>In Postgres, because the update was processed as insert+delete, running the same also reads only one block, but it returns no rows:
+<pre>
+explain (analyze,verbose,costs,buffers) select  a from demo1  where ctid='(142,6)' ;
+                                              QUERY PLAN
+------------------------------------------------------------------------------------------------------
+ Tid Scan on public.demo1  (cost=0.00..4.01 rows=1 width=4) (actual time=0.014..0.014 rows=0 loops=1)
+   Output: a
+   TID Cond: (demo1.ctid = '(142,6)'::tid)
+   Buffers: shared hit=1
+ Planning time: 0.442 ms
+ Execution time: 0.028 ms
+</pre></p>
+<p>The new version is in another block, then the TID to find it is different:
+<pre>
+select ctid from demo1  where n=1000;
+   ctid
+----------
+ (1428,5)
+(1 row)
+</pre></p>
+<p>There was not enough space for another version of the whole row within the same block. Free space was found in the last block (1428). Of course, this is why the index was updated even if the indexed column did not change: it had to address a different block.</p>
+<p>Let&#8217;s query with the new TID:
+<pre>
+explain (analyze,verbose,costs,buffers) select  a from demo1  where ctid='(1428,5)' ;
+                                              QUERY PLAN
+------------------------------------------------------------------------------------------------------
+ Tid Scan on public.demo1  (cost=0.00..4.01 rows=1 width=4) (actual time=0.008..0.008 rows=1 loops=1)
+   Output: a
+   TID Cond: (demo1.ctid = '(1428,5)'::tid)
+   Buffers: shared hit=1
+ Planning time: 0.449 ms
+ Execution time: 0.023 ms
+</pre></p>
+<p>Only one buffer read. However, as we have seen with the <a href="../postgres-vs-oracle-access-paths-ii/index.html" target="_blank">Index Only Scan</a>, there is a need for cleanup to avoid Heap Fetches. There are also the old tuples that should be removed later or the updated tables and indexes grow forever.</p>
+<p>There&#8217;s only one Postgres access path remaining. That&#8217;s for the <a href="https://blog.dbi-services.com/postgres-vs-oracle-access-paths-x/" target="_blank">last post</a> of this series, which will include the table of content.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-183580"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

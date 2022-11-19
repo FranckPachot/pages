@@ -1,0 +1,92 @@
+This was first published on <a href=https://blog.dbi-services.com/multitenant-dictionary-what-is-stored-only-in-cdbroot>https://blog.dbi-services.com/multitenant-dictionary-what-is-stored-only-in-cdbroot</a> (2016-05-17)
+								<h1 class="entry-title">Multitenant dictionary: what is stored only in CDB$ROOT?</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Multitenant architecture is about dictionary separation. The idea is that all system metadata is stored only in CDB$ROOT so that space and upgrade time are optimized. Is it entirely true? let&#8217;s count the rows in the dictionary tables.
+<span id="more-7984"></span>
+In order to verify that, I&#8217;ve build a query that will count the rows from the dictionary tables, in CDB$ROOT and in PDB$SEED.
+The idea is to query DBA_OBJECTS for ORACLE_MAINTAINED=Y objects and call a function that run an &#8216;execute immediate&#8217; to do a &#8216;select count(*)&#8217;. Inline functions in 12<em>c</em> are great for that. Especially when I want to switch to another container for it. Note that I&#8217;m not 100% sure that it&#8217;s supported to switch to another container there but al least don&#8217;t forget to switch back to initial one.
+As I&#8217;m using some inline function, I&#8217;ve added one &#8216;hextoasc&#8217; that helps me to lookup into the dictionary cache for the presence of object (not related to this post) and I also check which table is in the bootstrap procedure (which hard codes some dictionary metadata into row cache before they are available through buffer cache).</p>
+<p>So here is the query:</p>
+<p><pre>
+with function countrows(con_name varchar2,name varchar2) return number as
+ n number;
+ saved_con_name varchar2(128);
+begin
+ saved_con_name:=sys_context('userenv','con_name');
+ execute immediate 'alter session set container='||con_name;
+ execute immediate 'select count(*) from "'||name||'"' into n;
+ execute immediate 'alter session set container='||saved_con_name;
+ return n;
+exception when others then
+ execute immediate 'alter session set container='||saved_con_name;
+ return null;
+end;
+function hex2asc(s varchar2) return varchar2 as r varchar2(32000);
+begin
+ for i in 1..length(s)/2
+  loop
+   exit when substr(s,2*i-1,2)='00';
+   r:=r||chr(to_number(substr(s,2*i-1,2),'XX'));
+  end loop;
+  return r;
+end;
+select v.*
+,(select count(*) from v$rowcache_parent where key like '00%' and hex2asc(substr(key,13)||'00') like object_name||'%' and existent='Y' and con_id=1) rowcache_entries
+,(select substr(sql_text,1,30) from bootstrap$ where sql_text like '%TABLE '||object_name||'(%') bootstrap
+from (
+select object_name,countrows('PDB$SEED',object_name) SEED_COUNT,countrows('CDB$ROOT',object_name) ROOT_COUNT
+from user_objects where object_type='TABLE' and oracle_maintained='Y' and object_name like '%$'
+) v
+where root_count&gt;0 order by seed_count desc, root_count desc;
+/
+</pre></p>
+<p>And the first rows of the result where sorting those that have lot of lines in PDB$SEED first:</p>
+<p><pre>
+OBJECT_NAME                    SEED_COUNT ROOT_COUNT                        ROWCACHE_ENTRIES BOOTSTRAP
+------------------------------ ---------- ---------- --------------------------------------- ------------------------------
+DEPENDENCY$                        162253     162180                                       2
+COL$                               111623     111663                                       2 CREATE TABLE COL$("OBJ#" NUMBE
+OBJ$                                91511      91721                                       2 CREATE TABLE OBJ$("OBJ#" NUMBE
+OBJAUTH$                            45085      45084                                       2
+HIST_HEAD$                          30585      50516                                       2
+ACCESS$                             27351     109485                                       2
+KOTAD$                              25927      27456                                       2
+JAVASNM$                            25073      25073                                       2
+HISTGRM$                            22653      72890                                       2
+SETTINGS$                           19872      52936                                       2
+SOURCE$                             17608     327589                                       2
+ATTRIBUTE$                          13975      13975                                       2
+PARAMETER$                          11785      11785                                       2
+CCOL$                               11362      11400                                       2 CREATE TABLE CCOL$("CON#" NUMB
+CON$                                 9648       9686                                       2 CREATE TABLE CON$("OWNER#" NUM
+CDEF$                                9493       9685                                       2 CREATE TABLE CDEF$("CON#" NUMB
+METASCRIPTFILTER$                    7365       7365                                       2
+IDL_SB4$                             7288      17787                                       2
+ICOL$                                6432       6432                                       2 CREATE TABLE ICOL$("OBJ#" NUMB
+IDL_UB1$                             6290      53505                                       2
+IDL_UB2$                             5931      13029                                       2
+OID$                                 5119       6574                                       2
+IND$                                 4264       4264                                       2 CREATE TABLE IND$("OBJ#" NUMBE
+</pre></p>
+<p>You see immediately that the largest metadata, which is the source of the stored procedures, in SOURCE$, is mostly stored only in CDB$ROOT. For space efficiency this is good.</p>
+<p>However you can see that COL$ and TAB$ have same number of rows in CDB$ROOT and in PDB, which is not exactly what is described in the oracle documentation.</p>
+<p>And tables such as DEPENDENCY$, managing dependency among objects, is still huge in the PDB. Dependencies are managed at that level.</p>
+<p>This explain why it still takes time to upgrade or patch a PDB when the CDB has been upgraded or patched. There is not only the metadata/data links to verify. There is still some DDL to run to maintain the pluggable database dictionary.</p>
+<p>This is not exactly what is documented in <a href="https://docs.oracle.com/database/121/CNCPT/cdbovrvw.htm#CNCPT89242">https://docs.oracle.com/database/121/CNCPT/cdbovrvw.htm#CNCPT89242</a>:
+<em>Fewer database patches and upgrades
+It is easier to apply a patch to one database than to 100 databases, and to upgrade one database than to upgrade 100 databases.</em></p>
+<p>But we can expect that this will be improved in further releases.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-79850"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

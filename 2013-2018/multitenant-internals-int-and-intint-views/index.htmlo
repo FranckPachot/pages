@@ -1,0 +1,215 @@
+This was first published on <a href=https://blog.dbi-services.com/multitenant-internals-int-and-intint-views>https://blog.dbi-services.com/multitenant-internals-int-and-intint-views</a> (2017-11-05)
+								<h1 class="entry-title">Multitenant internals: INT$ and INT$INT$ views</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>This month, I&#8217;ll talk &#8211; with lot of demos &#8211; about multitenant internals at <a href="https://2017.doag.org/en/home/" target="_blank">DOAG conference</a>. <a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/11/CaptureMultitenantInternals.png" rel="lightbox[19396]"><img src="../wp-insides/uploads/sites/2/2017/11/CaptureMultitenantInternals-300x184.png" alt="CaptureMultitenantInternals" width="300" height="184" class="alignleft size-medium wp-image-19398" /></a>
+The multitenant dictionary architecture starts with a simple idea: system metadata and data are in CDB$ROOT and user metadata and data are in PDB. And it could have been that simple. When a session connected to a PDB needs to read some system information, the session context is switched to the CDB$ROOT container and reads from CDB$ROOT SYS tablespace and objects, and then switches back to the PDB container. This is implemented by metadata and data links: the PDB lists the objects for which the session has to switch to CDB$ROOT to get metadata or data. </p>
+<p><a href="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/11/CaptureMultitenantInternals1.png" rel="lightbox[19396]"><img src="../wp-insides/uploads/sites/2/2017/11/CaptureMultitenantInternals1-300x187.png" alt="CaptureMultitenantInternals1" width="300" height="187" class="alignright size-medium wp-image-19409" /></a>But, for compatibility reason, and ease of administration, the dictionary views must display information from both containers, transparently, and then things become a little more complex with common views and extended data views.</p>
+<p>At Oracle Open World, the multitenant architects, in the #PDBExpert session, answered questions about the multitenant architecture posted on Twitter. My first question (because I was investigating a <a href="../wrong-result-with-multitenant-dba_contraints-and-current_schema/index.html" target="_blank">bug</a> at that time) was about some views, such as INT$INT$DBA_CONSTRAINTS, introduced to implement the complexity of showing the same information in dictionary views as the ones we had on non-CDB. Of course, the architects didn&#8217;t want to go too far on this and had a very accurate answer: INT$ is for internal, and here you have two &#8216;INT$&#8217; so you shouldn&#8217;t look at that.</p>
+<p>But I like to understand how things work and here is the explanation of these INT$INT$ views. And I&#8217;m not even sure that INT is for &#8216;internal&#8217; but maybe &#8216;intermediate&#8217;. But for sure, the $ at the end is used by Oracle internal dictionary objects.</p>
+<p><span id="more-19396"></span></p>
+<h3>INT$ Extended Data views</h3>
+<p>We are used to seeing all objects, system ones and user ones, listed by the dictionary views. For example, DBA_PROCEDURES shows all procedures, system and user ones, and then have to read from both containers (current PDB and CDB$ROOT) through extended data links. ALL_PROCEDURES shows all procedures accessible by the user, and they also have to switch to CDB$ROOT if the user has been granted to read system objects. USER_PROCEDURES shows only the objects owned by the current user, and then can read from the current container only.</p>
+<p>For the ease of the definition, in 12<i>c</i> all the joins on the underlying tables(such as procedureinfo$, user$, obj$) is done by an intermediate view such as INT$DBA_PROCEDURES which is defined as EXTENDED DATA link to read from CDB$ROOT in addition to the local table. Then DBA_PROCEDURES, ALL_PROCEDURES and USER_PROCEDURES are defined on top of it with the required where clause to filter out owner and privilege accessibility.</p>
+<h3>INT$INT$ Extended Data views</h3>
+<p>In this post, I&#8217;ll detail the special case of DBA_CONSTRAINTS because things are more complex to get the multitenant architecture behaving the same as the non-CDB.</p>
+<p>There are several types of constraints which are identified with the CONSTRAINT_TYPE column of DBA_CONSTRAINTS, or the TYPE# of the underlying table CDEF#</p>
+<p>Here, I query the underlying table with the CONTAINER() function to see what is stored in each container:
+<pre>
+SQL&gt; select decode(type#,1,'C',2,'P',3,'U',4,'R',5,'V',6,'O',7,'C',8,'H',9,'F',10,'F',11,'F',13,'F','?') constraint_type,
+  2  type#,con_id,count(*) from containers(cdef$)
+  3  group by type#,con_id order by type#,con_id;
+
+CONSTRAINT_TYPE     TYPE#   CON_ID   COUNT(*)
+---------------     -----   ------   --------
+C                       1        1         74
+C                       1        3         74
+P                       2        1        843
+P                       2        3        844
+U                       3        1        238
+U                       3        3        238
+R                       4        1        324
+R                       4        3        324
+V                       5        1         11
+O                       6        1        172
+O                       6        3         26
+C                       7        1       5337
+C                       7        3       5337
+F                      11        1         11
+F                      11        3         11
+?                      12        1          3
+?                      12        3          3
+</pre>
+I have very few user objects in this database. CON_ID=1 is CDB$ROOT and CON_ID=3 is my PDB. What we can see here is that we have nearly the same number of rows in both containers for the following constraint types: C (check constraint on a table), P (primary key), U (unique key), R (referential integrity), and other types related to tables. And some types have most of their rows in CDB$ROOT only: V (check option on views), R (read only on views)</p>
+<p>That&#8217;s an implementation specificity of the multitenant architecture which makes things more complex for the dictionary views. For some objects (such as procedures and views) the metadata is stored in only one container: system objects have all their information in CDB$ROOT and the PDB has only a link which is a dummy row in OBJ$ which mentions the sharing (such as metadata link), owner and name (to match to the object in CDB$ROOT), and a signature (to verify that the DDL creating the object is the same). But other objects (such as tables) have their information duplicated in all containers for system objects (CDB$ROOT, PDB$SEED and all user PDBs). This is the reason why we see rows in both containers for constraint definition when they are related to a table.</p>
+<h3>Example on view constraint</h3>
+<p>I&#8217;ll take a constraint on system view as an example: constraint SYS_C003357 on table SYS.DBA_XS_SESSIONS</p>
+<p><pre>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where owner='SYS' and object_name='DBA_XS_SESSIONS';
+
+OWNER   OBJECT_NAME       OBJECT_TYPE   SHARING
+-----   -----------       -----------   -------
+SYS     DBA_XS_SESSIONS   VIEW          METADATA LINK
+
+SQL&gt; select owner,table_name,constraint_type,constraint_name from containers(dba_constraints) where owner='SYS' and table_name='DBA_XS_SESSIONS'  and rownum=1;
+
+OWNER   TABLE_NAME        CONSTRAINT_TYPE   CONSTRAINT_NAME
+-----   ----------        ---------------   ---------------
+SYS     DBA_XS_SESSIONS   O                 SYS_C003357
+</pre></p>
+<p>I&#8217;m looking at the dependencies for the DBA_CONSTRAINTS view:
+<pre>
+SQL&gt; select owner,name,referenced_owner,referenced_name from dba_dependencies where owner='SYS' and name='DBA_CONSTRAINTS' and type='VIEW';
+
+OWNER   NAME              REFERENCED_OWNER   REFERENCED_NAME
+-----   ----              ----------------   ---------------
+SYS     DBA_CONSTRAINTS   SYS                GETLONG
+SYS     DBA_CONSTRAINTS   SYS                INT$DBA_CONSTRAINTS
+</pre></p>
+<p>So the DBA_CONSTRAINT is a view on INT$DBA_CONSTRAINTS as we have seen above. However, this view is not directly reading the tables but another view:
+<pre>
+SQL&gt; select owner,name,referenced_owner,referenced_name from dba_dependencies where owner='SYS' and name='INT$DBA_CONSTRAINTS' and type='VIEW';
+
+OWNER   NAME                  REFERENCED_OWNER   REFERENCED_NAME
+-----   ----                  ----------------   ---------------
+SYS     INT$DBA_CONSTRAINTS   SYS                GETLONG
+SYS     INT$DBA_CONSTRAINTS   SYS                INT$INT$DBA_CONSTRAINTS
+</pre></p>
+<p>Here is our additional INT$INT$ view which is reading the tables:
+<pre>
+SQL&gt; select owner,name,referenced_owner,referenced_name from dba_dependencies where owner='SYS' and name='INT$INT$DBA_CONSTRAINTS' and type='VIEW';
+
+OWNER   NAME                      REFERENCED_OWNER   REFERENCED_NAME
+-----   ----                      ----------------   ---------------
+SYS     INT$INT$DBA_CONSTRAINTS   SYS                USER$
+SYS     INT$INT$DBA_CONSTRAINTS   SYS                CDEF$
+SYS     INT$INT$DBA_CONSTRAINTS   SYS                OBJ$
+SYS     INT$INT$DBA_CONSTRAINTS   SYS                CON$
+SYS     INT$INT$DBA_CONSTRAINTS   SYS                _CURRENT_EDITION_OBJ
+SYS     INT$INT$DBA_CONSTRAINTS   SYS                _BASE_USER
+SYS     INT$INT$DBA_CONSTRAINTS   SYS                GETLONG
+</pre></p>
+<p>In summary, the EXTENDED DATA view which reads the tables on each container (CDB$ROOT and PDB) is here the INT$INT$DBA_CONSTRAINTS and the INT$DBA_CONSTRAINTS is another intermediate one before the DBA_CONSTRAINTS view.</p>
+<p><pre>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where object_name in ('DBA_CONSTRAINTS','INT$DBA_CONSTRAINTS','INT$INT$DBA_CONSTRAINTS') order by object_id desc;
+
+OWNER    OBJECT_NAME               OBJECT_TYPE   SHARING
+-----    -----------               -----------   -------
+PUBLIC   DBA_CONSTRAINTS           SYNONYM       METADATA LINK
+SYS      DBA_CONSTRAINTS           VIEW          METADATA LINK
+SYS      INT$DBA_CONSTRAINTS       VIEW          METADATA LINK
+SYS      INT$INT$DBA_CONSTRAINTS   VIEW          EXTENDED DATA LINK
+</pre></p>
+<p>In this example, we don&#8217;t understand the reason for the additional intermediate view because the return all the same number of rows in each container:</p>
+<p><pre>
+SQL&gt; select con_id,constraint_type,constraint_name from containers(INT$INT$DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003357'
+
+  CON_ID CONSTRAINT_TYPE   CONSTRAINT_NAME
+  ------ ---------------   ---------------
+       1 O                 SYS_C003357
+       3 O                 SYS_C003357
+
+SQL&gt; select con_id,constraint_type,constraint_name from containers(INT$DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003357'
+
+  CON_ID CONSTRAINT_TYPE   CONSTRAINT_NAME
+  ------ ---------------   ---------------
+       1 O                 SYS_C003357
+       3 O                 SYS_C003357
+
+SQL&gt; select con_id,constraint_type,constraint_name from containers(DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003357'
+
+  CON_ID CONSTRAINT_TYPE   CONSTRAINT_NAME
+  ------ ---------------   ---------------
+       1 O                 SYS_C003357
+       3 O                 SYS_C003357
+</pre></p>
+<p>The difference is only a few additional columns from the object definition (OWNERID,OBJECT_ID,OBJECT_TYPE#,SHARING) in the INT$ and INT$INT$ which are not selected in the final view:
+<pre>
+SQL&gt; select * from containers(INT$INT$DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003357'
+
+OWNER     OWNERID CONSTRAINT_NAME   CONSTRAINT_TYPE   TABLE_NAME          OBJECT_ID   OBJECT_TYPE# SEARCH_CONDITION_VC   R_OWNER   R_CONSTRAINT_NAME   DELETE_RULE   STATUS    DEFERRABLE       DEFERRED    VALIDATED       GENERATED        BAD   RELY   LAST_CHANGE   INDEX_OWNER   INDEX_NAME   INVALID   VIEW_RELATED     SHARING   ORIGIN_CON_ID   CON_ID
+-----     ------- ---------------   ---------------   ----------          ---------   ------------ -------------------   -------   -----------------   -----------   ------    ----------       --------    ---------       ---------        ---   ----   -----------   -----------   ----------   -------   ------------     -------   -------------   ------
+SYS             0 SYS_C003357       O                 DBA_XS_SESSIONS         10316              4                                                                   ENABLED   NOT DEFERRABLE   IMMEDIATE   NOT VALIDATED   GENERATED NAME                26-JAN-17                                                                 1               1        1
+SYS             0 SYS_C003357       O                 DBA_XS_SESSIONS         10316              4                                                                   ENABLED   NOT DEFERRABLE   IMMEDIATE   NOT VALIDATED   GENERATED NAME                26-JAN-17                                                                 1               1        3
+
+SQL&gt; select * from containers(INT$DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003357'
+
+OWNER     OWNERID CONSTRAINT_NAME   CONSTRAINT_TYPE   TABLE_NAME          OBJECT_ID   OBJECT_TYPE# SEARCH_CONDITION_VC   R_OWNER   R_CONSTRAINT_NAME   DELETE_RULE   STATUS    DEFERRABLE       DEFERRED    VALIDATED       GENERATED        BAD   RELY   LAST_CHANGE   INDEX_OWNER   INDEX_NAME   INVALID   VIEW_RELATED     SHARING   ORIGIN_CON_ID   CON_ID
+-----     ------- ---------------   ---------------   ----------          ---------   ------------ -------------------   -------   -----------------   -----------   ------    ----------       --------    ---------       ---------        ---   ----   -----------   -----------   ----------   -------   ------------     -------   -------------   ------
+SYS             0 SYS_C003357       O                 DBA_XS_SESSIONS         10316              4                                                                   ENABLED   NOT DEFERRABLE   IMMEDIATE   NOT VALIDATED   GENERATED NAME                26-JAN-17                                                                 1               1        1
+SYS             0 SYS_C003357       O                 DBA_XS_SESSIONS         10316              4                                                                   ENABLED   NOT DEFERRABLE   IMMEDIATE   NOT VALIDATED   GENERATED NAME                26-JAN-17                                                                 1               1        3
+
+SQL&gt; select * from containers(DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003357'
+
+OWNER   CONSTRAINT_NAME   CONSTRAINT_TYPE   TABLE_NAME        SEARCH_CONDITION_VC   R_OWNER   R_CONSTRAINT_NAME   DELETE_RULE   STATUS    DEFERRABLE       DEFERRED    VALIDATED       GENERATED        BAD   RELY   LAST_CHANGE   INDEX_OWNER   INDEX_NAME   INVALID   VIEW_RELATED     ORIGIN_CON_ID   CON_ID
+-----   ---------------   ---------------   ----------        -------------------   -------   -----------------   -----------   ------    ----------       --------    ---------       ---------        ---   ----   -----------   -----------   ----------   -------   ------------     -------------   ------
+SYS     SYS_C003357       O                 DBA_XS_SESSIONS                                                                     ENABLED   NOT DEFERRABLE   IMMEDIATE   NOT VALIDATED   GENERATED NAME                26-JAN-17                                                                       1        1
+SYS     SYS_C003357       O                 DBA_XS_SESSIONS                                                                     ENABLED   NOT DEFERRABLE   IMMEDIATE   NOT VALIDATED   GENERATED NAME                26-JAN-17
+</pre></p>
+<p>If we look at the INT$DBA_CONSTRAINTS definition we see some filters on those object definition:
+<pre>
+SQL&gt; ddl INT$DBA_CONSTRAINTS
+
+  CREATE OR REPLACE FORCE NONEDITIONABLE VIEW "SYS"."INT$DBA_CONSTRAINTS" ("OWNER", "OWNERID", "CONSTRAINT_NAME", "CONSTRAINT_TYPE", "TABLE_NAME", "OBJECT_ID", "OBJECT_TYPE#", "SEARCH_CONDITION", "SEARCH_CONDITION_VC", "R_OWNER", "R_CONSTRAINT_NAME", "DELETE_RULE", "STATUS", "DEFERRABLE", "DEFERRED", "VALIDATED", "GENERATED", "BAD", "RELY", "LAST_CHANGE", "INDEX_OWNER", "INDEX_NAME", "INVALID", "VIEW_RELATED", "SHARING", "ORIGIN_CON_ID") AS
+  select OWNER, OWNERID, CONSTRAINT_NAME, CONSTRAINT_TYPE,
+       TABLE_NAME, OBJECT_ID, OBJECT_TYPE#, SEARCH_CONDITION,
+       SEARCH_CONDITION_VC, R_OWNER, R_CONSTRAINT_NAME, DELETE_RULE, STATUS,
+       DEFERRABLE, DEFERRED, VALIDATED, GENERATED,
+       BAD, RELY, LAST_CHANGE, INDEX_OWNER, INDEX_NAME,
+       INVALID, VIEW_RELATED, SHARING, ORIGIN_CON_ID
+from   INT$INT$DBA_CONSTRAINTS INT$INT$DBA_CONSTRAINTS
+where  INT$INT$DBA_CONSTRAINTS.OBJECT_TYPE# = 4         /* views */
+       OR (INT$INT$DBA_CONSTRAINTS.OBJECT_TYPE# = 2     /* tables */
+           AND (INT$INT$DBA_CONSTRAINTS.ORIGIN_CON_ID
+                = TO_NUMBER(SYS_CONTEXT('USERENV', 'CON_ID'))));
+</pre></p>
+<p>For views (OBJECT_TYPE#=4) there is no filter, which explains why we see the same number of rows in the previous example. But for tables (OBJECT_TYPE#=2) there&#8217;s an additional filter to keep the row from the current container only.</p>
+<h3>Example on table constraint</h3>
+<p>Then, I&#8217;ll take another example with a constraint definition for a table:
+<pre>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where owner='SYS' and object_name='RXS$SESSIONS';
+
+OWNER   OBJECT_NAME    OBJECT_TYPE   SHARING
+-----   -----------    -----------   -------
+SYS     RXS$SESSIONS   TABLE         METADATA LINK
+
+SQL&gt; select owner,table_name,constraint_type,constraint_name from dba_constraints where owner='SYS' and table_name='RXS$SESSIONS' and rownum=1;
+
+OWNER   TABLE_NAME     CONSTRAINT_TYPE   CONSTRAINT_NAME
+-----   ----------     ---------------   ---------------
+SYS     RXS$SESSIONS   C                 SYS_C003339
+</pre></p>
+<p>From the INT$INT$ view, we have a duplicate when we query on a PDB because for tables the PDB not only holds a dummy row in OBJ$ but full information about the table is duplicated in other tables such as TAB$ and CDEF$:
+<pre>
+SQL&gt; select con_id,constraint_type,constraint_name from containers(INT$INT$DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003339'
+
+  CON_ID CONSTRAINT_TYPE   CONSTRAINT_NAME
+  ------ ---------------   ---------------
+       1 C                 SYS_C003339
+       3 C                 SYS_C003339
+       3 C                 SYS_C003339
+</pre></p>
+<p>This is the reason for the additional intermediate view: filtering out those duplicate by removing the rows from CDB$ROOT when queried from a PDB.
+<pre>
+SQL&gt; select con_id,constraint_type,constraint_name from containers(INT$DBA_CONSTRAINTS) where OWNER='SYS' and constraint_name='SYS_C003339'
+
+  CON_ID CONSTRAINT_TYPE   CONSTRAINT_NAME
+  ------ ---------------   ---------------
+       1 C                 SYS_C003339
+       3 C                 SYS_C003339
+</pre></p>
+<p>Thanks to that, the duplicates are not visible to the end-user views DBA_CONSTRAINTS and PDB_CONSTRAINTS.</p>
+<p>You may wonder why only DBA_CONSTRAINTS needs this views and not DBA_TABLES, DBA_INDEXES or DBA_TAB_COLUMNS? That&#8217;s because all information about system tables and indexes are replicated in all PDBs and then there is no need for EXTENDED DATA and context switches. DBA_CONSTRAINT has the particularity of showing information about tables and views, which implement the metadata links in a different way.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-193970" data-img="https://blog.dbi-services.com/wp-insides/uploads/sites/2/2017/11/CaptureMultitenantInternals-300x184.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

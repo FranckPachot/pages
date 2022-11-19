@@ -1,0 +1,262 @@
+This was first published on <a href=https://blog.dbi-services.com/multithreaded-12c-and-connect-as-sysdba>https://blog.dbi-services.com/multithreaded-12c-and-connect-as-sysdba</a> (2015-06-24)
+								<h1 class="entry-title">Multithreaded 12c and &#8216;connect / as sysdba&#8217;</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In Oracle 12c you can run Oracle processes as operating system threads, lowering the number of OS processes. But you can&#8217;t use OS authentification: you need to provide a password. Here is a way to set an environment so that you can still &#8216;connect / as sysdba&#8217; to a multithreaded instance.</p>
+<h3>Windows</h3>
+<p>I start with Windows because Oracle has always been multithreaded on windows. Are you able to use operating system authentication then? You  think so because you can &#8216;connect / as sysdba&#8217;. But look at your sqlnet.ora:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQLNET.AUTHENTICATION_SERVICES = (NTS)</pre>
+<p>You need NTS to connect locally without a password, the same authentication as when you connect remotely. If you don&#8217;t set NTS then both local and remote connections need a password.</p>
+<h3>Threaded execution</h3>
+<p>Back to Linux, I&#8217;ve set my instance with multithreading:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+threaded_execution                   boolean     TRUE</pre>
+<p>If I try to connect witout a password I got an error:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect / as sysdba
+ERROR:
+ORA-01017: invalid username/password; logon denied</pre>
+<p>it&#8217;s exacly the same as if I set</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQLNET.AUTHENTICATION_SERVICES = (NONE)</pre>
+<p>by default on Unix/Linux the AUTHENTICATION_SERVICES is not set, which allows operating system suthentication for Bequeath connections.</p>
+<p>When multithreaded, I can only connect with a password:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect sys as sysdba
+Enter password:
+Connected.</pre>
+<p>But I don&#8217;t want that. I want to keep she same scripts and procedures as I had before going to multithread instance. I can put the password in an external password file (wallet) and then connect without typing the password. But then I have to use a network service name. I can use TWO_TASK environment variable to add that network service name to connections transparently, but &#8211; for waterver reason &#8211; I don&#8217;t want to connect through the listener. So let&#8217;s see how to set it up.</p>
+<h3>TNS_ADMIN</h3>
+<p>I&#8217;ll setup my own SQL*Net files in a custom directory and use TNS_ADMIN to use them.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ mkdir /home/franck/tns
+$ export TNS_ADMIN=/home/franck/tns</pre>
+<p>Here are my ORACLE_HOME and ORACLE_SID:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ env | grep ORACLE
+ORACLE_SID=DEMO11
+ORACLE_BASE=/u01/app/oracle
+ORACLE_HOME=/u01/app/oracle/product/12102EE</pre>
+<h3>External password file</h3>
+<p>It has been described before on our <a href="https://blog.dbi-services.com/use-a-wallet-to-encrypt-oracle-client-passwords">blog</a> by Nicolas Jardot.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ mkstore -wrl $TNS_ADMIN -create
+$ mkstore -wrl $TNS_ADMIN -createCredential BEQ_DEMO11_SYS SYS</pre>
+<p>this as created the wallet containing my user (SYS) and password for the network service name BEQ_DEMO111_SYS</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ ls -l
+-rwxrwx---. 1 root vboxsf 589 Jun 23 23:29 cwallet.sso
+-rwxrwx---. 1 root vboxsf   0 Jun 23 23:29 cwallet.sso.lck
+-rwxrwx---. 1 root vboxsf 544 Jun 23 23:29 ewallet.p12
+-rwxrwx---. 1 root vboxsf   0 Jun 23 23:29 ewallet.p12.lck</pre>
+<p>I have to declare the wallet in my sqlnet.ora</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ cat sqlnet.ora
+WALLET_LOCATION=(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY=/home/franck/tns)))
+SQLNET.WALLET_OVERRIDE=TRUE</pre>
+<h3>Beqeath connection string</h3>
+<p>Now time to define that BEQ_DEMO11_SYS network service name. I want to connect locally (not through the listener) so I define a BEQ connection string:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ cat tnsnames.ora
+BEQ_DEMO11_SYS=(ADDRESS=(PROTOCOL=BEQ)(PROGRAM=/u01/app/oracle/product/12102EE/bin/oracle)(ARGV0=oracleDEMO11)(ARGS='(DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=BEQ)))')(ENVS='ORACLE_HOME=/u01/app/oracle/product/12102EE,ORACLE_SID=DEMO11'))</pre>
+<p>Here is how a beaqueath (PROTOCOL=BEQ) connection is defined. You need to define the PROGRAM to be run (the oracle binary) and the ARGS. You need to pass the environement variables &#8211; at least ORACLE_HOME and ORACLE_SID</p>
+<p>The ARGV0 is the name that will be displayed by the ps &#8216;CMD&#8217; command, but you can put whatever you want in it (just saying&#8230; have fun but not in prod please). The convention is to add the ORACLE_SID to the binary name &#8216;oracle&#8217;.</p>
+<p>Then I can connect:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect /@BEQ_DEMO11_SYS as sysdba
+Connected.</pre>
+<h3>TWO_TASK</h3>
+<p>Finally, I don&#8217;t want to add the network service name in my scripts, then I can set the TWO_TASK environment variable to it.  I definitely don&#8217;t want to set it for all my environment because it can be misleading (you think you use the ORACLE_SID but you are not, you change environement with oraenv but TWO_TASK remains,&#8230;). So i set it locally when I run sqlplus.</p>
+<p>Here is an example where I set TNS_ADMIN and TWO_TASK only when calling sqlplus:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ TNS_ADMIN=$PWD TWO_TASK=BEQ_DEMO11_SYS sqlplus / as sysdba
+
+SQL*Plus: Release 12.1.0.2.0 Production on Wed Jun 24 10:54:58 2015
+
+Copyright (c) 1982, 2014, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options</pre>
+<p>If the scripts does a &#8216;connect / as sysdba&#8217; it still work:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect / as sysdba
+Connected.</pre>
+<p>but you should now that if the script is connecting with another user, TWO_TASK is still used:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect scott/tiger
+Connected.</pre>
+<p>Note that those sessions are multithreaded even if you don&#8217;t set DEDICATED_THROUGH_BROKER for the listener, because you&#8217;re not connecting through the listener here. More information about it in Martin Bach&#8217;s <a href="https://martincarstenbach.wordpress.com/2014/07/21/implications-of-threaded_execution-true-in-12c/">post</a>.</p>
+<p>Here is how to check it &#8211; process and thread id from v$process:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select spid, stid, program, execution_type from v$process where addr=(select paddr from v$session where sid=sys_context('userenv','sid'));
+
+SPID                     STID                     PROGRAM              EXECUTION_TYPE
+------------------------ ------------------------ -------------------- ------------------
+21107                    21107                    oracle@VM111         PROCESS
+</pre>
+<p>and the info about it from Linux:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; host ps -Lfp &amp;pid
+UID        PID  PPID   LWP  C NLWP STIME TTY          TIME CMD
+oracle   21107     1 21107  0    1 11:04 ?        00:00:00 oracleDEMO11 (DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=BEQ)))
+</pre>
+<p>&nbsp;</p>
+<p>TWO_TASK is coming from very old version but will be useful to run old scripts in 12c. Here is an example with threaded instance. You can use it also to connect directly to a PDB (but through listener then &#8211; you need a service).</p>
+<h3>But&#8230;</h3>
+<p>There is one thing that doesn&#8217;t work as I want with external password files. DGMGRL keeps the password provided and uses it to connect to the remote instance &#8211; which is why you need same password for sys on standby. But let&#8217;s see if it works with external password file:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">$ TNS_ADMIN=$PWD TWO_TASK=BEQ_DEMO11_SYS dgmgrl /
+DGMGRL for Linux: Version 12.1.0.2.0 - 64bit Production
+
+Copyright (c) 2000, 2013, Oracle. All rights reserved.
+
+Welcome to DGMGRL, type "help" for information.
+Connected as SYSDG.
+DGMGRL&gt; switchover to demo11
+Performing switchover NOW, please wait...
+New primary database "demo11" is opening...
+Operation requires start up of instance "DEMO12" on database "demo12"
+Starting instance "DEMO12"...
+ORA-01017: invalid username/password; logon denied
+
+Warning: You are no longer connected to ORACLE.
+
+Please complete the following steps to finish switchover:
+        start up instance "DEMO12" of database "demo12"
+</pre>
+<p>I have to finish the switchover manually because the password retreived from the wallet is not used here. Same behaviour than OS authentication here. Tip: if you connect to the primary to do the switchover, then the connection to remote is detected at the begining.</p>
+<h3>Final note</h3>
+<p>This is not best practice. Using external password file is a good practice of course because we should never put passwords in our scripts or in command line. Passwords are something to be only typed by human fingers. TWO_TASK and BEQ connection string are not a good practice, but only a workaround to keep old scripts compatible with new features.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-24340"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="pingback even thread-even depth-1" id="comment-3958">
+				<div id="div-comment-3958" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='https://qguang.wordpress.com/2016/07/09/connect-as-sysdba-failed-in-oracle-12c/' rel='external nofollow' class='url'>connect as sysdba failed in Oracle 12c &#8211; qguang</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3958">
+			July 9, 2016 at 6 h 39 min</a>		</div>
+
+		<p>[&#8230;] reading an article from DBi Service, I checked the 3 things below to get the issue [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-39591"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3958' onclick='return addComment.moveForm( "div-comment-3958", "3958", "respond", "2433" )' aria-label='Reply to connect to connect as sysdba failed in Oracle 12c &#8211; qguang'>Reply to connect</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-4786">
+				<div id="div-comment-4786" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/6ca97a89995fb1049fcc1f6403ab182b?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.oracle.com' rel='external nofollow' class='url'>Kishore</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4786">
+			October 4, 2016 at 16 h 11 min</a>		</div>
+
+		<p>Though it did not work :(, it was fun and worth trying this.
+Thanks for sharing.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-47871"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4786' onclick='return addComment.moveForm( "div-comment-4786", "4786", "respond", "2433" )' aria-label='Reply to Kishore to Kishore'>Reply to Kishore</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1 parent" id="comment-7728">
+				<div id="div-comment-7728" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/b2919606d5a16f08baf302a413ec0c35?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rakesh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7728">
+			June 27, 2017 at 7 h 16 min</a>		</div>
+
+		<p>Hi Frank, </p>
+<p>Thanks for the article, my environment is having same issue, but in my case the threaded_execution is set to false but still OS authentication is throwing ORA-1017 error. </p>
+<p>User logged in is software owner and has dba role assigned to it. Could you please suggest , what else can be verified?</p>
+<p><pre>
+$ sqlplus / as sysdba
+SQL*Plus: Release 12.2.0.1.0 Production on Mon Jun 26 22:13:50 2017
+Copyright (c) 1982, 2016, Oracle.  All rights reserved.
+
+ERROR:
+ORA-01017: invalid username/password; logon denied
+
+Enter user-name: ^C
+$ sqlplus sys/***** as sysdba
+
+SQL*Plus: Release 12.2.0.1.0 Production on Mon Jun 26 22:14:00 2017
+
+Copyright (c) 1982, 2016, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.2.0.1.0 - 64bit Production
+
+SQL&gt; sho parameter threaded_execution
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+threaded_execution                   boolean     FALSE
+</pre></p>
+<p>Thanks
+Rakesh
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-77291"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7728' onclick='return addComment.moveForm( "div-comment-7728", "7728", "respond", "2433" )' aria-label='Reply to Rakesh to Rakesh'>Reply to Rakesh</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-7739">
+				<div id="div-comment-7739" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7739">
+			June 28, 2017 at 11 h 51 min</a>		</div>
+
+		<p>Hi Rakesh,
+maybe you have SQLNET.AUTHENTICATION_SERVICES = (NONE)
+or you are not in the dba group.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-77401"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7739' onclick='return addComment.moveForm( "div-comment-7739", "7739", "respond", "2433" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

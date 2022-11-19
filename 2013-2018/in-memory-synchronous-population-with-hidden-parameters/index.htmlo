@@ -1,0 +1,177 @@
+This was first published on <a href=https://blog.dbi-services.com/in-memory-synchronous-population-with-hidden-parameters>https://blog.dbi-services.com/in-memory-synchronous-population-with-hidden-parameters</a> (2015-11-15)
+								<h1 class="entry-title">In-Memory synchronous population with hidden parameters</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>By default, In-Memory Column Store population is done in background, asynchronously. There are two hidden parameters that can change this behaviour, let&#8217;s see how it works.
+<span id="more-5401"></span>
+Note that this is only good for research, those parameters are undocumented which means that they may not behave as you think they would.
+In a demo about in-Memory (<a href="http://blog.dbi-services.com/oracle-in-memory-column-store-for-business-intelligence-at-swissbiday/" target="_blank">slides</a>,<a href="http://screencast-o-matic.com/watch/co1Q1kfDXB" target="_blank">video</a>) I show that In-Memory is triggered by instance startup or query on tables, and is done asynchronously by the background processes (IMCO and Wnnn). The demo warns about the intermediate state where the execution plan is optimized for In-Memory (Full Table Scan) but rows are read from buffer cache.</p>
+<p>Let&#8217;s take a simple example and see different ways to populate.</p>
+<h3>default population</h3>
+<p>I&#8217;ve a table DEMO with default priority which is on-demand: population is triggered by first access to the table.
+Then I&#8217;m doing that first access with a simple &#8216;count(*)&#8217;and then measure the direct path reads done by my session and by the In-Memory worker processes (Wnnn)
+<pre>
+SQL&gt; select segment_name,populate_status from v$im_segments;
+no rows selected
+
+SQL&gt; select count(*) from DEMO;
+
+  COUNT(*)
+----------
+   4000000
+
+SQL&gt; select segment_name,populate_status from v$im_segments;
+no rows selected
+
+SQL&gt; select program,e.event,e.total_waits,e.time_waited_micro/1e6 seconds,e.wait_class from v$session_event e join v$session using(sid)
+  2  where (program like '%(W%' or sid=sys_context('userenv','sid')) and e.wait_class='User I/O' order by total_waits;
+
+PROGRAM             EVENT                          TOTAL_WAITS    SECONDS WAIT_CLASS
+------------------- ------------------------------ ----------- ---------- ----------------------------------------------------------------
+oracle@Exdb3 (W000) Disk file operations I/O                 1    .002772 User I/O
+sqlplus@Exdb3 (TNS  db file scattered read                   2    .001731 User I/O
+oracle@Exdb3 (W001) Disk file operations I/O                 3    .004728 User I/O
+sqlplus@Exdb3 (TNS  Disk file operations I/O                 3    .000533 User I/O
+oracle@Exdb3 (W001) db file sequential read                  6    .024402 User I/O
+oracle@Exdb3 (W000) direct path read                        25    .140749 User I/O
+oracle@Exdb3 (W001) direct path read                       116    .887163 User I/O
+sqlplus@Exdb3 (TNS  db file sequential read                170    .186352 User I/O
+sqlplus@Exdb3 (TNS  direct path read                       493   1.849471 User I/O
+</pre></p>
+<p>The population was triggered. The query on V$IM_SEGMENT run immediately after show no population yet. And the following query on session waits show 493 direct path reads by my session &#8211; for the count(*) &#8211; and few direct path reads from IM workers because most of the IMCU were not populated yet.</p>
+<h3>_inmemory_populate_wait</h3>
+<p>We can choose synchronous population with the &#8220;_inmemory_populate_wait&#8221;. When set to true (default is false) our foreground session will wait for the table to be populated in memory. Let&#8217;s test it.
+<pre>
+SQL&gt; alter session set "_inmemory_populate_wait"=true;
+Session altered.
+
+SQL&gt; select count(*) from DEMO;
+
+  COUNT(*)
+----------
+   4000000
+
+SQL&gt; select segment_name,populate_status from v$im_segments;
+
+SEGMENT_NAME POPULATE_STATUS
+------------ ----------------
+DEMO         COMPLETED
+
+SQL&gt; select program,e.event,e.total_waits,e.time_waited_micro/1e6 seconds,e.wait_class from v$session_event e join v$session using(sid)
+  2  where (program like '%(W%' or sid=sys_context('userenv','sid')) and e.wait_class='User I/O' order by total_waits;
+
+PROGRAM             EVENT                          TOTAL_WAITS    SECONDS WAIT_CLASS
+------------------- ------------------------------ ----------- ---------- ----------------------------------------------------------------
+oracle@Exdb3 (W001) Disk file operations I/O                 1    .007857 User I/O
+oracle@Exdb3 (W000) Disk file operations I/O                 2    .001091 User I/O
+sqlplus@Exdb3 (TNS  db file scattered read                   2    .001382 User I/O
+sqlplus@Exdb3 (TNS  Disk file operations I/O                 4    .000555 User I/O
+oracle@Exdb3 (W000) db file sequential read                  5    .002017 User I/O
+sqlplus@Exdb3 (TNS  db file sequential read                173    .072744 User I/O
+oracle@Exdb3 (W001) direct path read                       336   1.962332 User I/O
+oracle@Exdb3 (W000) direct path read                       473   2.048195 User I/O
+sqlplus@Exdb3 (TNS  direct path read                       490   1.994116 User I/O
+</pre></p>
+<p>Here, population status was &#8216;COMPLETED&#8217; immediately after my count(*) query. This is exactly what the &#8220;_inmemory_populate_wait&#8221; is for.
+We see the direct-path reads done my the IM worker processes. But the count(*) did the same direct-path reads as before, which means that the execution of the query did not use the IMCS at that time. We wait for population before completing the user call, but we don&#8217;t wait for it to execute the query.</p>
+<p>As a proof of that, here is the autotrace stat from this count(*):
+<pre>
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2180342005
+----------------------------------------------------------------------------
+| Id  | Operation                   | Name | Rows  | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |      |     1 |   727   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE             |      |     1 |            |          |
+|   2 |   TABLE ACCESS INMEMORY FULL| DEMO |  4000K|   727   (1)| 00:00:01 |
+----------------------------------------------------------------------------
+Statistics
+----------------------------------------------------------
+        168  recursive calls
+          0  db block gets
+      62421  consistent gets
+      62274  physical reads
+        284  redo size
+        542  bytes sent via SQL*Net to client
+        552  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+         18  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+</pre>
+and here is one when running it a second time:
+<pre>
+Statistics
+----------------------------------------------------------
+          0  recursive calls
+          0  db block gets
+          3  consistent gets
+          0  physical reads
+          0  redo size
+        542  bytes sent via SQL*Net to client
+        552  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+</pre>
+The first execution read from the row store, triggers IMCS population, waits for the population, and the second run ca read from the IMCS.</p>
+<h3>_inmemory_populate_fg</h3>
+<p>There is another parameter that can make population synchronous because population is then done in the foreground process.
+This cannot be set at session level, and it needs an instance restart:
+<pre>
+SQL&gt; connect / as sysdba
+Connected.
+SQL&gt; alter system set "_inmemory_populate_fg"=true scope=spfile;
+System altered.
+
+SQL&gt; startup force
+...
+</pre>
+Then I do the same as before:
+<pre>
+SQL&gt; select count(*) from DEMO;
+
+  COUNT(*)
+----------
+   4000000
+
+SQL&gt; select segment_name,populate_status from v$im_segments;
+
+SEGMENT_NAME POPULATE_STATUS
+------------ ----------------
+DEMO         COMPLETED
+
+SQL&gt; select program,e.event,e.total_waits,e.time_waited_micro/1e6 seconds,e.wait_class from v$session_event e join v$session using(sid)
+  2  where (program like '%(W%' or sid=sys_context('userenv','sid')) and e.wait_class='User I/O' order by total_waits;
+
+PROGRAM             EVENT                          TOTAL_WAITS    SECONDS WAIT_CLASS
+------------------- ------------------------------ ----------- ---------- ----------------------------------------------------------------
+sqlplus@Exdb3 (TNS  db file scattered read                   2    .001608 User I/O
+oracle@Exdb3 (W001) Disk file operations I/O                 3    .000506 User I/O
+sqlplus@Exdb3 (TNS  Disk file operations I/O                 5    .000749 User I/O
+oracle@Exdb3 (W001) db file sequential read                 70    .027488 User I/O
+sqlplus@Exdb3 (TNS  db file sequential read                178    .084757 User I/O
+sqlplus@Exdb3 (TNS  direct path read                      1215    3.32137 User I/O
+</pre>
+Same amount of direct path reads here, but all done by my foreground session.
+Once again, the population is obviously done after the execution.</p>
+<h3>So what?</h3>
+<p>The asynchronous population is an implementation choice, but code is there for foreground one.</p>
+<p>There is something that I don&#8217;t understand however. When waiting for population, it would be better to populate first, and then use the populated IMCS to execute the query. It seems that it&#8217;s the opposite here, which means that the table is read two times in this case.
+Of course there are cases where this implementation is better, so that we can fetch first rows without waiting for whole population.</p>
+<p>Anyway, I use &#8220;_inmemory_populate_wait&#8221; in my tests or demos when I want the IMCS to be populated. Easier to set this parameter than looping on a select on V$IM_SEGMENTS to see population status being COMPLETED.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-54020"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

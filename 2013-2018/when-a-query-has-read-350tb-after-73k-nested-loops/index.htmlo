@@ -1,0 +1,156 @@
+This was first published on <a href=https://blog.dbi-services.com/when-a-query-has-read-350tb-after-73k-nested-loops>https://blog.dbi-services.com/when-a-query-has-read-350tb-after-73k-nested-loops</a> (2016-05-03)
+								<h1 class="entry-title">When a query has read 350TB after 73K nested loops</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>According that you have Tuning Pack, SQL Monitor is the right way to see what a query is currently doing. A query was running for days and the first figure I see is that it has read 350TB. This is not the kind of thing you do in only one operation, so I immediately checked the &#8216;executions&#8217; columns: 73K table scans. So that&#8217;s finally only 5GB. The problem is not the full scan, but the nested loop that iterates into it.
+<span id="more-8451"></span>
+Here&#8217;s the tweet that reclaim some more explanation:</p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr">LOL. A case where Adaptive Plan would have been a good idea&#8230; time to switch to hash join after reading 350TB <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /> <a href="https://t.co/iLEszMdpZQ">pic.twitter.com/iLEszMdpZQ</a></p>
+<p>&mdash; Franck Pachot (@FranckPachot) <a href="https://twitter.com/FranckPachot/status/727051462363222016">May 2, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>Finally it could have been worse. The nested loop has iterated 21M times and thanks to the filter we did only 73K full table scans.</p>
+<p>The problem is not the full table scan. 21M access by index would not have been better. The problem is nested loop. You can expect a hash join for that. I tried to force a hash join in vain and finally checked the query. I&#8217;ve reproduced it with same idea on a small table.</p>
+<p>Here are the table creation:</p>
+<p><pre>
+create table demo as select rownum id from xmltable('1 to 10');
+create table repart (rep_id number, id1 number, id2 number , x char);
+insert into repart select rownum*4+0 ,   id id1, null id2 , 'A' from demo where id between 1 and 3;
+insert into repart select rownum*4+1 , null id1,   id id2 , 'B' from demo where id between 3 and 5;
+insert into repart select rownum*4+2 , null id1, null id2 , 'C' from demo where id between 5 and 7;
+insert into repart select rownum*4+3 ,   id id1,   id id2 , 'D' from demo where id between 7 and 9;
+</pre></p>
+<p>table DEMO has rows with id from 1 to 10 and table REPART have rows that may match this 1 to 10 number wither in ID1 or in ID2
+<pre>
+SQL&gt; select * from repart;
+
+    REP_ID        ID1        ID2 X
+---------- ---------- ---------- -
+         4          1            A
+         8          2            A
+        12          3            A
+         5                     3 B
+         9                     4 B
+        13                     5 B
+         6                       C
+        10                       C
+        14                       C
+         7          7          7 D
+        11          8          8 D
+        15          9          9 D
+
+12 rows selected.
+</pre>
+And the user wants to get the rows that match one of them. He wants all rows from DEMO, then the value of &#8220;X&#8221; in REPART that matches with ID1 and if no row matches ID1 but matches ID2, he wants the &#8220;X&#8221; from this row. Not too hard to write: left outer joins, and a coalesce to get the first not null:
+<pre>
+SQL&gt; select id,coalesce(repart1.x,repart2.x) from demo
+    left outer join repart repart1 on demo.id=repart1.id1
+    left outer join repart repart2 on demo.id=repart2.id2
+    where repart1.rep_id is not null or repart2.rep_id is not null
+    /
+
+        ID C
+---------- -
+         3 A
+         4 B
+         5 B
+         7 D
+         8 D
+         9 D
+         1 A
+         2 A
+</pre>
+And the plan is ok with hash join:
+<pre>
+Plan hash value: 3945081217
+
+--------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name   | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+--------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |        |      1 |        |      8 |00:00:00.01 |      18 |       |       |          |
+|*  1 |  FILTER              |        |      1 |        |      8 |00:00:00.01 |      18 |       |       |          |
+|*  2 |   HASH JOIN OUTER    |        |      1 |     10 |     10 |00:00:00.01 |      18 |  1888K|  1888K| 1131K (0)|
+|*  3 |    HASH JOIN OUTER   |        |      1 |     10 |     10 |00:00:00.01 |      10 |  2440K|  2440K| 1468K (0)|
+|   4 |     TABLE ACCESS FULL| DEMO   |      1 |     10 |     10 |00:00:00.01 |       3 |       |       |          |
+|   5 |     TABLE ACCESS FULL| REPART |      1 |     12 |     12 |00:00:00.01 |       7 |       |       |          |
+|   6 |    TABLE ACCESS FULL | REPART |      1 |     12 |     12 |00:00:00.01 |       8 |       |       |          |
+--------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(("REPART1"."REP_ID" IS NOT NULL OR "REPART2"."REP_ID" IS NOT NULL))
+   2 - access("DEMO"."ID"="REPART2"."ID2")
+   3 - access("DEMO"."ID"="REPART1"."ID1")
+</pre></p>
+<p>but this is not the query I&#8217;ve seen. Actually, the user tried to optimize it. He wants to read REPART for ID2 only when there were no match for ID1. So his idea was to add a predicate in the join so that we join to REPART.ID2 only when REPART.ID1 is null:
+<pre>
+SQL&gt; select id,coalesce(repart1.x,repart2.x) from demo
+    left outer join repart repart1 on demo.id=repart1.id1
+    left outer join repart repart2 on demo.id=repart2.id2
+    /* added */ and repart1.rep_id is null
+    where repart1.rep_id is not null or repart2.rep_id is not null
+    /
+
+        ID C
+---------- -
+         1 A
+         2 A
+         3 A
+         7 D
+         8 D
+         9 D
+         5 B
+         4 B
+</pre>
+This attempt to optimize is there in the FILTER operation. And this is why in the original query we had to access only 73K times instead of 21M. But in order to do that, the optimizer has implemented the outer join to a lateral view through a nested loop:
+<pre>
+Plan hash value: 1922575045
+
+------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name            | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                 |      1 |        |      8 |00:00:00.01 |      39 |       |       |          |
+|*  1 |  FILTER               |                 |      1 |        |      8 |00:00:00.01 |      39 |       |       |          |
+|   2 |   NESTED LOOPS OUTER  |                 |      1 |     10 |     10 |00:00:00.01 |      39 |       |       |          |
+|*  3 |    HASH JOIN OUTER    |                 |      1 |     10 |     10 |00:00:00.01 |      11 |  2440K|  2440K| 1414K (0)|
+|   4 |     TABLE ACCESS FULL | DEMO            |      1 |     10 |     10 |00:00:00.01 |       3 |       |       |          |
+|   5 |     TABLE ACCESS FULL | REPART          |      1 |     12 |     12 |00:00:00.01 |       8 |       |       |          |
+|   6 |    VIEW               | VW_LAT_3A0EC601 |     10 |      1 |      2 |00:00:00.01 |      28 |       |       |          |
+|*  7 |     FILTER            |                 |     10 |        |      2 |00:00:00.01 |      28 |       |       |          |
+|*  8 |      TABLE ACCESS FULL| REPART          |      4 |      1 |      2 |00:00:00.01 |      28 |       |       |          |
+------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(("REPART1"."REP_ID" IS NOT NULL OR "ITEM_1" IS NOT NULL))
+   3 - access("DEMO"."ID"="REPART1"."ID1")
+   7 - filter("REPART1"."REP_ID" IS NULL)
+   8 - filter("DEMO"."ID"="REPART2"."ID2")
+</pre></p>
+<p>If I check how the query is transformed:
+<pre>
+SQL&gt; exec dbms_sqldiag.dump_trace(p_sql_id=&gt;'4s003zk0ggftd',p_child_number=&gt;0,p_component=&gt;'Compiler',p_file_id=&gt;'TB350');
+PL/SQL procedure successfully completed.
+</pre>
+I can see that it has been transformed to a lateral view in order to include the predicate on the left table column:
+<pre>
+Final query after transformations:******* UNPARSED QUERY IS *******
+SELECT "DEMO"."ID" "ID",COALESCE("REPART1"."X","VW_LAT_3A0EC601"."ITEM_4_3") "COALESCE(REPART1.X,REPART2.X)" FROM "DEMO"."DEMO" "DEMO","DEMO"."REPART" "REPART1", LATERAL( (SELECT "REPART2"."REP_ID" "ITEM_1_0","REPART2"."X" "ITEM_4_3" FROM "DEMO"."REPART" "REPART2" WHERE "DEMO"."ID"="REPART2"."ID2" AND "REPART1"."REP_ID" IS NULL))(+) "VW_LAT_3A0EC601" WHERE ("REPART1"."REP_ID" IS NOT NULL OR "VW_LAT_3A0EC601"."ITEM_1_0" IS NOT NULL) AND "DEMO"."ID"="REPART1"."ID1"(+)
+</pre>
+and this can be joined only with nested loop&#8230;</p>
+<p>Sometimes, it&#8217;s better to let the optimizer optimize rather than trying to do it ourselves because we can reduce the possibilities of join methods.
+Of course, hash join had other problems such as the size of workarea. That&#8217;s what happens when we try to do some reporting on a table that has not been designed for it at all.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-84520"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">
