@@ -14,7 +14,7 @@ mm=  gensub(/This was first published on .*>(.*)<.* [(](....)-(..)-(..)[)].*/,"\
 dd=  gensub(/This was first published on .*>(.*)<.* [(](....)-(..)-(..)[)].*/,"\\4",1)
 dir=yyyy"/"mm"/"dd
 if ( dir ~ "^201" ) system( "mkdir -p " dir)
-$0="<p class=firstpub>"$0", republishing for new followers. The content is related to the the versions available at the publication date</p>"
+$0="<p class=firstpub>"$0"<br>Republishing for new followers. The content is related to the the versions available at the publication date</p>"
 }
 dir =="" { exit }
 /.*<h1 class="entry-title">(.*)<[/]h1>.*/{
@@ -25,16 +25,18 @@ dir =="" { exit }
 body=body"\n"$0
 }
 END{
-print "<html><head>\n<link rel=canonical href="link" />\n<meta name=description content="q"A blog post from "yyyy " about " title q ">\n<title>"title"</title>\n<link rel=stylesheet href=../../../style.css media=all>   "head"\n</head><body>\n"body"\n</body></html>" > dir "/" name ".html"
-print dir "/" name ".html" , link > "/dev/stderr"
+body="\n"banner"\n"body"\n"banner"\n"
+print "<html><head>\n<link rel=canonical href="link" />\n<meta name=description content="q"A blog post from "yyyy " about " title q ">\n<title>"title"</title>\n<link rel=stylesheet href=../../style.css media=all>   "head"\n</head><body>\n"body"\n</body></html>" > gensub(/.$/,"",1,FILENAME)
 }
-' body='
+' banner='
 <p class=aboutme>
 <br/>
 <table width=100%>
 <tr>
 <td>
+<div class=message>Follow:
 <a href=https://linkedin.com/in/franckpachot>Linkedin</a>, <a href=https://twitter.com/franckpachot>Twitter</a>, <a href=https://www.youtube.com/@franckpachot/community>Youtube</a>, <a href=https://mastodon.social/@FranckPachot>Mastodon</a>, <a href=https://dev.to/franckpachot>dev.to</a>
+ </div>
 </td><td>
 <img src=https://pbs.twimg.com/profile_images/1487359683119788033/4ejaJ4S5_400x400.jpg height=100 width=100/>
 </td>
@@ -43,5 +45,5 @@ print dir "/" name ".html" , link > "/dev/stderr"
 <br/>
 </p>
 ' head='
-' q="'" name=$(basename $(dirname "$file")) "$file"
+' q="'" name=$(basename $(dirname "$file")) "$file"o
 done
