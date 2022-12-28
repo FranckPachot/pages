@@ -1,5 +1,10 @@
 
+old='^<img src=(.*1487359683119788033.*) height=100 width=100/>'
+new="<img class=portrait src=https://res.cloudinary.com/practicaldev/image/fetch/s--h5Lx9WjS--/c_fill,f_auto,fl_progressive,h_320,q_auto,w_320/https://dev-to-uploads.s3.amazonaws.com/uploads/user/profile_image/114176/c569c0db-9431-4319-ae0b-cb5aa7c7d0e3.png height=100 width=100/>"
+sed -E "s!$old!$new!" -i $(grep -Elr "$old" .)
 
+
+exit
 
 file="2013-2018/12c-access-control-lists/index.html"
 
