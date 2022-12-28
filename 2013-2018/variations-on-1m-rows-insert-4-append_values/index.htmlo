@@ -1,0 +1,71 @@
+This was first published on <a href=https://blog.dbi-services.com/variations-on-1m-rows-insert-4-append_values>https://blog.dbi-services.com/variations-on-1m-rows-insert-4-append_values</a> (2015-05-18)
+								<h1 class="entry-title">Variations on 1M rows insert (4): APPEND_VALUES</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="http://blog.dbi-services.com/variations-on-1m-rows-insert-1-bulk-insert/">first variation</a> I did a bulk insert with the PL/SQL FORALL statement. A comment suggests to add the APPEND_VALUES hint that appeared in 11gR2. APPEND_VALUES hint does the same than APPEND but it&#8217;s for inserts with VALUES clause: It inserts in direct-path &#8211; directly into the datafile, bypassing the buffer cache. Of course, this makes sense only with bulk insert because you don&#8217;t want to do that with only one row.</p>
+<h3>APPEND_VALUES</h3>
+<p>So, from the previous test, inserting 1 million rows in only one transaction (no intermediate commits) into a table with only one index (primary key) took 46 seconds. With bulk insert, the time is only 7 seconds. Let&#8217;s do the same bulk, but with the APPEND_VALUES hint. I changed only the insert line:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create table DEMO ("id" number primary key, "text" varchar2(15), "number" number) ;
+Table created.
+
+SQL&gt; set timing on
+SQL&gt; declare
+  2   type people_array is varray(12) of varchar(15);
+  3   people people_array := people_array( 'Marc', 'Bill', 'George', 'Eliot', 'Matt', 'Trey', 'Tracy','Greg', 'Steve', 'Kristina', 'Katie', 'Jeff' );
+  4   people_count number :=people.COUNT;
+  5   type DEMO_record_type is record ("user_id" number , "name" varchar2(15), "number" number) ;
+  6   type DEMO_collection_type is table of DEMO_record_type index by binary_integer;
+  7   DEMO_collection DEMO_collection_type;
+  8  begin
+  9   -- fill the collection
+ 10   for i in 1..1e6 loop
+ 11    DEMO_collection(i)."user_id":=i;
+ 12    DEMO_collection(i)."name":=people( dbms_random.value(1,people.count) );
+ 13    DEMO_collection(i)."number":=trunc(dbms_random.value(0,10000));
+ 14    null;
+ 15   end loop;
+ 16   forall i in 1..DEMO_collection.count insert /*+ append_values */ into DEMO values DEMO_collection(i);
+ 17   commit;
+ 18  end;
+ 19  /
+</pre>
+<p>and here is the execution time:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:00:05.28
+</pre>
+<p>It&#8217;s a bit faster. However this testcase is not very well suited to show the benefit.</p>
+<p>First, you must know that inserting in direct-path locks the table. We bypass the buffer cache and it&#8217;s the buffer cache that manages concurrency when updating the blocks. Only one session can modify a block, and that&#8217;s available also in RAC. So, when you bypass the buffer cache you must lock the table (or the partition if you insert into a partition) to be sure you are the only one that inserts after the high water mark.</p>
+<p>Now about the testcase. Here I insert into an empty table. The direct-path insert is very efficient for index maintenance because instead of maintaining index row-by-row, the insert is build afterwards (data inserted after high water mark is read and sorted) and merged to the existing index. This optimization gives better performance on an index that has an higher depth.</p>
+<h3>APPEND</h3>
+<p>If you want to have an idea about how fast is direct-path insert, let&#8217;s see how long it takes to insert the 1 million rows into another table &#8211; identical, with a primary key. This is easy with CTAS:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; set timing on
+SQL&gt; create table DEMO2 ("id" primary key , "text" , "number" ) as select * from DEMO;
+Table created.
+Elapsed: 00:00:01.01
+</pre>
+<p>One second. That&#8217;s the fastest way to insert 1 million rows in batch when you have them in a table (or file through external table), when you can lock the whole table and you don&#8217;t need to do intermediate commits.
+We can also do the same with INSERT /*+ APPEND */</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; truncate table DEMO2 reuse storage;
+Table truncated.
+Elapsed: 00:00:00.17
+
+SQL&gt; insert /*+ append */ into DEMO2 select * from DEMO;
+1000000 rows created.
+Elapsed: 00:00:01.36
+</pre>
+<p>An it&#8217;s the same time (I&#8217;ll not compare when difference is less than one second).</p>
+<p>The index maintenance is fast, but you can go further by disabling the indexes (ALTER INDEX &#8230; UNUSABLE) before and rebuild them afterwards.</p>
+<p>However, my initial testcase was made thinking of OLTP, concurrent inserts from difference sessions. So direct-path writes is definitly not for that as it locks the table. But I wanted to show how 1 million rows is very small when we are doing thinks in bulk from one session.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-20240"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

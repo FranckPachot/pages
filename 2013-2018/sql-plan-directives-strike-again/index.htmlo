@@ -1,0 +1,207 @@
+This was first published on <a href=https://blog.dbi-services.com/sql-plan-directives-strike-again>https://blog.dbi-services.com/sql-plan-directives-strike-again</a> (2016-02-04)
+								<h1 class="entry-title">SQL Plan Directives strikes again</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>12c SQL Plan Directives, a side effect, a bad application design, a bug&#8230; and the occasion to show how to quickly troubleshoot.
+An application has long response time since 12c migration. No blind guesses, no reason to compare with previous version, let&#8217;s just troubleshoot performance with methodical approach.
+<span id="more-6876"></span></p>
+<h3>Time Model</h3>
+<p>You should already know that, I often start from a Statspack or AWR report. I check first what the DB Time is used for.
+<pre>
+Time Model System Stats  DB/Inst: EPNP/EPNP  Snaps: 1-8
+-&gt; Ordered by % of DB time desc, Statistic name
+
+Statistic                                       Time (s) % DB time
+----------------------------------- -------------------- ---------
+DB CPU                                           3,254.3     101.2
+parse time elapsed                               2,155.6      67.1
+hard parse elapsed time                          2,029.8      63.1
+sql execute elapsed time                         1,007.6      31.3
+connection management call elapsed                  24.8        .8
+PL/SQL compilation elapsed time                      0.3        .0
+PL/SQL execution elapsed time                        0.1        .0
+hard parse (sharing criteria) elaps                  0.1        .0
+sequence load elapsed time                           0.0        .0
+failed parse elapsed time                            0.0        .0
+repeated bind elapsed time                           0.0        .0
+</pre></p>
+<p>This is hard parsing. Let&#8217;s go to SQL sections. </p>
+<h3>SQL ordered by Parse Calls</h3>
+<p><pre>
+SQL ordered by Parse Calls  DB/Inst: EPNP/EPNP  Snaps: 1-8
+-&gt; End Parse Calls Threshold:      1000 Total Parse Calls:       5,229,021
+-&gt; Captured SQL accounts for   86.2% of Total Parse Calls
+-&gt; SQL reported below exceeded  1.0% of Total Parse Calls
+
+                           % Total    Old
+ Parse Calls   Executions   Parses Hash Value
+------------ ------------ -------- ----------
+   4,094,739    4,094,712    78.31 3360804353
+select default$ from col$ where rowid=:1
+</pre></p>
+<p>This is an internal statement. First idea: check My Oracle Support.
+That&#8217;s very similar to bug <a href="https://support.oracle.com/epmos/faces/BugDisplay?id=20907061" target="_blank">20907061 HIGH # OF EXECUTIONS FOR RECURSIVE CALL ON COL$</a> except that this bug is supposed to happen when we have default values larger than 32 bytes and I don&#8217;t have default values on this application. Let&#8217;s continue investigation.</p>
+<h3>tkprof</h3>
+<p>I sql_trace the session at level 4 in order to get the bind values for that rowid, so that I can check which column is concerned.
+Let&#8217;s tkprof first to see if my trace shows the same symptoms:
+<pre>
+SQL ID: 47r1y8yn34jmj Plan Hash: 2191121161
+
+select default$
+from
+ col$ where rowid=:1
+
+call     count       cpu    elapsed       disk      query    current        rows
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+Parse   362494      2.43       3.11          0          0          0           0
+Execute 362494     14.61      17.13          0          0          0           0
+Fetch   362494      2.33       2.82          0     724988          0      362494
+------- ------  -------- ---------- ---------- ---------- ----------  ----------
+total   1087482     19.38      23.07          0     724988          0      362494
+
+Misses in library cache during parse: 0
+Optimizer mode: CHOOSE
+Parsing user id: SYS   (recursive depth: 1)
+Number of plan statistics captured: 1
+</pre>
+This looks like the same bug: dictionary information is not kept in row cache, which means lot of buffer gets.</p>
+<h3>Raw trace</h3>
+<p>From the raw trace I&#8217;m interested about the bind value for that statement:
+<pre>
+PARSING IN CURSOR #139947924936336 len=40 dep=1 uid=0 oct=3 lid=0 tim=30754233695312 hv=2821867121 ad='13fc1ec80' sqlid='47r1y8yn34jmj'
+select default$ from col$ where rowid=:1
+END OF STMT
+PARSE #139947924936336:c=0,e=99,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=2191121161,tim=30754233695310
+BINDS #139947924936336:
+ Bind#0
+  oacdty=11 mxl=16(16) mxlc=00 mal=00 scl=00 pre=00
+  oacflg=18 fl2=0001 frm=00 csi=00 siz=16 off=0
+  kxsbbbfp=7f482a5a5250  bln=16  avl=16  flg=05
+  value=000093EB.000F.0001
+EXEC #139947924936336:c=0,e=136,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=2191121161,tim=30754233695589
+FETCH #139947924936336:c=0,e=62,p=0,cr=2,cu=0,mis=0,r=1,dep=1,og=4,plh=2191121161,tim=30754233695686
+STAT #139947924936336 id=1 cnt=1 pid=0 pos=1 obj=21 op='TABLE ACCESS BY USER ROWID COL$ (cr=1 pr=0 pw=0 time=49 us cost=1 size=15 card=1)'
+CLOSE #139947924936336:c=0,e=74,dep=1,type=1,tim=30754233695857
+PARSE #139947924936336:c=0,e=19,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=2191121161,tim=30754233695986
+BINDS #139947924936336:
+ Bind#0
+  oacdty=11 mxl=16(16) mxlc=00 mal=00 scl=00 pre=00
+  oacflg=18 fl2=0001 frm=00 csi=00 siz=16 off=0
+  kxsbbbfp=7f482a5a5250  bln=16  avl=16  flg=05
+  value=000093EA.0001.0001
+EXEC #139947924936336:c=0,e=104,p=0,cr=0,cu=0,mis=0,r=0,dep=1,og=4,plh=2191121161,tim=30754233696151
+FETCH #139947924936336:c=1000,e=30,p=0,cr=2,cu=0,mis=0,r=1,dep=1,og=4,plh=2191121161,tim=30754233696212
+CLOSE #139947924936336:c=0,e=14,dep=1,type=3,tim=30754233696293
+</pre>
+Remember Oracle 7 rowid format? 000093EB.000F.0001 is block number . row number . file number</p>
+<h3>My Oracle Support</h3>
+<h3>Default value</h3>
+<p>then let&#8217;s get the COL$ (data_object_id of COL$ is 2) row for it:
+<pre>
+SQL&gt; select owner,object_name,name,default$ from col$ join dba_objects on obj#=object_id where col$.rowid=DBMS_ROWID.ROWID_CREATE (1,2,1,37866,1);
+
+OWNER      OBJECT_NAME          NAME                                     DEFAULT$
+---------- -------------------- ---------------------------------------- ----------------------------------------
+XXXX       TABLES               SYS_STSFZ3ZG3BYVJUHOAOR7U6TO36           SYS_OP_COMBINED_HASH("TYPE","IDENT_PAP")
+</pre>
+Okay. I&#8217;ve no default value for the columns I defined. But the system has created his own ones. Virtual columns for extended statistics. Column groups are defined as a hash of columns.</p>
+<h3>Extensions</h3>
+<p>And actually I&#8217;ve a lot of extensions on that table:
+<pre>
+select * from dba_stat_extensions where owner='XXXX' and table_name='TABLES';
+
+OWNER      TABLE_NAME           EXTENSION_NAME                           EXTENSION                                                    CREATO DRO
+---------- -------------------- ---------------------------------------- ------------------------------------------------------------ ------ ---
+XXXX       TABLES               SYS_STSAZ#Y734_B7NAVBQRCV_07KJ           ("NUMERO","IDENT_PAP")                                       SYSTEM YES
+XXXX       TABLES               SYS_STSFZ3ZG3BYVJUHOAOR7U6TO36           ("TYPE","IDENT_PAP")                                         SYSTEM YES
+XXXX       TABLES               SYS_STSXVAD3SBEYJ$KNF69JWC$QSV           ("LOCAL","TYPE","IDENT_PAP")                                 SYSTEM YES
+XXXX       TABLES               SYS_STSW2#AXTKKSSH0MM4NR$E_YS9           ("TYPE","IDENT_PAP","IDENT_PAP_BIS","X","Y")                 SYSTEM YES
+XXXX       TABLES               SYS_STSNBBWV$TKD1323KXM5YZ7KPL           ("LOCAL","IDENT_PAP")                                        SYSTEM YES
+XXXX       TABLES               SYS_STSFCX_6I8KOFMDY_IY3#64I2H           ("NUMERO","TYPE","IDENT_PAP","LONGUEUR","NUMERO_BIS")        SYSTEM YES
+XXXX       TABLES               SYS_STSR#78FTBPXMUCCTLJSODS846           ("NUMERO","TYPE","IDENT_PAP","IDENT_PAP_BIS")                SYSTEM YES
+XXXX       TABLES               SYS_STSV5C$ERVCXVPQ_WWFC$B4FD0           ("TYPE","IDENT_PAP","IDENT_PAP_BIS")                         SYSTEM YES
+XXXX       TABLES               SYS_STSYPBYX4YV907UXQ5QG4R2N4G           ("IDENT_PAP","NIVEAU")                                       SYSTEM YES
+
+9 rows selected.
+</pre></p>
+<h3>SQL Plan Directives</h3>
+<p>If you know how SQL Plan directives works, then you know where those column groups are coming from.
+If you don&#8217;t know, then it&#8217;s in Baden (Switzerland) on 2nd of March at 15:00 <a href="http://www.soug.ch/events/020316-sougday-agenda.html" target="_blank">http://www.soug.ch/events/020316-sougday-agenda.html</a></p>
+<p>Actually, 12c can create lot of column groups for you:</p>
+<p><pre>
+SQL&gt; select directive_id,type,state,reason from dba_sql_plan_directives where directive_id in(select directive_id from dba_sql_plan_dir_objects where owner='XXXX' and object_name='TABLES' );
+        DIRECTIVE_ID TYPE             STATE         REASON
+-------------------- ---------------- ------------- ------------------------------------
+ 8794114115142958506 DYNAMIC_SAMPLING PERMANENT     JOIN CARDINALITY MISESTIMATE
+ 8117485436508017308 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+17449438648188877549 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+ 1651449127980030174 DYNAMIC_SAMPLING PERMANENT     JOIN CARDINALITY MISESTIMATE
+ 7306874980619572993 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+15367585934080234683 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+ 6984979082531240597 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+11591426134547187869 DYNAMIC_SAMPLING PERMANENT     JOIN CARDINALITY MISESTIMATE
+ 7350444383897437289 DYNAMIC_SAMPLING PERMANENT     JOIN CARDINALITY MISESTIMATE
+14964006389450232792 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+ 6994764429265082323 DYNAMIC_SAMPLING PERMANENT     JOIN CARDINALITY MISESTIMATE
+ 7446442670215314532 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+ 1756676544008628542 DYNAMIC_SAMPLING HAS_STATS     SINGLE TABLE CARDINALITY MISESTIMATE
+10941525217270092916 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+  219069820824454127 DYNAMIC_SAMPLING NEW           SINGLE TABLE CARDINALITY MISESTIMATE
+ 7377491717956776334 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+  233608853702643127 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+ 2552098580334338460 DYNAMIC_SAMPLING PERMANENT     JOIN CARDINALITY MISESTIMATE
+11789724805619074802 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+16211053123545351781 DYNAMIC_SAMPLING HAS_STATS     SINGLE TABLE CARDINALITY MISESTIMATE
+15215871106139158771 DYNAMIC_SAMPLING HAS_STATS     SINGLE TABLE CARDINALITY MISESTIMATE
+15710833686769870070 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+ 5189294152039066378 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+  798588162556407282 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+13022929319971523184 DYNAMIC_SAMPLING NEW           SINGLE TABLE CARDINALITY MISESTIMATE
+  722059721778001206 DYNAMIC_SAMPLING NEW           JOIN CARDINALITY MISESTIMATE
+14359263752097676624 DYNAMIC_SAMPLING HAS_STATS     SINGLE TABLE CARDINALITY MISESTIMATE
+ 8856200028259655090 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+10989662787548036325 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+13019616966644728092 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+ 9949611300156421363 DYNAMIC_SAMPLING HAS_STATS     SINGLE TABLE CARDINALITY MISESTIMATE
+16724606582023948887 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+ 9529470199340570651 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+14968714134736676769 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+17207666278887909291 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+ 2085721135336820101 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+ 3399278268320241269 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+ 4717659897959055394 DYNAMIC_SAMPLING PERMANENT     JOIN CARDINALITY MISESTIMATE
+ 1370532447375937784 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+ 7480183286602769305 DYNAMIC_SAMPLING PERMANENT     GROUP BY CARDINALITY MISESTIMATE
+13318940391279153288 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+10981064134896750754 DYNAMIC_SAMPLING NEW           SINGLE TABLE CARDINALITY MISESTIMATE
+13826770130463026145 DYNAMIC_SAMPLING HAS_STATS     SINGLE TABLE CARDINALITY MISESTIMATE
+10629713882167842929 DYNAMIC_SAMPLING HAS_STATS     GROUP BY CARDINALITY MISESTIMATE
+  334431847807025603 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+16381543551256728378 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+12085920252231302395 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+14143819104063380925 DYNAMIC_SAMPLING HAS_STATS     JOIN CARDINALITY MISESTIMATE
+15133868083663596886 DYNAMIC_SAMPLING PERMANENT     SINGLE TABLE CARDINALITY MISESTIMATE
+
+49 rows selected.
+</pre></p>
+<p>Yes&#8230; 49 column groups for only 15 columns&#8230;
+Maybe you think that it&#8217;s very good because without them the estimations were bad and execution plans not optimal?
+Then let me tell you that it&#8217;s a migration from 9i and users were happy with performance before we migrate to 12c <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /></p>
+<p>SYS_OP_COMBINED_HASH(column names) makes a default value larger than 32 bytes. Because of bug, they are not cached in row cache and this increases a lot the parsing time. The application is not using bind variables and parses too much. It was ok in 9i but not in 12c.</p>
+<h3>Conclusion</h3>
+<p>In that case, the solution is both to change the application to use bind variable (it&#8217;s perl, very easy) and apply the patch.
+I&#8217;m sharing that because it&#8217;s a good illustration of what side effects can do, as well as a good example of methodical troubleshooting. When you know the reason without blind guesses, you can address the root cause. If you don&#8217;t, the risk is that you add even more side effects.</p>
+<p>By the way, please use bind variables&#8230;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-68770"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,119 @@
+This was first published on <a href=https://blog.dbi-services.com/pdb-snapshot-using-dbms_dnfs-clonedb_renamefile>https://blog.dbi-services.com/pdb-snapshot-using-dbms_dnfs-clonedb_renamefile</a> (2016-01-02)
+								<h1 class="entry-title">PDB Snapshot using dbms_dnfs.clonedb_renamefile</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the <a href="http://blog.dbi-services.com/pdb-snapshot-copy-for-continuous-integration-testing/" target="_blank">previous post</a> I&#8217;ve explained how to use &#8216;snapshot copy&#8217; PDB creation for thin provisioning and quick restore of initial state for continuous integration tests. If you don&#8217;t have the multitenant option, you need a remote CDB to do it. Here is a way to do the same on only one single-tenant CDB.
+<span id="more-6260"></span>
+The idea here is to use dbms_dnfs.clonedb_renamefile thatblog-thin-arch-121.txt can do snapshots using sparse files.</p>
+<h3>clonedb=true</h3>
+<p>This is required to do thin clones in a regular filesystem:
+<pre>
+18:31:09 SQL&gt; show parameter clonedb
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+clonedb                              boolean     TRUE
+</pre></p>
+<h3>Unplug</h3>
+<p>I&#8217;ve a PDB with the state I want to snapshot. I close it and unplug it in order to be able to plug it later. My idea here is to be able to do that in single tenant, so with only one PDB in the CDB.
+<pre>
+18:31:09 SQL&gt; alter pluggable database PDB close;
+Pluggable database altered.
+</pre>
+At that point I thought to unplug that, then plug-in and clone. The idea was to have nothing to copy: the clone creates the sparse file without touching the original file, so it can be used later to plug it again. However, the plug-in operation modifies the file headers which means that they cannot be plugged-in again with the same unplug xml file. Currently, I don&#8217;t know how to plug-in a read-only set of datafiles.</p>
+<h3>clone</h3>
+<p>So, finally I do the clone before unplugging.
+<pre>
+18:32:04 SQL&gt; exec dbms_dnfs.clonedb_renamefile('/u02/app/oracle/oradata/CDB/PDB/system01.dbf','/u02/app/oracle/oradata/CDB/PDB/system01.dbf.cow');
+PL/SQL procedure successfully completed.
+18:32:04 SQL&gt; exec dbms_dnfs.clonedb_renamefile('/u02/app/oracle/oradata/CDB/PDB/sysaux01.dbf','/u02/app/oracle/oradata/CDB/PDB/sysaux01.dbf.cow');
+PL/SQL procedure successfully completed.
+18:32:04 SQL&gt; exec dbms_dnfs.clonedb_renamefile('/u02/app/oracle/oradata/CDB/PDB/SAMPLE_SCHEMA_users01.dbf','/u02/app/oracle/oradata/CDB/PDB/SAMPLE_SCHEMA_users01.dbf.cow');
+PL/SQL procedure successfully completed.
+18:32:04 SQL&gt; exec dbms_dnfs.clonedb_renamefile('/u02/app/oracle/oradata/CDB/PDB/example01.dbf','/u02/app/oracle/oradata/CDB/PDB/example01.dbf.cow');
+PL/SQL procedure successfully completed.
+</pre>
+This keeps the original datafiles read only and creates the sparse files (.cow) where only the modified blocks are copied.</p>
+<h3>unplug</h3>
+<p>Then the unplug creates the .xml file that references only those .cow ones.
+<pre>
+18:33:20 SQL&gt; alter pluggable database PDB unplug into '/tmp/pdbcow.xml';
+Pluggable database altered.
+</pre>
+Then as I want to be able to plug-in several times, I have to archive the files to be able to restore them. But here it&#8217;s only small files (the .cow ones) as the original ones are not modified anymore.
+<pre>
+18:33:32 SQL&gt; host tar -Pcvf /tmp/pdbcow.tar /u02/app/oracle/oradata/CDB/PDB/*.cow
+/u02/app/oracle/oradata/CDB/PDB/example01.dbf.cow
+/u02/app/oracle/oradata/CDB/PDB/SAMPLE_SCHEMA_users01.dbf.cow
+/u02/app/oracle/oradata/CDB/PDB/sysaux01.dbf.cow
+/u02/app/oracle/oradata/CDB/PDB/system01.dbf.cow
+</pre>
+and you can check that this tar file is small:
+<pre>
+18:33:36 SQL&gt; host du -k /tmp/pdbcow.tar
+2179880 /tmp/pdbcow.tar
+</pre>
+Now, I have everything to be able to plug-in several times the PDB in order to restore the original state. I can drop it:
+<pre>
+18:33:37 SQL&gt; drop pluggable database PDB;
+Pluggable database dropped.
+</pre></p>
+<h3>plug</h3>
+<p>Now I can do the following as many as I want.
+Plug:
+<pre>
+18:33:56 SQL&gt; create pluggable database PDB using '/tmp/pdbcow.xml' nocopy;
+Pluggable database created.
+</pre>
+then use it:
+<pre>
+18:34:03 SQL&gt; alter session set container=PDB;
+Session altered.
+18:34:03 SQL&gt; startup
+Pluggable Database opened.
+18:34:04 SQL&gt; connect hr/hr@//localhost/PDB
+Connected.
+</pre>
+Here I can run my test.
+And when I&#8217;ve finished I can drop it:
+<pre>
+18:34:04 SQL&gt; connect / as sysdba
+Connected.
+18:34:05 SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+18:34:05 SQL&gt; alter pluggable database PDB close;
+Pluggable database altered.
+18:34:06 SQL&gt; drop pluggable database PDB including datafiles;
+Pluggable database dropped.
+</pre>
+I&#8217;ve dropped it &#8216;including datafiles&#8217; because those (the .cow ones) cannot be used anymore. However the original files remain and have not changed.
+So the only thing I have to do to start again is restore those small .cow files:
+<pre>
+18:34:06 SQL&gt; host tar -Pxvf /tmp/pdbcow.tar
+/u02/app/oracle/oradata/CDB/PDB/example01.dbf.cow
+/u02/app/oracle/oradata/CDB/PDB/SAMPLE_SCHEMA_users01.dbf.cow
+/u02/app/oracle/oradata/CDB/PDB/sysaux01.dbf.cow
+/u02/app/oracle/oradata/CDB/PDB/system01.dbf.cow
+18:34:14 SQL&gt;
+</pre>
+which is very fast, and it&#8217;s ready to start again with:
+<pre>
+create pluggable database PDB using '/tmp/pdbcow.xml' nocopy;
+</pre>
+as above. So you can restore the same saved state in a few seconds, without having to restore the full datafiles.</p>
+<h3>Conclusion</h3>
+<p>I show this only for the context of continuous integration testing, as an alternative to rebuild or restore or flashback the database. I would never do that in production because I don&#8217;t know exactly how it works. I mean, in order to work, you need to keep the original files. They are referenced in the controlfile so that the processes can read them when the block is not found in the sparse file, but I don&#8217;t know the lifecycle of that. The drop commands ignores them. If you trace controlfile to trace, you will not see them. And you don&#8217;t see them in v$datafile. So there is a high risk of losing them accidently. And when you drop all PDB that can reference them, they are still there. So how to clean that up?
+Anyway, for a database build only for automatic tests, it&#8217;s a good alternative to snapshot copy if you don&#8217;t have multitenant option and don&#8217;t want to keep a remote CDB to hold the original datafiles.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-62610"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

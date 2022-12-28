@@ -1,0 +1,239 @@
+This was first published on <a href=https://blog.dbi-services.com/parallel-dml-in-12c>https://blog.dbi-services.com/parallel-dml-in-12c</a> (2015-06-12)
+								<h1 class="entry-title">Parallel DML in 12c</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Following a <a href="https://community.oracle.com/message/13118790?et=watches.email.thread#13117716">question</a> from Randolf Geist (who can imagine that there is something about parallel query that Randolf didn&#8217;t know?), I get back to some notes I&#8217;ve taken when 12c was out and I&#8217;ve tested them again on 12.1.0.2 &#8211; it&#8217;s about the ability to enable parallel DML at query level.</p>
+<h3>Test case</h3>
+<p>In 12.1.0.2 I create two tables. DEMO1 has 100000 rows and is about 80MB. DEMO2 is empty. DEMO1 is parallel.</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; create table DEMO1 parallel 2 as
+  2  select rownum id , ora_hash(rownum,10) a from xmltable('1 to 1000000');
+
+Table created.
+
+SQL&gt; select table_name,num_rows,blocks from user_tables where table_name='DEMO';
+
+TABLE_NAME   NUM_ROWS     BLOCKS
+---------- ---------- ----------
+DEMO           100000      10143
+
+SQL&gt;
+SQL&gt; create table DEMO2 as select * from DEMO1 where null is not null;
+
+Table created.
+
+SQL&gt;
+SQL&gt; alter session set statistics_level=all;
+
+Session altered.
+
+</pre>
+<h3>insert &#8230; select &#8230;</h3>
+<p>Here is a simple insert as select:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; insert into DEMO2 select * from DEMO1;
+
+1000000 rows created.
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+-----------------------------------------------------------------------------------------------
+SQL_ID  bx27xdnkr7dvw, child number 0
+-------------------------------------
+insert into DEMO2 select * from DEMO1
+
+Plan hash value: 4271246053
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation                | Name     | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT         |          |      1 |        |      0 |00:00:17.40 |   24311 |
+|   1 |  LOAD TABLE CONVENTIONAL | DEMO2    |      1 |        |      0 |00:00:17.40 |   24311 |
+|   2 |   PX COORDINATOR         |          |      1 |        |   1000K|00:00:04.49 |       5 |
+|   3 |    PX SEND QC (RANDOM)   | :TQ10000 |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|   4 |     PX BLOCK ITERATOR    |          |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|*  5 |      TABLE ACCESS FULL   | DEMO1    |      0 |   1000K|      0 |00:00:00.01 |       0 |
+-----------------------------------------------------------------------------------------------
+
+Note                                                                                                                                
+-----
+   - Degree of Parallelism is 2 because of table property
+   - PDML is disabled in current session
+
+</pre>
+<p>The select part is done in parallel (it&#8217;s below the coordinator) but the insert part (LOAD TABLE) is above the coordinator, which means that it is done in serial by the coordinator. In 12.1.0.2 you have no doubt: dbms_xplan has a note to tell you that PDML was not used and it gives the reason: it&#8217;s not enabled in the session.</p>
+<p>When you have tuning pack the parallel queries are monitored by default, so we can get the SQL Monitor Plan. You can get it as text, html or flash but I&#8217;ll use <a href="http://www.orachrome.com/en/index.html">Lighty</a> here as I find it awesome for that as well:</p>
+<p><a class="easyblog-thumb-preview" title="PDML1.png" href="http://blog.dbi-services.com/images/easyblog_images/139/PDML1.png" rel="lightbox[2386]"><img title="PDML1.png" src="../images/easyblog_images/139/PDML1.png" alt="PDML1.png" /></a></p>
+<p>Look at the bottom right which details the highlighted plan line: 100% of the load has been done by my session process.</p>
+<h3>Enable parallel dml</h3>
+<p>So we need to enable parallel DML for our session. Do you know why? Because inserting in parallel requires to lock the table (or partition) it is inserted into, so the optimizer cannot decide that without our permission. So let&#8217;s enable parallel DML:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session enable parallel dml;
+ERROR:
+ORA-12841: Cannot alter the session parallel DML state within a transaction
+
+</pre>
+<p>I cannot do that here because I have a transaction in progress. But in 12c you can also enable parallel DML at query level, with the ENABLE_PARALLEL_DML hint. I&#8217;ve seen it when 12c came out, but it was undocumented. But I discover today that it is documented in the <a href="https://docs.oracle.com/database/121/VLDBG/GUID-5EB01FA8-030B-45BB-9B16-2D13881F6010.htm">Enable Parallel DML Mode</a> of the Database VLDB and Partitioning Guide.</p>
+<p>With the DISABLE_PARALLEL_DML hint you can disable PDML at query level when you have enabled it in the session. And with the ENABLE_PARALLEL_DML hint you can enable PDML for one query even when it&#8217;s not enabled in the session. And you can do that even if you have a transaction in progress:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; insert /*+ enable_parallel_dml */ into DEMO2 select * from DEMO1;
+
+1000000 rows created.
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+-----------------------------------------------------------------------------------------------
+SQL_ID  707bk8y125hp4, child number 0
+-------------------------------------
+insert /*+ enable_parallel_dml */ into DEMO2 select * from DEMO1
+
+Plan hash value: 4271246053
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation                | Name     | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT         |          |      1 |        |      0 |00:00:18.76 |   22343 |
+|   1 |  LOAD TABLE CONVENTIONAL | DEMO2    |      1 |        |      0 |00:00:18.76 |   22343 |
+|   2 |   PX COORDINATOR         |          |      1 |        |   1000K|00:00:04.22 |       5 |
+|   3 |    PX SEND QC (RANDOM)   | :TQ10000 |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|   4 |     PX BLOCK ITERATOR    |          |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|*  5 |      TABLE ACCESS FULL   | DEMO1    |      0 |   1000K|      0 |00:00:00.01 |       0 |
+-----------------------------------------------------------------------------------------------
+
+Note
+-----
+   - Degree of Parallelism is 2 because of table property
+   - PDML disabled because object is not decorated with parallel clause
+   - Direct Load disabled because no append hint given and not executing in parallel
+
+</pre>
+<p>Ok. I&#8217;ve enabled PDML but PDML occurs only when in parallel. Here the table has no parallel degree and there is no PARALLEL hint. Once again dbms_xplan gives us the reason. And because it&#8217;s not PDML and there is no append hint, then it&#8217;s not loaded in direct-path.</p>
+<p>Here is the SQL Monitoring plan. Note that is the same as the previous one except that it&#8217;s not the same cost. I don&#8217;t know why yet. If you have any idea, please comment.</p>
+<p><a class="easyblog-thumb-preview" title="PDML2.png" href="http://blog.dbi-services.com/images/easyblog_images/139/PDML2.png" rel="lightbox[2386]"><img title="PDML2.png" src="../images/easyblog_images/139/PDML2.png" alt="PDML2.png" /></a></p>
+<h3>Enable parallel DML while in a transaction</h3>
+<p>I disable PDML and start a transaction:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; commit;
+
+Commit complete.
+
+SQL&gt; alter session disable parallel dml;
+
+Session altered.
+
+SQL&gt; delete from DEMO1 where rownum
+SQL&gt; select status,used_urec from v$transaction where ses_addr=(select saddr from v$session where sid=sys_context('userenv','sid'));
+
+STATUS            USED_UREC
+---------------- ----------
+ACTIVE                 1000
+
+</pre>
+<p>And while I&#8217;m within that transaction, Let&#8217;s do the parallel insert enabled by hint:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; insert /*+ parallel enable_parallel_dml */ into DEMO2 select * from DEMO1;
+
+999000 rows created.
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------------------------------------
+SQL_ID  2b8q4k902pbdx, child number 1
+-------------------------------------
+insert /*+ parallel enable_parallel_dml */ into DEMO2 select * from DEMO1
+
+Plan hash value: 86785878
+
+-------------------------------------------------------------------------------------------------------
+| Id  | Operation                          | Name | Starts | A-Rows | Buffers | OMem |1Mem | Used-Mem |
+-------------------------------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT                   |      |      1 |      4 |     136 |      |     |          |
+|   1 |  PX COORDINATOR                    |      |      1 |      4 |     136 |      |     |          |
+|   2 |   PX SEND QC (RANDOM)              | :TQ10|      0 |      0 |       0 |      |     |          |
+|   3 |    LOAD AS SELECT (HYBRID TSM/HWMB)|      |      0 |      0 |       0 |   33M|  33M| 2068K (0)|
+|   4 |     OPTIMIZER STATISTICS GATHERING |      |      0 |      0 |       0 |      |     |          |
+|   5 |      PX BLOCK ITERATOR             |      |      0 |      0 |       0 |      |     |          |
+|*  6 |       TABLE ACCESS FULL            | DEMO1|      0 |      0 |       0 |      |     |          |
+-------------------------------------------------------------------------------------------------------
+
+Note
+-----
+   - automatic DOP: Computed Degree of Parallelism is 2
+
+</pre>
+<p>Here PDML occurred. We know that because of the load operator under the coordinator (Note to self: HYBRID TSM/HWMB is something to investigate &#8211; once again comments welcome). I&#8217;ve displayed the plan with &#8216;allstats last&#8217; which show only the coordinator activity. SQL Monitor can show all:</p>
+<p><a class="easyblog-thumb-preview" title="PDML5.png" href="http://blog.dbi-services.com/images/easyblog_images/139/PDML5.png" rel="lightbox[2386]"><img title="PDML5.png" src="../images/easyblog_images/139/PDML5.png" alt="PDML5.png" /></a></p>
+<h3>Conclusion</h3>
+<p>Yes you can enable PDML at query level in 12c and it is documented. And you can do it even when within a transaction which is a restriction only for &#8216;alter session enable parallel dml&#8217; but not for that hint.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-23870" data-img="http://blog.dbi-services.com/images/easyblog_images/139/PDML1.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1479">
+				<div id="div-comment-1479" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/fee4a6544804260fad9184cddc51be75?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Randolf Geist</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1479">
+			June 11, 2015 at 21 h 09 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>thanks for the informative post. </p>
+<p>Interesting that it allows PDML within an ongoing transaction that didn&#8217;t have PDML enabled &#8211; something I have to think about.</p>
+<p>Regarding the new LOAD AS SELECT decorators: See this informative blog post by the optimizer team:</p>
+<p><a href="https://blogs.oracle.com/optimizer/entry/space_management_and_oracle_direct" rel="nofollow">https://blogs.oracle.com/optimizer/entry/space_management_and_oracle_direct</a></p>
+<p>And yes, I know a lot about Parallel Execution, but certainly not everything <img src="../wp-includes/images/smilies/icon_smile.gif" alt=":-)" class="wp-smiley" /></p>
+<p>Cheers,
+Randolf
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14801"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1479' onclick='return addComment.moveForm( "div-comment-1479", "1479", "respond", "2386" )' aria-label='Reply to Randolf to Randolf Geist'>Reply to Randolf</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-2815">
+				<div id="div-comment-2815" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/688dee05dc3f6c573c0f78a6e5c8bfcd?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dba-scripts.com' rel='external nofollow' class='url'>Cyrille</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-2815">
+			February 15, 2016 at 18 h 32 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>Thank you very much for this informative post. I found it very well explained, keep up the good work.</p>
+<p>Cyrille
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-28161"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-2815' onclick='return addComment.moveForm( "div-comment-2815", "2815", "respond", "2386" )' aria-label='Reply to Cyrille to Cyrille'>Reply to Cyrille</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

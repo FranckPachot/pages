@@ -1,0 +1,202 @@
+This was first published on <a href=https://blog.dbi-services.com/statspack-idle-events>https://blog.dbi-services.com/statspack-idle-events</a> (2016-06-28)
+								<h1 class="entry-title">Statspack Idle Events</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you don&#8217;t have Enterprise Edition + Diagnostic Pack, you cannot use AWR but you can, and should, install Statspack. Statspack is still there, but unfortunately do not evolve a lot. The most important section, the &#8216;Top 5 Timed Events&#8217; shows only foreground events, or is supposed to do so. When a user process waits on a background process, this section must count only the foreground wait and not the activity of the background process or we will have double accounting. The background activity is included in &#8216;Idle&#8217; events in order to be excluded from this section.
+But unfortunately, new versions come with new wait events, and the list of Statspack idle events is not up to date anymore.
+<span id="more-9486"></span>
+Here is the &#8216;Top 5 Timed Events&#8217; I got from a database between 22:00 and 23:00 where there is no application activity:
+<pre>
+Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+LGWR worker group idle                               6      22,049 ######   65.2
+AQPC idle                                          120       3,602  30014   10.7
+heartbeat redo informer                          3,568       3,601   1009   10.7
+lreg timer                                       1,195       3,598   3011   10.6
+direct path read                                31,221         466     15    1.4
+          -------------------------------------------------------------
+</pre>
+Humm. What can you do with that? Idle events and timers are at the top. Direct path read seem to be minimal. And no CPU usage?
+Obviously, something is wrong here.</p>
+<p>Statspack uses a fixed list of wait events that are considered as &#8216;idle&#8217; events and it is stored at Statspack installation into STATS$IDLE_EVENT.
+This comes from an age where wait classes were not there. In current version, a more realistic list of wait events is in V$EVENT_NAME where class_name=&#8217;Idle&#8217;</p>
+<p>Let&#8217;s compare them (that&#8217;s in 12.1.0.1)</p>
+<p>First, are there some non-idle events that are considered as &#8216;idle&#8217; by Statspack?</p>
+<p><pre>
+SQL&gt; select s.event statspack_idle_event,v.name,v.wait_class from STATS$IDLE_EVENT s left outer join V$EVENT_NAME v on s.event=v.name where wait_class!='Idle';
+
+STATSPACK_IDLE_EVENT                    NAME                                    WAIT_CLASS
+--------------------------------------- --------------------------------------- ----------
+null event                              null event                              Other
+SQL*Net message to client               SQL*Net message to client               Network
+SQL*Net more data from client           SQL*Net more data from client           Network
+KSV master wait                         KSV master wait                         Other
+parallel recovery slave wait for change parallel recovery slave wait for change Other
+</pre></p>
+<p>The goal of this blog post is not to detail the meaning of each of those events (search for them on <a href="https://www.google.ch/?ion=1&amp;espv=2#q=%2Bsite:tanelpoder.com+%22SQL*Net+message+to+client%22" target="_blank">tanelpoder.com</a> as a good start for that), but if they are now considered as non-idle, Statspack should obey the same rule.</p>
+<p>Then we can check which idle events are not in Statspack list:</p>
+<p><pre>
+SQL&gt; select s.event statspack_idle_event,v.name,v.wait_class from STATS$IDLE_EVENT s right outer join V$EVENT_NAME v on s.event=v.name where wait_class='Idle' and s.event is null;
+
+STATSPACK_IDLE_EVENT NAME                                       WAIT_CLASS
+-------------------- ------------------------------------------ ----------
+                     OFS idle                                   Idle
+                     heartbeat redo informer                    Idle
+                     LGWR worker group idle                     Idle
+                     Recovery Server waiting for work           Idle
+                     Recovery Server waiting restore start      Idle
+                     Recovery Server Surrogate wait             Idle
+                     Recovery Server Servlet wait               Idle
+                     Recovery Server Comm SGA setup wait        Idle
+                     parallel recovery coordinator idle wait    Idle
+                     recovery sender idle wait                  Idle
+                     recovery receiver idle wait                Idle
+                     recovery merger idle wait                  Idle
+                     virtual circuit next request               Idle
+                     lreg timer                                 Idle
+                     REPL Apply: txns                           Idle
+                     REPL Capture/Apply: messages               Idle
+                     REPL Capture: archive log                  Idle
+                     PL/SQL lock timer                          Idle
+                     Emon coordinator main loop                 Idle
+                     Emon slave main loop                       Idle
+                     AQ: 12c message cache init wait            Idle
+                     AQ Cross Master idle                       Idle
+                     AQPC idle                                  Idle
+                     Streams AQ: load balancer idle             Idle
+                     Sharded  Queues : Part Maintenance idle    Idle
+                     REPL Capture/Apply: RAC AQ qmn coordinator Idle
+                     iowp msg                                   Idle
+                     iowp file id                               Idle
+                     netp network                               Idle
+                     gopp msg                                   Idle
+</pre></p>
+<p>There are a lot of them. We can see lot of idle events that have been introduced in recent versions.</p>
+<p>The Statspack list is an old list. Here is how to refresh it:</p>
+<p><pre>
+delete from STATS$IDLE_EVENT;
+insert into STATS$IDLE_EVENT select name from V$EVENT_NAME where wait_class='Idle';
+commit;
+</pre></p>
+<p>Once I did that and run a new Statspack report on the same snapshots as above, I get a more realistic &#8216;Top 5 Timed Events':</p>
+<p><pre>
+Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+direct path read                                31,221         466     15   48.7
+CPU time                                                       310          32.4
+db file sequential read                         49,137          77      2    8.0
+SQL*Net vector data to client                   15,189          31      2    3.3
+enq: TM - contention                                 1          24  23937    2.5
+</pre></p>
+<p>Actually, this 22:00 to 23:00 time period is where the maintenance jobs are running. dbms_space.auto_space_advisor_job_proc likes to read your tables in bulk in order to see if there is some free space. And I don&#8217;t like this 24 seconds TM lock wait at a time where I though the database was not in use. This was hidden from the original report.</p>
+<h3>Patch?</h3>
+<p>Statspack is still supported and there&#8217;s a <a href="https://updates.oracle.com/download/18284201.html" target="_blank">patch</a> to add the following events as idle:
+<pre>"virtual circuit next request" "AQ Cross Master idle" "AQ: 12c message cache init wait" "AQPC idle" "Emon coordinator main loop" "Emon slave main loop" "LGWR worker group idle" "OFS idle" "REPL Apply: txns" "REPL Capture/Apply: RAC AQ qmn coordinator" "REPL Capture/Apply: messages" "REPL Capture: archive log" "Recovery Server Comm SGA setup wait" "Recovery Server Servlet wait" "Recovery Server Surrogate wait" "Recovery Server waiting for work" "Recovery Server waiting restore start" "Sharded Queues : Part Maintenance idle" "Streams AQ: load balancer idle" "gopp msggopp msg" "heartbeat redo informer" "iowp file id" "iowp msg" "lreg timer" "netp network" "parallel recovery coordinator idle wait" "recovery merger idle wait" "recovery receiver idle wait" "recovery sender idle wait" "imco timer" "process in prespawned state"</pre>
+(Nice way to be referenced by google for all those improbable wait events, isn&#8217;t it?)</p>
+<p>However, I think that filing STATS$IDLE_EVENT from V$EVENTNAME, or maybe even replacing it as a view can be a better long term solution. Each version comes with new wait events and it seems that Statspack evolves only through patches.</p>
+<h3>Update later</h3>
+<p>I think that this page will become very dynamic as I&#8217;ll add idle events when I encounter them.
+&#8216;log file parallel write&#8217; is background process by log writer (or rather by log writer slave since 12c, and &#8216;target log write size&#8217; is the time spend by log writer activity)
+<pre>
+insert into STATS$IDLE_EVENT values('log file parallel write');
+insert into STATS$IDLE_EVENT values('target log write size');
+</pre></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-94870"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-6538">
+				<div id="div-comment-6538" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/df8e7334fb7a17bb5acef05d675096eb?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Pang</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6538">
+			February 3, 2017 at 21 h 57 min</a>		</div>
+
+		<p>Thanks, it saved my time today. It is exactly I saw in 12c statspack before apply that oracle statspack patch you mentioned. Thumbs up.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-65391"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6538' onclick='return addComment.moveForm( "div-comment-6538", "6538", "respond", "9486" )' aria-label='Reply to Pang to Pang'>Reply to Pang</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-6984">
+				<div id="div-comment-6984" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/21365eb03fb4f7cb7968d94622c1ed97?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://oraculix.com' rel='external nofollow' class='url'>Uwe Küchler</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6984">
+			February 24, 2017 at 20 h 10 min</a>		</div>
+
+		<p>I like the idea of using a View on V$EVENTNAME to replace STATS$IDLE_EVENT. Guess I&#8217;ll update my deployment scripts for Statspack with that.</p>
+<p>Shameless plug ahead:
+Alternatively, If you don&#8217;t want to fiddle with the original Tables, you might consider using my Statspack Reports for SQL Developer instead, e.g. <a href="https://oraculix.com/2015/03/24/visualizing-statspack-average-active-sessions-in-sql-developer/" rel="nofollow">https://oraculix.com/2015/03/24/visualizing-statspack-average-active-sessions-in-sql-developer/</a></p>
+<p>Have a nice weekend!
+Uwe
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-69851"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6984' onclick='return addComment.moveForm( "div-comment-6984", "6984", "respond", "9486" )' aria-label='Reply to Uwe to Uwe Küchler'>Reply to Uwe</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-6987">
+				<div id="div-comment-6987" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6987">
+			February 24, 2017 at 21 h 45 min</a>		</div>
+
+		<p>Hi Uwe, thanks. Your SQL Developer reports are very useful. Regards, Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-69881"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6987' onclick='return addComment.moveForm( "div-comment-6987", "6987", "respond", "9486" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,178 @@
+This was first published on <a href=https://blog.dbi-services.com/12c-dbms_stats-gather_table_stats-on-gtt-do-not-commit>https://blog.dbi-services.com/12c-dbms_stats-gather_table_stats-on-gtt-do-not-commit</a> (2017-09-05)
+								<h1 class="entry-title">12c dbms_stats.gather_table_stats on GTT do not commit</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In my UKOUG OracleScene <a href="http://viewer.zmags.com/publication/07edc028#/07edc028/46" target="_blank">article</a> on 12<em>c</em> online statistics and GTT I mentioned the following:</p>
+<p><em>A final note about those 12c changes in statistics gathering on GTT. In 11g the dbms_stats did a commit at the start. So if you did gather stats after the load, you had to set the GTT as ON COMMIT PRESERVE ROWS. Or you just vacuum what you’ve loaded. That has changed in 12c. If you now choose to do a conventional insert followed by dbms_stats (having set private stats of course) then you don’t need to set on commit preserve rows anymore.</em></p>
+<p>Today, I realized that I&#8217;ve never explained exactly when dbms_stats.gather_table_stats commits the transaction or not. Because, of course, it depends. In summary: 12<em>c</em> non-SYS owner GTT with private statistics.
+<span id="more-18489"></span></p>
+<p>Here is an example. I connect as non-SYS user:
+<pre>
+SQL&gt; connect demo/demo@//localhost/pdb1
+Connected.
+SQL&gt; show user
+USER is "DEMO"
+</pre>
+I create a permanent table and a global temporary table:
+<pre>
+SQL&gt; create table DEMO(text varchar2(20));
+Table created.
+
+SQL&gt; create global temporary table DEMOGTT(text varchar2(20));
+Table created.
+</pre>
+In the permanent table, I insert my row. The goal is to be sure that this insert is not commited and can be rolled back at the end:
+<pre>
+SQL&gt; insert into DEMO values('Forget me, please!');
+1 row created.
+</pre>
+In the global temporary table I insert one row. The goal is to be sure that the row remains until the end of my transaction (on commit delete rows):
+<pre>
+SQL&gt; insert into DEMOGTT values('Preserve me, please!');
+1 row created.
+</pre>
+Here it is:
+<pre>
+SQL&gt; select * from DEMO;
+
+TEXT
+--------------------
+Forget me, please!
+
+SQL&gt; select * from DEMOGTT;
+
+TEXT
+--------------------
+Preserve me, please!
+</pre></p>
+<p>Then, I gather statistics on the GTT:
+<pre>
+SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMOGTT');
+PL/SQL procedure successfully completed.
+</pre></p>
+<p>I check that my rows in the GTT are still there, which is a proof that no commit happened:
+<pre>
+SQL&gt; select * from DEMOGTT;
+
+TEXT
+--------------------
+Preserve me, please!
+</pre></p>
+<p>And I check that, as no commit happened, I can rollback my previous insert on the permanent table:
+<pre>
+SQL&gt; rollback;
+Rollback complete.
+
+SQL&gt; select * from DEMO;
+no rows selected
+</pre></p>
+<p>This is the new behavior in 12<i>c</i>. The same in 11<i>g</i> would have committed my transaction before and after the call to dbms_stats.</p>
+<h3>GTT only</h3>
+<p>Here is the same example when gathering the stats on the permanent table:
+<pre>SQL&gt; show user
+USER is "DEMO"
+SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+PL/SQL procedure successfully completed.
+&amp;nbsp:
+SQL&gt; select * from DEMOGTT;
+no rows selected
+&amp;nbsp:
+SQL&gt; rollback;
+Rollback complete.
+&amp;nbsp:
+SQL&gt; select * from DEMO;
+&amp;nbsp:
+TEXT
+--------------------
+Forget me, please!
+</pre></p>
+<p>The transaction was committed by dbms_stats here: no rows from GTT (on commit delete rows), and the insert in permanent table was commited before my rollback.</p>
+<h3>Not for SYS</h3>
+<p>When connected as SYS:
+<pre>SQL&gt; show user
+USER is "SYS"
+SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMOGTT');
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from DEMOGTT;
+no rows selected
+
+SQL&gt; rollback;
+Rollback complete.
+
+SQL&gt; select * from DEMO;
+
+TEXT
+--------------------
+Forget me, please!
+</pre></p>
+<p>The transaction was committed by dbms_stats here: when the table is owned by SYS, dbms_stats commits.</p>
+<h3>I mean, not for SYS owner</h3>
+<p>If I&#8217;m connected by SYS but gather stats on a non-SYS table, dbms_stats do not commit:
+<pre>
+SQL&gt; show user
+USER is "SYS"
+SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMOGTT');
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from DEMOGTT;
+
+TEXT
+--------------------
+Preserve me, please!
+
+SQL&gt; rollback;
+Rollback complete.
+
+SQL&gt; select * from DEMO;
+no rows selected
+</pre></p>
+<p>The behaviour is not related to the user who runs dbms_stats, but the owner of the GTT.</p>
+<h3>Private statistics only</h3>
+<p>The default in 12<i>c</i> for GTT is private statistics, visible to session only. Trying the same with shared statistics (as in 11<i>g</i>):
+<pre>SQL&gt; show user
+USER is "DEMO"
+
+SQL&gt; select dbms_stats.get_prefs(ownname=&gt;user,tabname=&gt;'DEMO_GTT',pname=&gt;'GLOBAL_TEMP_TABLE_STATS') from dual;
+
+DBMS_STATS.GET_PREFS(OWNNAME=&gt;USER,TABNAME=&gt;'DEMO_GTT',PNAME=&gt;'GLOBAL_TEMP_TABLE
+--------------------------------------------------------------------------------
+SESSION
+
+SQL&gt; exec dbms_stats.set_table_prefs(user,'DEMO_GTT','GLOBAL_TEMP_TABLE_STATS','SHARED' );
+PL/SQL procedure successfully completed.
+
+SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMOGTT');
+PL/SQL procedure successfully completed.
+&amp;nbsp:
+SQL&gt; select * from DEMOGTT;
+no rows selected
+&amp;nbsp:
+SQL&gt; rollback;
+Rollback complete.
+&amp;nbsp:
+SQL&gt; select * from DEMO;
+&amp;nbsp:
+TEXT
+--------------------
+Forget me, please!
+
+SQL&gt; exec dbms_stats.set_table_prefs(user,'DEMO_GTT', 'GLOBAL_TEMP_TABLE_STATS',null);
+PL/SQL procedure successfully completed.
+</pre></p>
+<p>The dbms_stats did commit my transaction here.</p>
+<h3>So what?</h3>
+<p>Private session statistics for GTT is a great feature. Use it: gather statistics after filling the GTT. And don&#8217;t worry about on commit delete rows GTT (the default) because this statistic gathering do not commit the transation.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-184900"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

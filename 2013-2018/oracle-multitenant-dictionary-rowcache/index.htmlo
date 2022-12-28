@@ -1,0 +1,214 @@
+This was first published on <a href=https://blog.dbi-services.com/oracle-multitenant-dictionary-rowcache>https://blog.dbi-services.com/oracle-multitenant-dictionary-rowcache</a> (2015-02-08)
+								<h1 class="entry-title">Oracle multitenant dictionary: rowcache</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I&#8217;ve not finished with my investigation on 12c multitenant dictionary. Here, I&#8217;m checking how metadata links are managed by the dictionary cache (aka rowcache).
+As I did previously, I&#8217;ll create a metadata link function in my lab environment (this is not for production. For the moment metadata/object links are supported only for oracle objects).</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; connect / as sysdba
+Connected.
+
+SQL&gt; create or replace function DEMO_MDL_FUNCTION sharing=metadata
+  2    return varchar2 as
+  3    begin return 'XXXXXXXXXX'; end;
+  4  /
+Function created.
+
+SQL&gt; alter session set "_oracle_script"=true container=PDB1;
+Session altered.
+
+SQL&gt; create or replace function DEMO_MDL_FUNCTION sharing=metadata
+  2    return varchar2 as
+  3    begin return 'XXXXXXXXXX'; end;
+  4  /
+Function created.
+</pre>
+<p>It&#8217;s not difficult. You set _oracle_script to true and run the DDL in all containers (CDB$ROOT and PDBs) with the sharing=metadata undocumented syntax.
+I&#8217;m checking object_id in both containers:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+
+SQL&gt; select object_id,con_id from cdb_objects where object_name='DEMO_MDL_FUNCTION';
+
+ OBJECT_ID     CON_ID
+---------- ----------
+     92013          1
+     92371          3
+</pre>
+<p>And I flush the shared pool in order to flush the rowcache component:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter system flush shared_pool;
+System altered.
+
+SQL&gt; select * from v$sgastat where name like 'row cache';
+
+POOL         NAME                            BYTES     CON_ID
+------------ -------------------------- ---------- ----------
+shared pool  row cache                     8640160          1
+
+</pre>
+<p>Now I connect to the PDB and call the function:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select DEMO_MDL_FUNCTION from dual;
+
+DEMO_MDL_FUNCTION
+---------------------------------------
+XXXXXXXXXX
+
+</pre>
+<p>And then back to the CDB$ROOT I check what I have in the rowcache:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+
+SQL&gt; select cache_name,con_id,utl_raw.cast_to_varchar2(key) from v$rowcache_parent
+  2  where utl_raw.cast_to_varchar2(key) like chr(37)||' DEMO_MDL_FUNCTION '||chr(37) order by 1,3,2;
+
+CACHE_NAME     CON_ID UTL_RAW.CAST_TO_VARC
+---------- ---------- --------------------
+dc_objects          1       DEMO_MDL_FUNCT
+dc_objects          1       DEMO_MDL_FUNCT
+dc_objects          3       DEMO_MDL_FUNCT
+dc_objects          3       DEMO_MDL_FUNCT
+
+</pre>
+<p>I&#8217;ve two entries in each container. I&#8217;ve used the object only within the PDB (con_id=3) but I&#8217;ve also an entry for the CDB$ROOT (con_id=1). Is that a problem? I don&#8217;t know. Dictionary cache is not a large component of the shared pool so the size overhead is probably not an issue. However, I&#8217;ll have to investigate what is the consequence about dictionary cache contention.</p>
+<p>Something interesting is that the &#8216;row cache&#8217; component of the shared pool is reported only for CDB$ROOT:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from v$sgastat where name like 'row cache';
+
+POOL         NAME                            BYTES     CON_ID
+------------ -------------------------- ---------- ----------
+shared pool  row cache                     8640160          1
+
+SQL&gt; alter session set container=PDB1;
+Session altered.
+
+SQL&gt; select * from v$sgastat where name like 'row cache';
+no rows selected
+</pre>
+<p>Then, do we have an entry for CDB$ROOT in addition to the PDB ones in that CDB$ROOT shared pool? Let&#8217;s dump it:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+
+SQL&gt; alter session set events 'immediate trace name row_cache level 8';
+Session altered.
+</pre>
+<p>then get the trace file name:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; column tracefile new_value tracefile
+SQL&gt; select tracefile from v$process where addr=(select paddr from v$session where sid=sys_context('USERENV','SID'));
+
+TRACEFILE
+--------------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/cdb/CDB/trace/CDB_ora_6125.trc
+</pre>
+<p>and grep my function name sith 4 rows before and 8 rows after:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; host grep -B 4 -A 18 "name=DEMO_MDL_FUNCTION" &amp;tracefile
+</pre>
+<p>The result is here:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">BUCKET 26928:
+  row cache parent object: addr=0x6cd8c4e0 cid=8(dc_objects) conid=1 conuid=1
+  hash=102a692f typ=11 transaction=(nil) flags=00000002 inc=1, pdbinc=1
+  objectno=92013 ownerid=0 nsp=1
+  name=DEMO_MDL_FUNCTION
+  own=0x6cd8c5b0[0x6cd8c5b0,0x6cd8c5b0] wat=0x6cd8c5c0[0x6cd8c5c0,0x6cd8c5c0] mode=N
+  status=VALID/-/-/-/-/-/-/-/-
+  set=0, complete=FALSE
+  data=
+  00000000 45440011 4d5f4f4d 465f4c44 54434e55 004e4f49 00000000 00000000
+  00000000 00000001 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 0001676d 0000ffff ffffffff 02737808 08271508
+  08027378 78063115 15080273 00010631 00510000 00000000 00000000 00000000
+  00000000 00000006 00000000 00000000 00000000 00000000 7a7871ab b01c11e7
+  61dbc633 23ade680 00000001 00000000 00000000 102a692f 6cd8c4e0 00000000
+  7ec6d318 00000000 7ec6d318 00000000 00000001 9a2a6093 6cd8c4e0 00000000
+  7ec64958 00000000 7ec64958 00000000
+  BUCKET 26928 total object count=1
+--
+BUCKET 49724:
+  row cache parent object: addr=0x61783968 cid=8(dc_objects) conid=3 conuid=2451138288
+  hash=f5dac23b typ=11 transaction=(nil) flags=00000002 inc=1, pdbinc=1
+  objectno=92371 ownerid=0 nsp=1
+  name=DEMO_MDL_FUNCTION
+  own=0x61783a38[0x61783a38,0x61783a38] wat=0x61783a48[0x61783a48,0x61783a48] mode=N
+  status=VALID/-/-/-/-/-/-/-/-
+  set=0, complete=FALSE
+  data=
+  00000000 45440011 4d5f4f4d 465f4c44 54434e55 004e4f49 00000000 00000000
+  00000000 00000001 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 000168d3 0000ffff ffffffff 02737808 08271508
+  08027378 78073115 15080273 00010731 00510000 00000000 00000000 00000000
+  00000000 00000006 00000000 00000000 00000000 00000000 7a7871ab b01c11e7
+  61dbc633 23ade680 00000001 00000000 00000000 f5dac23b 61783968 00000000
+  7ecc63d8 00000000 7ecc63d8 00000000 00000001 f452019d 61783968 00000000
+  7ec059f8 00000000 7ec059f8 00000000
+  BUCKET 49724 total object count=1
+--
+BUCKET 414:
+  row cache parent object: addr=0x61783968 cid=8(dc_objects) conid=3 conuid=2451138288
+  hash=f5dac23b typ=11 transaction=(nil) flags=00000002 inc=1, pdbinc=1
+  objectno=92371 ownerid=0 nsp=1
+  name=DEMO_MDL_FUNCTION
+  own=0x61783a38[0x61783a38,0x61783a38] wat=0x61783a48[0x61783a48,0x61783a48] mode=N
+  status=VALID/-/-/-/-/-/-/-/-
+  set=0, complete=FALSE
+  data=
+  00000000 45440011 4d5f4f4d 465f4c44 54434e55 004e4f49 00000000 00000000
+  00000000 00000001 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 000168d3 0000ffff ffffffff 02737808 08271508
+  08027378 78073115 15080273 00010731 00510000 00000000 00000000 00000000
+  00000000 00000006 00000000 00000000 00000000 00000000 7a7871ab b01c11e7
+  61dbc633 23ade680 00000001 00000000 00000000 f5dac23b 61783968 00000000
+  7ecc63d8 00000000 7ecc63d8 00000000 00000001 f452019d 61783968 00000000
+  7ec059f8 00000000 7ec059f8 00000000
+  BUCKET 414 total object count=1
+--
+BUCKET 24724:
+  row cache parent object: addr=0x6cd8c4e0 cid=8(dc_objects) conid=1 conuid=1
+  hash=102a692f typ=11 transaction=(nil) flags=00000002 inc=1, pdbinc=1
+  objectno=92013 ownerid=0 nsp=1
+  name=DEMO_MDL_FUNCTION
+  own=0x6cd8c5b0[0x6cd8c5b0,0x6cd8c5b0] wat=0x6cd8c5c0[0x6cd8c5c0,0x6cd8c5c0] mode=N
+  status=VALID/-/-/-/-/-/-/-/-
+  set=0, complete=FALSE
+  data=
+  00000000 45440011 4d5f4f4d 465f4c44 54434e55 004e4f49 00000000 00000000
+  00000000 00000001 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 00000000 00000000 00000000 00000000 00000000
+  00000000 00000000 00000000 0001676d 0000ffff ffffffff 02737808 08271508
+  08027378 78063115 15080273 00010631 00510000 00000000 00000000 00000000
+  00000000 00000006 00000000 00000000 00000000 00000000 7a7871ab b01c11e7
+  61dbc633 23ade680 00000001 00000000 00000000 102a692f 6cd8c4e0 00000000
+  7ec6d318 00000000 7ec6d318 00000000 00000001 9a2a6093 6cd8c4e0 00000000
+  7ec64958 00000000 7ec64958 00000000
+  BUCKET 24724 total object count=1
+</pre>
+<p>Do we learn something else from that? Not a lot, except that we have actually dump different entries for both containers, and object_id matches.</p>
+<p>So it seems that sharing the dictionary do not share the dictionary cache. However, I&#8217;m not sure that the overhead is significant or not. But if you want to play with those object/metadata links then don&#8217;t forget to flush the shared_pool when you see something weird.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5780"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,224 @@
+This was first published on <a href=https://blog.dbi-services.com/postgres-vs-oracle-access-paths-iv>https://blog.dbi-services.com/postgres-vs-oracle-access-paths-iv</a> (2017-08-05)
+								<h1 class="entry-title">Postgres vs. Oracle access paths IV &#8211; Order By and Index</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I realize that I&#8217;m talking about indexes in Oracle and Postgres, and didn&#8217;t mention yet the best website you can find about indexes, with concepts and examples for all RDBMS: <a href="http://use-the-index-luke.com" target="_blank">http://use-the-index-luke.com</a>. You will probably learn a lot about SQL design. Now let&#8217;s continue on execution plans with indexes.</p>
+<p>As we have seen <a href="../postgres-vs-oracle-access-paths-ii/index.html" target="_blank">two posts</a> ago, an index can be used even with a 100% selectivity (all rows), when we don&#8217;t filter any rows. Oracle has INDEX FAST FULL SCAN which is the fastest, reading blocks sequentially as they come. But this doesn&#8217;t follow the B*Tree leaves chain and does not return the rows in the order of the index. However, there is also the possibility to read the leaf blocks in the index order, with INDEX FULL SCAN and random reads instead of multiblock reads.
+It is similar to the Index Only Scan of Postgres except that there is no need to get to the table to filter out uncommitted changes. Oracle reads the transaction table to get the visibility information, and goes to undo records if needed.
+<span id="more-17677"></span>
+The <a href="../postgres-vs-oracle-access-paths-iii/index.html" target="_blank">previous post</a> had a query with a &#8216;where n is not null&#8217; predicate to be sure having all index entries in Oracle indexes and we will continue on this by adding an order by.</p>
+<p>For this post, I&#8217;ve increased the size of the column N in the Oracle table, by adding 1/3 to each number. I did this for this post only, and for the Oracle table only. The index on N is now 45 blocks instead of 20. The reason is to show what happens when the cost of &#8216;order by&#8217; is high. I didn&#8217;t change the Postgres table because there is only one way to scan the index, where result is always sorted.</p>
+<h3>Oracle Index Fast Full Scan vs. Index Full Scan</h3>
+<p><pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dbck3rgnqbakg, child number 0
+-------------------------------------
+select /*+  */  n from demo1  where n is not null order by n
+---------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |         |      1 |        |    46 (100)|  10000 |00:00:00.01 |      48 |
+|   1 |  INDEX FULL SCAN | DEMO1_N |      1 |  10000 |    46   (0)|  10000 |00:00:00.01 |      48 |
+---------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<p>Index Full Scan, the random read version of index read is chosen here by the Oracle optimizer because we want the result on the column N and the index can provide this without additional sorting.</p>
+<p>We can force the optimizer to do multiblock reads, with INDEX_FFS hint:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  anqfbf5caat2a, child number 0
+-------------------------------------
+select /*+ index_ffs(demo1) */  n from demo1  where n is not null order
+by n
+-----------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+-----------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |         |      1 |        |    82 (100)|  10000 |00:00:00.01 |      51 |       |       |          |
+|   1 |  SORT ORDER BY        |         |      1 |  10000 |    82   (2)|  10000 |00:00:00.01 |      51 |   478K|   448K|  424K (0)|
+|   2 |   INDEX FAST FULL SCAN| DEMO1_N |      1 |  10000 |    14   (0)|  10000 |00:00:00.01 |      51 |       |       |          |
+-----------------------------------------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - (#keys=1) "N"[NUMBER,22]
+   2 - "N"[NUMBER,22]
+</pre></p>
+<p>The estimated cost is higher: the index read is cheaper (cost=14 instead of 46) but then the sort operation brings this to 82. We can see additional columns in the execution plan here because the sorting operation needs a workarea in memory (estimated 478K, actually 424K used during the execution). Note that the multiblock read has a few blocks of overhead (reads 51 blocks instead of 48) because it has to read the segment header to identify the extents to scan.</p>
+<h3>Postgres Index Only Scan</h3>
+<p>In PostgreSQL there&#8217;s only one way to scan indexes: random reads by following the chain of leaf blocks. This returns the rows in the order of the index and does not require an additional sort:</p>
+<p><pre>
+explain (analyze,verbose,costs,buffers) select  n from demo1  where n is not null order by n ;
+                                                             QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_n on public.demo1  (cost=0.29..295.29 rows=10000 width=4) (actual time=0.125..1.277 rows=10000 loops=1)
+   Output: n
+   Index Cond: (demo1.n IS NOT NULL)
+   Heap Fetches: 0
+   Buffers: shared hit=30
+ Planning time: 0.532 ms
+ Execution time: 1.852 ms
+</pre></p>
+<p>In the previous posts, we have seen a cost of cost=0.29..270.29 for the Index Only Scan. Here we have an additional cost of 25 for the cpu_operator_cost because I&#8217;ve added the &#8216;where n is not null&#8217;. As the default constant is 0.0025 this is the query planner estimating to evaluate it for 10000 rows.</p>
+<h3>First Rows</h3>
+<p>The Postgres cost always shows two values. The first one is the startup cost: the cost just before being able to return the first row. Some operations have a very small startup cost, others have some blocking operations that must finish before sending their first result rows. Here, as we have no sort operation, the first row retrieved from the index can be returned immediately and the startup cost is small: 0.29
+In Oracle you can see the initial cost by optimizing the plan to retrieve the first row, with the FIRST_ROWS() hint:</p>
+<p><pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0fjk9vv4g1q1w, child number 0
+-------------------------------------
+select /*+ first_rows(1) */  n from demo1  where n is not null order by
+n
+---------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |         |      1 |        |     2 (100)|  10000 |00:00:00.01 |      48 |
+|   1 |  INDEX FULL SCAN | DEMO1_N |      1 |  10000 |     2   (0)|  10000 |00:00:00.01 |      48 |
+---------------------------------------------------------------------------------------------------
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "N"[NUMBER,22]
+</pre></p>
+<p>The actual number of blocks read (48) is the same as before because I finally fetched all rows, but the cost is small because it was estimated for two rows only. Of course, we can also tell Postgres or Oracle that we want only the first rows. This is for the next post.</p>
+<h3>Character strings</h3>
+<p>The previous example is an easy one because the column N is a number and both Oracle and Postgres stores number in a binary format that follows the same order as the numbers. But that&#8217;s different with character strings. If you are not in America, there is a very little chance that the order you want to see follows the ASCII order. Here I&#8217;ve run a similar query but using the column X instead of N, which is a text (VARCHAR2 in Oracle):
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  fsqk4fg1t47v5, child number 0
+-------------------------------------
+select /*+  */  x from demo1  where x is not null order by x
+--------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers | Reads  |  OMem |  1Mem | Used-Mem |
+--------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |         |      1 |        |  2493 (100)|  10000 |00:00:00.27 |    1644 |     18 |       |       |          |
+|   1 |  SORT ORDER BY        |         |      1 |  10000 |  2493   (1)|  10000 |00:00:00.27 |    1644 |     18 |    32M|  2058K|   29M (0)|
+|*  2 |   INDEX FAST FULL SCAN| DEMO1_X |      1 |  10000 |   389   (0)|  10000 |00:00:00.01 |    1644 |     18 |       |       |          |
+--------------------------------------------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - filter("X" IS NOT NULL)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - (#keys=1) NLSSORT("X",'nls_sort=''FRENCH''')[2000], "X"[VARCHAR2,1000]
+   2 - "X"[VARCHAR2,1000]
+</pre>
+I have created an index on X, and as you can see it can be used to get all X values, but with an Index Fast Full Scan, the multiblock index only access which is fast but does not return rows in the order of the index. And then a sort operation is applied. I can force an Index Full Scan with INDEX() hint but the sort will still have to be done.</p>
+<p>The reason can be seen in the column projection note. My Oracle client application is running on a laptop where the OS is in French and Oracle returns the setting according to what the end-user can expect. This is National Language Support. An Oracle database can be accessed by users all around the world and they will see ordered lists, date format, decimal separators,&#8230; according to their country and language.</p>
+<h3>ORDER BY &#8230; COLLATE &#8230;</h3>
+<p>My databases has been created in a system which is in English. In Postgres we can get results sorted in French with the COLLATE option of ORDER BY:</p>
+<p><pre>
+explain (analyze,verbose,costs,buffers) select  x from demo1  where x is not null order by x collate "fr_FR" ;
+                                                                  QUERY PLAN
+----------------------------------------------------------------------------------------------------------------------------------------------
+ Sort  (cost=5594.17..5619.17 rows=10000 width=1036) (actual time=36.163..37.254 rows=10000 loops=1)
+   Output: x, ((x)::text)
+   Sort Key: demo1.x COLLATE "fr_FR"
+   Sort Method: quicksort  Memory: 1166kB
+   Buffers: shared hit=59
+   -&gt;  Index Only Scan using demo1_x on public.demo1  (cost=0.29..383.29 rows=10000 width=1036) (actual time=0.156..1.559 rows=10000 loops=1)
+         Output: x, x
+         Index Cond: (demo1.x IS NOT NULL)
+         Heap Fetches: 0
+         Buffers: shared hit=52
+ Planning time: 0.792 ms
+ Execution time: 38.264 ms
+</pre>
+Same idea here as in Oracle: there is an additional sort operation, which is a blocking operation that needs to be completed before being able to return the first row.</p>
+<p>The detail of the cost is the following:</p>
+<ul>
+<li>The index on the column X has 52 blocks witch is estimated at cost=208 (random_page_cost=4)</li>
+<li>We have 10000 index entries to process, estimated at cost=50 (cpu_index_tuple_cost=0.005)</li>
+<li>We have 10000 result rows to process, estimated at cost=100 (cpu_tuple_cost=0.01)</li>
+<li>We have evaluated 10000 &#8216;is not null&#8217; conditions, estimated at cost=25 (cpu_operator_cost=0.0025)</li>
+</ul>
+<p>In Oracle we can use the same COLLATE syntax, but the name of the language is different, consistent across platforms rather than useing the OS one:</p>
+<p><pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  82az4syppyndf, child number 0
+-------------------------------------
+select /*+  */  x from demo1  where x is not null order by x collate "French"
+-----------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation             | Name    | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+-----------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |         |      1 |        |  2493 (100)|  10000 |00:00:00.28 |    1644 |       |       |          |
+|   1 |  SORT ORDER BY        |         |      1 |  10000 |  2493   (1)|  10000 |00:00:00.28 |    1644 |    32M|  2058K|   29M (0)|
+|*  2 |   INDEX FAST FULL SCAN| DEMO1_X |      1 |  10000 |   389   (0)|  10000 |00:00:00.01 |    1644 |       |       |          |
+-----------------------------------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - filter("X" IS NOT NULL)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - (#keys=1) NLSSORT("X" COLLATE "French",'nls_sort=''FRENCH''')[2000], "X"[VARCHAR2,1000]
+   2 - "X"[VARCHAR2,1000]
+</pre></p>
+<p>In Oracle, we do not need to use the COLLATE option. The language can be set for the session (NLS_LANGUAGE=&#8217;French&#8217;) or from the environment (NLS_LANG=&#8217;=French_.&#8217;). Oracle can share cursors across sessions (to avoid to waste resource compiling and optimizing the same statements used by different sessions) but will not share execution plans among different NLS environments because, as we have seen, the plan can be different. Postgres do not have to manage that because each PREPARE statement does a full compilation and optimization. There is no cursor sharing in Postgres.</p>
+<h3>Indexing for different languages</h3>
+<p>We have seen in the Oracle execution plan Column Projection Information that an NLSSORT operation is applied on the column to get a value that follows the collation order of the language. We have seen in the previous post that we can index a function on a column. Then we have the possibility to create an index for different languages. The following index will be used to avoid sort from French users:
+<pre>
+create index demo1_x_fr on demo1(nlssort(x,'NLS_SORT=French'));
+</pre>
+Since 12<i>c</i>R2 we can create the same with de collate syntax:
+<pre>
+create index demo1_x_fr on demo1(x collate "French");
+</pre>
+Both syntaxes create the same index, which can be used by queries with ORDER BY &#8230; COLLATE or with session that set the NLS_LANGUAGE:
+<pre>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  82az4syppyndf, child number 0
+-------------------------------------
+select /*+  */  x from demo1  where x is not null order by x collate "French"
+-----------------------------------------------------------------------------------------------------------------
+| Id  | Operation                   | Name       | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT            |            |      1 |        |  4770 (100)|  10000 |00:00:00.02 |    4772 |
+|*  1 |  TABLE ACCESS BY INDEX ROWID| DEMO1      |      1 |  10000 |  4770   (1)|  10000 |00:00:00.02 |    4772 |
+|   2 |   INDEX FULL SCAN           | DEMO1_X_FR |      1 |  10000 |  3341   (1)|  10000 |00:00:00.01 |    3341 |
+-----------------------------------------------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   1 - filter("X" IS NOT NULL)
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "X"[VARCHAR2,1000]
+   2 - "DEMO1".ROWID[ROWID,10], "DEMO1"."SYS_NC00004$"[RAW,2000]
+</pre></p>
+<p>There&#8217;s no sort operation here as the INDEX FULL SCAN returns the rows in order.</p>
+<p>PostgreSQL has the same syntax:
+<pre>
+create index demo1_x_fr on demo1(x collate "fr_FR");
+</pre>
+and then the query can use this index and bypass the sort operation:
+<pre>
+explain (analyze,verbose,costs,buffers) select  x from demo1  where x is not null order by x collate "fr_FR" ;
+                                                                QUERY PLAN
+-------------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo1_x_fr on public.demo1  (cost=0.29..383.29 rows=10000 width=1036) (actual time=0.190..1.654 rows=10000 loops=1)
+   Output: x, x
+   Index Cond: (demo1.x IS NOT NULL)
+   Heap Fetches: 0
+   Buffers: shared hit=32 read=20
+ Planning time: 1.049 ms
+ Execution time: 2.304 ms
+</pre></p>
+<p>Avoiding a sort operation can really improve the performance of queries in two ways: save the resources required by a sort operation (which will have to spill to disk when the workarea do not fit in memory) and avoid a blocking operation and then be able to return the first rows quickly.</p>
+<p>We have seen how indexes can be used to access a subset of columns from a smaller structure, and how they can be used to access a sorted version of the rows. Future posts will show how the index access is used to quickly filter a subset of rows. But for the moment I&#8217;ll continue on this blocking operation. We have seen a lot of Postgres costs, and they have two values (startup cost and total cost). More on startup cost in the <a href="../postgres-vs-oracle-access-paths-v/index.html" target="_blank">next post</a>.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-176780"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

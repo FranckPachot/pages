@@ -1,0 +1,253 @@
+This was first published on <a href=https://blog.dbi-services.com/adaptive-plans-and-sql-baselines>https://blog.dbi-services.com/adaptive-plans-and-sql-baselines</a> (2016-06-21)
+								<h1 class="entry-title">Adaptive Plans and SQL Baselines</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I encountered recently an issue with Adaptive Plan and SPM. Documentations says that it works perfectly together but I remembered a presentation from Nelson Calero at UKOUG TECH15 mentioning strange behavior. I reproduced the issue and share the test case here as you may encounter it in 12.1 leading to regressions when you capture SQL Plan Baselines.
+<span id="more-9388"></span></p>
+<h3>Cleanup</h3>
+<p>Whith all those adaptive features, you need to start clean if you want a reproductible testcase
+<pre>SQL&gt; -- drop tables
+SQL&gt; drop table DEMO1;
+Table dropped.
+SQL&gt; drop table DEMO2;
+Table dropped.
+SQL&gt;
+SQL&gt; whenever sqlerror exit failure
+SQL&gt;
+SQL&gt; -- drop all sql plan baselines
+SQL&gt; set serveroutput on long 100000 longc 100000
+SQL&gt; exec for i in (select sql_handle, plan_name, accepted, origin, created from dba_sql_plan_baselines) loop dbms_output.put_line(''||dbms_spm.drop_sql_plan_baseline(sql_handle=&gt;i.sql_handle,plan_name=&gt;i.plan_name)); end loop;
+1
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; set serveroutput off
+SQL&gt; select 0/0 from dba_sql_plan_baselines;
+no rows selected
+SQL&gt;
+SQL&gt; -- flush shared pool
+SQL&gt; alter system flush shared_pool;
+System altered.
+SQL&gt; select 0/0 from v$sql where sql_id='agw7bn072730a';
+no rows selected</pre></p>
+<h3>Create the tables</h3>
+<p><pre>SQL&gt; -- create two tables with few rows for L=1 and lot of rows for L=15
+SQL&gt; create table DEMO2 (id constraint PK1 primary key,l) as select rownum,floor(log(2,rownum)) from xmltable('1 to 100000');
+Table created.
+
+SQL&gt; create table DEMO1 as select * from DEMO2;
+Table created.</pre></p>
+<h3>Run the query</h3>
+<p><pre>
+SQL&gt; -- run a join for the few rows case
+SQL&gt; alter session set statistics_level=all;
+Session altered.
+SQL&gt; select count(DEMO2.l) from DEMO1 join DEMO2 using(id) where DEMO1.l=1;
+
+COUNT(DEMO2.L)
+--------------
+             3</pre></p>
+<p>And here is the adaptive plan:</p>
+<p><pre>SQL&gt; select * from table(dbms_xplan.display_cursor(null,null,format=&gt;'allstats last +adaptive +outline'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------
+SQL_ID  agw7bn072730a, child number 0
+-------------------------------------
+select count(DEMO2.l) from DEMO1 join DEMO2 using(id) where DEMO1.l=1
+
+Plan hash value: 2870612662
+
+-------------------------------------------------------------------------------------------------------------
+|   Id  | Operation                      | Name  | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+-------------------------------------------------------------------------------------------------------------
+|     0 | SELECT STATEMENT               |       |      1 |        |      1 |00:00:00.01 |     203 |    183 |
+|     1 |  SORT AGGREGATE                |       |      1 |      1 |      1 |00:00:00.01 |     203 |    183 |
+|- *  2 |   HASH JOIN                    |       |      1 |   5882 |      3 |00:00:00.01 |     203 |    183 |
+|     3 |    NESTED LOOPS                |       |      1 |   5882 |      3 |00:00:00.01 |     203 |    183 |
+|     4 |     NESTED LOOPS               |       |      1 |        |      3 |00:00:00.01 |     200 |    183 |
+|-    5 |      STATISTICS COLLECTOR      |       |      1 |        |      3 |00:00:00.01 |     195 |    179 |
+|  *  6 |       TABLE ACCESS FULL        | DEMO1 |      1 |   5882 |      3 |00:00:00.01 |     195 |    179 |
+|  *  7 |      INDEX UNIQUE SCAN         | PK1   |      3 |        |      3 |00:00:00.01 |       5 |      4 |
+|     8 |     TABLE ACCESS BY INDEX ROWID| DEMO2 |      3 |      1 |      3 |00:00:00.01 |       3 |      0 |
+|-    9 |    TABLE ACCESS FULL           | DEMO2 |      0 |    100K|      0 |00:00:00.01 |       0 |      0 |
+-------------------------------------------------------------------------------------------------------------
+
+Outline Data
+-------------
+
+  /*+
+      BEGIN_OUTLINE_DATA
+      INDEX(@"SEL$58A6D7F6" "DEMO2"@"SEL$1" ("DEMO2"."ID"))
+      NLJ_BATCHING(@"SEL$58A6D7F6" "DEMO2"@"SEL$1")
+      USE_NL(@"SEL$58A6D7F6" "DEMO2"@"SEL$1")
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.2.0.1')
+      DB_VERSION('12.2.0.1')
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$58A6D7F6")
+      MERGE(@"SEL$1")
+      OUTLINE(@"SEL$2")
+      OUTLINE(@"SEL$1")
+      FULL(@"SEL$58A6D7F6" "DEMO1"@"SEL$1")
+      LEADING(@"SEL$58A6D7F6" "DEMO1"@"SEL$1" "DEMO2"@"SEL$1")
+      END_OUTLINE_DATA
+  */
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("DEMO1"."ID"="DEMO2"."ID")
+   6 - filter("DEMO1"."L"=1)
+   7 - access("DEMO1"."ID"="DEMO2"."ID")
+
+Note
+-----
+   - this is an adaptive plan (rows marked '-' are inactive)
+</pre></p>
+<p>It&#8217;s an adaptive plan, HASH JOIN was the initial choice but first execution activated the NESTED LOOP.</p>
+<h3>SQL Baseline Capture</h3>
+<p><pre>SQL&gt; alter session set optimizer_capture_sql_plan_baselines=true;
+Session altered.
+
+SQL&gt; select count(DEMO2.l) from DEMO1 join DEMO2 using(id) where DEMO1.l=1;
+
+COUNT(DEMO2.L)
+--------------
+             3
+
+SQL&gt; alter session set optimizer_capture_sql_plan_baselines=false;
+Session altered.</pre></p>
+<p>Here is the SQL Baseline:</p>
+<p><pre>SQL&gt; select sql_handle, plan_name, accepted, origin, created from dba_sql_plan_baselines;
+
+SQL_HANDLE                     PLAN_NAME                                ACC ORIGIN                        CREATED
+------------------------------ ---------------------------------------- --- ----------------------------- ---------------------------------------------------------------------------
+SQL_4c1b404640b73a81           SQL_PLAN_4s6u08t0bffn1e47b6a4d           YES AUTO-CAPTURE                  28-MAY-16 09.13.04.000000 PM</pre></p>
+<p>and its plan:</p>
+<p><pre>SQL&gt; select plan_table_output from dba_sql_plan_baselines,table(dbms_xplan.display_sql_plan_baseline(sql_handle, plan_name, format=&gt;'+adaptive'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+SQL handle: SQL_4c1b404640b73a81
+SQL text: select count(DEMO2.l) from DEMO1 join DEMO2 using(id) where DEMO1.l=1
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Plan name: SQL_PLAN_4s6u08t0bffn1e47b6a4d         Plan id: 3833293389
+Enabled: YES     Fixed: NO      Accepted: YES     Origin: AUTO-CAPTURE
+Plan rows: From dictionary
+--------------------------------------------------------------------------------
+
+Plan hash value: 740165205
+
+-------------------------------------------------------------------------------
+|   Id  | Operation           | Name  | Rows  | Bytes | Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------
+|     0 | SELECT STATEMENT    |       |     1 |    16 |   108   (2)| 00:00:01 |
+|     1 |  SORT AGGREGATE     |       |     1 |    16 |            |          |
+|  *  2 |   HASH JOIN         |       |  5882 | 94112 |   108   (2)| 00:00:01 |
+|  *  3 |    TABLE ACCESS FULL| DEMO1 |  5882 | 47056 |    54   (2)| 00:00:01 |
+|     4 |    TABLE ACCESS FULL| DEMO2 |   100K|   781K|    54   (2)| 00:00:01 |
+-------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("DEMO1"."ID"="DEMO2"."ID")
+   3 - filter("DEMO1"."L"=1)
+
+Note
+-----
+   - this is an adaptive plan (rows marked '-' are inactive)</pre></p>
+<p>Unfortunately, the baseline captured only the &#8216;initial&#8217; plan with the HASH JOIN.
+This is not what is documented in <a href="http://www.oracle.com/technetwork/database/bi-datawarehousing/twp-sql-plan-mgmt-12c-1963237.pdf" target="_blank">Maria Colgan paper</a>:
+<em>SPM plan capture and Adaptive Plans: When automatic plan capture is enabled and a SQL statement that has an adaptive plan is executed, <strong>only the final plan used will be captured in the SQL plan baseline</strong>.</em></p>
+<h3>Run with baseline</h3>
+<p><pre>SQL&gt; alter session set statistics_level=all;
+Session altered.
+
+SQL&gt; select count(DEMO2.l) from DEMO1 join DEMO2 using(id) where DEMO1.l=1;
+
+COUNT(DEMO2.L)
+--------------
+             3
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(null,null,format=&gt;'allstats last +adaptive'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------
+SQL_ID  agw7bn072730a, child number 1
+-------------------------------------
+select count(DEMO2.l) from DEMO1 join DEMO2 using(id) where DEMO1.l=1
+
+Plan hash value: 740165205
+
+------------------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |       |      1 |        |      1 |00:00:00.01 |     390 |       |       |          |
+|   1 |  SORT AGGREGATE     |       |      1 |      1 |      1 |00:00:00.01 |     390 |       |       |          |
+|*  2 |   HASH JOIN         |       |      1 |   5882 |      3 |00:00:00.01 |     390 |  2545K|  2545K|  826K (0)|
+|*  3 |    TABLE ACCESS FULL| DEMO1 |      1 |   5882 |      3 |00:00:00.01 |     195 |       |       |          |
+|   4 |    TABLE ACCESS FULL| DEMO2 |      1 |    100K|    100K|00:00:00.01 |     195 |       |       |          |
+------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("DEMO1"."ID"="DEMO2"."ID")
+   3 - filter("DEMO1"."L"=1)
+
+Note
+-----
+   - SQL plan baseline SQL_PLAN_4s6u08t0bffn1e47b6a4d used for this statement</pre></p>
+<p>This confirms that the SQL baseline forces the initial HASH JOIN plan. It&#8217;s a bug that should be fixed in 12.2 so for the moment, be very careful when you want to fix an adaptive plan with SQL Baselines: your goal is to stabilize once you have the optimal plan, but the result may be a regression to a bad plan.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-93890"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-7776">
+				<div id="div-comment-7776" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/a3b4e769ef2bcb671a06b05cf498d3b8?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Frédéric</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7776">
+			July 3, 2017 at 14 h 29 min</a>		</div>
+
+		<p>Bonjour Franck,</p>
+<p>Merci pour cet article très utile.</p>
+<p>Cordialement,</p>
+<p>Frédéric
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-77771"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7776' onclick='return addComment.moveForm( "div-comment-7776", "7776", "respond", "9388" )' aria-label='Reply to Frédéric to Frédéric'>Reply to Frédéric</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

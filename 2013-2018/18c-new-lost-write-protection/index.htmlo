@@ -1,0 +1,543 @@
+This was first published on <a href=https://blog.dbi-services.com/18c-new-lost-write-protection>https://blog.dbi-services.com/18c-new-lost-write-protection</a> (2018-03-04)
+								<h1 class="entry-title">18c new Lost Write Protection</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>There are many layers between the Oracle Database pwrite() calls and the physical sector written on disk: filesystem, logical volume, SAN or NAS, with a lot of smart software running for Virtualisation, Compression, Snapshotting, Synchronisation&#8230; Are you sure that the changes you made to your data is actually persisted on disk, completely and without any corruption? In case of bug or crash in the storage layer, it may happen that only part of the changes was written. In the case of crash, Oracle ensures that the datafile headers are written at the end, so that recovery can kick-in after the crash. Then, a partially written block can be detected and restored. With different checksum settings, you can also check block integrity while writing or reading. But that protects only for fractured blocks. What if a block write just did not occur? An old version of the block remains and then is perfectly correct for checksum, RMAN, and DBV.</p>
+<p>You may be 100% sure that you have never experienced lost writes. But then I&#8217;ll ask you: how do you know it? You don&#8217;t. Except if you enable Lost Write Protection.
+<span id="more-21673"></span>
+In 11g Oracle introduced this feature for Data Guard configurations. Data Guard is the best protection as the synchronization is done at the highest level: the change vector, generated before any I/O and block modification occurred. Do not use SAN synchronization for your database. Data Guard is less expensive (no option needed), more efficient (only the persistent change information is shipped), and protects over all layers. It protects from lost writes because blocks are written on both sites by a different server, instance, storage. And Data Guard can detect lost writes by shipping the block SCN for each read to compare it with the standby.</p>
+<p>However, this has an overhead: redo generation for reads. Oracle 18c comes with a new solution with no need for a standby database: a new LOST WRITE PROTECTION tablespace is created to store the SCN of each block modified.</p>
+<h3>Do you have lost writes?</h3>
+<p>First I&#8217;ll show what happens without this feature. I create a table filled with number, timestamp and SCN:
+<pre>
+SQL&gt; create table DEMO.DEMO pctfree 99 as select rownum id,1 n, current_timestamp ts , (select current_scn from v$database) scn from xmltable('1 to 10');
+Table DEMO.DEMO created.
+
+SQL&gt; select owner,segment_name,segment_type,block_id,blocks,sum(blocks)over(partition by owner,segment_name,segment_type) from dba_extents where owner='DEMO' and segment_name='DEMO' order by 1,2,3,4;
+
+OWNER   SEGMENT_NAME   SEGMENT_TYPE     BLOCK_ID   BLOCKS   SUM(BLOCKS)OVER(PARTITIONBYOWNER,SEGMENT_NAME,SEGMENT_TYPE)
+-----   ------------   ------------     --------   ------   -----------------------------------------------------------
+DEMO    DEMO           TABLE                3128        8                                                             8
+
+SQL&gt; column block_id new_value last_block_id
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO;
+
+  BLOCK_ID   ID   N TS                                                    SCN
+  --------   --   - --                                                    ---
+      3131    1   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3131    2   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3132    3   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3132    4   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3133    5   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3133    6   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3134    7   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3134    8   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3135    9   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3135   10   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+
+SQL&gt; column block_id clear
+</pre></p>
+<p>I&#8217;ve recorded the las BLOCK_ID in &amp;last_block_id and ensures that all those modifications are written on dosk:
+<pre>
+SQL&gt; alter system checkpoint;
+System CHECKPOINT altered.
+
+SQL&gt; alter system flush buffer_cache;
+System FLUSH altered.
+</pre></p>
+<p>I save the block 3133 to keep an old version of it. This will be my way to simulate a lost write.
+<pre>
+SQL&gt; host dd if=/u01/oradata/CDB1/PDB1/users01.dbf of=/var/tmp/lwp.blk skip=$(( &amp;last_block_id - 2 )) bs=8k count=1
+1+0 records in
+1+0 records out
+8192 bytes (8.2 kB) copied, 0.000263416 s, 31.1 MB/s
+</pre></p>
+<p>Now, I update all rows, set new timestamp, SCN and increase the number 1 to 2.
+<pre>
+SQL&gt; update DEMO.DEMO set n=2+1, ts=current_timestamp, scn=(select current_scn from v$database);
+10 rows updated.
+SQL&gt; commit;
+Commit complete.
+
+SQL&gt; alter system checkpoint;
+System CHECKPOINT altered.
+SQL&gt; alter system flush buffer_cache;
+System FLUSH altered.
+</pre></p>
+<p>Here is how I reproduce lost writes. All blocks changed were written to disk, but I restore the old version of block 3133 as if this one was not written:
+<pre>
+SQL&gt; host dd if=/var/tmp/lwp.blk of=/u01/oradata/CDB1/PDB1/users01.dbf seek=$(( &amp;last_block_id - 2 )) bs=8k count=1 conv=notrunc
+1+0 records in
+1+0 records out
+8192 bytes (8.2 kB) copied, 0.000111582 s, 73.4 MB/s
+</pre></p>
+<p>This is what you can see if one of your storage layers missed a write and nevertheless acknowledged the I/O call.
+<pre>s
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO;
+  BLOCK_ID   ID   N TS                                                    SCN
+  --------   --   - ---------------------------------------------     -------
+      3131    1   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+      3131    2   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+      3132    3   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+      3132    4   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+      3133    5   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3133    6   1 03-MAR-18 04.51.37.838991000 PM EUROPE/ZURICH     4619734
+      3134    7   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+      3134    8   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+      3135    9   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+      3135   10   3 03-MAR-18 04.51.39.255582000 PM EUROPE/ZURICH     4619806
+</pre></p>
+<p>No errors. No corruption. Just old values for the rows in this block. And there&#8217;s no way to detect it. Physical reads, RMAN, DBV, will all see a perfectly correct block. Only if those changes are inconsistent with other tables (with constraints) or indexes, you may detect a logical corruption.</p>
+<p>The probability that this problem occurs is very low (a storage bug on exactly one 8k block or multiple of it). But it is critical because it cannot be detected. To detect it, you need to compare the full block or a checksum, or simply the SCN with another copy, such as in the standby database. Or, with this new feature, store the SCN of each data block in a new structure: the 18c LOST WRITE DETECTION.</p>
+<h3>Enabling Lost Write Protection</h3>
+<p>You need to create a tablespace to store those SCN. There&#8217;s no choice you must use a bigfile tablespace, but you can create multiple small ones if you want.
+<pre>
+SQL&gt; create bigfile tablespace SHADOW
+  2   datafile '/u01/oradata/CDB1/PDB1/shadow.dbf'
+  3   size 5M
+  4   lost write protection;
+
+Tablespace SHADOW created.
+
+SQL&gt; select tablespace_name,status,bigfile,contents,logging,allocation_type,encrypted,lost_write_protect,chunk_tablespace from dba_tablespaces;
+TABLESPACE_NAME   STATUS   BIGFILE   CONTENTS                LOGGING     ALLOCATION_TYPE   ENCRYPTED   LOST_WRITE_PROTECT   CHUNK_TABLESPACE
+---------------   ------   -------   --------                -------     ---------------   ---------   ------------------   ----------------
+SYSTEM            ONLINE   NO        PERMANENT               LOGGING     SYSTEM            NO          OFF                  N
+SYSAUX            ONLINE   NO        PERMANENT               LOGGING     SYSTEM            NO          OFF                  N
+UNDOTBS1          ONLINE   NO        UNDO                    LOGGING     SYSTEM            NO          OFF                  N
+TEMP              ONLINE   NO        TEMPORARY               NOLOGGING   UNIFORM           NO          OFF                  N
+SHADOW            ONLINE   YES       LOST WRITE PROTECTION   LOGGING     SYSTEM            NO          OFF                  N
+USERS             ONLINE   NO        PERMANENT               LOGGING     SYSTEM            NO          OFF                  N
+
+SQL&gt; select * from dba_data_files;
+
+FILE_NAME                                FILE_ID TABLESPACE_NAME         BYTES   BLOCKS STATUS        RELATIVE_FNO AUTOEXTENSIBLE        MAXBYTES   MAXBLOCKS   INCREMENT_BY   USER_BYTES   USER_BLOCKS ONLINE_STATUS   LOST_WRITE_PROTECT
+---------                                ------- ---------------         -----   ------ ------        ------------ --------------        --------   ---------   ------------   ----------   ----------- -------------   ------------------
+/u01/oradata/CDB1/PDB1/undotbs01.dbf         164 UNDOTBS1            104857600    12800 AVAILABLE                9 YES                34359721984     4194302            640    103809024         12672 ONLINE          OFF
+/u01/oradata/CDB1/PDB1/sysaux01.dbf          163 SYSAUX              408944640    49920 AVAILABLE                4 YES                34359721984     4194302           1280    407896064         49792 ONLINE          OFF
+/u01/oradata/CDB1/PDB1/system01.dbf          162 SYSTEM              272629760    33280 AVAILABLE                1 YES                34359721984     4194302           1280    271581184         33152 SYSTEM          OFF
+/u01/oradata/CDB1/PDB1/users01.dbf           169 USERS               104857600    12800 AVAILABLE              169 NO                           0           0              0    103809024         12672 ONLINE          OFF
+/u01/oradata/CDB1/PDB1/shadow.dbf             58 SHADOW                5242880      640 AVAILABLE             1024 NO                           0           0              0      4194304           512 ONLINE          OFF
+</pre></p>
+<p>Then you enable this feature for the database (or pluggable database) and for the tablespaces you want to protect:
+<pre>
+SQL&gt; alter pluggable database enable lost write protection;
+Pluggable database ENABLE altered.
+
+SQL&gt; alter tablespace USERS enable lost write protection;
+Tablespace USERS altered.
+</pre></p>
+<p>Here are the new columns in DBA_TABLESPACES and DBA_DATA_FILES:
+<pre>
+SQL&gt; select tablespace_name,status,bigfile,contents,logging,allocation_type,encrypted,lost_write_protect,chunk_tablespace from dba_tablespaces;
+
+TABLESPACE_NAME   STATUS   BIGFILE   CONTENTS                LOGGING     ALLOCATION_TYPE   ENCRYPTED   LOST_WRITE_PROTECT   CHUNK_TABLESPACE
+---------------   ------   -------   --------                -------     ---------------   ---------   ------------------   ----------------
+SYSTEM            ONLINE   NO        PERMANENT               LOGGING     SYSTEM            NO          OFF                  N
+SYSAUX            ONLINE   NO        PERMANENT               LOGGING     SYSTEM            NO          OFF                  N
+UNDOTBS1          ONLINE   NO        UNDO                    LOGGING     SYSTEM            NO          OFF                  N
+TEMP              ONLINE   NO        TEMPORARY               NOLOGGING   UNIFORM           NO          OFF                  N
+SHADOW            ONLINE   YES       LOST WRITE PROTECTION   LOGGING     SYSTEM            NO          OFF                  N
+USERS             ONLINE   NO        PERMANENT               LOGGING     SYSTEM            NO          ENABLED              N
+
+SQL&gt; select * from dba_data_files;
+
+FILE_NAME                                FILE_ID TABLESPACE_NAME         BYTES   BLOCKS STATUS        RELATIVE_FNO AUTOEXTENSIBLE        MAXBYTES   MAXBLOCKS   INCREMENT_BY   USER_BYTES   USER_BLOCKS ONLINE_STATUS   LOST_WRITE_PROTECT
+---------                                ------- ---------------         -----   ------ ------        ------------ --------------        --------   ---------   ------------   ----------   ----------- -------------   ------------------
+/u01/oradata/CDB1/PDB1/undotbs01.dbf         164 UNDOTBS1            104857600    12800 AVAILABLE                9 YES                34359721984     4194302            640    103809024         12672 ONLINE          OFF
+/u01/oradata/CDB1/PDB1/sysaux01.dbf          163 SYSAUX              408944640    49920 AVAILABLE                4 YES                34359721984     4194302           1280    407896064         49792 ONLINE          OFF
+/u01/oradata/CDB1/PDB1/system01.dbf          162 SYSTEM              272629760    33280 AVAILABLE                1 YES                34359721984     4194302           1280    271581184         33152 SYSTEM          OFF
+/u01/oradata/CDB1/PDB1/users01.dbf           169 USERS               104857600    12800 AVAILABLE              169 NO                           0           0              0    103809024         12672 ONLINE          ENABLED
+/u01/oradata/CDB1/PDB1/shadow.dbf             58 SHADOW                5242880      640 AVAILABLE             1024 NO                           0           0              0      4194304           512 ONLINE          OFF
+</pre></p>
+<p>Note that we are on the Oracle Cloud here and all tablespaces must be encrypted. This is also the case with the LOST WRITE PROTECTION one. Here you can see ENCRYPTION at none only because I decrypted them to look at what is inside the files. </p>
+<p>Here are some internal tables giving some information about the storage. Note that tablespace number TSID=7 here is USERS, the one protected, and the TSID=6 one is the LOST WRITE PROTECTION one.
+<pre>
+SQL&gt; select * from new_lost_write_datafiles$;
+
+  DATAFILE_TSID_TRACKED   DATAFILE_RFN_TRACKED   SHADOW_DATAFILE_TSID   SHADOW_DATAFILE_RFN   SHADOW_DATAFILE_OFFSET   NUMBER_OF_BLOCKS_ALLOCATED DATAFILE_CURRENT_STATUS
+  ---------------------   --------------------   --------------------   -------------------   ----------------------   -------------------------- -----------------------
+                      7                    169                      6                  1024                      128                          184 enabled
+
+SQL&gt; select * from new_lost_write_extents$;
+
+  EXTENT_DATAFILE_RFN   EXTENT_DATAFILE_TSID   EXTENT_START   EXTENT_LENGTH_BLOCKS_2K   EXTENT_NEXT_BLOCK
+  -------------------   --------------------   ------------   -----------------------   -----------------
+                 1024                      6            312                      1312                 641
+
+SQL&gt; select * from new_lost_write_shadows$;
+
+  SHADOW_DATAFILE_RFN   SHADOW_DATAFILE_TSID   SHADOW_NUMBER_BLOCKS_ALLOC   SHADOW_FIRST_FREE_BLOCK   SHADOW_BLOCK_SIZE_BYTES   SHADOW_RECS_PER_BLOCK
+  -------------------   --------------------   --------------------------   -----------------------   -----------------------   ---------------------
+                 1024                      6                          640                       128                      8192                     136
+</pre></p>
+<p>Because there was already a &#8216;lost write&#8217; feature, this one is called &#8216;new lost write&#8217;.</p>
+<p>NEW_LOST_WRITE_DATAFILE$ lists all protected (aka tracked) datafiles with the LOST WRITE PROTECTION (aka shadow) tablespace protecting it. The status can be &#8216;enabled&#8217; or &#8216;suspended&#8217;. The row is deleted if the protection is removed.</p>
+<p>NEW_LOST_WRITE_SHADOWS$ lists the LOST WRITE PROTECTION tablespaces. It contains a 1MB bitmap in the first 128 blocks, and extents starts after this.</p>
+<p>NEW_LOST_WRITE_EXTENTS$ maps the free extents in the shadow tablespace. Here, the lost write protection for my USERS tablespace (100MB) takes 312 &#8211; 128 = 184 blocks (1.4 MB). The extent is 4MB. The 1312 EXTENT_LENGTH_BLOCKS_2K are the remaining free space in the extent, in 2KB blocks. 4MB-1.4MB=2.6MB which is 1312 x 2k blocks.</p>
+<h3>Simulate Lost Write</h3>
+<p>As I did before, I create a DEMO table
+<pre>
+SQL&gt; create table DEMO.DEMO pctfree 99 as select rownum id,1 n, current_timestamp ts , (select current_scn from v$database) scn from xmltable('1 to 10');
+Table DEMO.DEMO created.
+
+SQL&gt; column block_id new_value last_block_id
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO;
+  BLOCK_ID   ID   N TS                                                    SCN
+  --------   --   - ---------------------------------------------     -------
+      3123    1   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3123    2   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3124    3   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3124    4   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3125    5   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3125    6   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3126    7   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3126    8   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3127    9   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+      3127   10   1 03-MAR-18 04.21.00.797975000 PM EUROPE/ZURICH     4578079
+</pre>
+I save one block:
+<pre>
+SQL&gt; column block_id clear
+SQL&gt; alter system checkpoint;
+System CHECKPOINT altered.
+SQL&gt; alter system flush buffer_cache;
+System FLUSH altered.
+SQL&gt; host dd if=/u01/oradata/CDB1/PDB1/users01.dbf of=/var/tmp/lwp.blk skip=$(( &amp;last_block_id - 2 )) bs=8k count=1
+1+0 records in
+1+0 records out
+8192 bytes (8.2 kB) copied, 0.000325309 s, 25.2 MB/s
+</pre>
+Update the table:
+<pre>
+SQL&gt; update DEMO.DEMO set n=2+1, ts=current_timestamp, scn=(select current_scn from v$database);
+10 rows updated.
+SQL&gt; commit;
+Commit complete.
+SQL&gt; alter system checkpoint;
+System CHECKPOINT altered.
+SQL&gt; alter system flush buffer_cache;
+System FLUSH altered.
+</pre>
+Write back the block I saved, to simulate a lost write:
+<pre>
+SQL&gt; host dd if=/var/tmp/lwp.blk of=/u01/oradata/CDB1/PDB1/users01.dbf seek=$(( &amp;last_block_id - 2 )) bs=8k count=1 conv=notrunc
+1+0 records in
+1+0 records out
+8192 bytes (8.2 kB) copied, 0.000104103 s, 78.7 MB/s
+</pre></p>
+<h3>Lost Write detection</h3>
+<p>Now, when I query the table, the lost write is detected and an error is raised:
+<pre>
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO;
+
+Error starting at line : 93 File @ /media/sf_share/18c/lost_write_protection.sql
+In command -
+select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO
+Error report -
+ORA-65478: shadow lost write protection - found lost write
+</pre></p>
+<p>In the alert.log I have the mention of the block that failed:
+<pre>
+2018-03-03 16:21:06.842000 +01:00
+ERROR - I/O type:buffered I/O found lost write in block with file#:169 rdba:0x2a400c35, Expected SCN:0x000000000045db54 SCN in block:0x000000000045db23, approx current SCN:0x000000000045dbbb, RAC instance:1 pdb:5
+*****************************************************************
+An internal routine has requested a dump of selected redo.
+This usually happens following a specific internal error, when
+analysis of the redo logs will help Oracle Support with the
+diagnosis.
+It is recommended that you retain all the redo logs generated (by
+all the instances) during the past 12 hours, in case additional
+redo dumps are required to help with the diagnosis.
+*****************************************************************
+</pre></p>
+<p>The block defined by the RDBA in alert.log is the one I have manually corrupted:
+<pre>
+SQL&gt; select dbms_utility.data_block_address_file(to_number('2a400c35','XXXXXXXX'))file#,dbms_utility.data_block_address_block( to_number('2a400c35','XXXXXXXX'))block# from dual;
+
+     FILE#     BLOCK#
+---------- ----------
+       169       3125
+</pre></p>
+<p>As mentioned in the alert.log the session has dumped the redo, as found in the session trace file:
+<pre>
+ALTER SYSTEM DUMP REDO DBA MIN 169 3125 DBA MAX 169 3125 SCN MIN 4578132 SCN MAX 4578235 CON_ID 5
+</pre>
+This SCN 4578132 is the commit SCN for my update. And the 4578235 is the current one. I can see the change that was lost here:
+<pre>
+CHANGE #10 CON_ID:5 TYP:0 CLS:1 AFN:169 DBA:0x2a400c35 OBJ:73527 SCN:0x000000000045db23 SEQ:2 OP:11.4 ENC:0 RBL:0 FLG:0x0000
+KTB Redo
+op: 0x01  ver: 0x01
+compat bit: 4 (post-11) padding: 1
+op: F  xid:  0x0008.019.000002d6    uba: 0x02401257.01a2.24
+KDO Op code: LKR row dependencies Disabled
+  xtype: XA flags: 0x00000000  bdba: 0x2a400c35  hdba: 0x2a400c32
+itli: 2  ispac: 0  maxfr: 4858
+tabn: 0 slot: 0 to: 2
+CHANGE #11 CON_ID:5 TYP:0 CLS:1 AFN:169 DBA:0x2a400c35 OBJ:73527 SCN:0x000000000045db54 SEQ:1 OP:11.5 ENC:0 RBL:0 FLG:0x0000
+KTB Redo
+op: 0x02  ver: 0x01
+compat bit: 4 (post-11) padding: 1
+op: C  uba: 0x02401257.01a2.25
+KDO Op code: URP row dependencies Disabled
+  xtype: XAxtype KDO_KDOM2 flags: 0x00000080  bdba: 0x2a400c35  hdba: 0x2a400c32
+itli: 2  ispac: 0  maxfr: 4858
+tabn: 0 slot: 0(0x0) flag: 0x2c lock: 2 ckix: 0
+ncol: 4 nnew: 3 size: 0
+Vector content:
+col  1: [ 2]  c1 04
+col  2: [13]  78 76 03 03 10 16 02 0d 73 cd 48 86 58
+col  3: [ 5]  c4 05 3a 52 20
+</pre></p>
+<h3>Then we need to recover&#8230;</h3>
+<p>However, unfortunately, this block is not marked as corrupt:
+<pre>
+SQL&gt; select * from  V$DATABASE_BLOCK_CORRUPTION;
+no rows selected
+</pre></p>
+<p>This means that I cannot use RMAN block recovery:
+<pre>
+SQL&gt; host rman target / &lt;&lt;
+Starting recover at 03-MAR-18
+using target database control file instead of recovery catalog
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=152 device type=DISK
+allocated channel: ORA_DISK_2
+
+starting media recovery
+media recovery complete, elapsed time: 00:00:00
+
+Finished recover at 03-MAR-18
+</pre></p>
+<p>And the RMAN recovery advisor is not aware of the problem:
+<pre>
+RMAN&gt; list failure;
+
+using target database control file instead of recovery catalog
+Database Role: PRIMARY
+
+no failures found that match specification
+</pre></p>
+<p>So the solution is to mark it as corrupt or restore the whole datafile (or section). And maybe ensure that the write was lost on the data, and not on the lost write tracking block itself. The redo dump may help for that.</p>
+<h3>strace: additional I/Os</h3>
+<p>I traced the server process to see what files are read during my query:
+<pre>
+SQL&gt; column spid new_value pid
+SQL&gt; select spid from v$process join v$session on v$session.paddr=v$process.addr where sid=sys_context('userenv','sid');
+SPID
+9360
+SQL&gt; column spid clear
+SQL&gt; define bg=&amp;:
+SQL&gt; host strace -p &amp;pid -o strace.txt &amp;bg
+</pre></p>
+<p>This small awk filters I/O calls on users01.dbf and shadow.dbf and displays the system calls on the file handle
+<pre>
+awk '/open[(]["].*(shadow.dbf|users01.dbf).*["],/{l=$0;gsub(/[(,)]/," ");h[$NF]=$2" "$NF;print $l;$0=$l}/^[a-zA-Z0-9]+[(][0-9]+[,)]/{l=$0;gsub(/[(,)]/," "); if ( $1 == "close" ) h[$2]="" ; if ( h[$2]!="" ) printf "%-130s \t%80s\n",l,h[$2]}/F_DUPFD/{if ( h[$2]!="" ) h[$NF]=h[$2]" "$NF;h[$2]=""}' strace.txt | grep --color=auto -E "^|^.*users01.*"
+</pre></p>
+<p>Here are the open() and pread() calls:
+<pre>
+open "/u01/oradata/CDB1/PDB1/shadow.dbf"  O_RDWR|O_DSYNC  = 8
+fcntl(8, F_SETFD, FD_CLOEXEC)           = 0                                                             "/u01/oradata/CDB1/PDB1/shadow.dbf" 8
+fcntl(8, F_DUPFD, 256)                  = 256                                                           "/u01/oradata/CDB1/PDB1/shadow.dbf" 8
+fcntl(256, F_SETFD, FD_CLOEXEC)         = 0                                                         "/u01/oradata/CDB1/PDB1/shadow.dbf" 8 256
+pread64(256, "X\242\226V\333E\1\f\372\366"..., 8192, 1056768) = 8192                                "/u01/oradata/CDB1/PDB1/shadow.dbf" 8 256
+open "/u01/oradata/CDB1/PDB1/users01.dbf"  O_RDWR|O_DSYNC  = 8
+fcntl(8, F_SETFD, FD_CLOEXEC)           = 0                                                            "/u01/oradata/CDB1/PDB1/users01.dbf" 8
+fcntl(8, F_DUPFD, 256)                  = 257                                                          "/u01/oradata/CDB1/PDB1/users01.dbf" 8
+fcntl(257, F_SETFD, FD_CLOEXEC)         = 0                                                        "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+pread64(257, "#\242002\f@*%\333E\1\4\370\264"..., 8192, 25575424) = 8192                           "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+pread64(257, "\6\242003\f@*T\333E\5\6\317H\1007\37\1!\333E"..., 40960, 25583616) = 40960           "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+pread64(257, "\6\242005\f@*#\333E\2\4zo\1007\37\1!\333E"..., 8192, 25600000) = 8192                "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+pread64(257, "\6\242003\f@*T\333E\5\6\317H\1007\37\1!\333E"..., 40960, 25583616) = 40960           "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+pread64(257, "\6\242005\f@*#\333E\2\4zo\1007\37\1!\333E"..., 8192, 25600000) = 8192                "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+pread64(257, "\6\242003\f@*T\333E\5\6\317H\1007\37\1!\333E"..., 40960, 25583616) = 40960           "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+pread64(257, "\6\242005\f@*#\333E\2\4zo\1007\37\1!\333E"..., 8192, 25600000) = 8192                "/u01/oradata/CDB1/PDB1/users01.dbf" 8 257
+</pre></p>
+<p>We can see the lost write protection file read first (1 block at offset 1056768 which is block 129, the first one after the 1MB header) and the SCNs for my 5 blocks table are all there. Then the table blocks are read. Note that all those blocks (lost protection and data) goes into the buffer cache, and then do not have to be re-read each time. Here, I&#8217;ve run my failing select 3 times and only the first one had to read the shadow datafile.</p>
+<h3>X$BH: additional buffer gets</h3>
+<p>As those blocks are read through the buffer cache during the consistent reads, I checked the buffer cache headers for the 3 times I&#8217;ve run the queries. I&#8217;ve identified them from the function that reads them: kcbr_lost_get_lost_write_scns
+<pre>
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO;
+ORA-65478: shadow lost write protection - found lost write
+
+SQL&gt; select obj,state,tch,fp_whr from x$bh where fp_whr like 'kr_gcur_4: kcbr_lost_get_lost_w%';
+
+         OBJ   STATE   TCH FP_WHR
+         ---   -----   --- ------
+  4294967295       1     1 kr_gcur_4: kcbr_lost_get_lost_w
+
+
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO;
+ORA-65478: shadow lost write protection - found lost write
+
+SQL&gt; select obj,state,tch,fp_whr from x$bh where fp_whr like 'kr_gcur_4: kcbr_lost_get_lost_w%';
+
+         OBJ   STATE   TCH FP_WHR
+         ---   -----   --- ------
+  4294967295       1     2 kr_gcur_4: kcbr_lost_get_lost_w
+
+
+SQL&gt; select dbms_rowid.rowid_block_number(rowid) block_id,DEMO.* from DEMO.DEMO;
+ORA-65478: shadow lost write protection - found lost write
+
+SQL&gt; select obj,state,tch,fp_whr from x$bh where fp_whr like 'kr_gcur_4: kcbr_lost_get_lost_w%';
+
+         OBJ   STATE   TCH FP_WHR
+         ---   -----   --- ------
+  4294967295       1     3 kr_gcur_4: kcbr_lost_get_lost_w
+</pre></p>
+<p>Here we can see the touch count increasing. It seems that for each query the kcbr_lost_get_lost_write_scns is called, even when there was no modification and no new read from disk.</p>
+<p>While we&#8217;re there, let&#8217;s breakpoint on this fonction to see when it is called:
+<pre>
+(gdb) break kcbr_lost_get_lost_write_scns
+Breakpoint 1 at 0x85a9140
+(gdb) c
+Continuing.
+
+Breakpoint 1, 0x00000000085a9140 in kcbr_lost_get_lost_write_scns ()
+(gdb) bt
+#0  0x00000000085a9140 in kcbr_lost_get_lost_write_scns ()
+#1  0x0000000001cf9c01 in kcbzibmlt ()
+#2  0x0000000001ce2f29 in kcbzib ()
+#3  0x0000000011e7f6e9 in kcbgtcr ()
+#4  0x0000000011e366bd in ktrget2 ()
+#5  0x00000000121d5ca7 in kdst_fetch0 ()
+#6  0x00000000121e4f5a in kdstf000110100000000km ()
+#7  0x00000000121d398e in kdsttgr ()
+#8  0x000000001224d28f in qertbFetch ()
+#9  0x00000000120340ef in opifch2 ()
+#10 0x0000000002d8d033 in kpoal8 ()
+#11 0x000000001203af9c in opiodr ()
+#12 0x000000001230acf7 in ttcpip ()
+#13 0x00000000026a5667 in opitsk ()
+#14 0x00000000026aa27d in opiino ()
+#15 0x000000001203af9c in opiodr ()
+#16 0x00000000026a10a3 in opidrv ()
+#17 0x00000000032a58af in sou2o ()
+#18 0x0000000000d68047 in opimai_real ()
+#19 0x00000000032b2667 in ssthrdmain ()
+#20 0x0000000000d67e53 in main ()
+</pre>
+Look at <a href="https://fritshoogland.wordpress.com/2017/10/16/oracle-c-functions-annotations/" target="_blank">Frits Hoogland annotations</a> for the signification and you will see that this is called during consistent reads -&gt; input buffer.</p>
+<h3>So what?</h3>
+<p>This feature is interesting. Of course, we need to measure the overhead of this detection, but this additional storage of the SCN being implemented as any data block, benefits from all its efficiency: buffer cache, background writes by dbwr, protection by redo, backups,&#8230; These times, I see more and more databases installed on storage with fancy features, and admins playing with snapshot without really knowing whether it is consistent or not. This is the opposite of the &#8216;reliable&#8217; and &#8216;keep it simple&#8217; properties that we want for our data. For these environments, when I cannot convince the storage admins to forget about those features and rely on Data Guard on top of the simplest storage, then at least we have a way to protect us from failures in those layers.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-216740"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 4 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1 parent" id="comment-10705">
+				<div id="div-comment-10705" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/c87ebf5ac8670e47d944b4f9c8a91661?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Geert De Paep</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10705">
+			March 5, 2018 at 16 h 48 min</a>		</div>
+
+		<p>Nice. It even seems like a no-additional-cost option. Unfortunately only availabel on EE if I am right.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107061"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10705' onclick='return addComment.moveForm( "div-comment-10705", "10705", "respond", "21673" )' aria-label='Reply to Geert to Geert De Paep'>Reply to Geert</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt depth-2" id="comment-10726">
+				<div id="div-comment-10726" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10726">
+			March 19, 2018 at 23 h 19 min</a>		</div>
+
+		<p>Hi Geert, I&#8217;ve tested in a SE cloud service and it works. The licensing doc only mention the Data Guard feature, which is of course EE, but not this new 18c feature. Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107271"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10726' onclick='return addComment.moveForm( "div-comment-10726", "10726", "respond", "21673" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-10716">
+				<div id="div-comment-10716" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/80548cc10a95337c729ad2e9fa09ec9f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Casi</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10716">
+			March 13, 2018 at 13 h 31 min</a>		</div>
+
+		<p>Interesting, thank you.
+When using ASM mirroring on 12c upwards, there is a similar feature called &#8220;ASM Disk Scrubbing&#8221; which is able to repair logical corruption by reading data from mirror copies.</p>
+<p>Referrences:
+<a href="http://asmsupportguy.blogspot.ch/2015/12/asm-data-scrubbing.html" rel="nofollow">http://asmsupportguy.blogspot.ch/2015/12/asm-data-scrubbing.html</a>
+and
+<a href="http://www.oracle.com/technetwork/articles/database/asm-odb12c-enhancements-2206102.html" rel="nofollow">http://www.oracle.com/technetwork/articles/database/asm-odb12c-enhancements-2206102.html</a>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107171"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10716' onclick='return addComment.moveForm( "div-comment-10716", "10716", "respond", "21673" )' aria-label='Reply to Casi to Casi'>Reply to Casi</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-10722">
+				<div id="div-comment-10722" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/fb64b1ce533a14c3180d912cb2f52989?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbarj.com.br' rel='external nofollow' class='url'>Rodrigo Jorge</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-10722">
+			March 19, 2018 at 17 h 31 min</a>		</div>
+
+		<p>Amazing Franck! Your blog is always the first where I find out many of the 18c new features. I will play with it soon.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-107231"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-10722' onclick='return addComment.moveForm( "div-comment-10722", "10722", "respond", "21673" )' aria-label='Reply to Rodrigo to Rodrigo Jorge'>Reply to Rodrigo</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

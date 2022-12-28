@@ -1,0 +1,172 @@
+This was first published on <a href=https://blog.dbi-services.com/rman-channels-in-rac>https://blog.dbi-services.com/rman-channels-in-rac</a> (2015-11-05)
+								<h1 class="entry-title">RMAN channels in RAC</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you want to minimize the backup or restore duration, you can parallelize RMAN operations by allocating multiple channels. If you are in cluster, you can open channels from several nodes. Let&#8217;s see why, how, and a strange issue: need to set cell_offload_processing=false even if not on Exadata.
+<span id="more-5117"></span></p>
+<h3>Reason</h3>
+<p>Why do I want to run backup or restore from several nodes instead of opening all channels from one node?
+Usually the bottleneck is on the storage, not the host. But storage have evolved a lot and the FC HBA throughput may be lower than the storage capability. </p>
+<p>Here I&#8217;ve an EMC XtremIO Brick storage which can deliver 3GB/s and I&#8217;ve 4 nodes with two 10 Gbit/s HBA each. Which mean that one node cannot transfer more than 2GB per second. I need to use more than one node if we want the full rate of the XtremIO brick.</p>
+<p>Here is the node HBA configuration that shows the two 10 Gbit/s:
+<pre>
+# systool -c fc_host -v
+Class = "fc_host"
+
+  Class Device = "host1"
+  Class Device path = "/sys/devices/pci0000:00/0000:00:03.0/0000:05:00.0/0000:06:00.0/0000:07:00.0/0000:08:03.0/0000:0c:00.0/host1/fc_host/host1"
+    active_fc4s         = "0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 "
+    dev_loss_tmo        = "10"
+    fabric_name         = "0x200a002a6a2505c1"
+    issue_lip           =
+    maxframe_size       = "2048 bytes"
+    node_name           = "0x20f20025b5000012"
+    port_id             = "0x510002"
+    port_name           = "0x200a0025b5200002"
+    port_state          = "Online"
+    port_type           = "NPort (fabric via point-to-point)"
+    speed               = "10 Gbit"
+    supported_classes   = "Class 3"
+    supported_fc4s      = "0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 "
+    supported_speeds    = "10 Gbit"
+    symbolic_name       = "fnic v1.5.0.1 over fnic1"
+    tgtid_bind_type     = "wwpn (World Wide Port Name)"
+    uevent              =
+
+    Device = "host1"
+    Device path = "/sys/devices/pci0000:00/0000:00:03.0/0000:05:00.0/0000:06:00.0/0000:07:00.0/0000:08:03.0/0000:0c:00.0/host1"
+      uevent              = "DEVTYPE=scsi_host"
+
+
+  Class Device = "host2"
+  Class Device path = "/sys/devices/pci0000:00/0000:00:03.0/0000:05:00.0/0000:06:00.0/0000:07:00.0/0000:08:04.0/0000:0d:00.0/host2/fc_host/host2"
+    active_fc4s         = "0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 "
+    dev_loss_tmo        = "10"
+    fabric_name         = "0x2014002a6a2508c1"
+    issue_lip           =
+    maxframe_size       = "2048 bytes"
+    node_name           = "0x20f20025b5000012"
+    port_id             = "0xdd0003"
+    port_name           = "0x200b0025b5200002"
+    port_state          = "Online"
+    port_type           = "NPort (fabric via point-to-point)"
+    speed               = "10 Gbit"
+    supported_classes   = "Class 3"
+    supported_fc4s      = "0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x01 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 0x00 "
+    supported_speeds    = "10 Gbit"
+    symbolic_name       = "fnic v1.5.0.1 over fnic2"
+    tgtid_bind_type     = "wwpn (World Wide Port Name)"
+    uevent              =
+
+    Device = "host2"
+    Device path = "/sys/devices/pci0000:00/0000:00:03.0/0000:05:00.0/0000:06:00.0/0000:07:00.0/0000:08:04.0/0000:0d:00.0/host2"
+      uevent              = "DEVTYPE=scsi_host"
+</pre></p>
+<h3>RMAN</h3>
+<p>In that test, I didn&#8217;t rely on speed specification and opened lot of channels: 2 channels from each node. Here is how to allocate channels from several nodes: you need to connect to all nodes.
+<pre>
+run {
+ allocate channel C11 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.201)(PORT=1521)))';
+ allocate channel C12 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.201)(PORT=1521)))';
+ allocate channel C21 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.202)(PORT=1521)))';
+ allocate channel C22 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.202)(PORT=1521)))';
+ allocate channel C31 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.203)(PORT=1521)))';
+ allocate channel C32 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.203)(PORT=1521)))';
+ allocate channel C41 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.204)(PORT=1521)))';
+ allocate channel C42 device type disk format '+FRA' connect 'sys/"..."@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=XXXX))(ADDRESS=(PROTOCOL=TCP)(HOST=10.230.160.204)(PORT=1521)))';
+ backup as backupset tablespace CPY format '+FRA' tag 'TEST-BACKUP';
+}
+</pre>
+Then I can expect to reach the limit of the XtremIO Brick, which is 3GB/s:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/CaptureXtremIORACRMAN1.jpg" rel="lightbox[5117]"><img src="../wp-insides/uploads/sites/2/2015/11/CaptureXtremIORACRMAN1.jpg" alt="CaptureXtremIORACRMAN1" width="1106" height="668" class="alignnone size-full wp-image-5122" /></a></p>
+<p>As you can see here, I had a surprise at the first test: limited to 2GB/s as if that came from only one node. I&#8217;ll detail it later.
+If you check the second test, I&#8217;ve reached the 3GB/s which is great. Of course I  don&#8217;t need to have 8 channels for that. 3 channels are ok, and over 2 nodes so that I can use 3 10Gbit channels.</p>
+<p>Now the fun part&#8230; </p>
+<h3>&#8216;ASM file metadata operation&#8217; msgop=41</h3>
+<p>You have seen that I had contention in the first test. Here it is:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/CaptureXtremIORACRMAN3.jpg" rel="lightbox[5117]"><img src="../wp-insides/uploads/sites/2/2015/11/CaptureXtremIORACRMAN3.jpg" alt="CaptureXtremIORACRMAN3" width="857" height="653" class="alignnone size-full wp-image-5124" /></a></p>
+<p>I was waiting very long time (average 500ms) on &#8216;ASM file metadata operation&#8217; the parameter p1 being &#8216;msgop&#8217;=41.
+There is a bug which is supposed to be fixed in 11.2.0.3 (<a href="http://cgswong.blogspot.ch/2011/06/ensure-celloffloadprocessing-is-false.html" target="_blank">@cgswong blog post about it</a>). I&#8217;m in 11.2.0.3 so it&#8217;s supposed to be fixed, but the workaround solved by issue.</p>
+<p>And the workaround is:
+<pre>
+SQL&gt; alter system set cell_offload_processing = false;
+</pre></p>
+<p>Funny, isn&#8217;t it? I&#8217;m not on Exadata, so I don&#8217;t have offload processing, but it seems that some offloading code is still running and brings contention here. Just disable it and the wait event is still there, but lower wait time:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/CaptureXtremIORACRMAN4.jpg" rel="lightbox[5117]"><img src="../wp-insides/uploads/sites/2/2015/11/CaptureXtremIORACRMAN4.jpg" alt="CaptureXtremIORACRMAN4" width="852" height="658" class="alignnone size-full wp-image-5130" /></a></p>
+<p>Even if to wait is still there, and the time is still in hundred of seconds, it seems that be issue is fixed because I can reach the maximum throughput (3GB/s)</p>
+<p>If you encounter that wait event and you are not on Exadata, then the recommendation is to disable offloading.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-51180" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2015/11/CaptureXtremIORACRMAN1.jpg"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 2 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1739">
+				<div id="div-comment-1739" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/f9e5ccc94458c1a14a32a44a6fc3e389?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Bertrand Gineste</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1739">
+			November 5, 2015 at 17 h 01 min</a>		</div>
+
+		<p>Hello Franck,</p>
+<p>Just about this bug, it is not fixed even in 11.2.0.4 and you can encounter it in SE ( thx Lighty for showing this so clearly in SE).
+I hit it a few times on my SE RACs, I now have the use to disable cell_offload_processing on each new 11.2 RAC.
+Havent tried it in 12c yet.</p>
+<p>Regards,</p>
+<p>&#8212;
+Bertrand
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-17401"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1739' onclick='return addComment.moveForm( "div-comment-1739", "1739", "respond", "5117" )' aria-label='Reply to Bertrand to Bertrand Gineste'>Reply to Bertrand</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1740">
+				<div id="div-comment-1740" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1740">
+			November 5, 2015 at 17 h 07 min</a>		</div>
+
+		<p>Hi Bertrand,
+Thanks for your feedback.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-17411"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1740' onclick='return addComment.moveForm( "div-comment-1740", "1740", "respond", "5117" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

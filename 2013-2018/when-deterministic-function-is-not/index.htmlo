@@ -1,0 +1,84 @@
+This was first published on <a href=https://blog.dbi-services.com/when-deterministic-function-is-not>https://blog.dbi-services.com/when-deterministic-function-is-not</a> (2017-09-26)
+								<h1 class="entry-title">When deterministic function is not</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>When you declare a function-based index, the function is deterministic, which means that calling it with same arguments will always return the same result. This is required because the indexed values, which are the result of the function, are stored in the index. But what happens if you declare a function deterministic when it is not?
+<span id="more-18169"></span>
+I wanted to do this test after reading the following documents about Postgres HOT and WARM. </p>
+<blockquote class="twitter-tweet" data-width="550"><p lang="en" dir="ltr">The relevant read is <a href="https://t.co/rCzqdz9RyJ">https://t.co/rCzqdz9RyJ</a> and <a href="https://t.co/rFis1lqlFf">https://t.co/rFis1lqlFf</a></p>
+<p>&mdash; Vladimir Sitnikov (@VladimirSitnikv) <a href="https://twitter.com/VladimirSitnikv/status/892856027930009601">August 2, 2017</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>They say that they cannot vacuum one page at a time because index entries must be cleaned, and there&#8217;s a risk when trying to find an index entry from the table in case a user indexed a function which is not actually deterministic. This could lead to logical corruption. So, it seems that Postgres will always navigate from the index to the table and not the opposite. And that is possible in Postgres because they don&#8217;t implement DELETE and UPDATE physically. They only do an INSERT with the new version of the whole row and mark the old version as stale.</p>
+<p>But Oracle is far more complex than that. Critical OLTP applications must be able to update in-place, without row movement, or the indexes maintenance would kill the performance and the redo generation would be orders of magnitude larger. An update is done in-place and the updated column must maintain the related index. And deletes will also delete all the index entries. Then, Oracle needs to navigate from the table to the index. This is done with a lookup onf the value in the index structure. The value is either a value stored in the table row, or derived with a deterministic function.</p>
+<p>So what happens if I declare a function deterministic when it is not?</p>
+<p>Here is a table:
+<pre>
+SQL&gt; create table DEMO (n not null) pctfree 99 as select rownum from xmltable('1 to 5');
+
+Table created.
+</pre></p>
+<p>And here is a function which returns a rendom number. But I declare it deterministic:
+<pre>
+SQL&gt; create or replace function DEMO_FUNCTION(n number) return number deterministic as
+  2  begin
+  3   return dbms_random.value;
+  4  end;
+  5  /
+
+Function created.
+</pre></p>
+<p>I declare an index on it:
+<pre>
+SQL&gt; create index DEMO_FUNCTION on DEMO(DEMO_FUNCTION(n));
+
+Index created.
+</pre>
+Oracle cannot verify if the function is deterministic or not, and trusts me.</p>
+<p>A full table scan re-calculates the value each time, and do not raise any error.
+<pre>
+SQL&gt; select /*+ full(DEMO) */ DEMO_FUNCTION(n),rowid,n from DEMO where DEMO_FUNCTION(n) is not null;
+
+DEMO_FUNCTION(N) ROWID                       N
+---------------- ------------------ ----------
+      .743393494 AAAR5kAAMAAABXbAAA          1
+      .075404174 AAAR5kAAMAAABXbAAB          2
+      .601606733 AAAR5kAAMAAABXbAAC          3
+      .716335239 AAAR5kAAMAAABXbAAD          4
+      .253810651 AAAR5kAAMAAABXbAAE          5
+</pre>
+If you run it several times, you will see different values.</p>
+<p>An index acess will show always the same values because they come from the index:
+<pre>
+SQL&gt; select /*+ index(DEMO) */ DEMO_FUNCTION(n),rowid,n from DEMO where DEMO_FUNCTION(n) is not null;
+
+DEMO_FUNCTION(N) ROWID                       N
+---------------- ------------------ ----------
+      .135108581 AAAR5kAAMAAABXbAAE          5
+      .440540027 AAAR5kAAMAAABXbAAD          4
+      .480565266 AAAR5kAAMAAABXbAAA          1
+      .546056579 AAAR5kAAMAAABXbAAB          2
+      .713949559 AAAR5kAAMAAABXbAAC          3
+</pre>
+Oracle could have run the function on the value from the table and compare it with the value from the index, and then raise an error. But that would be more expensive.</p>
+<p>But then, what happens if I delete a row? Oracle will try to find the index entry by running the function, but then the value is not found in the index:
+<pre>
+SQL&gt; delete from DEMO where n=3 and DEMO_FUNCTION(n) is not null;
+delete from DEMO where n=3 and DEMO_FUNCTION(n) is not null
+*
+ERROR at line 1:
+ORA-08102: index key not found, obj# 73317, file 12, block 5603 (2)
+</pre>
+This is a logical corruption caused by the bug in the function which was declared deterministic but is not. Verifying the deterministic truth would require running the function several times and even that would not detect values that change after days. It is the developer responsibility, to tell the truth. This was just a test. I you are in this case, make the index unusable and fix the function before re-building it.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-181700"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

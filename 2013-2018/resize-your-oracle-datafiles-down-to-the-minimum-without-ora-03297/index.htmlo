@@ -1,0 +1,812 @@
+This was first published on <a href=https://blog.dbi-services.com/resize-your-oracle-datafiles-down-to-the-minimum-without-ora-03297>https://blog.dbi-services.com/resize-your-oracle-datafiles-down-to-the-minimum-without-ora-03297</a> (2014-09-08)
+								<h1 class="entry-title">Resize your Oracle datafiles down to the minimum without ORA-03297</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>Your datafiles have grown in the past but now you want to reclaim as much space as possible, because you are short on filesystem space, or you want to move some files without moving empty blocks, or your backup size is too large. ALTER DATABASE DATAFILE &#8230; RESIZE can reclaim the space at the end of the datafile, down to the latest allocated extent.</p>
+<p>But if you try to get lower, you will get:
+<pre>ORA-03297: file contains used data beyond requested RESIZE value
+</pre></p>
+<p>So, how do you find this minimum value, which is the datafile&#8217;s high water mark?
+You have the brute solution: try a value. If it passes, then try a lower value. If it failed, then try a higher one.
+Or there is the smart solution: find the datafile high water mark.</p>
+<p>You can query DBA_EXTENTS to know that. But did you try on a database with a lot of datafiles? It runs forever. Because DBA_EXTENTS is doing a lot of joins that you don&#8217;t need here. So my query directly reads SYS.X$KTFBUE which is the underlying fixed table that gives extent allocation in Locally Managed Tablespaces.</p>
+<p>Note that the query may take a few minutes when you have a lot of tables, because the information is on disk, in each segment header, in the bitmaps used by LMT tablepaces. And you have to read all of them.</p>
+<p>Here is my query:
+<pre>set linesize 1000 pagesize 0 feedback off trimspool on
+with
+ hwm as (
+  -- get highest block id from each datafiles ( from x$ktfbue as we don't need all joins from dba_extents )
+  select /*+ materialize */ ktfbuesegtsn ts#,ktfbuefno relative_fno,max(ktfbuebno+ktfbueblks-1) hwm_blocks
+  from sys.x$ktfbue group by ktfbuefno,ktfbuesegtsn
+ ),
+ hwmts as (
+  -- join ts# with tablespace_name
+  select name tablespace_name,relative_fno,hwm_blocks
+  from hwm join v$tablespace using(ts#)
+ ),
+ hwmdf as (
+  -- join with datafiles, put 5M minimum for datafiles with no extents
+  select file_name,nvl(hwm_blocks*(bytes/blocks),5*1024*1024) hwm_bytes,bytes,autoextensible,maxbytes
+  from hwmts right join dba_data_files using(tablespace_name,relative_fno)
+ )
+select
+ case when autoextensible='YES' and maxbytes&gt;=bytes
+ then -- we generate resize statements only if autoextensible can grow back to current size
+  '/* reclaim '||to_char(ceil((bytes-hwm_bytes)/1024/1024),999999)
+   ||'M from '||to_char(ceil(bytes/1024/1024),999999)||'M */ '
+   ||'alter database datafile '''||file_name||''' resize '||ceil(hwm_bytes/1024/1024)||'M;'
+ else -- generate only a comment when autoextensible is off
+  '/* reclaim '||to_char(ceil((bytes-hwm_bytes)/1024/1024),999999)
+   ||'M from '||to_char(ceil(bytes/1024/1024),999999)
+   ||'M after setting autoextensible maxsize higher than current size for file '
+   || file_name||' */'
+ end SQL
+from hwmdf
+where
+ bytes-hwm_bytes&gt;1024*1024 -- resize only if at least 1MB can be reclaimed
+order by bytes-hwm_bytes desc
+/
+</pre>
+and here is a sample output:
+<pre>/* reclaim    3986M from    5169M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_undotbs1_o9pfojva_.dbf' resize 1183M;
+/* reclaim    3275M from   15864M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_apcpy_o5pfojni_.dbf' resize 12589M;
+/* reclaim    2998M from    3655M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_cpy_qt_oepfok3n_.dbf' resize 657M;
+/* reclaim    2066M from    2250M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_undotbs2_olpfokc9_.dbf' resize 185M;
+/* reclaim     896M from    4000M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_cpy_ocpfok3n_.dbf' resize 3105M;
+</pre>
+You get directly the resize statements, with the reclaimable space in comments.</p>
+<p>A few remarks about my query:</p>
+<ul>
+<li>I generate the resize statements only for datafiles which are autoextensible. This is because I want to be sure that the datafiles can grow back to their original size if needed.</li>
+<li>When datafile is not autoextensible, or maxsize is not higher than the current size, I only generate a comment.</li>
+<li>When a datafile has no extents at all I generate a resize to 5MB. I would like to find the minimum possible size (without getting ORA-3214) but my test do not validate yet what is documented in MOS. If anyone has an idea, please share.</li>
+<li>There is probably a way to get that high water mark in a cheaper way. Because the alter statement gives the ORA-03297 much quicker. Information is probably available in the datafile headers, without going to segment headers, but I don&#8217;t know if it is exposed in a safe way. If you have an idea, once again, please share.</li>
+</ul>
+<p>Note that I&#8217;m using that query for quite a long time. I even think that it was my first contribution to Oracle community on the web, about 9 years ago, in the <a href="http://www.dba-village.com/village/dvp_scripts.ScriptDetails?ScriptIdA=2142">dba-village</a> website. Since then my contribution has grown to forums, blogs, articles, presentations, &#8230; and tweets. Sharing is probably addictive <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" /></p>
+<h3>Update May 18th, 2016</h3>
+<p>Thanks to <a href="https://sqldep.com/">#QueryScope @SQLdep</a> here is the query visualisation:
+<a href="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2014/09/current_graph_column_lineage_HWM_Datafile.png" rel="lightbox[484]"><img src="../wp-insides/uploads/sites/2/2014/09/current_graph_column_lineage_HWM_Datafile.png" alt="current_graph_column_lineage_HWM_Datafile" width="958" height="284" class="alignnone size-full wp-image-8723" /></a>
+Nothing difficult here, isn&#8217;t it?</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-4850" data-img="http://blog.dbi-services.com/wp-insides/uploads/sites/2/2014/09/current_graph_column_lineage_HWM_Datafile.png"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 25 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1384">
+				<div id="div-comment-1384" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/8cf1b7296f5aed4defcb9bbb91fc838e?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Leruo Khabutlane</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1384">
+			February 18, 2015 at 10 h 14 min</a>		</div>
+
+		<p>this is great stuff Frank!</p>
+<p>Thanks!
+Leruo
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13851"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1384' onclick='return addComment.moveForm( "div-comment-1384", "1384", "respond", "484" )' aria-label='Reply to Leruo to Leruo Khabutlane'>Reply to Leruo</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1395">
+				<div id="div-comment-1395" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/aa3a6e57cce98dba964a5c09ee668ebf?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Pureprecepts</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1395">
+			February 28, 2015 at 8 h 37 min</a>		</div>
+
+		<p>Hello.
+I have a tablespace with 4 datafiles. The name is mail_ts.dbf. It had grown to over 90gb.  I reviewed the application owner and discovered I could truncate a table.  This reduced the size to 4GB.  The resize will not work due o the high water mark. How can I resize the mail_ts.dbf to 4GB  and use only one datafile?
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13961"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1395' onclick='return addComment.moveForm( "div-comment-1395", "1395", "respond", "484" )' aria-label='Reply to Pureprecepts to Pureprecepts'>Reply to Pureprecepts</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1396">
+				<div id="div-comment-1396" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1396">
+			March 1, 2015 at 16 h 17 min</a>		</div>
+
+		<p>Hi,</p>
+<p>Basically, you need to move (table move or index rebuild) extents that are above the free space. You can check which table/index it is from dba_extents.</p>
+<p>Or much simple &#8211; but need 2x space &#8211; just move everything to another tablespace. This is the only solution if you want to reduce the number of datafiles rather than reduce their size but keep all.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13971"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1396' onclick='return addComment.moveForm( "div-comment-1396", "1396", "respond", "484" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1416">
+				<div id="div-comment-1416" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/90e8a90487385d7cdf0419db0c2cc7d3?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Ralph</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1416">
+			April 1, 2015 at 11 h 10 min</a>		</div>
+
+		<p>Great script Franck! Just saved me a ton of ball ache.
+Cheers
+Ralph
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14171"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1416' onclick='return addComment.moveForm( "div-comment-1416", "1416", "respond", "484" )' aria-label='Reply to Ralph to Ralph'>Reply to Ralph</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1429">
+				<div id="div-comment-1429" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/cd092bc47de1d3bbe72ebc90bc66f0c6?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Mark</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1429">
+			April 16, 2015 at 14 h 57 min</a>		</div>
+
+		<p>Very usefull information! Thank you so much!</p>
+<p>I have a doubt, the following queries (1 and 2) should return the same information?</p>
+<p>1) select max(ktfbuebno+ktfbueblks-1) hwm_blocks from sys.x$ktfbue where ktfbuefno = 8; </p>
+<p>2)select max(block_id + blocks-1) hwm_blocks from dba_extents where file_id=8;</p>
+<p>I am asking that because I have seen several places saying that the second one could be used to find the datafile HWM but I can&#8217;t resize my datafiles based on it (ORA-03297). From x$ktfbue I found a realistic number but unfortunatelly I dont&#8217;t know how to map it to database objects so i can move/shrink then to release free space and reduce fragmentation.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14301"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1429' onclick='return addComment.moveForm( "div-comment-1429", "1429", "respond", "484" )' aria-label='Reply to Mark to Mark'>Reply to Mark</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1433">
+				<div id="div-comment-1433" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1433">
+			April 18, 2015 at 12 h 00 min</a>		</div>
+
+		<p>Hi Mark,
+DBA_EXTENTS doesn&#8217;t show extents from tables in recyclebin. That may be the reason for the difference with querying directly x$ktfbue.
+The mapping to objects is done by ktfbuesegfno,ktfbuesegbno which maps to HEADER_FILE, HEADER_BLOCKS in DBA_SEGMENTS.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14341"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1433' onclick='return addComment.moveForm( "div-comment-1433", "1433", "respond", "484" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1445">
+				<div id="div-comment-1445" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/67e3ad429c56936b974ec7d604d04452?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Laurent B.</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1445">
+			April 29, 2015 at 15 h 31 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>I had a sql use to reduce some datafile and i loose it.</p>
+<p>I find your page and really, it s so excellent. Simple, quick and efficient, i like it.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14461"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1445' onclick='return addComment.moveForm( "div-comment-1445", "1445", "respond", "484" )' aria-label='Reply to Laurent to Laurent B.'>Reply to Laurent</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1446">
+				<div id="div-comment-1446" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1446">
+			April 30, 2015 at 13 h 07 min</a>		</div>
+
+		<p>Thanks a lot Laurent for your feedback.
+A good way to avoid to loose your sql is to put them in a blog post <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" />
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14471"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1446' onclick='return addComment.moveForm( "div-comment-1446", "1446", "respond", "484" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1473">
+				<div id="div-comment-1473" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/8be0dcee1bc0492bdf5dc5459c125795?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rahul H</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1473">
+			June 6, 2015 at 13 h 11 min</a>		</div>
+
+		<p>Hi Frank,</p>
+<p>Your query is excellent, but it only checks for datafiles which are autoextend on. I tried to modify it for all datafiles but it still returning for autoextend on datafiles.</p>
+<p>Can you help me modify your query for all datafiles?</p>
+<p>Regards,
+Rahul
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14741"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1473' onclick='return addComment.moveForm( "div-comment-1473", "1473", "respond", "484" )' aria-label='Reply to Rahul to Rahul H'>Reply to Rahul</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1474">
+				<div id="div-comment-1474" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1474">
+			June 6, 2015 at 16 h 52 min</a>		</div>
+
+		<p>Hi Rhaul,
+Thanks for your feedback.
+It&#8217;s on purpose that I generate resize statements only for autoextensible files that can reach back their original size, to avoid the risk of errors or monitoring alerts. The statements are commented out when datafile is not autoextensible.
+So you should see them but commented out.
+Regards,
+Franck
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14751"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1474' onclick='return addComment.moveForm( "div-comment-1474", "1474", "respond", "484" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1475">
+				<div id="div-comment-1475" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/409993460194cebe2fd5eaaf7bf07c35?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rahul</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1475">
+			June 7, 2015 at 4 h 34 min</a>		</div>
+
+		<p>Thanks for the quick response Frank, There are around 663 datafiles in my database.I want to resize all the datafiles which autoexend off as there are they have too much space.  My plan is to do not resize the datafiles which are autoextend on.</p>
+<p>I am trying to modify your query for this, but still unable to fetch the commands for the datafiles which are autoextend off. </p>
+<p>Can you help me out with modifying your code?</p>
+<p>Regards,
+Rahul
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14761"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1475' onclick='return addComment.moveForm( "div-comment-1475", "1475", "respond", "484" )' aria-label='Reply to Rahul to Rahul'>Reply to Rahul</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-1476">
+				<div id="div-comment-1476" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/409993460194cebe2fd5eaaf7bf07c35?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rahul</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1476">
+			June 7, 2015 at 5 h 40 min</a>		</div>
+
+		<p>Hi Frank, I was able to modify your query for autoextend off files. Also, this one will exclude UNDO tablespace datafiles which we should not resize.</p>
+<p>=========
+<pre>
+set linesize 1000 pagesize 0 feedback off trimspool on
+with
+ hwm as (
+  -- get highest block id from each datafiles ( from x$ktfbue as we don't need all joins from dba_extents )
+  select /*+ materialize */ ktfbuesegtsn ts#,ktfbuefno relative_fno,max(ktfbuebno+ktfbueblks-1) hwm_blocks
+  from sys.x$ktfbue group by ktfbuefno,ktfbuesegtsn
+ ),
+ hwmts as (
+  -- join ts# with tablespace_name
+  select name tablespace_name,relative_fno,hwm_blocks
+  from hwm join v$tablespace using(ts#)
+ ),
+ hwmdf as (
+  -- join with datafiles, put 5M minimum for datafiles with no extents
+  select file_name,nvl(hwm_blocks*(bytes/blocks),5*1024*1024) hwm_bytes,bytes,autoextensible,maxbytes
+  from hwmts right join dba_data_files using(tablespace_name,relative_fno) where tablespace_name not like '%UNDO%'
+  )
+select
+ case when autoextensible='NO' and maxbytes&gt;=bytes
+ then -- we generate resize statements only if autoextensible can grow back to current size
+  '/* reclaim '||to_char(ceil((bytes-hwm_bytes)/1024/1024),999999)
+   ||'M from '||to_char(ceil(bytes/1024/1024),999999)||'M */ '
+   ||'alter database datafile '''||file_name||''' resize '||ceil(hwm_bytes/1024/1024)||'M;'
+ else -- generate only a comment when autoextensible is off
+  '/* reclaim '||to_char(ceil((bytes-hwm_bytes)/1024/1024),999999)
+   ||'M from '||to_char(ceil(bytes/1024/1024),999999)||'M */ '
+   ||'alter database datafile '''||file_name||''' resize '||ceil(hwm_bytes/1024/1024)||'M;'
+ end SQL
+from hwmdf
+where
+ bytes-hwm_bytes&gt;1024*1024 -- resize only if at least 1MB can be reclaimed
+order by bytes-hwm_bytes desc
+/
+</pre>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14771"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1476' onclick='return addComment.moveForm( "div-comment-1476", "1476", "respond", "484" )' aria-label='Reply to Rahul to Rahul'>Reply to Rahul</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even thread-even depth-1" id="comment-1477">
+				<div id="div-comment-1477" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1477">
+			June 7, 2015 at 20 h 43 min</a>		</div>
+
+		<p>Hi Rahul,
+Thanks for sharing.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14781"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1477' onclick='return addComment.moveForm( "div-comment-1477", "1477", "respond", "484" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-3498">
+				<div id="div-comment-3498" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/77d08e23dd0b6a17aacc48239889796a?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">j</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3498">
+			May 11, 2016 at 14 h 03 min</a>		</div>
+
+		<p>Incredible
+Thanks for sharing</p>
+<p>J
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-34991"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3498' onclick='return addComment.moveForm( "div-comment-3498", "3498", "respond", "484" )' aria-label='Reply to j to j'>Reply to j</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-3518">
+				<div id="div-comment-3518" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/58d58f505135c89343daf20e32e397e9?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Syaifuddin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3518">
+			May 14, 2016 at 11 h 09 min</a>		</div>
+
+		<p>Hi,</p>
+<p>Many thanks for sharing this! It&#8217;s saved my a lot of time!.</p>
+<p>regards,
+Syaifuddin
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-35191"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3518' onclick='return addComment.moveForm( "div-comment-3518", "3518", "respond", "484" )' aria-label='Reply to Syaifuddin to Syaifuddin'>Reply to Syaifuddin</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-3609">
+				<div id="div-comment-3609" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/75312e6458fae05aeb8aef68c84cd046?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">asad_tashmatov</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-3609">
+			May 27, 2016 at 17 h 54 min</a>		</div>
+
+		<p>Thank you, Frank!
+I&#8217;ve left my headache!
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-36101"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-3609' onclick='return addComment.moveForm( "div-comment-3609", "3609", "respond", "484" )' aria-label='Reply to asad_tashmatov to asad_tashmatov'>Reply to asad_tashmatov</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-4134">
+				<div id="div-comment-4134" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/56b7b0596d21c750643c1e2c7eac18ba?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Andrew Limsk</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4134">
+			August 1, 2016 at 10 h 22 min</a>		</div>
+
+		<p>Excellent! I have seen several versions of similar scripts in the past but this is the most elegantly efficient of them
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-41351"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4134' onclick='return addComment.moveForm( "div-comment-4134", "4134", "respond", "484" )' aria-label='Reply to Andrew to Andrew Limsk'>Reply to Andrew</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1" id="comment-4838">
+				<div id="div-comment-4838" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/91f375937f8b7666c7b808c5b1f95ec2?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Rahul Singh</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4838">
+			October 11, 2016 at 19 h 16 min</a>		</div>
+
+		<p>This is indeed commendable work Frank.
+Something not many people would share that easily.</p>
+<p>Thankyou!
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-48391"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4838' onclick='return addComment.moveForm( "div-comment-4838", "4838", "respond", "484" )' aria-label='Reply to Rahul to Rahul Singh'>Reply to Rahul</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-4916">
+				<div id="div-comment-4916" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/690ee2b9453acd274a27615ec29a5db8?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Daniel Ne</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-4916">
+			October 19, 2016 at 16 h 07 min</a>		</div>
+
+		<p>Thanks for sharing this SQL. It performed very well even in a very huge database.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-49171"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-4916' onclick='return addComment.moveForm( "div-comment-4916", "4916", "respond", "484" )' aria-label='Reply to Daniel to Daniel Ne'>Reply to Daniel</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-odd thread-alt depth-1 parent" id="comment-5674">
+				<div id="div-comment-5674" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/623c98eaf114393f3497fa17e8b6cc72?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/amerdba' rel='external nofollow' class='url'>Amer ELHABBASH</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5674">
+			December 6, 2016 at 15 h 59 min</a>		</div>
+
+		<p>Thanks Frank ! </p>
+<p>I made some changes to your query :</p>
+<p>1.Add the same type of resizing for temporary files (based on sys.x$KTSSO)  , mainly for 10g where we do not have the convenient alter tablespace temp shrink space;
+2.Wrap the whole thing in a pl/sql
+<pre>
+declare
+sql_stm varchar2(300);
+BEGIN
+FOR enreg IN (
+	with
+ hwm as (
+  -- get highest block id from each datafiles ( from x$ktfbue as we don't need all joins from dba_extents )
+  select /*+ materialize */ ktfbuesegtsn ts#,ktfbuefno relative_fno,max(ktfbuebno+ktfbueblks-1) hwm_blocks
+  from sys.x$ktfbue group by ktfbuefno,ktfbuesegtsn
+  union
+  select /*+ materialize */ KTSSOTSNUM ts#,KTSSORFNO relative_fno,max(KTSSOBNO+KTSSOBLKS-1) hwm_blocks
+  from sys.x$KTSSO group by KTSSORFNO,KTSSOTSNUM
+ ),
+ hwmts as (
+  -- join ts# with tablespace_name
+  select name tablespace_name,relative_fno,hwm_blocks
+  from hwm join v$tablespace using(ts#)
+ ),
+ hwmdf as (
+  -- join with datafiles, put 5M minimum for datafiles with no extents
+  select file_name,nvl(hwm_blocks*(bytes/blocks),5*1024*1024) hwm_bytes,bytes,autoextensible,maxbytes ,'DATA' content
+  from hwmts  right join dba_data_files using(tablespace_name,relative_fno)
+  union
+  select file_name,nvl(hwm_blocks*(bytes/blocks),5*1024*1024) hwm_bytes,bytes,autoextensible,maxbytes, 'TEMP' content
+  from hwmts  right join dba_temp_files using(tablespace_name,relative_fno)
+  --where file_name like '%undo%'
+ )
+select
+ case when autoextensible='YES' and maxbytes&gt;=bytes
+ then -- we generate resize statements only if autoextensible can grow back to current size
+ '/* reclaim '||to_char(ceil((bytes-hwm_bytes)/1024/1024),999999)
+   ||'M from '||to_char(ceil(bytes/1024/1024),999999)||'M */ '
+|| case when hwmdf.content='DATA' then 'alter database datafile ''' else 'alter database tempfile  ''' end||file_name||''' resize '||ceil(hwm_bytes/1024/1024)||'M'
+end SQL_EXECUTE
+from hwmdf
+where
+ bytes-hwm_bytes&gt;1024*1024 -- resize only if at least 1MB can be reclaimed
+order by bytes-hwm_bytes desc
+	)
+	LOOP
+		begin
+		sql_stm:=enreg.SQL_EXECUTE;
+                dbms_output.put_line(sql_stm);
+		EXECUTE IMMEDIATE sql_stm;
+		exception
+		when others then
+		dbms_output.put_line('erreor while executing :'|| sql_stm);
+		end;
+	END LOOP;
+END;
+/
+</pre>
+Have a good day </p>
+<p>Amer
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-56751"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5674' onclick='return addComment.moveForm( "div-comment-5674", "5674", "respond", "484" )' aria-label='Reply to Amer to Amer ELHABBASH'>Reply to Amer</a></div>
+				</div>
+		<ul class="children">
+		<li class="comment byuser comment-author-franck-pachot bypostauthor even depth-2" id="comment-5687">
+				<div id="div-comment-5687" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='https://www.linkedin.com/in/franckpachot' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5687">
+			December 7, 2016 at 11 h 26 min</a>		</div>
+
+		<p>Thanks Amer.
+You take the responsibility for the &#8216;execute immediate&#8217; <img src="../wp-includes/images/smilies/icon_wink.gif" alt=";)" class="wp-smiley" />
+(I prefer to have people copy/paste so that they have a look at it)
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-56881"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5687' onclick='return addComment.moveForm( "div-comment-5687", "5687", "respond", "484" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+</ul><!-- .children -->
+</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-5716">
+				<div id="div-comment-5716" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/1ec42fb1d8b53604fd28f1d354f58c5f?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Hari Panamanna</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5716">
+			December 10, 2016 at 3 h 02 min</a>		</div>
+
+		<p>Amazing script, worked like a charm. Hats off to Frank!</p>
+<p>Thanks once again, Frank.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-57171"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5716' onclick='return addComment.moveForm( "div-comment-5716", "5716", "respond", "484" )' aria-label='Reply to Hari to Hari Panamanna'>Reply to Hari</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-6927">
+				<div id="div-comment-6927" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/5253565c15cb4357e9ce03f2dd01b991?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Nitin</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-6927">
+			February 16, 2017 at 7 h 38 min</a>		</div>
+
+		<p>Beautiful script Franck. Just what the doctor ordered. Thanks a ton.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-69281"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-6927' onclick='return addComment.moveForm( "div-comment-6927", "6927", "respond", "484" )' aria-label='Reply to Nitin to Nitin'>Reply to Nitin</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment odd alt thread-even depth-1" id="comment-7404">
+				<div id="div-comment-7404" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/0c11b526250fdbd635cd29d4e6ecc485?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Amit</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7404">
+			April 28, 2017 at 17 h 11 min</a>		</div>
+
+		<p>Works like a charm and a very useful script.
+Many thanks Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-74051"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7404' onclick='return addComment.moveForm( "div-comment-7404", "7404", "respond", "484" )' aria-label='Reply to Amit to Amit'>Reply to Amit</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-odd thread-alt depth-1" id="comment-7597">
+				<div id="div-comment-7597" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/8d4094a24688a2f053b84a32f414550e?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Raud Premananda</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-7597">
+			June 5, 2017 at 22 h 43 min</a>		</div>
+
+		<p>Nice Script. Very useful. Thank you very much.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-75981"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-7597' onclick='return addComment.moveForm( "div-comment-7597", "7597", "respond", "484" )' aria-label='Reply to Raud to Raud Premananda'>Reply to Raud</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

@@ -1,0 +1,277 @@
+This was first published on <a href=https://blog.dbi-services.com/convert-a-snapshot-standby-to-a-new-database>https://blog.dbi-services.com/convert-a-snapshot-standby-to-a-new-database</a> (2015-06-12)
+								<h1 class="entry-title">Convert a snapshot standby to a new database</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>A snapshot standby database is a nice solution when you want a temporary copy of the primary where you can do whatever you want (test a bug fix for example) and then convert it back to physical standby. But you don&#8217;t want to stay in that state definitely because you will accumulate archived logs from the changes done to the primary, and flashback logs for the changes made to the snapshot standby.</p>
+<p>Here I&#8217;ll show how to finish it when you want a permanent new database. You can use that when you want to do a duplicate, but don&#8217;t know in advance which point-in-time should be used. Then you just configure a physical standby, convert it to snapshot standby, maybe flashback it the the required point. And once you have found the right point, then you finish it to have a new database name and DBID.</p>
+<h3>The primary database</h3>
+<p>Here is the primary on host VM111, db name is DEMO11 and db unique name is DEMO11.
+I&#8217;m checking the DBID:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[oracle@VM111 ~]$ rman target /
+Recovery Manager: Release 12.1.0.2.0 - Production on Thu May 28 22:36:07 2015
+Copyright (c) 1982, 2014, Oracle and/or its affiliates.  All rights reserved.
+connected to target database: DEMO11 (DBID=684456715)
+</pre>
+<h3>Data Guard configuration</h3>
+<p>The standby is on VM112, db name is DEMO11 and db unique name is DEMO12:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[oracle@VM112 ~]$ dgmgrl /
+DGMGRL for Linux: Version 12.1.0.2.0 - 64bit Production
+Copyright (c) 2000, 2013, Oracle. All rights reserved.
+Welcome to DGMGRL, type "help" for information.
+Connected as SYSDG.
+
+DGMGRL&gt; show database demo12
+
+Database - demo12
+
+  Role:               PHYSICAL STANDBY
+  Intended State:     APPLY-ON
+  Transport Lag:      0 seconds (computed 1 second ago)
+  Apply Lag:          0 seconds (computed 1 second ago)
+  Average Apply Rate: 52.00 KByte/s
+  Real Time Query:    ON
+  Instance(s):
+    DEMO12
+
+Database Status:
+SUCCESS
+</pre>
+<p>I&#8217;ve a standby that is in sync.</p>
+<h3>Snapshot standby</h3>
+<p>I want to convert that standby to a new database. For the moment, I&#8217;ll only convert to a snapshot standby, so that I can flashback if I need to apply more archived logs later and start again from another point.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">DGMGRL&gt; convert database demo12 to snapshot standby;
+Converting database "demo12" to a Snapshot Standby database, please wait...
+Database "demo12" converted successfully
+</pre>
+<p>A restore point has been automatically created in order to be able to flashback to the point where log apply can continue:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; list restore point all;
+
+using target database control file instead of recovery catalog
+SCN              RSP Time  Type       Time      Name
+---------------- --------- ---------- --------- ----
+2156577                    GUARANTEED 28-MAY-15 SNAPSHOT_STANDBY_REQUIRED_05/28/2015 22:36:46
+</pre>
+<h3>Log shipping</h3>
+<p>The snapshot standby is a database that is open read-write. The only difference with a new database (a duplicate for example) is that the DBID is still the same as the primary. But the advantage is that it stills receives the archived log and can be converted back to a standby database. Look at the primary and switch a few logfiles:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">[oracle@VM111 ~]$ sqlplus / as sysdba
+SQL*Plus: Release 12.1.0.2.0 Production on Thu May 28 22:39:36 2015
+Copyright (c) 1982, 2014, Oracle.  All rights reserved.
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+
+SQL&gt; archive log list
+Database log mode              Archive Mode
+Automatic archival             Enabled
+Archive destination            USE_DB_RECOVERY_FILE_DEST
+Oldest online log sequence     47
+Next log sequence to archive   49
+Current log sequence           49
+SQL&gt; alter system switch logfile;
+System altered.
+SQL&gt; alter system switch logfile;
+System altered.
+</pre>
+<p>and check at the standby site:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[oracle@VM112 ~]$ NLS_DATE_FORMAT='dd-mon-yy hh24:mi:ss' rman target /
+Recovery Manager: Release 12.1.0.2.0 - Production on Thu May 28 22:41:35 2015
+Copyright (c) 1982, 2014, Oracle and/or its affiliates.  All rights reserved.
+connected to target database: DEMO11 (DBID=684456715)
+
+RMAN&gt; list archivelog all;
+...
+44      1    49      A 28-may-15 22:39:32
+        Name: /u02/DEMO/fast_recovery_area/DEMO12/archivelog/2015_05_28/o1_mf_1_49_bpgz9pxt_.arc
+45      1    50      A 28-may-15 22:40:22
+        Name: /u02/DEMO/fast_recovery_area/DEMO12/archivelog/2015_05_28/o1_mf_1_50_bpgzbbjs_.arc
+46      1    51      A 28-may-15 22:40:42
+        Name: /u02/DEMO/fast_recovery_area/DEMO12/archivelog/2015_05_28/o1_mf_1_51_bpgzbg5x_.arc
+</pre>
+<p>all the archived logs are there. You can see that DBID is the same as the primary.</p>
+<h3>Transport and Apply lag</h3>
+<p>Let&#8217;s check the lag:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">[oracle@VM111 ~]$ dgmgrl /
+DGMGRL for Linux: Version 12.1.0.2.0 - 64bit Production
+Copyright (c) 2000, 2013, Oracle. All rights reserved.
+Welcome to DGMGRL, type "help" for information.
+Connected as SYSDG.
+DGMGRL&gt; show database demo12
+
+Database - demo12
+
+  Role:               SNAPSHOT STANDBY
+  Transport Lag:      0 seconds (computed 1 second ago)
+  Apply Lag:          5 minutes 4 seconds (computed 1 second ago)
+  Instance(s):
+    DEMO12
+
+Database Status:
+SUCCESS
+</pre>
+<p>I have an apply lag (the apply stopped when I converted the physical standby to a snapshot standby) but there is no transport lag.</p>
+<p>At that point, I have my new database. I can do whatever I want, with the possibility to convert back to a standby, apply more archived logs, re-convert to a snapshot standby, etc. Then when I&#8217;m happy with it, I&#8217;ll finalize it:</p>
+<ul>
+<li>remove the standby configuration</li>
+<li>delete all the unwanted archived logs</li>
+<li>change DBID and DB_NAME to new ones</li>
+</ul>
+<h3>Remove standby database configuration</h3>
+<p>This is done from Data Guard Broker and it will stop log shipping to the standby.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">DGMGRL&gt; remove database demo12;
+Removed database "demo12" from the configuration
+
+</pre>
+<p>At that point we can remove the archived logs on the standby site (rman delete archivelog all). We can also check the parameters that have been set by standby configuration(file name convert, fal_server, archive_lag_target) and set the dg_broker_start if you don&#8217;t want it anymore. The log_archive_config and log_archive_dest should have been reset properly by the &#8216;remove database from configuration&#8217;.</p>
+<h3>DBNEWID</h3>
+<p>I&#8217;m setting the DB_NAME to DEMO12 (instead of DEMO11) and I want a new DBID. This is done with &#8216;nid&#8217; when in mount:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">SQL&gt; shutdown immediate
+Database closed.
+Database dismounted.
+ORACLE instance shut down.
+SQL&gt; startup mount
+ORACLE instance started.
+
+Total System Global Area  473956352 bytes
+Fixed Size                  2925744 bytes
+Variable Size             268438352 bytes
+Database Buffers          197132288 bytes
+Redo Buffers                5459968 bytes
+Database mounted.
+SQL&gt; exit
+Disconnected from Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+
+[oracle@VM112 dbs]$ nid target=sys/oracle dbname=DEMO12
+
+DBNEWID: Release 12.1.0.2.0 - Production on Thu May 28 22:52:04 2015
+Copyright (c) 1982, 2014, Oracle and/or its affiliates.  All rights reserved.
+Connected to database DEMO11 (DBID=684456715)
+Connected to server version 12.1.0
+
+Control Files in database:
+    /u01/DEMO/oradata/DEMO12/control01.ctl
+    /u01/DEMO/fast_recovery_area/DEMO12/control02.ctl
+
+Change database ID and database name DEMO11 to DEMO12? (Y/[N]) =&gt; Y
+
+Proceeding with operation
+Changing database ID from 684456715 to 833681684
+Changing database name from DEMO11 to DEMO12
+    Control File /u01/DEMO/oradata/DEMO12/control01.ctl - modified
+    Control File /u01/DEMO/fast_recovery_area/DEMO12/control02.ctl - modified
+    Datafile /u01/DEMO/oradata/DEMO12/system01.db - dbid changed, wrote new name
+    Datafile /u01/DEMO/oradata/DEMO12/sysaux01.db - dbid changed, wrote new name
+    Datafile /u01/DEMO/oradata/DEMO12/undotbs01.db - dbid changed, wrote new name
+    Datafile /u01/DEMO/oradata/DEMO12/example01.db - dbid changed, wrote new name
+    Datafile /u01/DEMO/oradata/DEMO12/users01.db - dbid changed, wrote new name
+    Datafile /u01/DEMO/oradata/DEMO12/temp01.db - dbid changed, wrote new name
+    Control File /u01/DEMO/oradata/DEMO12/control01.ctl - dbid changed, wrote new name
+    Control File /u01/DEMO/fast_recovery_area/DEMO12/control02.ctl - dbid changed, wrote new name
+    Instance shut down
+
+Database name changed to DEMO12.
+Modify parameter file and generate a new password file before restarting.
+Database ID for database DEMO12 changed to 833681684.
+All previous backups and archived redo logs for this database are unusable.
+Database is not aware of previous backups and archived logs in Recovery Area.
+Database has been shutdown, open database with RESETLOGS option.
+Succesfully changed database name and ID.
+DBNEWID - Completed succesfully.
+</pre>
+<p>I have to change the DB_NAME in the spfile and I also reset the parameters that I do not want as this database is not in a Data Guard configuration anymore:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter system set db_name='DEMO12' scope=spfile dg_broker_start=false scope=spfile;
+System altered.
+
+SQL&gt; alter system reset fal_server;
+System altered.
+</pre>
+<p>then I restart and open resetlogs:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; startup force
+ORACLE instance started.
+
+Total System Global Area  473956352 bytes
+Fixed Size                  2925744 bytes
+Variable Size             268438352 bytes
+Database Buffers          197132288 bytes
+Redo Buffers                5459968 bytes
+Database mounted.
+ORA-01589: must use RESETLOGS or NORESETLOGS option for database open
+
+SQL&gt; alter database open resetlogs;
+Database altered.
+</pre>
+<h3>Flashback logs</h3>
+<p>I had to remove the archived logs, bit let&#8217;s check the flashback logs:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select * from v$recovery_area_usage;
+
+FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES
+----------------------- ------------------ ------------------------- ---------------
+CONTROL FILE                             0                         0               0
+REDO LOG                                 0                         0               0
+ARCHIVED LOG                             0                         0               0
+BACKUP PIECE                             0                         0               0
+IMAGE COPY                               0                         0               0
+FLASHBACK LOG                            0                         0               0
+FOREIGN ARCHIVED LOG                     0                         0               0
+AUXILIARY DATAFILE COPY                  0                         0               0
+</pre>
+<p>the cleanup has been done because the restore point has been removed:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">RMAN&gt; list restore point all;
+
+using target database control file instead of recovery catalog
+SCN              RSP Time  Type       Time      Name
+---------------- --------- ---------- --------- ----
+</pre>
+<h3>Summary</h3>
+<p>The operation is something simple. The goal of this post is to show in which order to do it so that there is a minimum cleanup to do. Snapshot standby is a very useful feature available in Enterprise Edition since 11g.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-23220"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-5657">
+				<div id="div-comment-5657" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/5fa34c55cb2a993c8bde1ebabf0a9a8b?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Venkat</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-5657">
+			December 5, 2016 at 7 h 02 min</a>		</div>
+
+		<p>I got this issues</p>
+<p>NID-00600: Internal Error &#8211; [30] [3113] [0] [0]</p>
+<p>Change of database name and ID failed during validation &#8211; database is intact.
+DBNEWID &#8211; Completed with validation errors.</p>
+<p>Alert log:</p>
+<p>Errors in file /diagnostic/diag/rdbms/houstby/prod1/trace/prod1_rvwr_96533.trc:
+ORA-38734: Flashback log is inconsistent; belongs to another database.
+ORA-38701: Flashback database log 1 seq 1 thread 1: &#8220;/u01/app/oracle/fast_recovery_area/datastore/STBY/PRD/flashback/o1_mf_d47ph976_.flb&#8221;
+Sun Dec 04 22:38:32 2016
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-56581"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-5657' onclick='return addComment.moveForm( "div-comment-5657", "5657", "respond", "2321" )' aria-label='Reply to Venkat to Venkat'>Reply to Venkat</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

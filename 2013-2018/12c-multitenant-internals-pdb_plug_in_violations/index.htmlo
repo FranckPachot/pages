@@ -1,0 +1,225 @@
+This was first published on <a href=https://blog.dbi-services.com/12c-multitenant-internals-pdb_plug_in_violations>https://blog.dbi-services.com/12c-multitenant-internals-pdb_plug_in_violations</a> (2017-12-30)
+								<h1 class="entry-title">12c Multitenant internals: PDB_PLUG_IN_VIOLATIONS</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the previous post <a href="https://blog.dbi-services.com/12c-multitenant-internals-pdb-replay-ddl-for-common-users" target="_blank">https://blog.dbi-services.com/12c-multitenant-internals-pdb-replay-ddl-for-common-users</a> I&#8217;ve done some DDL on a common user to show how this is replayed later for PDBs that were not opened at that time. But what happens when one of the DDL fails on one PDB?
+<span id="more-20239"></span></p>
+<h3>PDB$LASTREPLAY</h3>
+<p>In the last post, the C##USER1 common user was created and all pluggable databases (PDB1 with con_id=3 and PDB2 with con_id=4) were opened and synchronized:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where opcode=-1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP   SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------   ------ -----                ----             --------   --------     ------   ------- -------
+       1        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+       3        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+       4        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+</pre>
+When REPLAY# in the PDB is equal to the CDB$ROOT one, this means that there are no additional statements to replicate on the PDB.</p>
+<p>I have PDB1 opened read write and PDB2 in read only:
+<pre>
+SQL&gt; show pdbs
+
+  CON_ID CON_NAME   OPEN MODE    RESTRICTED
+  ------ --------   ---- ----    ----------
+       2 PDB$SEED   READ ONLY    NO
+       3 PDB1       READ WRITE   NO
+       4 PDB2       READ ONLY    NO
+</pre></p>
+<p>For the demo my user&#8217;s default tablespace is SYSTEM:
+<pre>
+SQL&gt; select con_id,username,common,default_tablespace from cdb_users where username='C##USER1' order by 1;
+
+  CON_ID USERNAME   COMMON   DEFAULT_TABLESPACE
+  ------ --------   ------   ------------------
+       1 C##USER1   YES      SYSTEM
+       3 C##USER1   YES      SYSTEM
+       4 C##USER1   YES      SYSTEM
+</pre></p>
+<h3>Failure in opened containers</h3>
+<p>I want to change the default tablespace for C##USER1 and I have a USERS tablespace in CDB$ROOT (but not in the PDBs):
+<pre>
+SQL&gt; alter user C##USER1 default tablespace USERS;
+
+Error starting at line : 50 File @ common-users-pdb-sync.sql
+In command -
+alter user C##USER1 default tablespace USERS
+Error report -
+ORA-65048: error encountered when processing the current DDL statement in pluggable database PDB1
+ORA-00959: tablespace 'USERS' does not exist
+</pre></p>
+<p>As we have seen in the last post, the DDL is executed on all containers that are opened read write. Here it is fine on CDB$ROOT but fails on PDB1.</p>
+<p>Then I create the USERS tablespace in PDB1:
+<pre>
+SQL&gt; alter session set container=PDB1;
+Session altered.
+SQL&gt; create tablespace USERS datafile '/u01/oradata/CDB2/PDB1/users.dbf' size 5M;
+Tablespace USERS created.
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+</pre></p>
+<p>And now, the statement is successful in CDB$ROOT, replicated on PDB1:
+<pre>
+SQL&gt; alter user C##USER1 default tablespace USERS;
+User C##USER1 altered.
+</pre></p>
+<p>This is nice: the statement is successful in all containers or fails. When it is successful, statements are recorded in PDB_SYNC$:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id=1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP    SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------    ------ -----                ----             --------   --------     ------   ------- -------
+       1        0         0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        11
+       1        0    852610 26-jan-17 02:57:26   CTXSYS                      SYS               5         1 alter user CTXSYS account unlock identified by *^@
+       1        0    853177 26-jan-17 02:57:34   CTXSYS                      SYS               5         2 alter user CTXSYS password expire account lock^@
+       1        0   1405359 26-jan-17 03:31:31   SYSTEM                      SYS               5         3 alter user system account lock password expire^@
+       1        0   1408693 23-dec-17 11:34:43   SYS                         SYS               5         4 alter user sys account unlock identified by *^@
+       1        0   1408703 23-dec-17 11:34:43   SYSTEM                      SYS               5         5 alter user system account unlock identified by *^@
+       1        0   1466615 29-dec-17 09:26:56   C##PROFILE1                 SYS               7         6 create profile C##PROFILE1 limit inactive_account_time 15 container=all^@
+       1        0   1466641 29-dec-17 09:26:57   C##ROLE1                    SYS               3         7 create role C##ROLE1 container=all^@
+       1        0   1466748 29-dec-17 09:26:58   C##USER1                    SYS               1         8 create user C##USER1 identified by * container=all^@
+       1        0   1466812 29-dec-17 09:26:59   C##USER1                    SYS               5         9 alter user C##USER1 profile C##PROFILE1^@
+       1        0   1466853 29-dec-17 09:26:59   C##USER1         C##ROLE1   SYS              10        10 grant C##ROLE1 to C##USER1 container=all^@
+       1        0   1467010 29-dec-17 09:27:01   C##USER1                    SYS               5        11 alter user C##USER1 default tablespace USERS^@
+</pre></p>
+<h3>Failure in replay at open for closed containers</h3>
+<p>But PDB2 is not synchronized because it was not opened read write:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id&gt;1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP   SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------   ------ -----                ----             --------   --------     ------   ------- -------
+       3        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        11
+       4        0        0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        10
+</pre></p>
+<p>But I don&#8217;t have a USERS tablespace in PDB2, so the replay will fail:
+<pre>
+SQL&gt; alter pluggable database PDB2 close;
+Pluggable database PDB2 altered.
+
+SQL&gt; alter pluggable database PDB2 open;
+ORA-24344: success with compilation error
+Pluggable database PDB2 altered.
+</pre></p>
+<p>This is a warning only. The SQlcl feedback is a bit misleading, mentioning a compilation error because this is where we used to have warnings, but the SQl*Plus message is more clear:
+<pre>
+SQL&gt; alter pluggable database PDB2 open;
+Warning: PDB altered with errors.
+</pre></p>
+<p>The PDB2 cannot be left closed, because you need to create a tablespace here. But it cannot be opened to everyone, because it is not in sync with CDB$ROOT. So what happens is that the PDB is opened in restricted mode:
+<pre>
+SQL&gt; show pdbs
+
+  CON_ID CON_NAME   OPEN MODE    RESTRICTED
+  ------ --------   ---- ----    ----------
+       2 PDB$SEED   READ ONLY    NO
+       3 PDB1       READ WRITE   NO
+       4 PDB2       READ WRITE   YES
+</pre></p>
+<p>Note that if you look at PDB_SYNC$ in the PDB at that time, it looks like REPLAY#=11 has increased but you also see rows for the statement that has to be run. You have to connect to the PDB because containers() do not run in restricted session containers:
+<pre>
+SQL&gt; alter session set container=PDB2;
+Session altered.
+
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id&gt;1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP    SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------    ------ -----                ----             --------   --------     ------   ------- -------
+       4        0         0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        11
+       4        0   1469022 29-dec-17 09:27:02   C##USER1                    SYS               5        11 alter user C##USER1 default tablespace USERS^@
+
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+</pre>
+Actually, the attempt to sync has inserted the statements and pushed the last replay indicator. Now, the PDB has all information to do a sync without the need to go to CDB$ROOT. The DDL was not replayed, but has been stored locally. When the sync will be successful, statements will be removed from the local PDB_SYNC$ leaving only the LASTREPLAY indicator.</p>
+<h3>PDB_PLUG_IN_VIOLATIONS</h3>
+<p>More info about the warning is stored in PDB_ALERT$ which you query from PDB_PLUG_IN_VIOLATIONS (the strange name reminds the TRANSPORT_SET_VIOLATIONS view used by DBMS_TTS):
+<pre>
+SQL&gt; select name, cause, type, status,action,message,time from pdb_plug_in_violations;
+
+NAME   CAUSE          TYPE    STATUS    ACTION   MESSAGE                                                                               TIME
+----   -----          ----    ------    ------   -------                                                                               -------------------------------
+PDB2   Sync Failure   ERROR   PENDING            Sync PDB failed with ORA-959 during 'alter user C##USER1 default tablespace USERS'    29-DEC-17 09.27.03.266780000 PM
+</pre></p>
+<p>Here you have the statement that failed and the error number, but no recommended ACTION. However, ORA-959 is &#8220;tablespace &#8216;%s&#8217; does not exist&#8221; which gives a clue about the problem encountered.</p>
+<p>As the PDB is opened a DBA (with RESTRICTED SESSION privilege) can add the tablespace:
+<pre>
+SQL&gt; alter session set container=PDB2;
+Session altered.
+
+SQL&gt; create tablespace USERS datafile '/u01/oradata/CDB2/PDB2/users.dbf' size 5M;
+Tablespace USERS created.
+</pre></p>
+<p>But you cannot simply disable restricted session:
+<pre>
+SQL&gt; alter system disable restricted session;
+SQL&gt; alter system disable restricted session;
+
+Error starting at line : 74 File @ common-users-pdb-sync.sql
+In command -
+alter system disable restricted session
+Error report -
+ORA-65144: ALTER SYSTEM DISABLE RESTRICTED SESSION is not permitted
+65144. 00000 -  "ALTER SYSTEM DISABLE RESTRICTED SESSION is not permitted"
+*Cause:    An attempt was made to disable a restricted session while an unresolved error existed in PDB_PLUG_IN_VIOLATIONS.
+*Action:   Resolve all of the errors before trying to disable a restricted session.
+</pre></p>
+<p>One solution is to close and open the PDB to get the DDL replay:
+<pre>SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+SQL&gt; alter pluggable database PDB2 close;
+Pluggable database PDB2 altered.
+SQL&gt; alter pluggable database PDB2 open;
+Pluggable database PDB2 altered.
+</pre></p>
+<p>The other solution is to call DBMS_PDB.SYNC_PDB and disable restricted mode:
+<pre>
+SQL&gt; exec dbms_pdb.sync_pdb; commit;
+PL/SQL procedure successfully completed.
+
+SQL&gt; alter system disable restricted session;
+System DISABLE altered.
+</pre></p>
+<p>In both case, no warning here, and no restricted mode:
+<pre>
+SQL&gt; show pdbs
+
+  CON_ID CON_NAME   OPEN MODE    RESTRICTED
+  ------ --------   ---- ----    ----------
+       2 PDB$SEED   READ ONLY    NO
+       3 PDB1       READ WRITE   NO
+       4 PDB2       READ WRITE   NO
+</pre></p>
+<p>and the PDB_PLUG_IN_VIOLATIONS is updated to flag the issue as resolved:
+<pre>
+SQL&gt; select name, cause, type, status,action,message,time from pdb_plug_in_violations;
+
+NAME   CAUSE          TYPE    STATUS     ACTION   MESSAGE                                                                               TIME
+----   -----          ----    ------     ------   -------                                                                               -------------------------------
+PDB2   Sync Failure   ERROR   RESOLVED            Sync PDB failed with ORA-959 during 'alter user C##USER1 default tablespace USERS'    29-DEC-17 09.27.04.093659000 PM
+</pre></p>
+<p>At that time, the local PDB_SYNC$ table in PDB2 contains only the PDB$LASTREPLAY row, with the same value as in the CDB$ROOT table. The rows with the statements have been deleted once the DDL has been successfully replayed:
+<pre>
+SQL&gt; select con_id,scnwrp,scnbas,ctime,name,auxname1,auxname2,opcode,replay#,sqlstmt from containers(pdb_sync$) where con_id&gt;1 and bitand(flags,8)!=8 order by con_id,replay#;
+
+  CON_ID   SCNWRP    SCNBAS CTIME                NAME             AUXNAME1   AUXNAME2     OPCODE   REPLAY# SQLSTMT
+  ------   ------    ------ -----                ----             --------   --------     ------   ------- -------
+       4        0         0 26-jan-17 01:53:02   PDB$LASTREPLAY                               -1        11
+</pre></p>
+<h3>So what?</h3>
+<p>The mechanism is simple: record what is done in CDB$ROOT, replicate it in PDBs when possible (opened read-write) and try to replay it, mark the last replay step. For containers that were not writeable, at open, the DDL is replicated on the PDBs that lag being CDB$ROOT and replay step is updated. Then the DDL is replayed. When sucessful, the statement is removed from the replicated DDL. When it fails, you get a warning, and a message in PDB_PLUG_IN_VIOLATIONS, and the PDB is opened in restricted session mode to let you solve the problem.
+If you can fix the issue so that the DDL to be replayed is successful, then you can just sync and disable restricted session, or simply close and re-open the PDB.
+If you can&#8217;t fix it I suppose you need to hack the statements in the local PDB_SYNC$, with Oracle Support agreement of course, and make sure that you arrive to a state which is consistent with the other containers, especially CDB$ROOT.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-202400"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

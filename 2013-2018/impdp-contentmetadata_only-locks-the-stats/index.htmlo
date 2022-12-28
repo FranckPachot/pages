@@ -1,0 +1,132 @@
+This was first published on <a href=https://blog.dbi-services.com/impdp-contentmetadata_only-locks-the-stats>https://blog.dbi-services.com/impdp-contentmetadata_only-locks-the-stats</a> (2017-09-06)
+								<h1 class="entry-title">impdp content=metadata_only locks the stats</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>With Oracle you can learn something every day. Today, preparing a migration to 12.2, I found all tables had locked statistics. I learned that it is the expected behavior since 10.2 when importing metadata_only including statistics, to avoid that the automatic job gathering comes and replaces the stats by &#8216;0 rows&#8217;.
+<span id="more-18514"></span>
+It is documented in <a href="https://support.oracle.com/epmos/faces/DocContentDisplay?id=415081.1" target="_blank">DataPump Import Without Data Locks Table Statistics (Doc ID 415081.1)</a> but as I was really surprised about that (and also frustrated to learn a 10.2 thing when migrating to 12.2) that I wanted to test myself.</p>
+<p>I create a table DEMO with statistics:
+<pre>
+SQL&gt; connect sys/oracle@//localhost/pdb1 as sysdba
+Connected.
+SQL&gt; create table demo.demo as select * from dual;
+Table created.
+
+SQL&gt; create index demo.demo on demo.demo(dummy);
+Index created.
+
+SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMO');
+PL/SQL procedure successfully completed.
+
+SQL&gt; create or replace directory TMP as '/tmp';
+Directory created.
+
+SQL&gt; select count(*) from DEMO.DEMO;
+
+  COUNT(*)
+----------
+         1
+
+SQL&gt; select object_type from dba_objects where owner='DEMO' and object_name='DEMO';
+
+OBJECT_TYPE
+-----------------------
+TABLE
+INDEX
+
+SQL&gt; select owner,table_name,last_analyzed,stattype_locked,num_rows from dba_tab_statistics where owner='DEMO' and table_name='DEMO';
+
+OWNER      TABLE_NAME           LAST_ANALYZED        STATTYPE_LOCKED        NUM_ROWS
+---------- -------------------- -------------------- -------------------- ----------
+DEMO       DEMO                 06-SEP-17                                          1
+</pre></p>
+<p>I export it:
+<pre>
+Connected to: Oracle Database 12c Enterprise Edition Release 12.2.0.1.0 - 64bit Production
+Starting "SYS"."SYS_EXPORT_TABLE_01":  "sys/********@//localhost/pdb1 AS SYSDBA" tables=DEMO.DEMO directory=TMP
+Processing object type TABLE_EXPORT/TABLE/TABLE_DATA
+Processing object type TABLE_EXPORT/TABLE/INDEX/STATISTICS/INDEX_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Processing object type TABLE_EXPORT/TABLE/INDEX/INDEX
+. . exported "DEMO"."DEMO"                               5.054 KB       1 rows
+Master table "SYS"."SYS_EXPORT_TABLE_01" successfully loaded/unloaded
+******************************************************************************
+Dump file set for SYS.SYS_EXPORT_TABLE_01 is:
+  /tmp/expdat.dmp
+Job "SYS"."SYS_EXPORT_TABLE_01" successfully completed at Wed Sep 6 19:14:44 2017 elapsed 0 00:00:09
+</pre></p>
+<p>And drop it:
+<pre>
+SQL&gt; connect sys/oracle@//localhost/pdb1 as sysdba
+Connected.
+SQL&gt; drop table demo.demo;
+Table dropped.
+</pre></p>
+<p>Now import metadata only (for example because I want to change NLS semantics before importing the data)
+<pre>
+Import: Release 12.2.0.1.0 - Production on Wed Sep 6 19:21:28 2017
+
+Copyright (c) 1982, 2017, Oracle and/or its affiliates.  All rights reserved.
+
+Connected to: Oracle Database 12c Enterprise Edition Release 12.2.0.1.0 - 64bit Production
+Master table "SYS"."SYS_IMPORT_TABLE_01" successfully loaded/unloaded
+Starting "SYS"."SYS_IMPORT_TABLE_01":  "sys/********@//localhost/pdb1 AS SYSDBA" tables=DEMO.DEMO directory=TMP content=metadata_only exclude=index
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+Job "SYS"."SYS_IMPORT_TABLE_01" successfully completed at Wed Sep 6 19:21:39 2017 elapsed 0 00:00:11
+</pre></p>
+<p>If I check the statistics:
+<pre>
+SQL&gt; select owner,table_name,last_analyzed,stattype_locked,num_rows from dba_tab_statistics where owner='DEMO' and table_name='DEMO';
+
+OWNER      TABLE_NAME           LAST_ANALYZED        STATTYPE_LOCKED        NUM_ROWS
+---------- -------------------- -------------------- -------------------- ----------
+DEMO       DEMO                 06-SEP-17            ALL                           1
+</pre></p>
+<p>Stats are locked. I suppose that the idea is that you have the tables with same statistics as production for example, and you can load them with a subset of data but expect the same execution plans as in production. But this is not what I want for a migration.</p>
+<p>One possibility is to unlock the stats once you have imported the data.</p>
+<p>The other possibility is to import metadata without the statistics:
+<pre>
+Connected to: Oracle Database 12c Enterprise Edition Release 12.2.0.1.0 - 64bit Production
+Master table "SYS"."SYS_IMPORT_TABLE_01" successfully loaded/unloaded
+Starting "SYS"."SYS_IMPORT_TABLE_01":  "sys/********@//localhost/pdb1 AS SYSDBA" tables=DEMO.DEMO directory=TMP content=metadata_only exclude=index exclude=table_statistics
+Processing object type TABLE_EXPORT/TABLE/TABLE
+Job "SYS"."SYS_IMPORT_TABLE_01" successfully completed at Wed Sep 6 21:11:03 2017 elapsed 0 00:00:03
+</pre></p>
+<p>Then the table statistics are not locked:
+<pre>
+OWNER      TABLE_NAME           LAST_ANALYZED        STATTYPE_LOCKED        NUM_ROWS
+---------- -------------------- -------------------- -------------------- ----------
+DEMO       DEMO
+</pre></p>
+<p>Once you have changed what you want on the tables, you import the data (table_exists_action=truncate) and then you import the remaining: indexes, ref_constraints, triggers.
+This is where you can also add include=table_statistics:
+<pre>
+Starting "SYS"."SYS_IMPORT_TABLE_01":  "sys/********@//localhost/pdb1 AS SYSDBA" tables=DEMO.DEMO directory=TMP table_exists_action=truncate include=index include=table_statistics
+Processing object type TABLE_EXPORT/TABLE/INDEX/INDEX
+Processing object type TABLE_EXPORT/TABLE/INDEX/STATISTICS/INDEX_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/TABLE_STATISTICS
+Processing object type TABLE_EXPORT/TABLE/STATISTICS/MARKER
+</pre></p>
+<p>So that you have the statistics from the source, unlocked.
+<pre>
+OWNER      TABLE_NAME           LAST_ANALYZED        STATTYPE_LOCKED        NUM_ROWS
+---------- -------------------- -------------------- -------------------- ----------
+DEMO       DEMO                 06-SEP-17                                          1
+</pre></p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-185150"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+
+			<!-- If comments are open, but there are no comments. -->
+
+	 
+
+								<div id="respond" class="comment-respond">

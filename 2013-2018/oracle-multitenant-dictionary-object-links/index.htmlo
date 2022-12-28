@@ -1,0 +1,243 @@
+This was first published on <a href=https://blog.dbi-services.com/oracle-multitenant-dictionary-object-links>https://blog.dbi-services.com/oracle-multitenant-dictionary-object-links</a> (2014-12-29)
+								<h1 class="entry-title">Oracle multitenant dictionary: object links</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>I&#8217;ve described Oracle 12c metadata and object links internals in a <a href="http://www.dbi-services.com/index.php/blog/entry/oracle-12c-cdb-metadata-a-object-links-internals#comment-363">previous post</a>. But before that, the first time I investigated on it, I made a wrong assumption because I was looking at AUDIT_ACTIONS which is not correctly implemented. That investigation came from a question on <a href="http://www.dba-village.com/village/dvp_forum.OpenThread?ThreadIdA=69321#202961">dba-village</a>. And recently Ivica Arsov (<a href="https://twitter.com/IvicaArsov">@IvicaArsov</a>) has made an interesting <a href="http://www.dbi-services.com/index.php/blog/entry/oracle-12c-cdb-metadata-a-object-links-internals#comment-363">comment</a> about AUDIT_ACTIONS object link table, so I&#8217;ll explain here what is special with it.</p>
+<h3>AUDIT_ACTIONS</h3>
+<p>Here is how is defined AUDIT_ACTIONS:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select object_name,object_type,sharing from dba_objects where object_name in ('DBA_AUDIT_TRAIL','AUDIT_ACTIONS') order by object_name,object_type;
+
+OBJECT_NAME          OBJECT_TYPE     SHARING
+-------------------- --------------- -------------
+AUDIT_ACTIONS        SYNONYM         METADATA LINK
+AUDIT_ACTIONS        TABLE           OBJECT LINK
+DBA_AUDIT_TRAIL      SYNONYM         METADATA LINK
+DBA_AUDIT_TRAIL      VIEW            METADATA LINK
+</pre>
+<p>It&#8217;s a sharing=object table so you expect that the data is common to all containers. And we will also query a view that reads that table &#8211; DBA_AUDIT_TRAIL.</p>
+<p>Then let&#8217;s query the table from CDB$ROOT and from a PDB and check from ROWID if we read the same rows:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+
+SQL&gt; select rowid,action,name,dbms_rowid.rowid_to_absolute_fno(rowid,'SYS','AUDIT_ACTIONS') file_id from AUDIT_ACTIONS where action=3;
+
+ROWID                  ACTION NAME       FILE_ID
+------------------ ---------- ------- ----------
+AAABG7AABAAACo5AAD          3 SELECT           1
+
+SQL&gt; alter session set container=PDB1;
+Session altered.
+
+SQL&gt; select rowid,action,name,dbms_rowid.rowid_to_absolute_fno(rowid,'SYS','AUDIT_ACTIONS') file_id from AUDIT_ACTIONS where action=3;
+
+ROWID                  ACTION NAME       FILE_ID
+------------------ ---------- ------- ----------
+AAABG5AABAAAA3pAAD          3 SELECT           8
+
+</pre>
+<p>The rows are not coming from the same file, but from the local SYSTEM tablespace of each container. This is a proof that this OBJECT LINK table is not common at all.</p>
+<h3>DBA_AUDIT_TRAIL</h3>
+<p>Now I want to check what happens when we query through the view. I don&#8217;t have the ROWID so let&#8217;s update the table in the PDB so that we can distinguish rows coming from CDB$ROOT and from PDB1:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; update AUDIT_ACTIONS set name='select' where action=3;
+
+1 row updated.
+
+SQL&gt; select rowid,action,name from AUDIT_ACTIONS where action=3;
+
+ROWID                  ACTION NAME
+------------------ ---------- -------
+AAABG5AABAAAA3pAAD          3 select
+
+SQL&gt; select distinct dbid,action,action_name from DBA_AUDIT_TRAIL;
+
+      DBID     ACTION ACTION_NAME
+---------- ---------- ----------------------------
+ 314687597          3 select
+
+</pre>
+<p>Ok. I&#8217;ve changed one &#8216;ACTION_NAME&#8217; to lowercase &#8211; only in the PDB1. And when I query through the view I see the local row. This definitly prooves that the implementation of AUDIT_ACTIONS is not achieving the goal of multinenant dictionary: store common oracle objects only in CDB$ROOT to avoid duplication and faciliate upgrade. Note that it is not a big problem anyway as it is just a 200 rows table.</p>
+<h3>DBA_CPOOL_INFO</h3>
+<p>In order to show the normal behaviour of object links I&#8217;ll do the same with DBA_CPOOL_INFO which is a view over SYS.CPOOL$. I&#8217;ve described this behaviour <a href="http://www.dbi-services.com/index.php/blog/entry/oracle-12c-cdb-metadata-a-object-links-internals">previously</a> by creating my own objects but here I&#8217;ll show how it is used to store the DRCP information which is at CDB level. Here are the involved table and views:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; select object_name,object_type,sharing from dba_objects where object_name in ('CPOOL$','INT$DBA_CPOOL_INFO','DBA_CPOOL_INFO') order by object_name,object_type;
+
+OBJECT_NAME          OBJECT_TYPE     SHARING
+-------------------- --------------- -------------
+CPOOL$               TABLE           OBJECT LINK
+DBA_CPOOL_INFO       SYNONYM         METADATA LINK
+DBA_CPOOL_INFO       VIEW            METADATA LINK
+INT$DBA_CPOOL_INFO   VIEW            OBJECT LINK
+</pre>
+<p>CPOOL$ is defined with sharing=object. An internal view INT$DBA_CPOOL_INFO is defined on it with sharing=object as well. And finally that view is exposed through DBA_CPOOL_INFO.</p>
+<p>As before, I check the ROWID of CPOOL$ row from CDB$ROOT and PDB1:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+
+SQL&gt; select rowid,minsize,dbms_rowid.rowid_to_absolute_fno(rowid,'SYS','CPOOL$') file_id from SYS.CPOOL$;
+
+ROWID                 MINSIZE    FILE_ID
+------------------ ---------- ----------
+AAABz5AABAAADb5AAA          4          1
+
+SQL&gt; alter session set container=PDB1;
+Session altered.
+
+SQL&gt; select rowid,minsize,dbms_rowid.rowid_to_absolute_fno(rowid,'SYS','CPOOL$') file_id from SYS.CPOOL$;
+
+ROWID                 MINSIZE    FILE_ID
+------------------ ---------- ----------
+AAABz3AABAAABQJAAA          4          8
+
+</pre>
+<p>So this is the same as we have seen before: an OBJECT LINK has its data in each PDB.</p>
+<p>But what is different here is the view charing which is sharing=object. Let&#8217;s query that view after changing the value in PDB1:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; update SYS.CPOOL$ set minsize=0;
+1 row updated.
+
+SQL&gt; select rowid,minsize,dbms_rowid.rowid_to_absolute_fno(rowid,'SYS','CPOOL$') file_id from SYS.CPOOL$;
+
+ROWID                 MINSIZE    FILE_ID
+------------------ ---------- ----------
+AAABz3AABAAABQJAAA          0          8
+
+SQL&gt; select minsize from INT$DBA_CPOOL_INFO;
+
+   MINSIZE
+----------
+         4
+
+SQL&gt; select minsize from DBA_CPOOL_INFO;
+
+   MINSIZE
+----------
+         4
+
+</pre>
+<p>Now we have a view which will always show the CDB$ROOT rows, even when we are in a PDB container. We still have rows in the PDB containers, but they will not be used. Once again, this defeats the goal of deduplication, but this is a very small table.</p>
+<h3>AWR tables</h3>
+<p>The main advantage of multitenant dictionary architecture is with the big tables storing data which is common in the whole CDB, such as the AWR data:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+
+SQL&gt; select con_id,count(*) from containers(WRH$_SQLTEXT) group by con_id;
+
+    CON_ID   COUNT(*)
+---------- ----------
+         1       5549
+
+SQL&gt; alter session set container=PDB1;
+
+Session altered.
+
+SQL&gt; select count(*) from WRH$_SQLTEXT;
+
+  COUNT(*)
+----------
+         0
+
+</pre>
+<p>This information &#8211; stored only from CDB$ROOT &#8211; is shared in all PDB through the OBJECT LINK view.</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-5580"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> 3 Comments</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="comment even thread-even depth-1" id="comment-1381">
+				<div id="div-comment-1381" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/c88c1b791b98d01eb9edd095c1cabe64?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">Jure Bratina</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1381">
+			February 8, 2015 at 0 h 53 min</a>		</div>
+
+		<p>Hi Franck,</p>
+<p>After reading your very interesting posts about the multitenant database dictionary, I did some tests myself on a 12.1.0.2.0 instance, and still have some doubts, so I&#8217;d like to ask for your opinion. </p>
+<p>What&#8217;s the purpose of having object linked tables?
+If we create 3 pairs of tables in the root and pdb with sharing=metadata, another pair with sharing=object and another without sharing, the data in those respective pairs of tables seems to be independent of each other (so with a pair of object/metadata/none linked tables the data in the root is independent of the data in the pdb and apparently there&#8217;s no difference in how we declare the tables). As you pointed out here <a href="http://www.dba-village.com/village/dvp_forum.OpenThread?ThreadIdA=69321" rel="nofollow">http://www.dba-village.com/village/dvp_forum.OpenThread?ThreadIdA=69321</a> the documentation says that when an object is object linked &#8220;Oracle Database stores the data (not metadata) for an object only once in the root&#8221;, but as you noted for the object linked SYS.CPOOL$ table, it contains data both in the root and in the PDB.</p>
+<p>Is that maybe because such kind of linked tables are not meant to be created/maintained by &#8220;users&#8221; and thus Oracle doesn&#8217;t enforce checks on their contents (similar as modifying the data dictionary is not supported)?</p>
+<p>On the other hand, with object linked *views* on base tables, we always get the data from the root container, regardless if the underlying table pairs are created with sharing=metadata|object|none. Metadata linked views return only data from the current container. So for object linked views the purpose seems to be clear, that is to access common data (like AWR), but I don&#8217;t understand what&#8217;s the purpose of object linked tables?</p>
+<p>By the way, it&#8217;s also interesting Oracle allows to create pl/sql functions with sharing=object &#8211; their definition is stored only in the root, as for metadata linked functions, and it seems they also behave that way &#8211; I tested with a simple function which selects from a sharing=metadata|object|none table and it always returned data only for the current container.</p>
+<p>Thank you in advance and regards,
+Jure Bratina
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13821"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1381' onclick='return addComment.moveForm( "div-comment-1381", "1381", "respond", "557" )' aria-label='Reply to Jure to Jure Bratina'>Reply to Jure</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment byuser comment-author-franck-pachot bypostauthor odd alt thread-odd thread-alt depth-1" id="comment-1382">
+				<div id="div-comment-1382" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/9c04a89267afa42e63eeb3d620f4b873?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn"><a href='http://www.dbi-services.com/Blog' rel='external nofollow' class='url'>Franck Pachot</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1382">
+			February 8, 2015 at 18 h 16 min</a>		</div>
+
+		<p>Hi Jure,
+Thanks for your comment and for having tested all combinations. So it seems that sharing=object makes sense only for views. However we don&#8217;t know the internals.
+Don&#8217;t hesitate to comment further if you find something else.
+Regards,
+Franck.
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-13831"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1382' onclick='return addComment.moveForm( "div-comment-1382", "1382", "respond", "557" )' aria-label='Reply to Franck to Franck Pachot'>Reply to Franck</a></div>
+				</div>
+		</li><!-- #comment-## -->
+		<li class="comment even thread-even depth-1" id="comment-1431">
+				<div id="div-comment-1431" class="comment-body">
+				<div class="comment-author vcard">
+			<img alt='' src='https://secure.gravatar.com/avatar/259c5c76a05900d02c002e31ec183167?s=60&amp;d=https%3A%2F%2Fsecure.gravatar.com%2Favatar%2Fad516503a11cd5ca435acc9bb6523536%3Fs%3D60&amp;r=G' class='avatar avatar-60 photo' height='60' width='60' />			<cite class="fn">bruce</cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-1431">
+			April 17, 2015 at 9 h 50 min</a>		</div>
+
+		<p>Very Good Topic,
+ Its Really helpful&#8230;
+ Thanks a lot
+ keep it up&#8230;.
+(link deleted)
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-14321"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-1431' onclick='return addComment.moveForm( "div-comment-1431", "1431", "respond", "557" )' aria-label='Reply to bruce to bruce'>Reply to bruce</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">

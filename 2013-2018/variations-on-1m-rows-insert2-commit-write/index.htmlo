@@ -1,0 +1,145 @@
+This was first published on <a href=https://blog.dbi-services.com/variations-on-1m-rows-insert2-commit-write>https://blog.dbi-services.com/variations-on-1m-rows-insert2-commit-write</a> (2015-05-18)
+								<h1 class="entry-title">Variations on 1M rows insert(2): commit write</h1>
+		<div class="content-inner">
+			
+						
+						
+		   
+			<p>In the previous <a href="http://blog.dbi-services.com/variations-on-1m-rows-insert-1-bulk-insert/">blog post</a> I measured the time it takes to insert 1 million rows. About 45 seconds when done row-by-row which goes down to 7 seconds when inserted in bulk. In both case, the commit was done only at the end. But in some cases you need to commit at each row, in order to make it visible to other sessions as soon as it is inserted (think of several sessions inserting concurrently). And commit makes it also durable &#8211; available even after an instance crashes &#8211; and that supposes that the change is written to disk. What&#8217;s the cost for that?</p>
+<h3>Test case</h3>
+<p>Of course, I cannot do bulk insert for that as I want to commit for each row. I take the sane test as in the previous post. A table with a primary key (so only one index):</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">create table DEMO ("id" number , "text" varchar2(15), "number" number) ;
+</pre>
+<p>And the same PL/SQL except that I&#8217;ve added a COMMIT in the loop:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1">declare
+ type people_array is varray(12) of varchar(15);
+ people people_array := people_array( 'Marc', 'Bill', 'George', 'Eliot', 'Matt', 'Trey', 'Tracy','Greg', 'Steve', 'Kristina', 'Katie', 'Jeff' );
+ people_count number :=people.COUNT;
+ n number;
+begin
+ for i in 0..1e6 loop
+  n:=trunc(dbms_random.value(0,10000));
+  insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+  commit;
+ end loop;
+ commit;
+end;
+/
+</pre>
+<p>My test environment is still the <a href="http://www.oracle.com/technetwork/community/developer-vm/index.html">Oracle Developer Day 11g VM</a> with 1 CPU allocated from by VirtualBox.</p>
+<h3>simple commit in PL/SQL</h3>
+<p>Yes, this is a special case. I&#8217;m running that in a PL/SQL statement and PL/SQL has a special optimization here because the &#8216;commit successful&#8217; message is given to the user only at the end. Then the intermediate commits are lighter than commits that return to client. However, look at that 1 million insert + commit execution:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:02:16.34
+</pre>
+<p>We are far from the 45 seconds of row-by-row inserts that were committed only at the end. Commit has a big overhead.</p>
+<h3>commit write wait immediate</h3>
+<p>If you run the inserts from a client, doing a user call for each row, the special optimization is not there. In that case the commit waits for log writer and returns only when log writer has acknowledged the write to disk (and to SYNC standby database if you are in DataGuard). We can do the same from PL/SQL if we issue a COMMIT WRITE WAIT IMMEDIATE instead of a simple commit. So that&#8217;s a good way to compare the time without introducing additional roundtrip latency.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"> for i in 0..1e6 loop
+  n:=trunc(dbms_random.value(0,10000));
+  insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+  commit write wait immediate;
+ end loop;
+</pre>
+<p>When executing my procedure with the loop above, here is the time it takes:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:05:06.57
+</pre>
+<p>Time has doubled. This is the most expensive insert you can do. But it&#8217;s also the only way if you want to:</p>
+<ul>
+<li>Give commit feedback to the user at each commit</li>
+<li>Ensure that the commit is done as quick as possible (this is the IMMEDIATE write) favoring response time over throughput.</li>
+<li>Ensure that commit is durable (the D in ACID) meaning that we wait that the changes are on persistent storage (this is the WAIT write)</li>
+</ul>
+<p>As we can see here, those requirements have a cost.</p>
+<h3>commit write wait batch</h3>
+<p>We can favor the throughput with the BATCH commit logging instead of IMMEDIATE.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"> for i in 0..1e6 loop
+  n:=trunc(dbms_random.value(0,10000));
+  insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+  commit write wait batch;
+ end loop;
+</pre>
+<p>The optimization is not very high here where I&#8217;ve only one session doing all those inserts:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:04:28.97
+</pre>
+<p>but the redo size is reduced. I plan to show more statistics and wait events about it in a future post. The time spend here in the WAIT commits is mostly in that orange &#8216;log file sync&#8217; waits we don&#8217;t like to see on enterprise manager screen. The only point where session process is waiting for work that is expected to be done asynchronously in background. At commit, the session waits for the redo to be persisted.</p>
+<h3>commit write nowait immediate</h3>
+<p>If you are ok to loose a transaction even when the recent commit was successful, then you don&#8217;t have to wait. That seems to be heretic for ACID aficionados, but is totally acceptable for supporters of &#8216;eventual consistency&#8217;. I prefer to think about it according to business requirements.</p>
+<p>When something &#8211; external to the database &#8211; occurs when the commit is successful, then you must trust in ACID and you have to wait. When your customer withdraw money at the ATM then once they have their money you must be sure that the operation is commited in the database. A crash of the database should not give back the money on his account because he will not give back the bills.</p>
+<p>However, when you insert events coming from sensors (you can think Big Data) you probably want to keep them for a while in the database but you can accept to loose a few of them in the rare case of server crash. Especially if that improves a lot the performance and the scalability of the process. Maybe you can accept to loose some transactions. Or you are able to load them back again after a crash.
+Think of it like the NOLOGGING operations. It&#8217;s not what you want by default, but if you are sure about the business requirements, and the recover procedure, then you have new was to improve performance and scalability.</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"> for i in 0..1e6 loop
+  n:=trunc(dbms_random.value(0,10000));
+  insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+  commit write nowait immediate;
+ end loop;
+</pre>
+<p>And the improvement is obvious:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:02:08.75
+</pre>
+<p>When you don&#8217;t wait, obviously, you improve the response time and the scalability.</p>
+<h3>commit write nowait batch</h3>
+<p>And we can batch the redo record, as we did above, in addition to nowait:</p>
+<pre class="brush: actionscript3; gutter: true; first-line: 1"> for i in 0..1e6 loop
+  n:=trunc(dbms_random.value(0,10000));
+  insert into DEMO values( i , people( dbms_random.value(1,people_count) ) , n );
+  commit write nowait batch;
+ end loop;
+</pre>
+<p>And the improvement is obvious:</p>
+<pre class="brush: sql; gutter: true; first-line: 1">PL/SQL procedure successfully completed.
+Elapsed: 00:01:45.33
+</pre>
+<p>Let the log writer do its job in batch, without waiting for its acknowledgement, and the row-by-row commit overhead is minimized. And it&#8217;s ok as long as you know what you are doing:</p>
+<ul>
+<li>You can manage the loss of your transaction in case of server crash. Either by re-executing them or because the missing changes have no consequence.</li>
+<li>You do a WAIT commit when you return to the user a commit status, because he can do something you don&#8217;t manage and which depend on that commit status.</li>
+</ul>
+<h3>statement level, session level, instance level</h3>
+<p>I show only the statement level way to manage commit wait and commit logging because it&#8217;s a decision that must be done by developers. You can choose the same behavior with the commit_wait and commit_logging session parameters but that&#8217;s probably not the right option. As I said before, the commit behavior probably depends on where it is in the code. The final commit before returning to the user is probably managed differently.
+For the same reason, you probably don&#8217;t change those parameters at PDB or instance level. But there are always exceptions. If you are doing an application migration that is using the row-by-row API to insert data into the new system, then maybe you can do all that in NOWAIT BATCH by setting instance parameters. If it fails, you restart from the beginning (flashback database helps here).</p>
+<p>This kind of optimization exists also in SQL Server. David Barbarin has blogged about <a href="http://blog.dbi-services.com/sql-server-2014-classic-commit-vs-commit-with-delayed-durability-and-ios/">MSSQL delayed durability</a> previously. Want to meet in one day our experts from all technologies? Come to our <a href="http://www.dbi-services.com/index.php/newsroom-e/events/event-l-in-memory-r-boost-your-it-performance">Event In-Memory: boost your IT performance!</a> where we talk about SQL Server, Oracle and SAP HANA.</p>
+<p>And as we are talking about cross technology, stay tuned to see 1M row insert variations on other database systems&#8230;</p>
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels"><tr><td><nobr>&nbsp;</nobr></td><td><div class="rw-left"><div class="rw-ui-container rw-class-blog-post rw-urid-19480"></div></div></td></tr></table>							
+		</div><!--/content-inner-->
+<div class="comment-wrap ">
+
+	<h3 id="comments"> One Comment</h3>
+
+	<div class="navigation">
+		<div class="alignleft"></div>
+		<div class="alignright"></div>
+	</div>
+
+	<ul class="comment-list ">
+				<li class="pingback even thread-even depth-1" id="comment-134">
+				<div id="div-comment-134" class="comment-body">
+				<div class="comment-author vcard">
+						<cite class="fn"><a href='http://danielwestermann.com/2015/05/05/variations-on-1m-rows-insert2-commit-write/' rel='external nofollow' class='url'>Variations on 1M rows insert(2): commit write &laquo; Daniel Westermann&#039;s Blog</a></cite> <span class="says">says:</span>		</div>
+		
+		<div class="comment-meta commentmetadata"><a href="index.html#comment-134">
+			August 14, 2015 at 10 h 21 min</a>		</div>
+
+		<p>[&#8230;] Oracle post done by my colleague Franck Pachot: Variations on 1M rows insert(2): commit write [&#8230;]
+<table class="rw-rating-table rw-ltr rw-left rw-no-labels">
+<tr>
+<td><nobr>&nbsp;</nobr></td>
+<td>
+<div class="rw-left">
+<div class="rw-ui-container rw-class-comment rw-urid-1351"></div>
+</div>
+</td>
+</tr>
+</table>
+
+		<div class="reply"><a class='comment-reply-link' href='index.html#comment-134' onclick='return addComment.moveForm( "div-comment-134", "134", "respond", "1947" )' aria-label='Reply to Variations to Variations on 1M rows insert(2): commit write &laquo; Daniel Westermann&#039;s Blog'>Reply to Variations</a></div>
+				</div>
+		</li><!-- #comment-## -->
+	</ul>
+
+ 
+
+								<div id="respond" class="comment-respond">
