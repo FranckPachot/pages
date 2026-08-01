@@ -19,6 +19,7 @@ SITE_URL = "https://franckpachot.github.io/pages/"
 
 
 SOURCE_NAMES = {
+    "cern": "CERN",
     "dbi-services": "DBI Services",
     "dev.to": "Dev.to",
     "medium": "Medium",
@@ -115,11 +116,16 @@ def normalize_text(value: str) -> str:
 def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
     path = root / article["archive_path"]
     source = article["source"]
-    if source in {"dbi-services", "medium", "microsoft-techcommunity"}:
+    if source in {"medium", "microsoft-techcommunity"} or (
+        source == "dbi-services" and path.suffix.casefold() == ".html"
+    ):
         document = path.read_text(encoding="utf-8", errors="replace")
         return html_text(document), html_description(document)
 
     value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
+    if source == "dbi-services":
+        body = html_text(value.get("content", {}).get("rendered", ""))
+        return body, ""
     if source == "dev.to":
         body = value.get("body_markdown") or html_text(value.get("body_html", ""))
         return normalize_text(body), normalize_text(value.get("description", ""))
@@ -127,6 +133,9 @@ def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
         body = html_text(value.get("content", {}).get("rendered", ""))
         description = value.get("yoast_head_json", {}).get("description", "")
         return body, normalize_text(description)
+    if source == "cern":
+        body = html_text(value.get("attributes", {}).get("body", {}).get("processed", ""))
+        return body, ""
     return "", ""
 
 
@@ -317,7 +326,22 @@ def write_sitemap(path: Path, catalog: dict[str, Any]) -> None:
         publication for publication in catalog["publications"]
         if publication["source_key"] in {"dbi-services", "medium"}
     ]
-    entries = [f"  <url><loc>{SITE_URL}</loc></url>"]
+    static_pages = [
+        "",
+        "minibook/",
+        "minibook/sql-isolation/",
+        "minibook/indexes-and-access-paths/",
+        "minibook/postgresql-query-planning/",
+        "minibook/distributed-sql-for-postgresql/",
+        "minibook/foreign-keys-and-concurrency/",
+        "minibook/sql-statement-lifecycle/",
+        "minibook/database-time-and-ordering/",
+        "minibook/scalable-pagination/",
+        "minibook/postgresql-mvcc-backstage/",
+        "minibook/schema-design-for-concurrency/",
+        "minibook/oracle-to-postgresql/",
+    ]
+    entries = [f"  <url><loc>{SITE_URL}{page}</loc></url>" for page in static_pages]
     for publication in local_pages:
         url = SITE_URL + quote(publication["archive_url"], safe="/-._~")
         entries.append(f"  <url><loc>{html.escape(url)}</loc><lastmod>{publication['date']}</lastmod></url>")

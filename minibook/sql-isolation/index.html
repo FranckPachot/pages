@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="A practical minibook by Franck Pachot about SQL transaction isolation, MVCC, concurrency anomalies, locking, and product-specific behavior in PostgreSQL, Oracle, YugabyteDB, and MongoDB.">
+  <meta name="author" content="Franck Pachot">
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1">
+  <link rel="canonical" href="https://franckpachot.github.io/pages/minibook/sql-isolation/">
+  <link rel="icon" type="image/png" href="../../favicon.png">
+  <meta property="og:type" content="article">
+  <meta property="og:title" content="SQL Isolation Levels: From Anomalies to Application Design">
+  <meta property="og:description" content="A field guide to MVCC, locks, snapshots, serialization, and the SQL patterns that preserve business invariants.">
+  <meta property="og:url" content="https://franckpachot.github.io/pages/minibook/sql-isolation/">
+  <meta property="og:image" content="https://franckpachot.github.io/pages/franck-pachot-linkedin.jpg">
+  <title>SQL Isolation Levels: From Anomalies to Application Design | Franck Pachot</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&amp;family=IBM+Plex+Sans:wght@400;500;600&amp;family=Newsreader:opsz,wght@6..72,500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "TechArticle",
+    "headline": "SQL Isolation Levels: From Anomalies to Application Design",
+    "description": "A practical field guide to SQL transaction isolation, MVCC, locking, and concurrency anomalies.",
+    "author": {"@type": "Person", "name": "Franck Pachot", "url": "https://franckpachot.github.io/pages/"},
+    "url": "https://franckpachot.github.io/pages/minibook/sql-isolation/",
+    "proficiencyLevel": "Intermediate",
+    "keywords": ["SQL", "transaction isolation", "MVCC", "serializable", "snapshot isolation", "read committed", "PostgreSQL", "Oracle", "YugabyteDB", "MongoDB"]
+  }
+  </script>
+</head>
+<body>
+  <header class="book-bar">
+    <a class="book-bar__author" href="../../">
+      <img src="../../franck-pachot-linkedin.jpg" alt="" width="42" height="42">
+      <span><strong>Franck Pachot</strong><small>Database Developer Advocate</small></span>
+    </a>
+    <span class="book-bar__label">Field guide · SQL concurrency</span>
+    <a class="book-bar__back" href="../../?category=Transactions+%26+Consistency">All articles</a>
+  </header>
+
+  <div class="reading-progress" aria-hidden="true"><span id="reading-progress"></span></div>
+
+  <div class="book-layout">
+    <aside class="contents" aria-label="Table of contents">
+      <p class="contents__title">Contents</p>
+      <ol>
+        <li><a href="#mental-model">The mental model</a></li>
+        <li><a href="#anomalies">Name the anomaly</a></li>
+        <li><a href="#levels">The isolation spectrum</a></li>
+        <li><a href="#mvcc">MVCC and locking</a></li>
+        <li><a href="#write-skew">Write skew</a></li>
+        <li><a href="#products">Product semantics</a></li>
+        <li><a href="#patterns">Application patterns</a></li>
+        <li><a href="#decision-guide">Decision guide</a></li>
+        <li><a href="#resources">Talks and sources</a></li>
+      </ol>
+      <div class="contents__status"><span></span> Living minibook</div>
+    </aside>
+
+    <main>
+      <article class="book">
+        <header class="hero">
+          <p class="eyebrow">A practical minibook</p>
+          <h1>SQL Isolation Levels</h1>
+          <p class="hero__subtitle">From anomalies to application design</p>
+          <p class="hero__lede">Isolation is not a ladder from “unsafe” to “safe.” It is a contract between concurrent transactions, the database engine, and your application. This guide builds that contract from observable histories, then maps it to SQL levels, MVCC implementations, locks, and data models.</p>
+          <div class="hero__meta">
+            <span>Franck Pachot</span>
+            <span>~35 minute read</span>
+            <span>PostgreSQL · Oracle · YugabyteDB · MongoDB</span>
+          </div>
+          <div class="hero__actions">
+            <a class="button button--primary" href="https://docs.google.com/presentation/d/1gg8C7ibCRM0iJ92GVUTdqmeKZUXmlLaeM-4vJd2uoU0/present?slide=id.g2744dcb62d9_0_144">Open the 29-slide presentation</a>
+            <a class="button" href="#resources">Browse source articles</a>
+          </div>
+        </header>
+
+        <section class="premise" aria-label="Central premise">
+          <p>Correctness lives in <strong>business invariants</strong>, not in an isolation-level name.</p>
+          <span>A level is useful only when you know which histories it permits, what the engine detects, and what the application must retry or lock.</span>
+        </section>
+
+        <section id="mental-model" class="chapter">
+          <p class="chapter__number">01</p>
+          <h2>Start with a history, not a label</h2>
+          <p class="chapter__intro">A transaction reads a state, makes a decision, and attempts to publish a new state. Isolation asks whether concurrent decisions can be ordered as if they happened one after another.</p>
+
+          <div class="diagram timeline-diagram" role="img" aria-label="Two concurrent transactions read the same initial value and write conflicting updates">
+            <div class="timeline-diagram__label">Time</div>
+            <div class="timeline-diagram__axis"></div>
+            <div class="transaction transaction--a">
+              <strong>Transaction A</strong>
+              <span class="event event--read">read x = 10</span>
+              <span class="event event--decide">decide + 5</span>
+              <span class="event event--write">write x = 15</span>
+            </div>
+            <div class="transaction transaction--b">
+              <strong>Transaction B</strong>
+              <span class="event event--read">read x = 10</span>
+              <span class="event event--decide">decide − 3</span>
+              <span class="event event--write">write x = 7</span>
+            </div>
+          </div>
+
+          <p>The final value may be <code>7</code>, silently erasing A's update. Or the second writer may wait, restart, or fail. All are implementation choices. The application contract must say which outcome is acceptable.</p>
+
+          <div class="concept-grid">
+            <div><span>Atomicity</span><strong>All or nothing</strong><p>The transaction does not expose half of its work.</p></div>
+            <div><span>Consistency</span><strong>Invariants survive</strong><p>The schema and application define what “valid” means.</p></div>
+            <div><span>Isolation</span><strong>Concurrent histories</strong><p>Readers and writers observe a constrained ordering.</p></div>
+            <div><span>Durability</span><strong>Commit persists</strong><p>A successful commit survives the promised failures.</p></div>
+          </div>
+
+          <aside class="note"><strong>Two different meanings of consistency</strong><p>ACID consistency means preserving invariants. Distributed-systems consistency often describes when replicas expose a write. Do not substitute one for the other.</p></aside>
+        </section>
+
+        <section id="anomalies" class="chapter">
+          <p class="chapter__number">02</p>
+          <h2>Name the anomaly before choosing the remedy</h2>
+          <p class="chapter__intro">The classic SQL phenomena are useful vocabulary, but production failures are easier to reason about as dependency cycles: what did each transaction read, and which facts did it invalidate?</p>
+
+          <div class="anomaly-table" role="table" aria-label="Concurrency anomaly reference">
+            <div class="anomaly-table__head" role="row"><span>Phenomenon</span><span>What happens</span><span>Typical defense</span></div>
+            <div role="row"><strong>Dirty read</strong><span>A transaction reads data another transaction has not committed.</span><span>Read Committed or MVCC visibility.</span></div>
+            <div role="row"><strong>Dirty write</strong><span>One uncommitted write overwrites another uncommitted write.</span><span>Write locks; virtually every transactional SQL engine prevents it.</span></div>
+            <div role="row"><strong>Non-repeatable read</strong><span>The same row returns a different committed value later in one transaction.</span><span>Transaction snapshot or explicit lock.</span></div>
+            <div role="row"><strong>Phantom</strong><span>A repeated predicate finds a different set of rows.</span><span>Predicate/range protection or serialization detection.</span></div>
+            <div role="row"><strong>Lost update</strong><span>A read-modify-write cycle erases a concurrent update.</span><span>Atomic DML, row lock, version check, or abort/retry.</span></div>
+            <div role="row"><strong>Write skew</strong><span>Transactions update different rows after reading a shared invariant.</span><span>Serializable, explicit invariant lock, assertion, or remodel.</span></div>
+            <div role="row"><strong>Read skew</strong><span>A query or transaction combines values from incompatible moments.</span><span>Statement or transaction snapshot, depending on the invariant.</span></div>
+          </div>
+
+          <pre><code>-- Fragile read-modify-write
+SELECT balance FROM account WHERE id = 42;
+-- application computes a new value
+UPDATE account SET balance = :new_balance WHERE id = 42;
+
+-- Prefer one atomic statement when the rule is local to the row
+UPDATE account
+SET balance = balance - :amount
+WHERE id = 42
+  AND balance >= :amount;</code></pre>
+          <p>The second statement turns the predicate and mutation into one database operation. It narrows the isolation problem instead of asking a broad isolation level to repair an avoidable race.</p>
+        </section>
+
+        <section id="levels" class="chapter">
+          <p class="chapter__number">03</p>
+          <h2>The isolation spectrum is not one-dimensional</h2>
+          <p class="chapter__intro">SQL names describe intent, but engines reach that intent through different mechanisms. The most important distinction is often not the name; it is whether the snapshot is refreshed per statement or held for the transaction, and whether dangerous histories are blocked or detected.</p>
+
+          <div class="level-map">
+            <article><span class="level-map__index">00</span><h3>Non-transactional writes</h3><p>Atomicity may stop at one operation. Cross-record invariants belong to the application or data model.</p></article>
+            <article><span class="level-map__index">01</span><h3>Read Uncommitted</h3><p>The SQL standard permits dirty reads, though MVCC engines may implement it as Read Committed.</p></article>
+            <article class="level-map__active"><span class="level-map__index">02</span><h3>Read Committed</h3><p>Only committed versions are visible. A new statement can see a newer world than the previous statement.</p></article>
+            <article><span class="level-map__index">03</span><h3>Repeatable Read</h3><p>Often a transaction-level snapshot. The name does not guarantee full serializability or identical behavior across products.</p></article>
+            <article><span class="level-map__index">04</span><h3>Snapshot Isolation</h3><p>Readers use a stable snapshot; write-write conflicts are controlled. Write skew can remain.</p></article>
+            <article class="level-map__strong"><span class="level-map__index">05</span><h3>Serializable</h3><p>Committed transactions are equivalent to some serial order. Waiting or aborts are part of the contract.</p></article>
+          </div>
+
+          <h3>Statement snapshot versus transaction snapshot</h3>
+          <div class="diagram snapshot-diagram" role="img" aria-label="Read Committed takes a snapshot for each statement while Repeatable Read keeps one transaction snapshot">
+            <div class="snapshot-row"><strong>Read Committed</strong><span class="snapshot">S₁</span><span class="snapshot">S₂</span><span class="snapshot">S₃</span><small>Each statement may see newly committed data</small></div>
+            <div class="snapshot-row"><strong>Repeatable Read / SI</strong><span class="snapshot snapshot--wide">S₁ held for the transaction</span><small>Stable view; conflicts may abort at write or commit</small></div>
+          </div>
+
+          <blockquote>“Serializable” is a semantic guarantee. “Snapshot” is a visibility mechanism. One does not imply the other.</blockquote>
+        </section>
+
+        <section id="mvcc" class="chapter">
+          <p class="chapter__number">04</p>
+          <h2>MVCC removes read/write blocking, not coordination</h2>
+          <p class="chapter__intro">Multi-Version Concurrency Control lets readers find a visible committed version while writers create a new one. This is excellent for concurrency, but old versions cannot enforce a future business invariant.</p>
+
+          <div class="diagram version-chain" role="img" aria-label="MVCC version chain with transaction snapshots seeing different row versions">
+            <div class="version-chain__versions">
+              <span class="version version--old"><small>v1</small>balance 100</span>
+              <i>→</i>
+              <span class="version"><small>v2</small>balance 80</span>
+              <i>→</i>
+              <span class="version version--new"><small>v3</small>balance 120</span>
+            </div>
+            <div class="version-chain__views"><span>Snapshot A sees v1</span><span>Snapshot B sees v2</span><span>New statement sees v3</span></div>
+          </div>
+
+          <p>Locks and MVCC solve different parts of the problem:</p>
+          <ul class="check-list">
+            <li><strong>MVCC visibility</strong> chooses which committed version a reader can see.</li>
+            <li><strong>Row or key locks</strong> coordinate writers that touch the same protected object.</li>
+            <li><strong>Predicate protection</strong> covers facts such as “no row exists in this range.”</li>
+            <li><strong>Serialization detection</strong> observes dependency patterns and aborts a transaction before an impossible history commits.</li>
+          </ul>
+
+          <pre><code>BEGIN;
+SELECT balance
+FROM account
+WHERE id = 42
+FOR UPDATE;
+
+-- The row now represents the coordination point.
+UPDATE account SET balance = balance - 50 WHERE id = 42;
+COMMIT;</code></pre>
+          <p><code>SELECT FOR UPDATE</code> expresses an intention to modify the selected rows. It cannot lock a row that does not exist, and it does not automatically protect an arbitrary aggregate or predicate.</p>
+        </section>
+
+        <section id="write-skew" class="chapter chapter--feature">
+          <p class="chapter__number">05</p>
+          <h2>Write skew: when every row is valid and the database is wrong</h2>
+          <p class="chapter__intro">The doctor's on-call example is the canonical demonstration. The invariant says at least one doctor must remain on call. Alice and Bob each see two doctors, then update different rows. There is no write-write conflict, yet both can leave.</p>
+
+          <div class="diagram doctors-diagram" role="img" aria-label="Alice and Bob concurrently observe two doctors on call then each switch off a different row, violating the invariant">
+            <div class="doctor-path doctor-path--a"><strong>Transaction A</strong><span>reads Alice ✓ Bob ✓</span><span>sets Alice off</span><span class="commit">COMMIT</span></div>
+            <div class="doctor-invariant"><span>Invariant</span><strong>COUNT(on_call) ≥ 1</strong><small>Both snapshots satisfy it. The combined result does not.</small></div>
+            <div class="doctor-path doctor-path--b"><strong>Transaction B</strong><span>reads Alice ✓ Bob ✓</span><span>sets Bob off</span><span class="commit">COMMIT</span></div>
+          </div>
+
+          <h3>Four ways to preserve the invariant</h3>
+          <ol class="strategies">
+            <li><strong>Serializable plus retry.</strong><span>Let the engine detect the dangerous dependency cycle. Treat serialization failure as a normal control-flow result.</span></li>
+            <li><strong>Lock a shared invariant row.</strong><span>Make both transactions contend on one shift record before changing doctor assignments.</span></li>
+            <li><strong>Encode the rule in the model.</strong><span>Normalization, a unique structure, or an assertion can move correctness closer to declarative data integrity.</span></li>
+            <li><strong>Use one atomic statement.</strong><span>When possible, combine the checked predicate and mutation so they share one statement snapshot and write operation.</span></li>
+          </ol>
+
+          <aside class="note note--warning"><strong>A constraint is more than validation</strong><p>A well-chosen unique or exclusion constraint also supplies a precise concurrency control point. It can scale better than serializing every transaction because only conflicting keys or ranges coordinate.</p></aside>
+        </section>
+
+        <section id="products" class="chapter">
+          <p class="chapter__number">06</p>
+          <h2>Same SQL name, different operational contract</h2>
+          <p class="chapter__intro">Portable SQL syntax does not make concurrency behavior portable. Defaults, snapshots, lock timing, retry errors, and even the meaning behind a level name vary.</p>
+
+          <div class="product-matrix" role="table" aria-label="High-level comparison of transaction isolation behavior">
+            <div class="product-matrix__head" role="row"><span>System</span><span>Common default</span><span>Stable transaction snapshot</span><span>Serializable mechanism</span></div>
+            <div role="row"><strong>PostgreSQL</strong><span>Read Committed</span><span>Repeatable Read</span><span>SSI detects dangerous structures; applications retry serialization failures.</span></div>
+            <div role="row"><strong>Oracle Database</strong><span>Read Committed</span><span><code>SERIALIZABLE</code> uses snapshot semantics</span><span>Its historical naming needs care: write conflicts can raise ORA-08177, while the guarantee is not identical to PostgreSQL SSI.</span></div>
+            <div role="row"><strong>YugabyteDB</strong><span>Varies by API/version; Serializable is central</span><span>Distributed hybrid-time snapshots</span><span>Conflict detection and transparent internal restarts where safe; clients must still handle retryable failures.</span></div>
+            <div role="row"><strong>MongoDB</strong><span>Operation-level atomicity; configurable concerns</span><span>Snapshot read concern in transactions</span><span>Transactions, data modeling, unique indexes, and assertions-like coordination solve different invariant scopes.</span></div>
+          </div>
+
+          <aside class="note"><strong>Verify against the deployed version</strong><p>This matrix is a reasoning guide, not a substitute for product documentation and tests. Defaults and implementation details evolve. Run the two-session history that represents your invariant.</p></aside>
+
+          <h3>Why Oracle “serializable” needs qualification</h3>
+          <p>Oracle's level historically called <code>SERIALIZABLE</code> gives a transaction-consistent snapshot and rejects some conflicting updates with <code>ORA-08177</code>. Snapshot isolation is stronger than ordinary Read Committed, but a stable snapshot alone is not the general definition of serializability. The distinction matters for write skew and predicate-based invariants.</p>
+
+          <h3>Why distributed SQL makes retries visible</h3>
+          <p>A distributed database coordinates keys across nodes and clocks. Waiting forever would preserve correctness but destroy availability and latency. Optimistic conflict detection, transaction restarts, and explicit retry errors are therefore not defects; they are part of the isolation API.</p>
+        </section>
+
+        <section id="patterns" class="chapter">
+          <p class="chapter__number">07</p>
+          <h2>Design patterns that make isolation explicit</h2>
+
+          <div class="pattern-list">
+            <article><span>Pattern 01</span><h3>Atomic conditional DML</h3><p>Put the precondition in the <code>WHERE</code> clause and verify the affected-row count.</p><pre><code>UPDATE inventory
+SET quantity = quantity - :requested
+WHERE sku = :sku
+  AND quantity >= :requested;</code></pre></article>
+            <article><span>Pattern 02</span><h3>Optimistic version check</h3><p>Reject a stale decision without holding a lock during application work.</p><pre><code>UPDATE document
+SET body = :body, version = version + 1
+WHERE id = :id
+  AND version = :version_read;</code></pre></article>
+            <article><span>Pattern 03</span><h3>Pessimistic coordination</h3><p>Lock the row that truly represents the invariant, in a stable order, and keep the transaction short.</p><pre><code>SELECT id FROM shift
+WHERE id = :shift_id
+FOR UPDATE;</code></pre></article>
+            <article><span>Pattern 04</span><h3>Serializable retry loop</h3><p>Retry the entire transaction with bounded exponential backoff and idempotent external effects.</p><pre><code>for attempt in retry_budget:
+    try:
+        begin_serializable()
+        apply_business_transaction()
+        commit()
+        break
+    except SerializationFailure:
+        rollback()
+        backoff(attempt)</code></pre></article>
+          </div>
+
+          <h3>The retry boundary is the transaction boundary</h3>
+          <p>Do not retry only the failed statement: its inputs may have come from a now-invalid snapshot. Re-run every read and decision in the transaction. Keep emails, payments, and messages idempotent or publish them through an outbox committed with the data.</p>
+
+          <div class="retry-flow" role="img" aria-label="Serializable transaction retry flow">
+            <span>BEGIN</span><i>→</i><span>read + decide</span><i>→</i><span>write</span><i>→</i><span>COMMIT</span><b>serialization failure</b><em>↺ backoff and restart all reads</em>
+          </div>
+        </section>
+
+        <section id="decision-guide" class="chapter">
+          <p class="chapter__number">08</p>
+          <h2>A decision guide for real applications</h2>
+          <div class="decision-tree">
+            <div class="decision-tree__question"><span>1</span><p>Can the invariant be expressed by a unique, exclusion, check, or foreign-key constraint?</p><strong>Use the constraint first.</strong></div>
+            <div class="decision-tree__question"><span>2</span><p>Can the check and change be one conditional SQL statement?</p><strong>Prefer atomic DML.</strong></div>
+            <div class="decision-tree__question"><span>3</span><p>Does every conflicting transaction touch one known row or key?</p><strong>Lock that coordination point.</strong></div>
+            <div class="decision-tree__question"><span>4</span><p>Does the invariant span an open predicate, aggregate, or changing set?</p><strong>Use Serializable and retry, or remodel the invariant.</strong></div>
+            <div class="decision-tree__question"><span>5</span><p>Are retries expensive because transactions include network calls?</p><strong>Shorten the transaction; use idempotency and an outbox.</strong></div>
+          </div>
+
+          <h3>Test the history, not just the happy path</h3>
+          <ul class="check-list">
+            <li>Open two independent sessions and pause them at controlled points.</li>
+            <li>Record values read, locks waited on, errors returned, and final committed state.</li>
+            <li>Test the configured default and every level the application explicitly requests.</li>
+            <li>Repeat after database upgrades and driver or connection-pool changes.</li>
+            <li>Monitor serialization failures and deadlocks as expected concurrency signals, not generic server faults.</li>
+          </ul>
+
+          <section class="summary-box">
+            <h3>The compact rulebook</h3>
+            <ol>
+              <li>Write the invariant in one sentence.</li>
+              <li>Identify all rows and missing rows that influence it.</li>
+              <li>Prefer declarative constraints and atomic SQL.</li>
+              <li>Choose the snapshot and coordination mechanism deliberately.</li>
+              <li>Assume aborts can happen; design a correct retry boundary.</li>
+              <li>Verify behavior on the actual engine and version.</li>
+            </ol>
+          </section>
+        </section>
+
+        <section id="resources" class="chapter resources">
+          <p class="chapter__number">09</p>
+          <h2>Presentation, videos, and source articles</h2>
+          <p class="chapter__intro">This minibook synthesizes the following original material. The links remain part of the text so each claim can be followed back to its experiment and discussion.</p>
+
+          <div class="featured-resource">
+            <span>Presentation · 29 slides</span>
+            <h3>Isolation Levels and MVCC in SQL Databases: A Technical Comparative Study</h3>
+            <p>The visual companion to this guide, covering the comparative model and product behavior.</p>
+            <a href="https://docs.google.com/presentation/d/1gg8C7ibCRM0iJ92GVUTdqmeKZUXmlLaeM-4vJd2uoU0/present?slide=id.g2744dcb62d9_0_144">View presentation →</a>
+          </div>
+
+          <div class="media-resources">
+            <a href="https://www.youtube.com/live/-0_9Tl-ooV0?si=bHECA6iaQBe6SBE6&amp;t=1286">
+              <span>Video · YugabyteDB Open Hours</span>
+              <strong>Wait-on-Conflict and Read Committed</strong>
+              <small>Watch from the concurrency demonstration at 21:26 →</small>
+            </a>
+            <a href="https://prezi.com/uzdd5ttg4cu0/indexing-foreign-keys-in-oracle/">
+              <span>Presentation · Oracle</span>
+              <strong>Indexing Foreign Keys in Oracle</strong>
+              <small>Range locking, referential integrity, and concurrency →</small>
+            </a>
+          </div>
+
+          <h3>The original 13-part series</h3>
+          <ol class="bibliography bibliography--series">
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-i-introduction-bd5">Introduction</a><span>Why isolation is an application concern.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-ii-characteristics-and-use-case-21e0">Characteristics and use cases</a><span>How guarantees map to workloads.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-iii-main-concepts-55lg">Main concepts</a><span>Vocabulary for histories and concurrency.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-iv-serializable-flp">Serializable</a><span>The semantic target.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-v-read-only-323h">Read Only</a><span>Consistent reporting and snapshots.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-vi-snapshot-isolation-15k">Snapshot Isolation</a><span>Stable visibility and its limits.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-vii-repeatable-read-l11">Repeatable Read</a><span>Names versus implementations.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-viii-cursor-stability-40lm">Cursor Stability</a><span>Lock-oriented history.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-ix-read-committed-3lll">Read Committed</a><span>Statement snapshots and practical defaults.</span></li>
+            <li><a href="https://dev.to/yugabyte/isolation-levels-part-x-non-transactional-writes-1497">Non-Transactional Writes</a><span>When atomic scope is smaller.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-xi-read-uncommitted-36fi">Read Uncommitted</a><span>The weakest standard level.</span></li>
+            <li><a href="https://dev.to/franckpachot/isolation-levels-part-xii-to-go-further-n89">To go further</a><span>Models beyond the standard phenomena.</span></li>
+            <li><a href="https://dev.to/yugabyte/isolation-levels-part-xiii-explicit-locking-with-select-for-update-intention-4na3">Explicit locking with SELECT FOR UPDATE</a><span>Making write intention visible.</span></li>
+          </ol>
+
+          <h3>Applied studies</h3>
+          <div class="bibliography bibliography--cards">
+            <a href="https://dev.to/aws-heroes/read-committed-anomalies-in-postgresql-1ieg"><strong>READ COMMITTED anomalies in PostgreSQL</strong><span>Statement snapshots under concurrent DML.</span></a>
+            <a href="https://dev.to/yugabyte/dirty-writes-insert-on-conflict-do-update-read-committed-isolation-level-and-lost-update-13hk"><strong>Dirty writes and lost updates</strong><span>UPSERT, write locking, and Read Committed.</span></a>
+            <a href="https://dev.to/yugabyte/repeatable-read-with-wait-on-conflict-and-restarts-3fmp"><strong>Repeatable Read with wait-on-conflict</strong><span>Restarts as concurrency control.</span></a>
+            <a href="https://dev.to/yugabyte/the-doctors-on-call-shift-example-in-a-normalized-relational-schema-to-avoid-write-skew-4hhf"><strong>Doctor's on-call shift</strong><span>Normalize the invariant to avoid write skew.</span></a>
+            <a href="https://dev.to/aws-heroes/you-probably-dont-need-serializable-isolation-131g"><strong>You probably don't need Serializable</strong><span>Prefer precise constraints and coordination.</span></a>
+            <a href="https://dev.to/aws-heroes/a-brief-example-of-a-serializable-transaction-with-ansiiso-sql-1a70"><strong>A brief serializable transaction</strong><span>A compact ANSI SQL history.</span></a>
+            <a href="https://dev.to/yugabyte/indexing-for-a-scalable-serialization-isolation-level-36e2"><strong>Indexing for scalable serialization</strong><span>Access paths influence conflict scope and cost.</span></a>
+            <a href="../../2013-2018/oracle-serializable-is-not-serializable/index.html"><strong>Oracle serializable is not serializable</strong><span>An earlier investigation of snapshot semantics and naming.</span></a>
+          </div>
+
+          <h3>Video channel</h3>
+          <p>Recordings and short technical explanations are collected on <a href="https://www.youtube.com/@franckpachot">Franck Pachot's YouTube channel</a>. The presentation link above is the canonical visual companion currently verified for this minibook.</p>
+        </section>
+
+        <footer class="book-footer">
+          <div><strong>Franck Pachot</strong><span>🇨🇭 Database Developer Advocate</span></div>
+          <p>This is a living synthesis of experiments published from 2016 to 2024. Product behavior should always be verified against the version you deploy.</p>
+          <a href="../../">Explore all database articles →</a>
+        </footer>
+      </article>
+    </main>
+  </div>
+
+  <script src="book.js"></script>
+</body>
+</html>
