@@ -1,0 +1,1332 @@
+{
+  "id": 5301,
+  "date": "2021-11-19T08:00:00",
+  "date_gmt": "2021-11-19T16:00:00",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=5301"
+  },
+  "modified": "2025-06-17T12:59:15",
+  "modified_gmt": "2025-06-17T19:59:15",
+  "slug": "distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/",
+  "title": {
+    "rendered": "Distributed SQL: Sharding and Partitioning in YugabyteDB"
+  },
+  "content": {
+    "rendered": "<p>A <a href=\"https://www.yugabyte.com/distributed-sql/\">distributed SQL database</a> provides a service where you can query the global database without knowing where the rows are. You connect to any node, without having to know the cluster topology. You query your tables, and the database will determine the best access to your data, whether it’s close to your client or geographically distant.</p>\n<p>The organization of data, whether co-located or partitioned, is the most important consideration for high performance, high availability, and geo-distribution. <a href=\"/yugabytedb/\">YugabyteDB</a> has several features that help here. These features can be divided into three levels of physical organization:</p>\n<ul>\n<li>At the query level (YSQL), using the PostgreSQL syntax, the user partitions a logical table into multiple ones, based on column values. This is called table partitioning.</li>\n<li>At the storage level (DocDB), using the primary key and index column definition, we distribute rows into multiple tablets. We call this <a href=\"/tech/database-sharding/\">sharding</a>.</li>\n<li>At the file level, the rows—or index entries—are stored on the key, within each Sorted Sequence Table (SST).</li>\n</ul>\n<p>In this blog post, we’ll discuss the relevant terms and definitions behind sharding and partitioning in YugabyteDB and show you how to use both correctly.</p>\n<h2 style=\"text-align: left;\">Sharded vs. Distributed</h2>\n<p>Partitioning is a general term, and sharding is commonly used for horizontal partitioning to scale-out the database in a shared-nothing architecture. But these terms are used for different architectural concepts. However, since YugabyteDB provides both, it’s important to use the right terminology.</p>\n<p>Here are three general definitions before we dive into the YugabyteDB architecture.</p>\n<h3 style=\"text-align: left;\">Application sharding</h3>\n<p>If you split your data into multiple databases, this can be called sharding. For example, let&#8217;s say you have a database for your EMEA customers: one for the US, and one for Asia. The application connects to one or the other depending on the country code of the user. This is called application sharding, but is not a distributed database. You don&#8217;t need any special database for that, only some automation to manage it. You can also use multiple instances of a monolithic database. But this requires a lot of code in the application and operations to manage it.</p>\n<h3 style=\"text-align: left;\">Sharded databases</h3>\n<p>If you add middleware to handle part of this additional code, you then have a sharded database. For example,  CitusDB runs multiple PostgreSQL databases, and adds a master node. You have to connect to the master, or aggregator, which will redirect the query—or part of it—to the worker nodes. Oracle Sharding is similar, with Shard Director and Connection Pools to coordinate the work that is offloaded to the many databases. This technique is heavily used in data warehouses where you can split queries and process them in parallel. But OLTP transactions on relational tables have to maintain indexes and referential integrity across multiple shards.</p>\n<h3 style=\"text-align: left;\">Distributed SQL Databases</h3>\n<p>In a distributed SQL database, you have no master or director. All nodes are equal. You can connect wherever you want, and query your entire database from there. Each node knows the topology of the cluster, the location of data and metadata, the transaction status, and sequence next value (with a cache) because it is a single database. You have elasticity without giving up on SQL features from the most advanced relational databases.</p>\n<p><img loading=\"lazy\" decoding=\"async\" class=\"aligncenter size-large wp-image-5310\" src=\"https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1-1024x568.png\" alt=\"Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1\" width=\"1024\" height=\"568\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1-1024x568.png 1024w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1-600x333.png 600w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1-768x426.png 768w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1-1536x852.png 1536w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1-1200x666.png 1200w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1-1980x1098.png 1980w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-1.png 1999w\" sizes=\"auto, (max-width: 1024px) 100vw, 1024px\" /></p>\n<h2 style=\"text-align: left;\">Yugabyte Distributed SQL</h2>\n<p>Now that we’ve defined those techniques, let’s go deeper into all levels of data organization in YugabyteDB, starting from the storage layer.</p>\n<h3 style=\"text-align: left;\">“SST files”</h3>\n<p>At the lower level, the organization of rows—and index entries—is within the Sorted Sequence Table (SST) on a Linux filesystem. This is done automatically, during writes and compaction, so that reads can find a row easily. Each SST holds rows ordered by their key and version, with additional indexes and bloom filters to locate them. In terms of co-location, the rows—or index entries—with a key that has the same hash value, and within a narrow range of values, are stored together in each SST file. The number of SST files is limited by compaction. At this level, everything is automated in YugabyteDB. The user only provides the filesystem paths.</p>\n<h3 style=\"text-align: left;\">Tablet sharding</h3>\n<p>The SST files store the key-value pairs for tables and indexes. Sharding is the right term here because each tablet is a database (based on <a href=\"https://rocksdb.org/\" target=\"_blank\" rel=\"noopener\">RocksDB</a>), with its <a href=\"/blog/enhancing-rocksdb-for-speed-scale/\" target=\"_blank\" rel=\"noopener\">own protection</a>. This looks like the sharded databases we described above, except that they are not SQL databases but key-value document stores. They have all the required features for a reliable datastore, with transactions and strong consistency. However, they don’t have  the burden of managing them as multiple databases because the SQL layer is above. Joins and secondary indexes are not processed at this level because this prevents cross-shard transactions.</p>\n<p>The sharding is automatic, based on the SQL data model options:</p>\n<ul>\n<li>The colocated property, or tablegroup, defines which SQL tables (i.e.,  indexes or partitions, as we will see later) are sharded, with multiple dedicated tablets. And which ones are colocated, replicated but not sharded.</li>\n<li>The primary key or index column definition defines the sharding method, with the HASH or range (ASC or DESC) sharding. This is where we choose to distribute data on the hash column to load balance and avoid hot points. It’s also where we keep rows together on the ascending or descending columns for range scans (like &#8216;&lt;&#8216;, &gt;&#8217;, &#8216;BETWEEN&#8217; predicates)</li>\n<li>Optionally, the additional definition on the number of tablets with the <code>--ysql_num_tablets</code> at system level or SPLIT AT/INTO a table at index level.</li>\n</ul>\n<p>With sharding, we define the distribution method for the data model at metadata level. But at the data level this is done automatically: the distributed storage layer manages where rows or index entries must be written or read. This approach is sufficient for many applications:</p>\n<ul>\n<li>Co-locate the small tables together to reduce the memory footprint.</li>\n<li>Shard the large and growing tables into multiple tablets, one per node (or more), to be able to rebalance and scale them out when adding more nodes.</li>\n<li>For sharded tables, think about which columns will be accessed by a range scan, when rows are queried together using a range predicate.</li>\n</ul>\n<h3 style=\"text-align: left;\">Table partitioning</h3>\n<p>The previously-discussed approach to sharding considers all nodes to be equal, whether they are located in the same Data Center or multiple availability zones (AZ). You’ll want to load-balance across all compute and storage instances, and scale-out as needed. The organization of data is decided per table and index. However, you may want to go further with more control on rows, based on their value. This is where you partition a table at SQL level, on column values, with a HASH function, RANGE, or LIST of values. This is a PostgreSQL feature, known as declarative partitioning, which can be used with YugabyteDB because it is fully code <a href=\"/postgresql/postgresql-compatibility/\">compatible with PostgreSQL.</a></p>\n<p>The main reason for partitioning, besides partition pruning, is information lifecycle management. If you partition by month or years, purging old data is as simple as dropping a partition. This is the only scalable way to do it.</p>\n<p>Another reason to partition at this level in a distributed SQL database is when you want to constrain some data to specific locations, such as:</p>\n<ul>\n<li>For legal reasons, when you are required to store data from some countries in a specific region.</li>\n<li>To ensure predictable response time, with data close to the users.</li>\n<li>For cost reasons, to lower cross-AZ, cross-region, or cross-cloud provider network traffic.</li>\n</ul>\n<p>For this last option, the partitions are mapped to tablespaces. Tablespaces are used in PostgreSQL to store the partition in a specific filesystem. With YugabyteDB, you map tablespaces to the cluster topology with the placement attributes zone, region, and cloud provider.</p>\n<p><img loading=\"lazy\" decoding=\"async\" class=\"aligncenter size-large wp-image-5311\" src=\"https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2-1024x455.png\" alt=\"Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2\" width=\"1024\" height=\"455\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2-1024x455.png 1024w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2-600x267.png 600w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2-768x342.png 768w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2-1536x683.png 1536w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2-1200x534.png 1200w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2-1980x881.png 1980w, https://www.yugabyte.com/wp-content/uploads/2021/11/Distributed-SQL-Essentials-Sharding-and-Partitioning-in-YugabyteDB-Blog-Image-2.png 1999w\" sizes=\"auto, (max-width: 1024px) 100vw, 1024px\" /></p>\n<h2 style=\"text-align: left;\">Global indexes</h2>\n<p>After describing the levels of data distribution, let’s explain why we need all of them. SQL, especially for OLTP, is complex. You have multiple keys, usually one surrogate key and one or many natural keys. They all need to be enforced by a unique index. And because the tables can be partitioned on only one key, the others require a global index. A global index can be partitioned, but not on the same key as the table.</p>\n<p>With YugabyteDB, the tablets described above store table rows and index entries as key-value pairs. This is for high performance—with distribution of rows—and High Availability—with synchronous replication. When sharded databases, as mentioned earlier, add SQL at this level, it comes with severe limitations: SQL features are limited to a single-shard. This means that indexes are only local, that foreign keys can be enforced only on interleaved tables, and that transactions cannot touch rows from multiple shards. We are back to a hierarchical database where we have to access a table by the primary key only.</p>\n<p>In OLTP applications, there is a primary key, which is a generated surrogate key from a sequence or uuid to obtain an immutable identifier. But there’s also the natural key that we need to enforce with a unique constraint. This is why we use SQL databases: multiple access paths and integrity constraints to secure our data with less application code. A data warehouse can accept non-transactional global indexes, but this is not desirable for OLTP. Enforcing the unique constraint is also required to avoid data corruption, like double writes after a failure or through logical replication.</p>\n<p>Let’s take a simple example: a table of country citizens, where the natural key is the Social Security number. This is enforced with a unique constraint. The primary key is on a generated number, to be immutable, and then can be referenced by foreign keys.</p>\n<p>With a sharded database like CitusDB or any other database based on a foreign data wrapper, you cannot do that. Because each shard is a monolithic database, you cannot enforce unicity across multiple databases. If you shard by hash on the surrogate key, you can enforce its uniqueness, and foreign keys will be possible from the same shard only. But there’s no way to guarantee the unique natural key. You have SQL features within each shard, but not at the global level.</p>\n<p>What you need for this table is sharding the table on the primary key, for joins through foreign keys, and sharding the index on the natural key for queries by business value. This is where global indexes are required. Above it, the table can be partitioned by country to isolate each continent to a physical region. And there, local indexes are sufficient as the goal is partition placement rather than data distribution.</p>\n<h2 style=\"text-align: left;\">Summary</h2>\n<p>With a distributed SQL database like YugabyteDB, the purpose of sharding into tablets is to scale-out at row level. On top of this, you can create unique constraints, secondary indexes, foreign key constraints, and transactions. Partitions and tablespaces give more control on the physical location. A distributed SQL database needs to combine both and then be exposed as one database application that can connect to any node transparently. Sharding operates on tablets for data distribution, applying a hash or range function on rows and global index entries. Partitioning operates on table partitions for data placement, applying range or list defined on the table, with local indexes. Tablet sharding applies to YCQL and YSQL but partitioning is a YSQL feature. Documentation details can be found here:</p>\n<ul>\n<li><a href=\"https://docs.yugabyte.com/preview/explore/ysql-language-features/tablespaces/\" target=\"_blank\" rel=\"noopener\">Partitioning for data placement, described with tablespaces</a></li>\n<li><a href=\"https://docs.yugabyte.com/preview/architecture/docdb-sharding/sharding/\" target=\"_blank\" rel=\"noopener\">Sharding for data distribution, described in primary key and index definition</a></li>\n</ul>\n<p>The concept and syntax for YSQL is an extension of PostgreSQL CREATE TABLE and CREATE INDEX statements. In YCQL, you may see the general term of “partitioning” used for the automatic sharding of tablets. This is its name in Cassandra, and there’s no table-level declarative partitioning in YCQL.</p>\n<p><i>If you haven’t already, take YugabyteDB for a spin by </i><a href=\"https://download.yugabyte.com/\" target=\"_blank\" rel=\"noopener\"><i>downloading the latest version of the open source</i></a><i>. And if you have any questions, please don’t hesitate to ask them in the </i><a href=\"/community/\" target=\"_blank\" rel=\"noopener\"><i>YugabyteDB community Slack channel</i></a>.</p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>A <a href=\"https://www.yugabyte.com/distributed-sql/\">distributed SQL database</a> provides a service where you can query the global database without knowing where the rows are. You connect to any node, without having to know the cluster topology. You query your tables, and the database will determine the best access to your data, whether it’s close to your client or geographically distant.</p>\n<p>The organization of data, whether co-located or partitioned, is the most important consideration for high performance,</p>\n<p>&#8230;</p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 5305,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": false,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2158,
+    2150
+  ],
+  "tags": [
+    2242,
+    2267
+  ],
+  "class_list": [
+    "post-5301",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-databases",
+    "category-distributedsql",
+    "tag-data-sharding",
+    "tag-partitioning"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Distributed SQL: Sharding and Partitioning | YugabyteDB</title>\n<meta name=\"description\" content=\"Learn how sharding and partitioning works in the YugabyteDB distributed SQL database and how to use both correctly.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Distributed SQL: Sharding and Partitioning | YugabyteDB\" />\n<meta property=\"og:description\" content=\"Learn how sharding and partitioning works in the YugabyteDB distributed SQL database and how to use both correctly.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2021-11-19T16:00:00+00:00\" />\n<meta property=\"article:modified_time\" content=\"2025-06-17T19:59:15+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Social.png\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Social.png\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"10 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"Distributed SQL: Sharding and Partitioning in YugabyteDB\",\"datePublished\":\"2021-11-19T16:00:00+00:00\",\"dateModified\":\"2025-06-17T19:59:15+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/\"},\"wordCount\":1984,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2021\\/11\\/1117-Sharding-Partitioning-in-YB-Preview.png\",\"keywords\":[\"Data Sharding\",\"Partitioning\"],\"articleSection\":[\"Databases\",\"Distributed SQL\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/\",\"name\":\"Distributed SQL: Sharding and Partitioning | YugabyteDB\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2021\\/11\\/1117-Sharding-Partitioning-in-YB-Preview.png\",\"datePublished\":\"2021-11-19T16:00:00+00:00\",\"dateModified\":\"2025-06-17T19:59:15+00:00\",\"description\":\"Learn how sharding and partitioning works in the YugabyteDB distributed SQL database and how to use both correctly.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2021\\/11\\/1117-Sharding-Partitioning-in-YB-Preview.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2021\\/11\\/1117-Sharding-Partitioning-in-YB-Preview.png\",\"width\":480,\"height\":320,\"caption\":\"1117-Sharding-Partitioning-in-YB-Preview\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Distributed SQL: Sharding and Partitioning in YugabyteDB\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "Distributed SQL: Sharding and Partitioning | YugabyteDB",
+    "description": "Learn how sharding and partitioning works in the YugabyteDB distributed SQL database and how to use both correctly.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "Distributed SQL: Sharding and Partitioning | YugabyteDB",
+    "og_description": "Learn how sharding and partitioning works in the YugabyteDB distributed SQL database and how to use both correctly.",
+    "og_url": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2021-11-19T16:00:00+00:00",
+    "article_modified_time": "2025-06-17T19:59:15+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Social.png",
+        "type": "image/png"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Social.png",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "10 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "Distributed SQL: Sharding and Partitioning in YugabyteDB",
+          "datePublished": "2021-11-19T16:00:00+00:00",
+          "dateModified": "2025-06-17T19:59:15+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/"
+          },
+          "wordCount": 1984,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview.png",
+          "keywords": [
+            "Data Sharding",
+            "Partitioning"
+          ],
+          "articleSection": [
+            "Databases",
+            "Distributed SQL"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/",
+          "url": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/",
+          "name": "Distributed SQL: Sharding and Partitioning | YugabyteDB",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview.png",
+          "datePublished": "2021-11-19T16:00:00+00:00",
+          "dateModified": "2025-06-17T19:59:15+00:00",
+          "description": "Learn how sharding and partitioning works in the YugabyteDB distributed SQL database and how to use both correctly.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview.png",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview.png",
+          "width": 480,
+          "height": 320,
+          "caption": "1117-Sharding-Partitioning-in-YB-Preview"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Distributed SQL: Sharding and Partitioning in YugabyteDB"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/5301",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=5301"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/5301/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/5305"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=5301"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=5301"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=5301"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 5305,
+        "date": "2021-11-17T16:21:05",
+        "slug": "1117-sharding-partitioning-in-yb-preview",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/distributed-sql-essentials-sharding-and-partitioning-in-yugabytedb/1117-sharding-partitioning-in-yb-preview/",
+        "title": {
+          "rendered": "1117-Sharding &#038; Partitioning in YB-Preview"
+        },
+        "author": 75,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview.png'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "1117-Sharding-Partitioning-in-YB-Preview",
+        "media_type": "image",
+        "mime_type": "image/png",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2021/11/1117-Sharding-Partitioning-in-YB-Preview.png",
+          "sizes": {
+            "thumbnail": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-150x150.png",
+              "width": 150,
+              "height": 150,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-150x150.png"
+            },
+            "alm-thumbnail": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-150x150.png",
+              "width": 150,
+              "height": 150,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-150x150.png"
+            },
+            "thumb_size_widget_popular2": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-80x80.png",
+              "width": 80,
+              "height": 80,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-80x80.png"
+            },
+            "thumb_size_popular": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-80x80.png",
+              "width": 80,
+              "height": 80,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-80x80.png"
+            },
+            "thumb_size_latest": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-80x80.png",
+              "width": 80,
+              "height": 80,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-80x80.png"
+            },
+            "thumb_size_related": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-80x80.png",
+              "width": 80,
+              "height": 80,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-80x80.png"
+            },
+            "thumb_size_featured": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-80x80.png",
+              "width": 80,
+              "height": 80,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-80x80.png"
+            },
+            "authorship-box-avatar": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-150x150.png",
+              "width": 150,
+              "height": 150,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-150x150.png"
+            },
+            "authorship-box-related": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-70x70.png",
+              "width": 70,
+              "height": 70,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-70x70.png"
+            },
+            "fw-mobile": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-480x246.png",
+              "width": 480,
+              "height": 246,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-480x246.png"
+            },
+            "popular-post-featured-image": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-60x60.png",
+              "width": 60,
+              "height": 60,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-60x60.png"
+            },
+            "rp4wp-thumbnail-post": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview-150x150.png",
+              "width": 150,
+              "height": 150,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview-150x150.png"
+            },
+            "full": {
+              "file": "1117-Sharding-Partitioning-in-YB-Preview.png",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/png",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview.png"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2021/11/1117-Sharding-Partitioning-in-YB-Preview.png",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/5305",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/75"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=5305"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 5301,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/5301"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2158,
+          "link": "https://www.yugabyte.com/blog/category/databases/",
+          "name": "Databases",
+          "slug": "databases",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Databases Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/databases/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Databases Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/databases/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/\",\"name\":\"Databases Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Databases\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Databases Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/databases/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Databases Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/databases/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/",
+                  "url": "https://www.yugabyte.com/blog/category/databases/",
+                  "name": "Databases Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/databases/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Databases"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2158",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2158"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2150,
+          "link": "https://www.yugabyte.com/blog/category/distributedsql/",
+          "name": "Distributed SQL",
+          "slug": "distributedsql",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Distributed SQL Library | YugabyteDB</title>\n<meta name=\"description\" content=\"Welcome to the home of all things distributed SQL database. Our library of blogs include expert presentations, webinars (of all shapes and flavors), how-to blogs, etc.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/distributedsql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Distributed SQL Library | YugabyteDB\" />\n<meta property=\"og:description\" content=\"Welcome to the home of all things distributed SQL database. Our library of blogs include expert presentations, webinars (of all shapes and flavors), how-to blogs, etc.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/distributedsql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/distributedsql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/distributedsql\\/\",\"name\":\"Distributed SQL Library | YugabyteDB\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"description\":\"Welcome to the home of all things distributed SQL database. Our library of blogs include expert presentations, webinars (of all shapes and flavors), how-to blogs, etc.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/distributedsql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/distributedsql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Distributed SQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Distributed SQL Library | YugabyteDB",
+            "description": "Welcome to the home of all things distributed SQL database. Our library of blogs include expert presentations, webinars (of all shapes and flavors), how-to blogs, etc.",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/distributedsql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Distributed SQL Library | YugabyteDB",
+            "og_description": "Welcome to the home of all things distributed SQL database. Our library of blogs include expert presentations, webinars (of all shapes and flavors), how-to blogs, etc.",
+            "og_url": "https://www.yugabyte.com/blog/category/distributedsql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/distributedsql/",
+                  "url": "https://www.yugabyte.com/blog/category/distributedsql/",
+                  "name": "Distributed SQL Library | YugabyteDB",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "description": "Welcome to the home of all things distributed SQL database. Our library of blogs include expert presentations, webinars (of all shapes and flavors), how-to blogs, etc.",
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/distributedsql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/distributedsql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Distributed SQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2150",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2150"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2242,
+          "link": "https://www.yugabyte.com/blog/tag/data-sharding/",
+          "name": "Data Sharding",
+          "slug": "data-sharding",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Data Sharding Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/data-sharding/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Data Sharding Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/data-sharding/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/\",\"name\":\"Data Sharding Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Data Sharding\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Data Sharding Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/data-sharding/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Data Sharding Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/data-sharding/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/data-sharding/",
+                  "url": "https://www.yugabyte.com/blog/tag/data-sharding/",
+                  "name": "Data Sharding Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/data-sharding/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/data-sharding/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Data Sharding"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2242",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2242"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2267,
+          "link": "https://www.yugabyte.com/blog/tag/partitioning/",
+          "name": "Partitioning",
+          "slug": "partitioning",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Partitioning Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/partitioning/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Partitioning Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/partitioning/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/\",\"name\":\"Partitioning Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Partitioning\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Partitioning Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/partitioning/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Partitioning Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/partitioning/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/partitioning/",
+                  "url": "https://www.yugabyte.com/blog/tag/partitioning/",
+                  "name": "Partitioning Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/partitioning/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/partitioning/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Partitioning"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2267",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2267"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

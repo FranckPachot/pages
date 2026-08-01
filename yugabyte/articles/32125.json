@@ -1,0 +1,1626 @@
+{
+  "id": 32125,
+  "date": "2024-04-16T04:47:00",
+  "date_gmt": "2024-04-16T11:47:00",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=32125"
+  },
+  "modified": "2024-04-28T00:36:21",
+  "modified_gmt": "2024-04-28T07:36:21",
+  "slug": "postgresql-advanced-partitioning-by-date",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/",
+  "title": {
+    "rendered": "Advanced PostgreSQL Partitioning by Date with YugabyteDB Auto Sharding"
+  },
+  "content": {
+    "rendered": "<p>Recently, I wrote about how <a href=\"https://www.yugabyte.com/blog/postgresql-indexes-partitioning-lockmanager-limitations/\">YugabyteDB can scale without having to use PostgreSQL declarative partitioning </a>and working around its limitations. I referenced a table from Kyle Hailey&#8217;s blog detailing a PostgreSQL production issue involving a &#8220;payments&#8221; table, where &#8220;payment_id&#8221; is the primary key. Kyle&#8217;s post pointed out that including a partition key in the primary key is mandatory in PostgreSQL.</p>\n<p>In my blog post, I discussed the scaling process and explained how to <a href=\"https://www.yugabyte.com/tech/database-sharding/\">hash shard </a>the &#8220;payments&#8221; table on the &#8220;payment_id&#8221; without changing its primary key. This method ensures fast inserts by distributing the table rows across the cluster&#8217;s nodes. This approach works seamlessly with YugabyteDB’s automatic sharding and supports the use of any secondary index for additional use cases.</p>\n<p>I <a href=\"https://www.reddit.com/r/PostgreSQL/comments/1bp76fr/comment/kwvbkpd/\">received some feedback</a> on Reddit and other sites that partitioning on a different column may be better. This is true for PostgreSQL, where the partition key limits the partitioning of the table and all the indexes. However, with YugabyteDB sharding, I don&#8217;t need to change the table partitioning to query a range of dates. YugabyteDB’s <a href=\"https://www.yugabyte.com/blog/a-quick-guide-to-secondary-indexes-in-yugabyte-db-database/\">secondary indexes</a> are global, meaning they don’t need to share a sharding key with their table. In addition, distributing the rows in a <a href=\"https://www.yugabyte.com/postgresql/distributed-postgresql/\">distributed PostgreSQL database</a> like YugabyteDB offers extra benefits since it spreads data across multiple active servers.</p>\n<p>To query a range of dates, you can create an index on the date and add more columns for an Index Only Scan. When defined as ascending or descending, this index will be range-sharded and distributed based on its key. Here’s an example:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">create index on payments ( created ASC, payment_id ) include ( amount );</pre>\n<p>If you have a reason to partition the table by date to group close dates together, you can also do that in YugabyteDB. Here is an example.</p>\n<h2>Sharding by a Range of Dates</h2>\n<p>I’ve modified the table’s primary key to include the &#8220;created&#8221; column, similar to how you would partition in PostgreSQL.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">create table payments (\n       primary key (created ASC, payment_id)\n     , unique(payment_id)\n     , payment_id bigint not null generated always as identity (cache 1000)\n     , created timestamptz not null default now()\n     , account_id bigint not null\n     , amount decimal(10,2) not null\n)\nsplit at values ( ('2001-01-01'),('2002-01-01'),('2003-01-01'),('2004-01-01') )\n;\n</pre>\n<p>My reasoning behind this approach includes three key points.</p>\n<ol>\n<li>I set <code>payment_id</code> as a unique key to ensure it’s indexed and enforced with no duplicates. In SQL, a unique key with non-nullable columns is similar to a primary key. The main difference is its physical organization. By starting the primary key with the “created” date, I can group close dates together, which is useful when date range queries are the critical access pattern vs. distributing the inserts.</li>\n<li>I added &#8216;<code>ASC</code>&#8216; to the primary key because YugabyteDB defaults to &#8216;<code>HASH</code>&#8216; on the first column of the primary key. Since I want to organize the table by a range of dates, I do not want to apply a hash function to this column. If you frequently query for the latest date with &#8216;<code>order by created desc limit 10</code>&#8216;, then it is better to avoid a backward scan and define it as &#8216;<code>DESC</code>&#8216;. Both options allow for range sharding.</li>\n<li>Although not mandatory (because the table will be split automatically by YugabyteDB as it grows), I added &#8216;<code>split at values</code>&#8216; clause to pre-split the table to five tablets. In my previous blog, I demonstrated that the number of tablets could number in the hundreds or thousands. While it is possible to pre-create hundreds of tablets by providing more splitting values, I opted for simplicity and stuck to the auto-splitting thresholds.</li>\n</ol>\n<p>The table is empty with five tablets, and the hash-sharded index for the unique constraints has one tablet per node:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; select num_tablets from yb_table_properties('payments'::regclass);\n num_tablets\n-------------\n           5\n(1 row)\n\nyugabyte=&gt; select num_tablets from yb_table_properties('payments_payment_id_key'::regclass);\n num_tablets\n-------------\n           9\n(1 row)\n</pre>\n<p>I can view the tablet boundaries from the console, which shows the data ranges in their internal int64 representation, which0 corresponds to the PostgreSQL Epoch (number of microseconds since Jan 1st, 2000):</p>\n<figure id=\"attachment_32131\" aria-describedby=\"caption-attachment-32131\" style=\"width: 1024px\" class=\"wp-caption aligncenter\"><img loading=\"lazy\" decoding=\"async\" class=\"size-large wp-image-32131 loaded come-in\" src=\"https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-before-loading-1024x379.png\" alt=\"List of table's tablets before loading\" width=\"1024\" height=\"379\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-before-loading-1024x379.png 1024w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-before-loading-600x222.png 600w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-before-loading-768x285.png 768w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-before-loading-1536x569.png 1536w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-before-loading-1200x445.png 1200w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-before-loading.png 1908w\" sizes=\"auto, (max-width: 1024px) 100vw, 1024px\" /><figcaption id=\"caption-attachment-32131\" class=\"wp-caption-text\">List of table&#8217;s tablets before loading: SplitDepth is zero.</figcaption></figure>\n<h2>Auto-Splitting: Let’s Insert a Hundred Million Rows</h2>\n<p>I will insert the same number of rows as I did in the previous blog: a hundred million.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; insert into payments (account_id, amount, created)\n select 1000 * random() as account, random() as amount,\n random() * interval '24.25 year' + timestamp '2000-01-01 00:00:00' as created\n from generate_series(1,100000) account_id\n\\watch c=1000\n</pre>\n<p>While the table was growing, the tablets were split, and more tablets became visible in the console. &#8220;SplitDepth&#8221; counted the number of automatic splits that resulted in each tablet.</p>\n<figure id=\"attachment_32130\" aria-describedby=\"caption-attachment-32130\" style=\"width: 1024px\" class=\"wp-caption aligncenter\"><img loading=\"lazy\" decoding=\"async\" class=\"size-large wp-image-32130 loaded come-in\" src=\"https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-after-loading-1024x568.png\" alt=\"List of table's tablets after loading\" width=\"1024\" height=\"568\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-after-loading-1024x568.png 1024w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-after-loading-600x333.png 600w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-after-loading-768x426.png 768w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-after-loading-1536x851.png 1536w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-after-loading-1200x665.png 1200w, https://www.yugabyte.com/wp-content/uploads/2024/04/List-of-tables-tablets-after-loading.png 1999w\" sizes=\"auto, (max-width: 1024px) 100vw, 1024px\" /><figcaption id=\"caption-attachment-32130\" class=\"wp-caption-text\">List of table&#8217;s tablets after loading: there are more tablets with higher SplitDepth.</figcaption></figure>\n<p>At the end of the load, I have 17 tablets for the table (ranges of date) and the same for the unique index (by hash).</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; select num_tablets, pg_size_pretty(pg_table_size('payments')) from yb_table_properties('payments'::regclass);\n\n num_tablets | pg_size_pretty\n-------------+----------------\n          17 | 5738 MB\n(1 row)\n\nyugabyte=&gt; select num_tablets, pg_size_pretty(pg_table_size('payments_payment_id_key')) from yb_table_properties('payments_payment_id_key'::regclass);\n\n num_tablets | pg_size_pretty\n-------------+----------------\n          17 | 4527 MB\n(1 row)\n\nyugabyte=&gt;\n</pre>\n<p>To view the number of tablets created by range sharding, you can utilize the <code>yb_get_range_split_clause() </code>function. This function provides the range clause needed if you want to replicate the table with the same tablet division:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; select yb_get_range_split_clause('payments'::regclass);\n                                                                                                                                                                                                                                                                                                                                        yb_get_range_split_clause                                                                                                                                                                                                                                                                                       \n-----------------------------------------------------------------------------------------\n SPLIT AT VALUES (('2001-01-01 00:00:00+00', MINVALUE), ('2002-01-01 00:00:00+00', MINVALUE), ('2003-01-01 00:00:00+00', MINVALUE), ('2004-01-01 00:00:00+00', MINVALUE), ('2005-07-24 14:37:18.5088+00', 2040738), ('2006-12-29 17:30:45.9936+00', 13050457), ('2009-08-15 00:22:12.5472+00', 15029518), ('2010-12-14 10:55:54.6816+00', 46169115), ('2011-12-30 05:40:38.8704+00', 38646207), ('2014-04-03 01:05:37.4208+00', 5689338), ('2015-10-23 17:18:36.1728+00', 16944332), ('2017-04-06 17:42:07.8624+00', 14921933), ('2018-08-19 21:15:27.6768+00', 63227870), ('2019-10-15 04:40:06.528+00', 8756978), ('2021-02-02 10:10:58.3968+00', 37865384), ('2022-05-14 02:18:22.8672+00', 27792641))\n(1 row)\n\nyugabyte=&gt;\n</pre>\n<p>From this, it’s clear that range sharding considers the entire key. Therefore if a huge amount of data is loaded for the same date, it can be split further within the same date.</p>\n<h2>Query on a Range of Dates: 80000 Rows in 250 Milliseconds</h2>\n<p>Remember, my primary goal when partitioning on the date was to query a range of dates.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; explain (analyze, dist, costs off, summary on)\n          select * from payments\n          where created between date '2023-12-25'::timestamptz\n                            and '2024-01-02'::timestamptz\n          order by created\n;\n                                                                   QUERY PLAN\n------------------------------------------------------------------------------------\n Index Scan using payments_pkey on payments\n (actual time=3.568..246.471 rows=80142 loops=1)\n   Index Cond: ((created &gt;= ('2023-12-25'::date)::timestamp with time zone) AND\n                (created &lt;= '2024-01-02 00:00:00+00'::timestamp with time zone))\n   Storage Table Read Requests: 79\n   Storage Table Read Execution Time: 202.721 ms\n Planning Time: 0.065 ms\n Execution Time: 250.869 ms\n Storage Read Requests: 79\n Storage Read Execution Time: 202.721 ms\n Storage Execution Time: 202.721 ms\n Peak Memory Usage: 8 kB\n(14 rows)\n</pre>\n<p>This approach splits data into date ranges to keep the table size manageable and keeps the rows sorted in the LSM Tree. As a result, it eliminates the need for an extra Sort operation for ORDER BY.</p>\n<h2>Query on a Global Unique Index in 2 milliseconds</h2>\n<p>The additional UNIQUE key on<code> payment_id</code> can be used to get fast access to the table&#8217;s business key because our primary key is now a surrogate key with a different order:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; explain (analyze, dist, costs off, summary off )\n          select * from payments\n          where payment_id = 42\n          order by created\n;\n                                              QUERY PLAN\n----------------------------------------------------------\n Sort (actual time=4.105..4.105 rows=1 loops=1)\n   Sort Key: created\n   Sort Method: quicksort  Memory: 25kB\n   -&gt;  Index Scan using payments_payment_id_key on payments\n     (actual time=4.094..4.097 rows=1 loops=1)\n         Index Cond: (payment_id = 42)\n         Storage Table Read Requests: 1\n         Storage Table Read Execution Time: 2.840 ms\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 1.080 ms\n(9 rows)\n</pre>\n<p>Since the index being used is not the primary index, it is necessary to access the table to retrieve values for the other columns, leading to a Table Read Request and an Index Read Request. However, since it is a unique identifier queried by value and sharded by hash, it will read only one row. The additional “hop” to the table is limited to one read request per query. Despite sounding counter-intuitive, declaring the business key with a unique constraint and using the primary key for another purpose is the right way to go. This is because the business key can be overloaded with a clustering key to store together that which is often queried together.</p>\n<div style=\"background: #e8e9f3;padding: 20px 20px 1px;margin: 0 0 20px\"><b>NOTE: Data Modeling Tip</b><br />\nIn SQL applications, tables often have multiple candidate keys. One is selected as the primary key for physical organization, while others are declared with unique constraints. In partitioned or sharded systems like Microsoft Citus, Aurora Limitless, or Oracle Globally Distributed Database, indexes can only be local, and the partitioning or sharding keys must belong to all unique or primary keys. However, distributed SQL databases like YugabyteDB offer global, consistent secondary indexes, so you can match indexes to use cases. A recent article by Alex DeBrie details secondary indexes in distributed databases: <a href=\"https://www.alexdebrie.com/posts/distributed-databases-indexes\">How do distributed databases handle secondary indexes?</a></div>\n<h2>Secondary Indexes for Additional Use Cases</h2>\n<p>In the previous blog, I <a href=\"https://www.yugabyte.com/blog/postgresql-indexes-partitioning-lockmanager-limitations/#yugabytedb-with-distributed-tables-and-indexes-to-scale\">created an index </a>to access by &#8220;account_id&#8221;.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">create index payments_by_account on payments(account_id, amount desc)\n;\n\nyugabyte=&gt; select num_tablets, pg_size_pretty(pg_table_size('payments_by_account')) from yb_table_properties('payments_by_account'::regclass);\n\n num_tablets | pg_size_pretty\n-------------+----------------\n           9 | 3513 MB\n(1 row)\n</pre>\n<p>Creating more secondary indexes does introduce overhead during insertions, deletions, or updates of the columns in the index. However, this overhead is minimal in YugabyteDB compared to traditional databases. Databases that use B-Tree, like Oracle, PostgreSQL, or SQL Server, require multiple reads and writes to insert a new index entry—finding the leaf block from root to branches, updating it, and (when full) splitting it and updating the branches. YugabyteDB’s <a href=\"https://docs.yugabyte.com/preview/architecture/docdb/lsm-sst/\">LSM-Tree </a>structure allows fast index entry inserts by appending the new entry directly to the MemTable without having to read previous values.</p>\n<h2>#1: Additional bucket number prefix for fast ingest</h2>\n<p>A key database principle is to store frequently accessed data together to minimize I/O and favor cache locality. A single access pattern determines your primary key. If you have multiple access patterns, one is chosen for the primary key, while the others define your secondary indexes, simplifying read operations as each index operates independently. However, during write operations such as data insertion, all indexes (except for partial ones covering distinct values) are involved. It&#8217;s crucial to adopt a strategy that prevents any index from becoming a bottleneck during data ingestion.</p>\n<p>In the previous blog, inserts were distributed across tablets because the primary key was on &#8220;<code> payment_id</code>&#8221;  by hash. However, in this blog, starting the primary key with the created date causes all inserts to target the same tablet. To achieve distribution and efficient row clustering, a partition key (for distribution) and a sort key (to cluster) are necessary. Defining the primary key as (<code>payment_id HASH, created ASC</code>) would be ineffective due to the high cardinality of the partition key which would undermine the sort key. Without a low cardinality column available, a modulo function can be used to create one as an additional &#8220;bucket#&#8221; column</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">create table payments (\n       primary key (\"bucket#\" ASC, created ASC, payment_id)\n     , unique(payment_id)\n     , \"bucket#\" int default (random()*1e6)::int%8\n     , payment_id bigint not null generated always as identity (cache 1000)\n     , created timestamptz not null default now()\n     , account_id bigint not null\n     , amount decimal(10,2) not null\n) split at values ( (1),(2),(3),(4),(5),(6) )\n;\n</pre>\n<p>In this simple demonstration, I&#8217;ve set a random &#8220;bucket#&#8221; between 0 and 7 to distribute inserts across 8 tablets. I could have chosen an existing low cardinality column or used a modulo to create one from a high cardinality column, utilizing a trigger or a generated column for calculation. If you have a value that can be used for fast access, you can use it. You can also use <code>pg_backend_pid()</code> if you want inserts from the same session to go into the same tablet. The goal with this technical column is to have the number of distinct values high enough to distribute the writes but low enough to keep rows clustered on the sort key.</p>\n<p>I have pre-split the tablets based on the number of distinct values (which will be automatically split further). This process is transparent to the application, allowing me to run the same INSERT and SELECT statements.</p>\n<p>You may wonder how the query on a range of dates behaves now that those dates can come from 8 ranges. With YugabyteDB, as long as the cardinality of the prefix is low, the index can still be efficient by doing an <a href=\"https://wiki.postgresql.org/wiki/Loose_indexscan#Loose_Indexscan_versus_Index_Skip_Scan\">Index Skip Scan</a>.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; explain (analyze, dist, costs off, summary on)\n           select * from payments\n           where created between date '2023-12-25'::timestamptz\n                             and '2024-01-02'::timestamptz\n           order by created\n;\n                                                                       QUERY PLAN                                                              \n----------------------------------------------------------------------------------------\n Sort (actual time=264.625..270.116 rows=79619 loops=1)\n   Sort Key: created\n   Sort Method: external merge  Disk: 3672kB\n   -&gt;  Index Scan using payments_pkey on payments \n       (actual time=5.348..243.203 rows=79619 loops=1)\n         Index Cond: ((created &gt;= ('2023-12-25'::date)::timestamp with time zone) AND\n                      (created &lt;= '2024-01-02 00:00:00+00'::timestamp with time zone))\n         Storage Table Read Requests: 88\n         Storage Table Read Execution Time: 192.481 ms\n Planning Time: 0.405 ms\n Execution Time: 273.751 ms\n Storage Read Requests: 88\n Storage Read Execution Time: 192.481 ms\n Storage Execution Time: 192.481 ms\n Peak Memory Usage: 5339 kB\n(17 rows)\n</pre>\n<p>The addition of the &#8220;bucket#&#8221; incurs only a 20-millisecond increase. This is primarily due to sorting and merging ranges for ORDER BY rather than the Index Scan itself, which just had to seek to eight ranges instead of one.</p>\n<p>Adding a bucket number proves to be a simpler and more scalable solution than declarative partitioning.</p>\n<h2>#2: Partition by date for lifecycle management</h2>\n<p>Grouping date ranges facilitates quick data purging by allowing old partitions to be dropped, such as one partition per year using PostgreSQL&#8217;s range partitioning. However, this limits indexing possibilities. For example, unique constraints cannot be enforced on multiple fields. Before considering optimization, assess if the automatic sharding already meets performance needs. A query on a range of dates is fast, which is crucial for purging jobs. These jobs insert <a href=\"https://www.yugabyte.com/blog/keep-tombstones-data-markers-slowing-scan-performance/\">tombstones </a>for row deletion in the LSM-Tree, with space being freed only after compaction. Compaction is conducted per tablet, and splitting is done according to date, so any deletions and compactions will impact specific tablets only. That&#8217;s the advantage of auto-splitting: keep each LSM-Tree within a manageable size.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; select num_tablets, pg_size_pretty(pg_table_size('payments')) from yb_table_properties('payments'::regclass);\n\n num_tablets | pg_size_pretty\n-------------+----------------\n          16 | 6887 MB\n(1 row)\n\n\nyugabyte=&gt; explain (analyze, dist, costs off, summary on)\n          delete from payments\n          where created &lt; date '2002-01-01'::timestamptz\n;\n                                              QUERY PLAN\n-----------------------------------------------------------------------------------------\n Delete on payments (actual time=325267.951..325267.951 rows=0 loops=1)\n   -&gt;  Index Scan using payments_pkey on payments\n       (actual time=9.294..291988.065 rows=8243282 loops=1)\n         Index Cond: (created &lt; ('2002-01-01'::date)::timestamp with time zone)\n         Storage Table Read Requests: 8061\n         Storage Table Read Execution Time: 681.241 ms\n         Storage Table Write Requests: 8243282\n         Storage Index Write Requests: 8243282\n         Storage Flush Requests: 8053\n         Storage Flush Execution Time: 278034.167 ms\n Planning Time: 9.552 ms\n Execution Time: 325303.007 ms\n Storage Read Requests: 8061\n Storage Read Execution Time: 681.241 ms\n Storage Write Requests: 16486564\n Catalog Read Requests: 19\n Catalog Read Execution Time: 15.104 ms\n Catalog Write Requests: 0\n Storage Flush Requests: 8054\n Storage Flush Execution Time: 278068.526 ms\n Storage Execution Time: 278764.870 ms\n Peak Memory Usage: 173 kB\n(21 rows)\n\nyugabyte=&gt; select num_tablets, pg_size_pretty(pg_table_size('payments')) from yb_table_properties('payments'::regclass);\n num_tablets | pg_size_pretty\n-------------+----------------\n          16 | 6632 MB\n(1 row)\n</pre>\n<p>This delete is slow due to the fact that it updates the indexes with strong consistency. The write requests are buffered and flushed by batches, which can run in the background. Note that this solution is effective when deletions are done daily for small amounts of data. When purging a large percentage, the whole tablet may become empty and remain unused because new rows go to higher ranges. The empty tablets are not merged in the current version of YugabyteDB (see enhancement request <a href=\"https://github.com/yugabyte/yugabyte-db/issues/21816\">#21816</a>). For such scenarios, I would use declarative partitioning on top of it.</p>\n<h2>PostgreSQL Declarative Partitioning on Top of Sharding</h2>\n<p>YugabyteDB’s automatic sharding effectively distributes data without restricting SQL capabilities, operating transparently and automatically. However, PostgreSQL&#8217;s declarative partitioning can still be utilized, with sharding then applied to each partition. As the partitions are sharded and distributed, their size can expand without scalability issues, helping to keep the number of declarative partitions to a minimum.</p>\n<p>For example, you can drop an old partition to eliminate the empty tablets when there are too many, but you don&#8217;t need to do that every year. In my example, I can define three partitions, each covering a 10-year range. After 10 years, the empty tablets left by the regular purge can be removed.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">create table payments (\n       primary key (\"bucket#\" ASC, created ASC, payment_id)\n     -- no global unique constraints -- , unique(payment_id)\n     , \"bucket#\" int default (random()*1e6)::int%8\n     , payment_id bigint not null generated always as identity (cache 1000)\n     , created timestamptz not null default now()\n     , account_id bigint not null\n     , amount decimal(10,2) not null\n) partition by range ( created );\n;\n\ncreate table payments1 partition of payments\n for values from ( minvalue                         ) to ('2009-12-31 23:59:59') ;\ncreate table payments2 partition of payments\n for values from ('2010-01-01 00:00:00') to ('2019-12-31 23:59:59') ;\ncreate table payments3 partition of payments\n for values from ('2020-01-01 00:00:00') to ('2029-12-31 23:59:59') ;\n\ncreate index payments_by_account on payments(account_id, amount desc);\n\nalter  table payments1 add unique(payment_id);\nalter  table payments2 add unique(payment_id);\nalter  table payments3 add unique(payment_id);\n</pre>\n<p>There are two drawbacks stemming from PostgreSQL limitations with partitioning:</p>\n<ol>\n<li>I cannot enforce the unique constraint across all partitions, although if a sequence generates it, this may be acceptable.</li>\n<li>I can create only local indexes, so a query that doesn&#8217;t contain the partition key (&#8220;created&#8221;) will have to read three indexes instead of one.</li>\n</ol>\n<p>Despite these limitations, performance remains acceptable with a minimal number of partitions. Running the same INSERT operation on a hundred million rows resulted in each partition being automatically split.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; select relname, pg_size_pretty(pg_table_size(inhrelid)), yb_get_range_split_clause(inhrelid)from pg_inherits natural join (select oid inhrelid, relname from pg_class) c where inhparent='payments'::regclass\n;\n\n-[ RECORD 1 ]-------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nrelname                   | payments1\npg_size_pretty            | 2164 MB\nyb_get_range_split_clause | SPLIT AT VALUES ((1, '2002-06-01 19:24:31.9392+00', 46334341), (2, '2001-07-24 13:05:25.4976+00', 15121966), (4, '2000-08-11 21:09:32.7456+00', 20511537), (5, '2002-05-19 02:58:03.792+00', 48456133), (6, '2002-03-05 13:53:41.4528+00', 16138115))\n-[ RECORD 2 ]-------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nrelname                   | payments2\npg_size_pretty            | 2335 MB\nyb_get_range_split_clause | SPLIT AT VALUES ((1, '2011-03-10 00:51:12.816+00', 59318232), (2, '2011-11-02 03:59:35.0592+00', 23581409), (4, '2010-07-30 00:37:46.3584+00', 20570203), (6, '2010-05-29 05:34:44.4576+00', 16023322))\n-[ RECORD 3 ]-------------+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------\nrelname                   | payments3\npg_size_pretty            | 1094 MB\nyb_get_range_split_clause | SPLIT AT VALUES ((4, '2020-01-26 16:18:24.2208+00', 19416037))\n</pre>\n<p>With queries on a range of dates, partition pruning occurs so the performance is the same as without declarative partitioning.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; explain (analyze, dist, costs off, summary off)\n          select * from payments\n          where created between date '2023-12-25'::timestamptz\n                            and '2024-01-02'::timestamptz\n          order by created\n;\n                                                                         QUERY PLAN\n\n-----------------------------------------------------------------------------------------\n\n Sort (actual time=242.162..247.673 rows=80237 loops=1)\n   Sort Key: payments3.created\n   Sort Method: external merge  Disk: 3696kB\n   -&gt;  Append (actual time=3.492..221.666 rows=80237 loops=1)\n         Subplans Removed: 2\n         -&gt;  Index Scan using payments3_pkey on payments3 \n       (actual time=3.491..215.714 rows=80237 loops=1)\n               Index Cond: ((created &gt;= ('2023-12-25'::date)::timestamp with time zone) AND \n                   (created &lt;= '2024-01-02 00:00:00+00'::timestamp with time zone))\n               Storage Table Read Requests: 80\n               Storage Table Read Execution Time: 169.034 ms\n</pre>\n<p>With point queries on the business key, declared as unique on each partition, there are three indexes to read. But that is still fast.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; explain (analyze, dist, costs off, summary off )\n          select * from payments\n          where payment_id = 42\n          order by created\n;\n                                                  QUERY PLAN\n-----------------------------------------------------------------------------------------\n Sort (actual time=5.643..5.644 rows=1 loops=1)\n   Sort Key: payments1.created\n   Sort Method: quicksort  Memory: 25kB\n   -&gt;  Append (actual time=5.632..5.634 rows=1 loops=1)\n         -&gt;  Index Scan using payments1_payment_id_key on payments1\n               (actual time=1.427..1.427 rows=0 loops=1)\n               Index Cond: (payment_id = 42)\n               Storage Index Read Requests: 1\n               Storage Index Read Execution Time: 1.321 ms\n         -&gt;  Index Scan using payments2_payment_id_key on payments2 \n       (actual time=0.955..0.955 rows=0 loops=1)\n               Index Cond: (payment_id = 42)\n               Storage Index Read Requests: 1\n               Storage Index Read Execution Time: 0.887 ms\n         -&gt;  Index Scan using payments3_payment_id_key on payments3 \n       (actual time=3.248..3.250 rows=1 loops=1)\n               Index Cond: (payment_id = 42)\n               Storage Table Read Requests: 1\n               Storage Table Read Execution Time: 1.646 ms\n               Storage Index Read Requests: 1\n               Storage Index Read Execution Time: 1.500 ms\n</pre>\n<p>When querying an indexed column without specifying partition keys, response time increases by the number of partitions. However, with only three partitions, the impact on performance is still acceptable.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; explain (analyze, buffers, costs off)\n                       select * from payments\n                       where account_id = 42 and amount &lt; 0.01\n;\n                                                   QUERY PLAN\n-----------------------------------------------------------------------------------------\n Append (actual time=8.215..23.361 rows=494 loops=1)\n   -&gt;  Index Scan using payments1_account_id_amount_idx on payments1 \n    (actual time=8.214..8.314 rows=192 loops=1)\n         Index Cond: ((account_id = 42) AND (amount &lt; 0.01))\n   -&gt;  Index Scan using payments2_account_id_amount_idx on payments2 \n    (actual time=9.812..9.928 rows=220 loops=1)\n         Index Cond: ((account_id = 42) AND (amount &lt; 0.01))\n   -&gt;  Index Scan using payments3_account_id_amount_idx on payments3 \n    (actual time=5.027..5.066 rows=82 loops=1)\n         Index Cond: ((account_id = 42) AND (amount &lt; 0.01))\n Planning Time: 9.587 ms\n Execution Time: 23.546 ms\n Peak Memory Usage: 56 kB\n(10 rows)\n</pre>\n<p>In practice, since partitions are created for operational reasons, you can hide them and provide users a view that shows only the time window they are allowed to query, such as the last five years.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; create view visible_payments as\n                      select * from payments\n                      where created between now() - interval '5  years' and now()\n;\n</pre>\n<p>Now, the additional partitions created for the future do not have to be read, and the query is faster:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">yugabyte=&gt; explain (analyze, buffers, costs off)\n                       select * from visible_payments\n                       where account_id = 42 and amount &lt; 0.01\n;\n                                                   QUERY PLAN\n-----------------------------------------------------------------------------------------\n Append (actual time=5.063..8.702 rows=105 loops=1)\n   Subplans Removed: 1\n   -&gt;  Index Scan using payments2_account_id_amount_idx on payments2 \n    (actual time=5.063..5.168 rows=23 loops=1)\n         Index Cond: ((account_id = 42) AND (amount &lt; 0.01))\n         Filter: ((created &lt;= now()) AND (created &gt;= (now() - '5 years'::interval)))\n         Rows Removed by Filter: 197\n   -&gt;  Index Scan using payments3_account_id_amount_idx on payments3 \n    (actual time=3.471..3.523 rows=82 loops=1)\n         Index Cond: ((account_id = 42) AND (amount &lt; 0.01))\n         Filter: ((created &lt;= now()) AND (created &gt;= (now() - '5 years'::interval)))\n Planning Time: 0.181 ms\n Execution Time: 8.771 ms\n Peak Memory Usage: 56 kB\n(12 rows)\n</pre>\n<p>It is a great strategy to create more partitions for the future to prevent them from being missing later, while ensuring that the application accesses only necessary partitions.</p>\n<p>You may not need to do this when partitioning by date. Still, there are other reasons to use declarative partitioning in YugabyteDB, such as geo-distribution, where each partition is assigned to a specific tablespace, maybe by list of &#8220;<code>account_id</code>&#8221; to isolate some of them, or on a country code. The rule remains the same: limit the number of declarative partitions to whatever the minimum is for lifecycle management or data placement, leveraging YugabyteDB’s automatic sharding for scalability within each of those partitions.</p>\n<h2>In Conclusion: Automatic Interval Partitioning With Global Indexes</h2>\n<p>Automatic sharding facilitates a wide range of scaling and distribution possibilities in YugabyteDB&#8217;s distributed storage. By defining primary keys and secondary indexes that serve your access patterns, the sharding key can differ for the table and the indexes. The result? You can optimize one schema for various use cases.<span style=\"font-weight: 400\"> The keys can contain a partition key— to distribute— and a sort key —for clustering.  You may also add a technical key to control the cardinality, so you can balance between the distribution of inserts to increase the write throughput and the clustering of rows or index entries to increase the read response time.</span></p>\n<p>In addition, you can use declarative partitioning to place some partitions in specific locations for geo-distribution, and having only local indexes at that level makes sense. Because each partition benefits from YugabyteDB distributed storage scalability, there&#8217;s no need to create a large number of partitions, avoiding the limitations that PostgreSQL encounters with hundreds of partitions.</p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>YugabyteDB&#8217;s automatic sharding overcomes PostgreSQL&#8217;s partition key limitations by allowing date range queries without modifying table partitioning. Thanks to its global secondary indexes, which don&#8217;t require a shared sharding key, YugabyteDB enhances performance by distributing rows across multiple servers. Discover the full advantages and see step-by-step instructions in our latest blog post.</p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 32128,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": false,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2194
+  ],
+  "tags": [
+    2242,
+    2246,
+    2267,
+    2371,
+    2183
+  ],
+  "class_list": [
+    "post-32125",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-postgresql",
+    "tag-data-sharding",
+    "tag-distributed-postgresql",
+    "tag-partitioning",
+    "tag-postgresql-compatible",
+    "tag-secondary-indexes"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Advanced Partitioning with YugabyteDB Sharding</title>\n<meta name=\"description\" content=\"YugabyteDB&#039;s automatic sharding and global secondary indexes allow querying by date range without shared keys, enhancing performance. Read to learn more.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Advanced Partitioning with YugabyteDB Sharding\" />\n<meta property=\"og:description\" content=\"Build resilient Spring Boot apps ready for any issue with our blog on retry mechanisms and transaction management using YugabyteDB.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2024-04-16T11:47:00+00:00\" />\n<meta property=\"article:modified_time\" content=\"2024-04-28T07:36:21+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_Advanced-PostgreSQL-Partitioning_1200x628.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:description\" content=\"Build resilient Spring Boot apps ready for any issue with our blog on retry mechanisms and transaction management using YugabyteDB.\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_Advanced-PostgreSQL-Partitioning_1200x628.jpg\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"12 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"Advanced PostgreSQL Partitioning by Date with YugabyteDB Auto Sharding\",\"datePublished\":\"2024-04-16T11:47:00+00:00\",\"dateModified\":\"2024-04-28T07:36:21+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/\"},\"wordCount\":2483,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/04\\/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg\",\"keywords\":[\"Data Sharding\",\"Distributed PostgreSQL\",\"Partitioning\",\"PostgreSQL Compatibility\",\"Secondary Indexes\"],\"articleSection\":[\"PostgreSQL\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/\",\"name\":\"PostgreSQL Advanced Partitioning with YugabyteDB Sharding\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/04\\/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg\",\"datePublished\":\"2024-04-16T11:47:00+00:00\",\"dateModified\":\"2024-04-28T07:36:21+00:00\",\"description\":\"YugabyteDB's automatic sharding and global secondary indexes allow querying by date range without shared keys, enhancing performance. Read to learn more.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/04\\/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/04\\/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg\",\"width\":480,\"height\":320,\"caption\":\"Blocks distributed and partitioned\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-advanced-partitioning-by-date\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Advanced PostgreSQL Partitioning by Date with YugabyteDB Auto Sharding\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "PostgreSQL Advanced Partitioning with YugabyteDB Sharding",
+    "description": "YugabyteDB's automatic sharding and global secondary indexes allow querying by date range without shared keys, enhancing performance. Read to learn more.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "PostgreSQL Advanced Partitioning with YugabyteDB Sharding",
+    "og_description": "Build resilient Spring Boot apps ready for any issue with our blog on retry mechanisms and transaction management using YugabyteDB.",
+    "og_url": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2024-04-16T11:47:00+00:00",
+    "article_modified_time": "2024-04-28T07:36:21+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_Advanced-PostgreSQL-Partitioning_1200x628.jpg",
+        "type": "image/jpeg"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_description": "Build resilient Spring Boot apps ready for any issue with our blog on retry mechanisms and transaction management using YugabyteDB.",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_Advanced-PostgreSQL-Partitioning_1200x628.jpg",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "12 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "Advanced PostgreSQL Partitioning by Date with YugabyteDB Auto Sharding",
+          "datePublished": "2024-04-16T11:47:00+00:00",
+          "dateModified": "2024-04-28T07:36:21+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/"
+          },
+          "wordCount": 2483,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg",
+          "keywords": [
+            "Data Sharding",
+            "Distributed PostgreSQL",
+            "Partitioning",
+            "PostgreSQL Compatibility",
+            "Secondary Indexes"
+          ],
+          "articleSection": [
+            "PostgreSQL"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/",
+          "url": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/",
+          "name": "PostgreSQL Advanced Partitioning with YugabyteDB Sharding",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg",
+          "datePublished": "2024-04-16T11:47:00+00:00",
+          "dateModified": "2024-04-28T07:36:21+00:00",
+          "description": "YugabyteDB's automatic sharding and global secondary indexes allow querying by date range without shared keys, enhancing performance. Read to learn more.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg",
+          "width": 480,
+          "height": 320,
+          "caption": "Blocks distributed and partitioned"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Advanced PostgreSQL Partitioning by Date with YugabyteDB Auto Sharding"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/32125",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=32125"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/32125/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/32128"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=32125"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=32125"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=32125"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 32128,
+        "date": "2024-04-14T09:48:32",
+        "slug": "yugabytedb_blog_postgresql-partitioning_480x320",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/postgresql-advanced-partitioning-by-date/yugabytedb_blog_postgresql-partitioning_480x320/",
+        "title": {
+          "rendered": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320"
+        },
+        "author": 104,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "Blocks distributed and partitioned",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg",
+          "filesize": 87760,
+          "sizes": {
+            "thumbnail": {
+              "file": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 14322,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-150x150.jpg"
+            },
+            "alm-thumbnail": {
+              "file": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 14322,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-150x150.jpg"
+            },
+            "authorship-box-avatar": {
+              "file": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 14322,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-150x150.jpg"
+            },
+            "authorship-box-related": {
+              "file": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-70x70.jpg",
+              "width": 70,
+              "height": 70,
+              "filesize": 6282,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-70x70.jpg"
+            },
+            "fw-mobile": {
+              "file": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-480x246.jpg",
+              "width": 480,
+              "height": 246,
+              "filesize": 47212,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-480x246.jpg"
+            },
+            "video-size": {
+              "file": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-370x247.jpg",
+              "width": 370,
+              "height": 247,
+              "filesize": 36347,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320-370x247.jpg"
+            },
+            "full": {
+              "file": "YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/04/YugabyteDB_Blog_PostgreSQL-Partitioning_480x320.jpg",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/32128",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/104"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=32128"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 32125,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/32125"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2194,
+          "link": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+          "name": "PostgreSQL",
+          "slug": "postgresql",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/databases/postgresql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/databases/postgresql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/\",\"name\":\"PostgreSQL Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Databases\",\"item\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/\"},{\"@type\":\"ListItem\",\"position\":3,\"name\":\"PostgreSQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "PostgreSQL Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "PostgreSQL Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+                  "url": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+                  "name": "PostgreSQL Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Databases",
+                      "item": "https://www.yugabyte.com/blog/category/databases/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 3,
+                      "name": "PostgreSQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2194",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "up": [
+              {
+                "embeddable": true,
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2158"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2194"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2242,
+          "link": "https://www.yugabyte.com/blog/tag/data-sharding/",
+          "name": "Data Sharding",
+          "slug": "data-sharding",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Data Sharding Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/data-sharding/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Data Sharding Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/data-sharding/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/\",\"name\":\"Data Sharding Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/data-sharding\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Data Sharding\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Data Sharding Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/data-sharding/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Data Sharding Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/data-sharding/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/data-sharding/",
+                  "url": "https://www.yugabyte.com/blog/tag/data-sharding/",
+                  "name": "Data Sharding Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/data-sharding/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/data-sharding/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Data Sharding"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2242",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2242"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2246,
+          "link": "https://www.yugabyte.com/blog/tag/distributed-postgresql/",
+          "name": "Distributed PostgreSQL",
+          "slug": "distributed-postgresql",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Distributed PostgreSQL Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/distributed-postgresql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Distributed PostgreSQL Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/distributed-postgresql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-postgresql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-postgresql\\/\",\"name\":\"Distributed PostgreSQL Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-postgresql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-postgresql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Distributed PostgreSQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Distributed PostgreSQL Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/distributed-postgresql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Distributed PostgreSQL Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/distributed-postgresql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/distributed-postgresql/",
+                  "url": "https://www.yugabyte.com/blog/tag/distributed-postgresql/",
+                  "name": "Distributed PostgreSQL Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/distributed-postgresql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/distributed-postgresql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Distributed PostgreSQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2246",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2246"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2267,
+          "link": "https://www.yugabyte.com/blog/tag/partitioning/",
+          "name": "Partitioning",
+          "slug": "partitioning",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Partitioning Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/partitioning/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Partitioning Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/partitioning/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/\",\"name\":\"Partitioning Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/partitioning\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Partitioning\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Partitioning Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/partitioning/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Partitioning Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/partitioning/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/partitioning/",
+                  "url": "https://www.yugabyte.com/blog/tag/partitioning/",
+                  "name": "Partitioning Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/partitioning/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/partitioning/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Partitioning"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2267",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2267"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2371,
+          "link": "https://www.yugabyte.com/blog/tag/postgresql-compatible/",
+          "name": "PostgreSQL Compatibility",
+          "slug": "postgresql-compatible",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Compatibility Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/postgresql-compatible/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Compatibility Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/postgresql-compatible/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-compatible\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-compatible\\/\",\"name\":\"PostgreSQL Compatibility Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-compatible\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-compatible\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"PostgreSQL Compatibility\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "PostgreSQL Compatibility Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/postgresql-compatible/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "PostgreSQL Compatibility Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/postgresql-compatible/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql-compatible/",
+                  "url": "https://www.yugabyte.com/blog/tag/postgresql-compatible/",
+                  "name": "PostgreSQL Compatibility Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/postgresql-compatible/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql-compatible/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "PostgreSQL Compatibility"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2371",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2371"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2183,
+          "link": "https://www.yugabyte.com/blog/tag/secondary-indexes/",
+          "name": "Secondary Indexes",
+          "slug": "secondary-indexes",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Secondary Indexes Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/secondary-indexes/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Secondary Indexes Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/secondary-indexes/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/secondary-indexes\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/secondary-indexes\\/\",\"name\":\"Secondary Indexes Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/secondary-indexes\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/secondary-indexes\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Secondary Indexes\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Secondary Indexes Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/secondary-indexes/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Secondary Indexes Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/secondary-indexes/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/secondary-indexes/",
+                  "url": "https://www.yugabyte.com/blog/tag/secondary-indexes/",
+                  "name": "Secondary Indexes Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/secondary-indexes/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/secondary-indexes/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Secondary Indexes"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2183",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2183"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

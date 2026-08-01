@@ -1,0 +1,1465 @@
+{
+  "id": 33645,
+  "date": "2024-12-03T03:01:04",
+  "date_gmt": "2024-12-03T11:01:04",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=33645"
+  },
+  "modified": "2026-01-08T23:38:04",
+  "modified_gmt": "2026-01-09T07:38:04",
+  "slug": "aws-clock-synchronization",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/aws-clock-synchronization/",
+  "title": {
+    "rendered": "Achieving Precise Clock Synchronization on AWS"
+  },
+  "content": {
+    "rendered": "<p>This blog post explores the potential levels of time synchronization available in an Amazon EC2 instance to allow you to maintain consistency at high-performance levels with YugabyteDB.</p>\n<h2>The Role of Clocks in Database Scalability</h2>\n<p>To achieve scalability, a distributed database must apply read and write operations without synchronizing with other cluster nodes. For example, in YugabyteDB, two transactions can be processed simultaneously by different nodes. Each node sends its read and write operations to other nodes based on:</p>\n<ul>\n<li>the sharding keys of the table rows</li>\n<li>the sharding keys of the index entries</li>\n<li>the identifier of the transaction to commit or rollback</li>\n</ul>\n<p>Although these operations occur independently, they must preserve the correct order of events. For instance, if a deposit is made to your account before a withdrawal, it&#8217;s essential that the bank accurately reflects this order. Reading operations in the same sequence executed is crucial for maintaining consistency and preventing issues such as stale reads.</p>\n<p>In monolithic databases or clusters sharing a low-latency private interconnect network, assigning a monotonically increasing number to sequence the database states is straightforward.</p>\n<p>Oracle Database, for example, uses the System Change Number (SCN) for this purpose. Some distributed databases, like TiDB use a <a href=\"https://docs.pingcap.com/tidb/stable/tso\" target=\"_blank\" rel=\"noopener\">TimeStamp Oracle</a>, which limits the scalability, especially when deploying to multiple regions, but provides precise ordering.</p>\n<p>To achieve linear scalability and eliminate any single point of truth, <a href=\"/yugabytedb/\">YugabyteDB</a> utilizes the wall clock, which is accessible in all systems. Despite this, clock drift can occur, necessitating synchronization between the nodes.</p>\n<p>This synchronization is inherently imperfect, so the database must account for the uncertainty arising from the hardware and software involved in clock synchronization and the network used for this process. YugabyteDB adds a logical clock (Lamport) to physical time for node synchronization during message exchange. However, physical time remains crucial for global ordering.</p>\n<h2>Time Synchronisation</h2>\n<p>Here is a description of the time synchronization levels that can be achieved in Amazon EC2 instances.</p>\n<h3>Network Time Protocol (NTP)</h3>\n<p>NTP is the default protocol for adjusting the internal electronic clock, which can drift. It synchronizes time with reference NTP servers that provide more accurate time using atomic clocks, either locally or via GPS signals. When the time depends on Network Time Protocol (NTP) synchronization, there is no guarantee of clock skew, because there&#8217;s unpredictable network latency in the roundtrip to these servers.</p>\n<p>YugabyteDB establishes a maximum allowable clock skew of 0.5 seconds (<code>--max_clock_skew_usec=500000</code>) to ensure safety. It treats the wall clock as reliable for comparing two timestamps only if the time difference exceeds this threshold. If any server detects a clock skew exceeding this limit, it will immediately crash to prevent inconsistencies.</p>\n<p>This affects performance. If a read operation detects a modification made within 500 milliseconds of its transaction read-time, it cannot accurately determine whether it occurred earlier or later. As a result, the read operation will restart with a newer timestamp to ensure accuracy. Availability is also affected, as infrastructure failures affecting clock synchronization can render a node unavailable.</p>\n<h3>AWS Time Sync Service</h3>\n<p>Amazon uses atomic clocks and GPS signals to provide more precise time in each region. This time is available through NTP to any instance in the VPC, accessible through the 169.254.169.123 address.</p>\n<p>It is configured by default in EC2 instances, and you can verify it with chronyc. I&#8217;ve run this in a simple cloud shell:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">[root@ip-10-134-32-254 sysconfig]# sudo yum install chrony\nLast metadata expiration check: 0:08:43 ago on Mon 18 Nov 2024 07:55:53 AM UTC.\nPackage chrony-4.3-1.amzn2023.0.4.x86_64 is already installed.\nDependencies resolved.\nNothing to do.\nComplete!\n\n[root@ip-10-134-32-254 sysconfig]# chronyc sources\nMS Name/IP address         Stratum Poll Reach LastRx Last sample               \n===============================================================================\n^* 169.254.169.123               3   4   377     5    +95us[  +97us] +/-  714us\n^- ec2-35-176-149-124.eu-we&gt;     4   6   377     7   +297us[ +299us] +/- 6363us\n^- ec2-3-8-121-220.eu-west-&gt;     4   6   377     5    -49us[  -47us] +/- 5324us\n^- ec2-13-40-182-125.eu-wes&gt;     4   6   377     6   -394us[ -392us] +/- 5660us\n^- ec2-18-133-139-197.eu-we&gt;     4   6   377     6    +69us[  +71us] +/- 6213us</pre>\n<p>The Amazon Time Sync NTP servers are also available to the public internet through time.aws.com.</p>\n<p>Amazon Time Sync provides sub-millisecond clock accuracy. If the service fails to provide a bound the system reports an error. YugabyteDB nodes crash if such an error is reported. However, YugabyteDB still recommends setting the maximum clock skew to 500ms to be safe when there&#8217;s no higher guarantee of precision to allow failures from the clock.</p>\n<h3>AWS Time Sync Service with Precision Hardware Clock (PHC)</h3>\n<p>At re:Invent 2023, Amazon Web Services announced the addition of a Precision Hardware Clock (PHC) to the hypervisor (Nitro) to provide a more accurate time source with Time Sync Service. NTP transparently uses this clock to obtain less than millisecond accurate time on instances that support PHC, typically under 100 microseconds.</p>\n<p>To test it, I use a recent instance type (C7i, M7i, R7i, C7a, M7a, R7a, M7g) from a region supporting PHC. I&#8217;m using <code>m7i.large</code> in <code>us-east-1</code> and checking the Time Sync precision though NTP:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">[ec2-user@ip-172-31-12-153 ~]$ chronyc sources\nMS Name/IP address         Stratum Poll Reach LastRx Last sample\n===============================================================================\n^- ip212-227-240-160.pbiaas&gt;     2   6    17     3   -161us[ -166us] +/-   33ms\n^- vps-4e90522b.vps.ovh.us       2   6    17     2   -195us[ -195us] +/-   68ms\n^- time2.tritan.host             2   6    17     2    +83us[  +83us] +/-   39ms\n^- clock.xmission.com            1   6    17     2  +4734us[+4734us] +/-   36ms\n^* 169.254.169.123               1   4    17     2  -4952ns[-9826ns] +/-   98us\n\n[ec2-user@ip-172-31-12-153 ~]$ chronyc tracking | awk '$0~re{$0=$0gensub(re,\" (0.\\\\1 m\\\\2)\",1)}{print}' re='.*0.000([0-9]+) (s)econds.*'\nReference ID    : A9FEA97B (169.254.169.123)\nStratum         : 2\nRef time (UTC)  : Mon Nov 18 08:46:53 2024\nSystem time     : 0.000000004 seconds fast of NTP time (0.4 ms)\nLast offset     : -0.000004874 seconds (0.4874 ms)\nRMS offset      : 0.000004874 seconds (0.4874 ms)\nFrequency       : 5.349 ppm fast\nResidual freq   : +0.018 ppm\nSkew            : 8.524 ppm\nRoot delay      : 0.000157363 seconds (0.157363 ms)\nRoot dispersion : 0.000105599 seconds (0.105599 ms)\nUpdate interval : 1.4 seconds\nLeap status     : Normal</pre>\n<p>This is automatic in an EC2 instance, provided it is recent hardware. Chrony can synchronize the system clock with PHC through NTP.</p>\n<h3>AWS Time Sync Service with Precision Time Protocol (PTP)</h3>\n<p>Chrony can synchronize the clock using the Precision Time Protocol (PTP) to achieve greater precision, typically under 40 microseconds. To do so, you need to install the latest <a href=\"https://github.com/amzn/amzn-drivers/tree/master/kernel/linux/ena\" target=\"_blank\" rel=\"noopener\">Elastic Network Adapter (ENA)</a> driver.</p>\n<p>Then chrony must be configured to use PHC. This is set by adding refclock PHC /dev/ptp0 poll 0 delay 0.000010 prefer in /etc/chrony.conf (poll 0 is continuous time keeping and delay 0.000010 is 10 milliseconds to account for network or processing latency).</p>\n<p>On AlmaLinux OS 8, I use the scripts provided by YugabyteDB to install ENA drivers and get NTP accessing the PTP Hardware Clock:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">curl -Ls https://raw.githubusercontent.com/yugabyte/yugabyte-db/refs/heads/master/bin/configure_ptp.sh |\n sudo bash -x</pre>\n<p><span style=\"font-weight: 400;\">The PHC source is now available with a higher precision:</span></p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">[ec2-user@ip-172-31-12-153 ~]$ chronyc sources\nMS Name/IP address         Stratum Poll Reach LastRx Last sample\n===============================================================================\n#* PHC0                          0   0   373     0   +401ns[ +426ns] +/- 5030ns\n^- triton.ellipse.net            2   6    37    10  -5061us[-5061us] +/-   31ms\n^- zero.txryan.com               2   6    37    10  -2396ns[-2283ns] +/- 1391us\n^- server.slakjd.com             3   6    37     9   -223us[ -223us] +/-   18ms\n^- 44.190.5.123                  2   6    37     9   +188us[ +188us] +/-   37ms\n^- 169.254.169.123               1   4   377     9   +147us[ +147us] +/-  227us\n\n[ec2-user@ip-172-31-12-153 ~]$ chronyc tracking | awk '$0~re{$0=$0gensub(re,\" (0.\\\\1 m\\\\2)\",1)}{print}' re='.*0.000([0-9]+) (s)econds.*'\nReference ID    : 50484330 (PHC0)\nStratum         : 1\nRef time (UTC)  : Mon Nov 18 08:53:47 2024\nSystem time     : 0.000000035 seconds fast of NTP time (0.35 ms)\nLast offset     : +0.000000027 seconds (0.27 ms)\nRMS offset      : 0.000000090 seconds (0.90 ms)\nFrequency       : 5.013 ppm fast\nResidual freq   : +0.001 ppm\nSkew            : 0.028 ppm\nRoot delay      : 0.000010000 seconds (0.0 ms)\nRoot dispersion : 0.000001070 seconds (0.1070 ms)\nUpdate interval : 1.0 seconds\nLeap status     : Normal\n\n[ec2-user@ip-172-31-12-153 ~]$ sudo cat /sys/devices/pci0000:24/0000:24:00.0/0000:25:00.0/0000:26:00.0/0000:27:00.0/phc_error_bound\n14023\n</pre>\n<h3>AWS Time Sync Service with Precision Time Protocol (PTP) and ClockBound</h3>\n<p>When the consistency of your transactions depends on it, it is not only important to have a precise time, we also need to guarantee the ordering of events.</p>\n<p>This requires knowing the maximum possible error, with a 100% guarantee. The calculation of the maximum clock error bound must add the error bound calculated by the hypervisor (Nitro) and exposed by phc_error_bound.</p>\n<p>I install and configure the ClockBound service using the scripts for YugabyteDB:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">curl -Ls https://raw.githubusercontent.com/yugabyte/yugabyte-db/refs/heads/master/bin/configure_clockbound.sh |\n sudo bash -x</pre>\n<p>As I am in a lab, I can test it with the C example from the ClockBound repo:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">git clone https://github.com/aws/clock-bound.git\n\n# Build the ClockBound Foreign Function Interface libraries\ncd clock-bound/clock-bound-ffi\ncurl https://sh.rustup.rs -sSf | sh &lt;&lt;&lt;\"\"\n. \"$HOME/.cargo/env\"\ncargo build --release\nsudo cp include/clockbound.h               /usr/include/\nsudo cp ../target/release/libclockbound.a  /usr/lib\nsudo cp ../target/release/libclockbound.so /usr/lib\ncd -\n\n# compile and run the example\ncd clock-bound/examples/c/src\ngcc clockbound_now.c -o clockbound_now -I/usr/include -L/usr/lib -lclockbound\nLD_LIBRARY_PATH=/usr/lib ./clockbound_now ; echo</pre>\n<p>Here is the output, showing the clock bound as well as the performance of the calls:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">[ec2-user@ip-172-31-12-153 src]$ LD_LIBRARY_PATH=/usr/lib ./clockbound_now\nWhen clockbound_now was called true time was somewhere within 1731939946.194796388 and 1731939946.194930750 seconds since Jan 1 1970. The clock status is SYNCHRONIZED.\nIt took 7.067347211 seconds to call clock bound 100000000 times (14149580 tps).\n[ec2-user@ip-172-31-12-153 src]$ LD_LIBRARY_PATH=/usr/lib ./clockbound_now ; echo\nWhen clockbound_now was called true time was somewhere within 1731939963.817817253 and 1731939963.817913367 seconds since Jan 1 1970. The clock status is SYNCHRONIZED.\nIt took 7.102227815 seconds to call clock bound 100000000 times (14080089 tps).</pre>\n<p>This establishes a true time as both a lower and upper bound. A distributed database can utilize this to compare read and write times, with a minimal uncertainty window. This helps minimize read retries at their maximum.</p>\n<h2>Distributed SQL Database</h2>\n<p>Once ClockBound and PHC are available, YugabyteDB can use them to replace the 500ms default clock skew conservative setting. I can start YugabyteDB with gigabyte start &#8211;enhance_time_sync_via_clockbound, which defines the time source as CloudBound instead of the Wall Clock.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">curl -Ls https://downloads.yugabyte.com/releases/2.23.1.0/yugabyte-2.23.1.0-b220-linux-x86_64.tar.gz | tar xzvf -\nsudo dnf install -y python39\nyugabyte-2.23.1.0/bin/yugabyted start --enhance_time_sync_via_clockbound --advertise_address=$(hostname)</pre>\n<p>It detects the correct configuration of ClockBound:</p>\n<p><img loading=\"lazy\" decoding=\"async\" class=\"loaded come-in aligncenter wp-image-33655 size-full\" src=\"https://www.yugabyte.com/wp-content/uploads/2024/12/configuration-of-clockbound.png\" alt=\"configuration of ClockBound\" width=\"512\" height=\"97\" /></p>\n<p>I use the psql shipped with YugabyteDB to run PostgreSQL statements:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">PGHOST=$(hostname) ./yugabyte-2.23.1.0/bin/ysqlsh</pre>\n<p>Here is what I&#8217;ve used to test the benefits of using ClockBound as a time source. The following creates a table with one row and a background connection updates it continuously. I disable the query layer retries (set yb_max_query_layer_retries=0 is set to 60 by default) and run a query to read the table:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">\\c\ndrop table demo;\ncreate table demo ( id bigserial primary key, value int, ts timestamptz default clock_timestamp() );\ninsert into demo(value) values (1);\n\\! sleep 1 ; echo -e 'update demo set value=value+1\\n\\\\watch 0.001' | timeout 60 ./yugabyte-2.23.1.0/bin/ysqlsh &gt;/dev/null &amp; sleep 1\nset yb_max_query_layer_retries=0;\nprepare q as select * from demo;\nexplain analyze execute q;\n\\watch 0.0001</pre>\n<p>If you run this with the wall clock as a time source, YugabyteDB uses a conservative 500ms maximum clock skew. As my query reads a state that was updated less than 500ms ago, and retries are disabled, it gets the following error:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"shell\">ERROR:  Restart read required at: { read: { physical: 1731940780361106 } local_limit: { physical: 1731940780361106 }\nglobal_limit: &lt;min&gt; in_txn_limit: &lt;max&gt; serial_no: 0 } (yb_max_query_layer_retries set to 0 are exhausted)</pre>\n<p>With the default 60 retries, the probability of such an error is much lower, but the latency increases with retries.</p>\n<p>When you run this with ClockBound as a time source, the query will never fail, even with no retries. The reason is that the probability of an update made 100 microseconds before the read is very low.</p>\n<p>Note: it is not recommended that you disable query layer retries. I did that to demonstrate the benefit of running a distributed SQL database with precise time. Just keep the default, and the benefit will be visible in the performance during the high concurrency peaks.</p>\n<h2>Conclusion</h2>\n<p>Thanks to Precision Hardware Clocks, the nodes of a distributed database can operate with a synchronized clock without incurring the costs associated with network synchronization. ClockBound ensures that clock error is kept within a guaranteed precision that does not negatively affect performance.</p>\n<p>One significant advantage of a public cloud infrastructure is its ability to offer easily provisioned hardware that would be almost impossible in an on-premises data center.</p>\n<p>AWS Time Sync Service and Amazon EC2 utilize both hardware and software solutions to facilitate the use of Precision Hardware Clocks (PHC) through Network Time Protocol (NTP) or Precision Time Protocol (PTP).</p>\n<p>Databases like YugabyteDB can leverage this technology to maintain consistency at high-performance levels.</p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>AWS Time Sync Service and Amazon EC2 utilize hardware and software solutions to facilitate the use of Precision Hardware Clocks (PHC) through Network Time Protocol (NTP) or Precision Time Protocol (PTP). Discover how YugabyteDB leverages this technology to maintain consistency at high-performance levels.</p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 33664,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": true,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2148
+  ],
+  "tags": [
+    2206,
+    3430,
+    3428,
+    2402
+  ],
+  "class_list": [
+    "post-33645",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-aws",
+    "tag-aws",
+    "tag-consistency",
+    "tag-synchronized-clock",
+    "tag-yugabytedb"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Achieving Precise Clock Synchronization on AWS | Yugabyte</title>\n<meta name=\"description\" content=\"Discover how the time synchronization in an Amazon EC2 instance allows you to maintain consistency at high-performance levels with YugabyteDB.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/aws-clock-synchronization/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Achieving Precise Clock Synchronization on AWS | Yugabyte\" />\n<meta property=\"og:description\" content=\"Discover how the time synchronization in an Amazon EC2 instance allows you to maintain consistency at high-performance levels with YugabyteDB.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/aws-clock-synchronization/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2024-12-03T11:01:04+00:00\" />\n<meta property=\"article:modified_time\" content=\"2026-01-09T07:38:04+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-social.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-social.jpg\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"7 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"Achieving Precise Clock Synchronization on AWS\",\"datePublished\":\"2024-12-03T11:01:04+00:00\",\"dateModified\":\"2026-01-09T07:38:04+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/\"},\"wordCount\":1399,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/12\\/aws-clock-synchronization-blog.jpg\",\"keywords\":[\"AWS\",\"Consistency\",\"Synchronized Clock\",\"YugabyteDB\"],\"articleSection\":[\"Amazon Web Services\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/\",\"name\":\"Achieving Precise Clock Synchronization on AWS | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/12\\/aws-clock-synchronization-blog.jpg\",\"datePublished\":\"2024-12-03T11:01:04+00:00\",\"dateModified\":\"2026-01-09T07:38:04+00:00\",\"description\":\"Discover how the time synchronization in an Amazon EC2 instance allows you to maintain consistency at high-performance levels with YugabyteDB.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/12\\/aws-clock-synchronization-blog.jpg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/12\\/aws-clock-synchronization-blog.jpg\",\"width\":480,\"height\":320,\"caption\":\"Achieving Precise Clock Synchronization on AWS\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/aws-clock-synchronization\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Achieving Precise Clock Synchronization on AWS\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "Achieving Precise Clock Synchronization on AWS | Yugabyte",
+    "description": "Discover how the time synchronization in an Amazon EC2 instance allows you to maintain consistency at high-performance levels with YugabyteDB.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/aws-clock-synchronization/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "Achieving Precise Clock Synchronization on AWS | Yugabyte",
+    "og_description": "Discover how the time synchronization in an Amazon EC2 instance allows you to maintain consistency at high-performance levels with YugabyteDB.",
+    "og_url": "https://www.yugabyte.com/blog/aws-clock-synchronization/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2024-12-03T11:01:04+00:00",
+    "article_modified_time": "2026-01-09T07:38:04+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-social.jpg",
+        "type": "image/jpeg"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-social.jpg",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "7 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "Achieving Precise Clock Synchronization on AWS",
+          "datePublished": "2024-12-03T11:01:04+00:00",
+          "dateModified": "2026-01-09T07:38:04+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/"
+          },
+          "wordCount": 1399,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog.jpg",
+          "keywords": [
+            "AWS",
+            "Consistency",
+            "Synchronized Clock",
+            "YugabyteDB"
+          ],
+          "articleSection": [
+            "Amazon Web Services"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/",
+          "url": "https://www.yugabyte.com/blog/aws-clock-synchronization/",
+          "name": "Achieving Precise Clock Synchronization on AWS | Yugabyte",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog.jpg",
+          "datePublished": "2024-12-03T11:01:04+00:00",
+          "dateModified": "2026-01-09T07:38:04+00:00",
+          "description": "Discover how the time synchronization in an Amazon EC2 instance allows you to maintain consistency at high-performance levels with YugabyteDB.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/aws-clock-synchronization/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog.jpg",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog.jpg",
+          "width": 480,
+          "height": 320,
+          "caption": "Achieving Precise Clock Synchronization on AWS"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/aws-clock-synchronization/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Achieving Precise Clock Synchronization on AWS"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/33645",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=33645"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/33645/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/33664"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=33645"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=33645"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=33645"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 33664,
+        "date": "2024-12-03T22:30:37",
+        "slug": "aws-clock-synchronization-blog",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/aws-clock-synchronization/aws-clock-synchronization-blog/",
+        "title": {
+          "rendered": "Achieving Precise Clock Synchronization on AWS"
+        },
+        "author": 75,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog.jpg'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "Achieving Precise Clock Synchronization on AWS",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2024/12/aws-clock-synchronization-blog.jpg",
+          "filesize": 115993,
+          "sizes": {
+            "thumbnail": {
+              "file": "aws-clock-synchronization-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 15155,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-150x150.jpg"
+            },
+            "alm-thumbnail": {
+              "file": "aws-clock-synchronization-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 15155,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-150x150.jpg"
+            },
+            "authorship-box-avatar": {
+              "file": "aws-clock-synchronization-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 15155,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-150x150.jpg"
+            },
+            "authorship-box-related": {
+              "file": "aws-clock-synchronization-blog-70x70.jpg",
+              "width": 70,
+              "height": 70,
+              "filesize": 6296,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-70x70.jpg"
+            },
+            "fw-mobile": {
+              "file": "aws-clock-synchronization-blog-480x246.jpg",
+              "width": 480,
+              "height": 246,
+              "filesize": 54999,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-480x246.jpg"
+            },
+            "video-size": {
+              "file": "aws-clock-synchronization-blog-370x247.jpg",
+              "width": 370,
+              "height": 247,
+              "filesize": 42864,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog-370x247.jpg"
+            },
+            "full": {
+              "file": "aws-clock-synchronization-blog.jpg",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog.jpg"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/12/aws-clock-synchronization-blog.jpg",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/33664",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/75"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=33664"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 33645,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/33645"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2148,
+          "link": "https://www.yugabyte.com/blog/category/cloud-providers/aws/",
+          "name": "Amazon Web Services",
+          "slug": "aws",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Amazon Web Services Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/cloud-providers/aws/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Amazon Web Services Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/cloud-providers/aws/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/cloud-providers\\/aws\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/cloud-providers\\/aws\\/\",\"name\":\"Amazon Web Services Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/cloud-providers\\/aws\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/cloud-providers\\/aws\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Cloud Providers\",\"item\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/cloud-providers\\/\"},{\"@type\":\"ListItem\",\"position\":3,\"name\":\"Amazon Web Services\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Amazon Web Services Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/cloud-providers/aws/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Amazon Web Services Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/cloud-providers/aws/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/cloud-providers/aws/",
+                  "url": "https://www.yugabyte.com/blog/category/cloud-providers/aws/",
+                  "name": "Amazon Web Services Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/cloud-providers/aws/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/cloud-providers/aws/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Cloud Providers",
+                      "item": "https://www.yugabyte.com/blog/category/cloud-providers/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 3,
+                      "name": "Amazon Web Services"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2148",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "up": [
+              {
+                "embeddable": true,
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2157"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2148"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2206,
+          "link": "https://www.yugabyte.com/blog/tag/aws/",
+          "name": "AWS",
+          "slug": "aws",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>AWS Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/aws/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"AWS Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/aws/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/aws\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/aws\\/\",\"name\":\"AWS Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/aws\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/aws\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"AWS\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "AWS Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/aws/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "AWS Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/aws/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/aws/",
+                  "url": "https://www.yugabyte.com/blog/tag/aws/",
+                  "name": "AWS Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/aws/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/aws/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "AWS"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2206",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2206"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 3430,
+          "link": "https://www.yugabyte.com/blog/tag/consistency/",
+          "name": "Consistency",
+          "slug": "consistency",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Consistency Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/consistency/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Consistency Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/consistency/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/consistency\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/consistency\\/\",\"name\":\"Consistency Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/consistency\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/consistency\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Consistency\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Consistency Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/consistency/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Consistency Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/consistency/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/consistency/",
+                  "url": "https://www.yugabyte.com/blog/tag/consistency/",
+                  "name": "Consistency Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/consistency/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/consistency/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Consistency"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/3430",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=3430"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 3428,
+          "link": "https://www.yugabyte.com/blog/tag/synchronized-clock/",
+          "name": "Synchronized Clock",
+          "slug": "synchronized-clock",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Synchronized Clock Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/synchronized-clock/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Synchronized Clock Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/synchronized-clock/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/synchronized-clock\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/synchronized-clock\\/\",\"name\":\"Synchronized Clock Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/synchronized-clock\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/synchronized-clock\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Synchronized Clock\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Synchronized Clock Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/synchronized-clock/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Synchronized Clock Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/synchronized-clock/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/synchronized-clock/",
+                  "url": "https://www.yugabyte.com/blog/tag/synchronized-clock/",
+                  "name": "Synchronized Clock Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/synchronized-clock/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/synchronized-clock/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Synchronized Clock"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/3428",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=3428"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2402,
+          "link": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+          "name": "YugabyteDB",
+          "slug": "yugabytedb",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>YugabyteDB Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/yugabytedb/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"YugabyteDB Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/yugabytedb/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/\",\"name\":\"YugabyteDB Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"YugabyteDB\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "YugabyteDB Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "YugabyteDB Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+                  "url": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+                  "name": "YugabyteDB Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "YugabyteDB"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2402",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2402"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

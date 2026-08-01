@@ -1,0 +1,1185 @@
+{
+  "id": 27868,
+  "date": "2023-05-22T04:46:00",
+  "date_gmt": "2023-05-22T11:46:00",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=27868"
+  },
+  "modified": "2026-02-25T21:47:55",
+  "modified_gmt": "2026-02-26T05:47:55",
+  "slug": "generate-sql-script-postgresql",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/",
+  "title": {
+    "rendered": "Generate SQL Script in PostgreSQL"
+  },
+  "content": {
+    "rendered": "<p>DBAs often need to generate SQL statements, specifically DDL (Data Definition Language), using SQL queries and then execute them. <a href=\"/postgresql/\">PostgreSQL</a> has many features that can be helpful here.</p>\n<p>All <a href=\"https://www.yugabyte.com/distributed-sql/sql-database/\">SQL databases</a> provide their metadata as relational views on the catalog (i.e. database dictionary). That is not a coincidence. Codd&#8217;s rule number 4 mandates that a dynamic online catalog must be based on the relational model. Therefore, it&#8217;s logical to use SQL queries to generate DDL dynamically from the database metadata and execute the output.</p>\n<p>YugabyteDB also uses one process per connection, mirroring PostgreSQL&#8217;s protocol and query layer. This isn&#8217;t typically a scalability problem as connections can be spread across nodes. With YugabyteDB, all nodes are equal, accepting connections with read and write transactions. Ongoing work to add a database resident connection pool—based on Odyssey—aims to address applications without client-side connection pools and microservices with too many connection pools.</p>\n<p>Let’s walk through an example using YugabyteDB, which is <a href=\"/postgresql/postgresql-compatibility/\">Postgres-compatible</a> and provides the same SQL language and catalog views as PostgreSQL.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">yugabyte=#  select format(\r\n             $SQL$ alter table %1$8I.%2$-30I add column %3$I text not null default %4$L $SQL$ ,\r\n             schemaname, tablename, 'user_mod', 'init'\r\n             ) as ddl from pg_tables where schemaname='public' and tablename like 'customer%';\r\n\r\n                                                 ddl\r\n------------------------------------------------------------------------------------------------------\r\n  alter table   public.customer_customer_demo         add column user_mod text not null default 'init'\r\n  alter table   public.customer_demographics          add column user_mod text not null default 'init'\r\n  alter table   public.customers                      add column user_mod text not null default 'init'\r\n(3 rows)\r\n\r\nyugabyte=#  \\gexec\r\nALTER TABLE\r\nALTER TABLE\r\nALTER TABLE</pre>\n<p>I have generated an ALTER TABLE statement to ADD COLUMN for a few tables following a pattern (<code>%customer</code>) in their name and executed the statement.</p>\n<p>Let’s look, in detail, at each feature that I used.</p>\n<p>The <b>DDL statement </b>will be a character string (<code>text</code>) in the result. Simple character strings can be enclosed in quotes (&#8216;) but they may contain quotes themselves which have to be doubled (&#8216; &#8216;). This can quickly be a nightmare to read and maintain. PostgreSQL has a simple solution: <a href=\"https://www.postgresql.org/docs/current/sql-syntax-lexical.html#SQL-SYNTAX-DOLLAR-QUOTING\" target=\"_blank\" rel=\"noopener\">Dollar-Quoted String Constants</a> where a tag enclosed between two dollar signs ($) replaces a quote. The advantages are twofold. You can choose:</p>\n<ol>\n<li>a tag that will not collide with any text you have in the string</li>\n<li>different tags to enclose quotes in quotes</li>\n</ol>\n<p>Note that the tag is not mandatory, and when there&#8217;s no need for multiple ones, $$ will appear a lot. Have you seen that same thing when defining a stored procedure or some procedural code in a DO block? If so, that&#8217;s because the PLpg/SQL code is declared in a character string as text and is interpreted as such at execution time.</p>\n<p>Here is another example. Let’s use <code>$PL$</code> for the PL/pgSQL code text, and <code>$MESSAGE$</code> for the text to print with NOTICE:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">yugabyte=# do $PL$ begin raise notice $MESSAGE$ select I'm a quote $MESSAGE$ ; end; $PL$;\r\n\r\nNOTICE:   select I'm a quote\r\nDO\r\n</pre>\n<p>This is equivalent to, but much easier to read, than:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">yugabyte=# do ' begin raise notice '' select I''''m a quote '' ; end; ';\r\n\r\nNOTICE:   select I'm a quote\r\nDO</pre>\n<p>Because my DDL contains single quotes, or I want to document the intention of the text string, I built my ALTER TABLE &#8230; ADD COLUMN text with <code>$SQL$</code>.</p>\n<p>The DDL I build dynamically needs to contain <code>schemaname</code> and <code>tablename</code> into it. Of course, I could concatenate strings like this:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\" data-enlighter-linenumbers=\"false\">select 'alter table '||schemaname||'.'||tablename||' add column' from pg_tables where schemaname='public' and tablename like 'customer%';\r\n\r\n</pre>\n<p>But identifiers should be double quoted when they contain special characters, reserved, or case sensitive words. The query could be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\" data-enlighter-linenumbers=\"false\">select 'alter table \"'||schemaname||'\".\"'||tablename||'\" add column' from pg_tables where schemaname='public' and tablename like 'customer%';</pre>\n<p>I did that a lot with the Oracle database but PostgreSQL is better with the <a href=\"https://www.postgresql.org/docs/current/functions-string.html#FUNCTIONS-STRING-FORMAT\" target=\"_blank\" rel=\"noopener\">format()</a> function. Omitting double quotes is a bug that you will probably encounter when you have table names that contain more than the basic characters. Similar to a <code>printf()</code> function, you can leave placeholders in the text to be replaced with the function arguments:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">yugabyte=# select format('Hello %s','World');\r\n\r\n   format\r\n-------------\r\n Hello World\r\n(1 row)</pre>\n<p>The same query, without the double quoted identifiers, is much simpler:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">select format('alter table %s.%s add column', schemaname, tablename) from pg_tables where schemaname='public' and tablename like 'customer%';</pre>\n<p>And format has more than <code>%s</code>. I change it to <code>%I</code> to add quoted identifiers:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">select format('alter table %I.%I add column', schemaname, tablename) from pg_tables where schemaname='public' and tablename like 'customer%';\r\n</pre>\n<p>Note that it does more than adding double quotes for all identifiers. It does this only when needed by the SQL identifier, because of case-sensitive name, reserved words, or special characters:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">yugabyte=# select format('Hello %I','World');\r\n    format\r\n---------------\r\n Hello \"World\"\r\n(1 row)\r\n\r\nyugabyte=# select format('Hello %I','world');\r\n   format\r\n-------------\r\n Hello world</pre>\n<p>I like to align the keywords and use left padding by adding a width, and right padding with an additional &#8216;<code>-</code>&#8216; flag link in: <code>%30I.%-30I</code></p>\n<p>When you have single quotes, you can add them by using the dollar-quoted strings, but also with the <code>%L</code> in format:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">yugabyte=# select format('Hello %L','world');\r\n\r\n    format\r\n---------------\r\n Hello 'world'\r\n(1 row)</pre>\n<p>Sometimes you need the same argument at multiple places. Rather than repeating it in the list of arguments, an additional position can be interposed as <code>%n$</code>. You can try this one:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"mssql\">select format ('I %1$s, you %1$s, we all %1$s for ice %2$s. ', 'scream','cream');</pre>\n<p>This is how I generated my DDL statements with placeholders for <code>schemaname</code>, <code>tablename</code> but also some constants that I found more convenient to put as format&#8217;s arguments.</p>\n<p>The next thing is to run it. Ending my query by ; displays the result. If I end it with <code>\\gexec</code> it will execute it.</p>\n<h2>Summary: Generate SQL Script in PostgreSQL</h2>\n<p>To sum up, use:</p>\n<ul>\n<li><code>$TAG$</code> to replace outer quotes</li>\n<li><code>format()</code> to build strings dynamically</li>\n<li><code>%s</code> for text, <code>%L</code> for test literals in single-quotes, <code>%I</code> for identifiers that may need double quotes</li>\n<li>catalog views to get metadata</li>\n<li><code>\\gexec</code> to execute the result</li>\n</ul>\n<p>To clarify, the purpose of this is not to execute arbitrary DDL statements in production. Rather, it&#8217;s meant to create scripts that are easily maintainable, free from hardcoded text, and that won&#8217;t overlook double quotes for identifiers. Additionally, using a small additional where clause when querying from catalog views can aid in creating idempotent scripts that avoid executing existing statements again.</p>\n<p>As a further example, I used this same technique in YugabyteDB to generate the 8 sequences. Watch my YugabyteDB Friday Tech Talk (YFTT), <a href=\"https://www.youtube.com/watch?v=er0eD46SCXA\" target=\"_blank\" rel=\"noopener\">Best Practices Using Sequences</a>, for more information.</p>\n<p><iframe loading=\"lazy\" title=\"Best Practices Using Sequences | YugabyteDB Friday Tech Talks | Episode 56\" width=\"500\" height=\"375\" src=\"https://www.youtube.com/embed/er0eD46SCXA?feature=oembed\" frameborder=\"0\" allow=\"accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share\" referrerpolicy=\"strict-origin-when-cross-origin\" allowfullscreen></iframe></p>\n<h2 class=\"wp-block-heading\">Additional PostgreSQL Tips and Tricks</h2>\n<p><a href=\"https://www.yugabyte.com/blog/generate-random-text-strings-in-postgresql/\">Generate Random Text Strings in PostgreSQL</a></p>\n<p><a href=\"https://www.yugabyte.com/blog/tag/tips-and-tricks/\">Tips and Tricks Library</a></p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>DBAs often need to generate SQL statements using SQL queries and then execute them. PostgreSQL has many features that can help. Let’s walk through an example using YugabyteDB, which is Postgres-compatible and provides the same SQL language and catalog views.</p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 27920,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": false,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2194
+  ],
+  "tags": [
+    2617,
+    2160
+  ],
+  "class_list": [
+    "post-27868",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-postgresql",
+    "tag-postgresql-tips-and-tricks",
+    "tag-sql"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Generate SQL from SQL in PostgreSQL</title>\n<meta name=\"description\" content=\"PostgreSQL has features to generate SQL statements from queries. Let’s look at an example using YugabyteDB, which is Postgres-compatible and offers similar SQL views.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/generate-sql-script-postgresql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Generate SQL from SQL in PostgreSQL\" />\n<meta property=\"og:description\" content=\"PostgreSQL has features to generate SQL statements from queries. Let’s look at an example using YugabyteDB, which is Postgres-compatible and offers similar SQL views.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/generate-sql-script-postgresql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2023-05-22T11:46:00+00:00\" />\n<meta property=\"article:modified_time\" content=\"2026-02-26T05:47:55+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-in-PostgreSQL-social.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-in-PostgreSQL-social.jpg\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"4 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"Generate SQL Script in PostgreSQL\",\"datePublished\":\"2023-05-22T11:46:00+00:00\",\"dateModified\":\"2026-02-26T05:47:55+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/\"},\"wordCount\":855,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/05\\/Generate-SQL-Script-PostgreSQL-blog.jpg\",\"keywords\":[\"PostgreSQL Tips and Tricks\",\"SQL\"],\"articleSection\":[\"PostgreSQL\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/\",\"name\":\"Generate SQL from SQL in PostgreSQL\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/05\\/Generate-SQL-Script-PostgreSQL-blog.jpg\",\"datePublished\":\"2023-05-22T11:46:00+00:00\",\"dateModified\":\"2026-02-26T05:47:55+00:00\",\"description\":\"PostgreSQL has features to generate SQL statements from queries. Let’s look at an example using YugabyteDB, which is Postgres-compatible and offers similar SQL views.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/05\\/Generate-SQL-Script-PostgreSQL-blog.jpg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/05\\/Generate-SQL-Script-PostgreSQL-blog.jpg\",\"width\":480,\"height\":320,\"caption\":\"Generate SQL Script PostgreSQL - blog\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/generate-sql-script-postgresql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Generate SQL Script in PostgreSQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "Generate SQL from SQL in PostgreSQL",
+    "description": "PostgreSQL has features to generate SQL statements from queries. Let’s look at an example using YugabyteDB, which is Postgres-compatible and offers similar SQL views.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "Generate SQL from SQL in PostgreSQL",
+    "og_description": "PostgreSQL has features to generate SQL statements from queries. Let’s look at an example using YugabyteDB, which is Postgres-compatible and offers similar SQL views.",
+    "og_url": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2023-05-22T11:46:00+00:00",
+    "article_modified_time": "2026-02-26T05:47:55+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-in-PostgreSQL-social.jpg",
+        "type": "image/jpeg"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-in-PostgreSQL-social.jpg",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "4 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "Generate SQL Script in PostgreSQL",
+          "datePublished": "2023-05-22T11:46:00+00:00",
+          "dateModified": "2026-02-26T05:47:55+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/"
+          },
+          "wordCount": 855,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg",
+          "keywords": [
+            "PostgreSQL Tips and Tricks",
+            "SQL"
+          ],
+          "articleSection": [
+            "PostgreSQL"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/",
+          "url": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/",
+          "name": "Generate SQL from SQL in PostgreSQL",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg",
+          "datePublished": "2023-05-22T11:46:00+00:00",
+          "dateModified": "2026-02-26T05:47:55+00:00",
+          "description": "PostgreSQL has features to generate SQL statements from queries. Let’s look at an example using YugabyteDB, which is Postgres-compatible and offers similar SQL views.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/generate-sql-script-postgresql/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg",
+          "width": 480,
+          "height": 320,
+          "caption": "Generate SQL Script PostgreSQL - blog"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Generate SQL Script in PostgreSQL"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/27868",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=27868"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/27868/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/27920"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=27868"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=27868"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=27868"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 27920,
+        "date": "2023-05-16T18:36:32",
+        "slug": "generate-sql-script-postgresql-blog",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/generate-sql-script-postgresql/generate-sql-script-postgresql-blog/",
+        "title": {
+          "rendered": "Generate SQL Script PostgreSQL &#8211; blog"
+        },
+        "author": 104,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "Generate SQL Script PostgreSQL - blog",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg",
+          "filesize": 117203,
+          "sizes": {
+            "thumbnail": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7018,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-150x150.jpg"
+            },
+            "alm-thumbnail": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7018,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-150x150.jpg"
+            },
+            "thumb_size_popular": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-80x80.jpg",
+              "width": 80,
+              "height": 80,
+              "filesize": 2670,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-80x80.jpg"
+            },
+            "thumb_size_latest": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-80x80.jpg",
+              "width": 80,
+              "height": 80,
+              "filesize": 2670,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-80x80.jpg"
+            },
+            "thumb_size_related": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-240x160.jpg",
+              "width": 240,
+              "height": 160,
+              "filesize": 10548,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-240x160.jpg"
+            },
+            "thumb_size_featured": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-80x80.jpg",
+              "width": 80,
+              "height": 80,
+              "filesize": 2670,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-80x80.jpg"
+            },
+            "authorship-box-avatar": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7018,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-150x150.jpg"
+            },
+            "authorship-box-related": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-70x70.jpg",
+              "width": 70,
+              "height": 70,
+              "filesize": 2231,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-70x70.jpg"
+            },
+            "fw-mobile": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-480x246.jpg",
+              "width": 480,
+              "height": 246,
+              "filesize": 30518,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-480x246.jpg"
+            },
+            "popular-post-featured-image": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-60x60.jpg",
+              "width": 60,
+              "height": 60,
+              "filesize": 1818,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-60x60.jpg"
+            },
+            "rp4wp-thumbnail-post": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7018,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog-150x150.jpg"
+            },
+            "full": {
+              "file": "Generate-SQL-Script-PostgreSQL-blog.jpg",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/05/Generate-SQL-Script-PostgreSQL-blog.jpg",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/27920",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/104"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=27920"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 27868,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/27868"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2194,
+          "link": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+          "name": "PostgreSQL",
+          "slug": "postgresql",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/databases/postgresql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/databases/postgresql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/\",\"name\":\"PostgreSQL Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Databases\",\"item\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/\"},{\"@type\":\"ListItem\",\"position\":3,\"name\":\"PostgreSQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "PostgreSQL Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "PostgreSQL Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+                  "url": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+                  "name": "PostgreSQL Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Databases",
+                      "item": "https://www.yugabyte.com/blog/category/databases/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 3,
+                      "name": "PostgreSQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2194",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "up": [
+              {
+                "embeddable": true,
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2158"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2194"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2617,
+          "link": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+          "name": "PostgreSQL Tips and Tricks",
+          "slug": "postgresql-tips-and-tricks",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Tips and Tricks Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Tips and Tricks Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/\",\"name\":\"PostgreSQL Tips and Tricks Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"PostgreSQL Tips and Tricks\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "PostgreSQL Tips and Tricks Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "PostgreSQL Tips and Tricks Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+                  "url": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+                  "name": "PostgreSQL Tips and Tricks Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "PostgreSQL Tips and Tricks"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2617",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2617"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2160,
+          "link": "https://www.yugabyte.com/blog/tag/sql/",
+          "name": "SQL",
+          "slug": "sql",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>SQL Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/sql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"SQL Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/sql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/\",\"name\":\"SQL Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"SQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "SQL Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/sql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "SQL Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/sql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/sql/",
+                  "url": "https://www.yugabyte.com/blog/tag/sql/",
+                  "name": "SQL Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/sql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/sql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "SQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2160",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2160"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

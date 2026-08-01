@@ -1,0 +1,1293 @@
+{
+  "id": 33738,
+  "date": "2025-01-31T04:00:00",
+  "date_gmt": "2025-01-31T12:00:00",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=33738"
+  },
+  "modified": "2025-01-30T22:51:18",
+  "modified_gmt": "2025-01-31T06:51:18",
+  "slug": "postgresql-15-compatibility-in-yugabytedb",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/",
+  "title": {
+    "rendered": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!"
+  },
+  "content": {
+    "rendered": "<p>The <a href=\"https://download.yugabyte.com/#/\" target=\"_blank\" rel=\"noopener\">latest YugabyteDB preview release</a> supports PostgreSQL 15 and represents a significant upgrade from the previous version.</p>\n<p>YugabyteDB 2.25 brings many new, long-awaited features, and this blog discusses the top 15 features (from PG12 to PG15) that will significantly benefit YugabyteDB developers.</p>\n<p>I&#8217;ve run the following examples in YugabyteDB 2.25, and the full version shows that it is fully compatible with PostgreSQL 15:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; select * from version();\n                                                                                            version                                                                     \n-------------------------------------------------------------------------\n PostgreSQL 15.2-YB-2.25.0.0-b0 on aarch64-unknown-linux-gnu, compiled by clang version 17.0.6 (https://github.com/yugabyte/llvm-project.git 9b881774e40024e901fc6f3d313607b071c08631), 64-bit\n(1 row)</pre>\n<h2>Feature 1: Generate UUID Without PgCrypto (PG13)</h2>\n<p>This was already available with the <code>pgcrypto</code> extension, but now <code>gen_random_uuid()</code> is part of core PostgreSQL.</p>\n<p>Without any CREATE EXTENSION command, I can create a table that will automatically assign a UUID primary key:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; create table message (\n primary key (message_id)\n ,message_id     uuid default gen_random_uuid()\n ,sender_name    text\n ,sender_country text\n ,message        text\n ,meta           jsonb\n);\n\nCREATE TABLE\n\nyugabyte=&gt; \\x\nExpanded display is on.\n\nyugabyte=&gt; insert into message \n (message, sender_name, sender_country, meta)\n values ('Hello', 'Franck', 'CH','{ \"date\": \"FEB-08, 2025\"}')\n returning *\n;\n\n-[ RECORD 1 ]--+-------------------------------------\nmessage_id     | bb8dbedf-6826-4872-a4f4-323186e815c0\nsender_name    | Franck\nsender_country | CH\nmessage        | Hello\nmeta           | {\"date\": \"FEB-08, 2025\"}\n\nyugabyte=&gt; \\x\nExpanded display is off.</pre>\n<h2>Feature 2: Generated Column (PG12)</h2>\n<p>It was already possible to generate from a sequence with GENERATE ALWAYS AS IDENTITY, but adding a column calculated from others was impossible.</p>\n<p>Here, I have created a table where I insert or update the height in centimeters, and the height in inches is automatically calculated and stored:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; create table people (\n primary key ( country, name )\n , country     text\n , name        text\n , height_cm numeric(3,0)\n , height_in numeric(3,1)\n    generated always as (height_cm / 2.54) stored\n) partition by list(country)\n;\n\nyugabyte=&gt; create table people_eu\n partition of people\n for values in ('CH','FR','DE')\n tablespace \"eu_west1\"\n;\n\nyugabyte=&gt; insert into people \n values ('CH','Franck',174) returning *\n;\n country |  name  | height_cm | height_in\n---------+--------+-----------+-----------\n CH      | Franck |       174 |      68.5\n(1 row)</pre>\n<p>I&#8217;ve created the table as partitioned to demonstrate the next feature, which was one of the most requested before YugabyteDB was PostgreSQL 15 compatible.</p>\n<h2>Feature 3: Foreign Key Referencing Partitioned Table (PG12)</h2>\n<p>Referential integrity is now possible with a partitioned parent table.</p>\n<p>In my example, a &#8220;message&#8221; references a sender from &#8220;people&#8221;:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; alter table message add constraint sender_fk\n foreign key ( sender_country, sender_name )\n references people ( country, name )\n;\n\nALTER TABLE</pre>\n<h2>Feature 4: Accelerated Partition Pruning (PG12)</h2>\n<p>YugabyteDB 2.25 includes many query layer performance improvements. When the query planner sees that only one partition can be read, it optimizes the execution plan accordingly.</p>\n<p>The following query would have generated an <code>Append</code> and <code>Sort</code> operation in previous versions, because of the ORDER BY. Because the query planner knows that only one partition needs to be read, it skips those operations:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; explain (costs off)\n           select * from people \n           where country='CH' \n           order by name\n;\n                                         QUERY PLAN\n-----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people \n   Index Cond: (country = 'CH'::text)\n(2 rows)</pre>\n<p>This is an excellent benefit for YugabyteDB geo-partitioning and simplifies the execution plan when querying a single region.</p>\n<p>To compare, here was the plan in PostgreSQL 11:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">                                        QUERY PLAN\n-----------------------------------------------------------------------------------------\n Merge Append  \n   Sort Key: people_eu.name\n   -&gt;  Index Scan using people_eu_pkey on people_eu \n         Index Cond: (country = 'CH'::text)</pre>\n<h2>Feature 5: Plan Cache Mode (PG12)</h2>\n<p>With prepared statements, PostgreSQL starts with custom plans (optimized for each value) and can switch to a generic plan (with a parameter) after five executions if the cost doesn&#8217;t appear more expensive.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; prepare q1 as\n select * from people\n where country=$1 order by name\n;\n\nyugabyte=&gt; explain execute q1('CH')\nyugabyte-&gt; \\watch c=6 i=0.1\n\n                        Sun 12 Jan 2025 08:57:08 PM GMT (every 0.1s)\n\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = 'CH'::text)\n(2 rows)\n\n                        Sun 12 Jan 2025 08:57:08 PM GMT (every 0.1s)\n\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = 'CH'::text)\n(2 rows)\n\n                        Sun 12 Jan 2025 08:57:08 PM GMT (every 0.1s)\n\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = 'CH'::text)\n(2 rows)\n\n                        Sun 12 Jan 2025 08:57:09 PM GMT (every 0.1s)\n\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = 'CH'::text)\n(2 rows)\n\n                        Sun 12 Jan 2025 08:57:09 PM GMT (every 0.1s)\n\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = 'CH'::text)\n(2 rows)\n\n                        Sun 12 Jan 2025 08:57:09 PM GMT (every 0.1s)\n\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = $1)\n(2 rows)</pre>\n<p>It is now possible to control this behavior with the <code>plan_cache_mode</code> parameter. This defaults to auto to provide the same as previous versions, but can be set to always use a custom plan (with literals), or a generic plan (with parameters):</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; show plan_cache_mode;\n plan_cache_mode\n-----------------\n auto\n(1 row)\n\nyugabyte=&gt; set plan_cache_mode to force_custom_plan;\nSET\nyugabyte=&gt; explain execute q1('CH');\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = 'CH'::text)\n(2 rows)\n\nyugabyte=&gt; set plan_cache_mode to force_generic_plan;\nSET\nyugabyte=&gt; explain execute q1('CH');\n                                         QUERY PLAN\n----------------------------------------------------\n Index Scan using people_eu_pkey on people_eu people  (cost=180.00..568.41 rows=5 width=128)\n   Index Cond: (country = $1)\n(2 rows)\n\nyugabyte=&gt; set plan_cache_mode to auto;\nSET</pre>\n<h2>Feature 6: Show Parameters in psql (PG15)</h2>\n<p>It is now easy to list the parameters with a wildcard.</p>\n<p>Here are all the YugabyteDB parameters (start with <code>yb</code>) with <code>transaction</code> in their name:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; \\dconfig yb*transaction*\n\n\n                           List of configuration parameters\n                 Parameter                 |                   Value\n-------------------------------------------+-------------------------------------------\n yb_default_copy_from_rows_per_transaction | 20000\n yb_disable_transactional_writes           | off\n yb_effective_transaction_isolation_level  | read committed\n yb_locks_max_transactions                 | 16\n yb_transaction_priority                   | 0.000000000 (Normal priority transaction)\n yb_transaction_priority_lower_bound       | 0\n yb_transaction_priority_upper_bound       | 1\n(7 rows)</pre>\n<p>When talking about parameters, a new feature makes it possible to set some parameters with decimals:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; set work_mem='1.5MB';\nSET</pre>\n<h2>Feature 7: Control the Unique Index behavior with Nulls (PG15)</h2>\n<p>By default, according to the SQL standard, nulls are distinct. Because nulls represent unknown values, their comparison is unknown. Two nulls do not violate a unique constraint. It is now possible to change this behavior when creating a unique index with NULLS DISTINCT (the default) or NULLS NOT DISTINCT.</p>\n<p>By default, a unique index on the sender and message text would allow many rows for the same sender with a null message. I can create an index that will allow only one row with null:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; create unique index message_unq\n on message( sender_name, sender_country, message)\n nulls not distinct\n;\nCREATE INDEX\n\nyugabyte=&gt; insert into message (sender_name, sender_country)\n values ('Franck', 'CH')\n;\nINSERT 0 1\n\nyugabyte=&gt; insert into message (sender_name, sender_country)\n values ('Franck', 'CH')\n;\nERROR:  duplicate key value violates unique constraint \"message_unq\"</pre>\n<p>This will help migrations from Oracle Database or Microsoft SQL Server which behave like NULLS NOT DISTINCT.</p>\n<h2>Feature 8: Fetch First With Ties (PG13)</h2>\n<p><code>ORDER BY cols LIMIT 1</code> or <code>ORDER BY ... FETCH FIRST n ROWS</code> returns at maximum <code>n</code> rows. If the values of the ORDER BY columns are the same, you may want to return all of them (even if it is more than <code>n</code>) rather than picking some randomly.</p>\n<p>The following limits to one row, but two have the same sender name on which it is sorted:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; \\x\nExpanded display is on.\n\nyugabyte=&gt; select * from message\n order by sender_name\n fetch first 1 row with ties\n;\n\n-[ RECORD 1 ]--+-------------------------------------\nmessage_id     | bb8dbedf-6826-4872-a4f4-323186e815c0\nsender_name    | Franck\nsender_country | CH\nmessage        | Hello\nmeta           | {\"date\": \"FEB-08, 2025\"}\n\n-[ RECORD 2 ]--+-------------------------------------\nmessage_id     | 99a637c6-c068-468d-afba-a30832a41536\nsender_name    | Franck\nsender_country | CH\nmessage        |\nmeta           |\n\nyugabyte=&gt; \\x\nExpanded display is off.\nyugabyte=&gt;</pre>\n<h2>Feature 9: Incremental Sort (PG13)</h2>\n<p>Yugabyte 2.25 introduces many Hash and Sort operation optimizations. One is the possibility of avoiding a complete sort when an index is partially sorted on one column. This reduces the working set and gives more chances to be sorted in memory.</p>\n<p>The following query has an ORDER BY on three columns, and an index starts with two of them. The query planner identified the pre-sorted prefix and does an incremental sort on the remaining column:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; explain /*+ IndexScan(message) */\nselect * from message\n order by sender_name, sender_country, message_id\n;\n                                         QUERY PLAN\n-----------------------------------------------------\n Incremental Sort  (cost=2670.73..11321.51 rows=1000 width=144)\n   Sort Key: sender_name, sender_country, message_id\n   Presorted Key: sender_name, sender_country\n   -&gt;  Index Scan using message_unq on message  (cost=2627.35..11281.96 rows=1000 width=144)\n(4 rows)</pre>\n<h2>Feature 10: More Regular Expression Functions (PG15)</h2>\n<p>More regexp functions are now available: regexp_count(), regexp_instr(), and regexp_like():</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; select message\n , regexp_like(message ,'l{2}')\n , regexp_count(message,'l{2}')\n , regexp_instr(message,'l{2}')\n from message\n;\n message | regexp_like | regexp_count | regexp_instr\n---------+-------------+--------------+--------------\n Hello   | t           |            1 |            3\n         |             |              |\n(2 rows)</pre>\n<h2>Feature 11: More JSON Functions (PG13)</h2>\n<p>YugabyteDB 2.25 supports the JSON path expressions and <code>datetime()</code> function. Here is an example that reads a JSON attribute representing a date in a specific format and using it as a timestamp:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; SELECT message, meta\nFROM message\nWHERE (\n    jsonb_path_query_first(\n        meta, '$.date.datetime(\"MON-DD, YYYY\")'\n    )::text::timestamp\n) &gt; now() - interval '1 month';\n message |           meta\n---------+--------------------------\n Hello   | {\"date\": \"FEB-08, 2025\"}\n(1 row)</pre>\n<h2>Feature 12: Multi-Range Intervals (PG14)</h2>\n<p>In addition to ranges of values, you can now store and use multi-ranges.</p>\n<p>I add an age target as multiple ranges of ages and used it to find messages that cover a specific age range:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; update message\nset meta = jsonb_set(\n    meta, '{target_age}',\n    '\"{[7, 18],[42, 77]}\"'::jsonb\n    )\nwhere message='Hello'\n;\nUPDATE 1\n\nyugabyte=&gt; select message,meta from message\nwhere (meta-&gt;&gt;'target_age')::int8multirange \n      &amp;&amp; int8range(20, 50)\n;\n message |                             meta\n---------+--------------------------------------------------------------\n Hello   | {\"date\": \"FEB-08, 2025\", \"target_age\": \"{[7, 18],[42, 77]}\"}\n(1 row)</pre>\n<h2>Feature 13: Filtering When Loading With COPY (PG12)</h2>\n<p>Adding a WHERE clause to a COPY FROM allows you to filter what is imported.</p>\n<p>The following imports messages from a list of words, excluding those less than thirty characters:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; copy message(message) \n           from '/usr/share/dict/words' \n           where length(message)&gt;=30\n;\nCOPY 3\n\nyugabyte=&gt; select message from message;\n                    message\n-----------------------------------------------\n Hello\n\n dichlorodiphenyltrichloroethane\n half-embracinghalf-embracingly\n pneumonoultramicroscopicsilicovolcanoconiosis\n(5 rows)</pre>\n<h2>Feature 14: Privileges For Setting Configuration Parameters (PG15)</h2>\n<p>Some parameters can only be set by a superuser. More fine-grained privileges can now be granted to specific parameters.</p>\n<p>This creates a user that can set its temporary file limit:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; create user superdev;\nCREATE ROLE\nyugabyte=&gt; grant set on parameter temp_file_limit\n           to superdev\n;\nGRANT\nyugabyte=&gt;</pre>\n<h2>Feature 15: Inlined Common Table Expressions (PG12)</h2>\n<p>Writing a complex SQL query by module with a WITH clause can make it more readable. This is also known as Common Table Expressions (CTE).</p>\n<p>In previous versions, it was a query planner frontier that may have limited the access path possibilities. The query planner can now inline them. The previous behavior, which may be used to restrict the query planner on purpose, is available with an additional MATERIALIZED keyword.</p>\n<p>The following uses MATERIALIZED to isolate the CTE:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; explain (costs off)\nwith msg as materialized (\n              select sender_country, sender_name\n                   , message\n              from message\n              where meta-&gt;'date' is not null\n)  , ppl as (\n              select country as sender_country, name as sender_name\n              from people\n) select * from msg natural join ppl\n;\n                                        QUERY PLAN\n---------------------------------------------------\n Merge Join\n   Merge Cond: ((people.country = msg.sender_country) AND (people.name = msg.sender_name))\n   CTE msg\n     -&gt;  Seq Scan on message\n           Storage Filter: ((meta -&gt; 'date'::text) IS NOT NULL)\n   -&gt;  Index Scan using people_eu_pkey on people_eu people\n   -&gt;  Sort\n         Sort Key: msg.sender_country, msg.sender_name\n         -&gt;  CTE Scan on msg\n(9 rows)</pre>\n<p>Without this keyword, There&#8217;s no CTE in the execution plan and this allowed the join condition to be pushed down to the inner table:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=&gt; explain (costs off)\nwith msg as (\n              select sender_country, sender_name\n                   , message\n              from message\n              where meta-&gt;'date' is not null\n)  , ppl as (\n              select country as sender_country, name as sender_name\n              from people\n) select * from msg natural join ppl\n;\n                                        QUERY PLAN\n----------------------------------------------------\n Nested Loop\n   -&gt;  Seq Scan on message\n         Storage Filter: ((meta -&gt; 'date'::text) IS NOT NULL)\n   -&gt;  Index Scan using people_eu_pkey on people_eu people\n         Index Cond: ((country = message.sender_country) AND (name = message.sender_name))\n(5 rows)</pre>\n<h2>Plus Many More!</h2>\n<p>In this blog, I arbitrarily limited myself to sharing the top 15 features introduced in YugabyteDB 2.25. There are many more exciting features, including improved algorithms for hash and sort operations that have to spill to disk, more observability (like having the planning time in pg_stat_statements), and improved security with invoker rights for views.</p>\n<p>The best part is that introducing these features has no downtime, as YugabyteDB can perform rolling upgrades even when they involve higher PostgreSQL compatibility.</p>\n<p>Find out for yourself! <a href=\"https://download.yugabyte.com/#/\" target=\"_blank\" rel=\"noopener\">Download YugabyteDB 2.25 (PREVIEW) today</a>!</p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>The latest YugabyteDB preview release supports PostgreSQL 15. This represents a significant upgrade from the previous version. YugabyteDB 2.25 brings many new, long-awaited features, and this blog discusses the top 15 features (from PG12 to PG15) that will significantly benefit YugabyteDB developers.</p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 33845,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": false,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2165
+  ],
+  "tags": [
+    2231,
+    2168,
+    2402
+  ],
+  "class_list": [
+    "post-33738",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-release-announcements",
+    "tag-distributed-sql",
+    "tag-postgresql",
+    "tag-yugabytedb"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features! | Yugabyte</title>\n<meta name=\"description\" content=\"YugabyteDB 2.25 brings many new, long-awaited features! Discover top 15 new features that will significantly benefit YugabyteDB developers.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features! | Yugabyte\" />\n<meta property=\"og:description\" content=\"YugabyteDB 2.25 brings many new, long-awaited features! Discover top 15 new features that will significantly benefit YugabyteDB developers.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2025-01-31T12:00:00+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-social.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-social.jpg\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"5 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!\",\"datePublished\":\"2025-01-31T12:00:00+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/\"},\"wordCount\":1032,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2025\\/01\\/postgresql-15-compatibility-in-yugabytedb-blog.jpeg\",\"keywords\":[\"Distributed SQL\",\"PostgreSQL\",\"YugabyteDB\"],\"articleSection\":[\"Release Announcements\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/\",\"name\":\"PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features! | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2025\\/01\\/postgresql-15-compatibility-in-yugabytedb-blog.jpeg\",\"datePublished\":\"2025-01-31T12:00:00+00:00\",\"description\":\"YugabyteDB 2.25 brings many new, long-awaited features! Discover top 15 new features that will significantly benefit YugabyteDB developers.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2025\\/01\\/postgresql-15-compatibility-in-yugabytedb-blog.jpeg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2025\\/01\\/postgresql-15-compatibility-in-yugabytedb-blog.jpeg\",\"width\":480,\"height\":320,\"caption\":\"PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/postgresql-15-compatibility-in-yugabytedb\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features! | Yugabyte",
+    "description": "YugabyteDB 2.25 brings many new, long-awaited features! Discover top 15 new features that will significantly benefit YugabyteDB developers.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features! | Yugabyte",
+    "og_description": "YugabyteDB 2.25 brings many new, long-awaited features! Discover top 15 new features that will significantly benefit YugabyteDB developers.",
+    "og_url": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2025-01-31T12:00:00+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-social.jpg",
+        "type": "image/jpeg"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-social.jpg",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "5 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!",
+          "datePublished": "2025-01-31T12:00:00+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/"
+          },
+          "wordCount": 1032,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg",
+          "keywords": [
+            "Distributed SQL",
+            "PostgreSQL",
+            "YugabyteDB"
+          ],
+          "articleSection": [
+            "Release Announcements"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/",
+          "url": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/",
+          "name": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features! | Yugabyte",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg",
+          "datePublished": "2025-01-31T12:00:00+00:00",
+          "description": "YugabyteDB 2.25 brings many new, long-awaited features! Discover top 15 new features that will significantly benefit YugabyteDB developers.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg",
+          "width": 480,
+          "height": 320,
+          "caption": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/33738",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=33738"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/33738/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/33845"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=33738"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=33738"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=33738"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 33845,
+        "date": "2025-01-30T22:49:22",
+        "slug": "postgresql-15-compatibility-in-yugabytedb-blog",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/postgresql-15-compatibility-in-yugabytedb/postgresql-15-compatibility-in-yugabytedb-blog/",
+        "title": {
+          "rendered": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!"
+        },
+        "author": 75,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "PostgreSQL 15 Compatibility in YugabyteDB 2.25: Top 15 Features!",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg",
+          "filesize": 152487,
+          "sizes": {
+            "thumbnail": {
+              "file": "postgresql-15-compatibility-in-yugabytedb-blog-150x150.jpeg",
+              "width": 150,
+              "height": 150,
+              "filesize": 9334,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-150x150.jpeg"
+            },
+            "alm-thumbnail": {
+              "file": "postgresql-15-compatibility-in-yugabytedb-blog-150x150.jpeg",
+              "width": 150,
+              "height": 150,
+              "filesize": 9334,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-150x150.jpeg"
+            },
+            "authorship-box-avatar": {
+              "file": "postgresql-15-compatibility-in-yugabytedb-blog-150x150.jpeg",
+              "width": 150,
+              "height": 150,
+              "filesize": 9334,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-150x150.jpeg"
+            },
+            "authorship-box-related": {
+              "file": "postgresql-15-compatibility-in-yugabytedb-blog-70x70.jpeg",
+              "width": 70,
+              "height": 70,
+              "filesize": 2808,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-70x70.jpeg"
+            },
+            "fw-mobile": {
+              "file": "postgresql-15-compatibility-in-yugabytedb-blog-480x246.jpeg",
+              "width": 480,
+              "height": 246,
+              "filesize": 51035,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-480x246.jpeg"
+            },
+            "video-size": {
+              "file": "postgresql-15-compatibility-in-yugabytedb-blog-370x247.jpeg",
+              "width": 370,
+              "height": 247,
+              "filesize": 31129,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog-370x247.jpeg"
+            },
+            "full": {
+              "file": "postgresql-15-compatibility-in-yugabytedb-blog.jpeg",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2025/01/postgresql-15-compatibility-in-yugabytedb-blog.jpeg",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/33845",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/75"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=33845"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 33738,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/33738"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2165,
+          "link": "https://www.yugabyte.com/blog/category/release-announcements/",
+          "name": "Release Announcements",
+          "slug": "release-announcements",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Release Announcements Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/release-announcements/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Release Announcements Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/release-announcements/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/release-announcements\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/release-announcements\\/\",\"name\":\"Release Announcements Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/release-announcements\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/release-announcements\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Release Announcements\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Release Announcements Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/release-announcements/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Release Announcements Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/release-announcements/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/release-announcements/",
+                  "url": "https://www.yugabyte.com/blog/category/release-announcements/",
+                  "name": "Release Announcements Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/release-announcements/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/release-announcements/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Release Announcements"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2165",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2165"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2231,
+          "link": "https://www.yugabyte.com/blog/tag/distributed-sql/",
+          "name": "Distributed SQL",
+          "slug": "distributed-sql",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Distributed SQL Blogs | YugabyteDB</title>\n<meta name=\"description\" content=\"Explore our catalog of blogs on all things distributed SQL database, including best practices, case studies, performance benchmarks, and customer chats.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/distributed-sql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Distributed SQL Blogs | YugabyteDB\" />\n<meta property=\"og:description\" content=\"Explore our catalog of blogs on all things distributed SQL database, including best practices, case studies, performance benchmarks, and customer chats.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/distributed-sql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-sql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-sql\\/\",\"name\":\"Distributed SQL Blogs | YugabyteDB\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"description\":\"Explore our catalog of blogs on all things distributed SQL database, including best practices, case studies, performance benchmarks, and customer chats.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-sql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/distributed-sql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Distributed SQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Distributed SQL Blogs | YugabyteDB",
+            "description": "Explore our catalog of blogs on all things distributed SQL database, including best practices, case studies, performance benchmarks, and customer chats.",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/distributed-sql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Distributed SQL Blogs | YugabyteDB",
+            "og_description": "Explore our catalog of blogs on all things distributed SQL database, including best practices, case studies, performance benchmarks, and customer chats.",
+            "og_url": "https://www.yugabyte.com/blog/tag/distributed-sql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/distributed-sql/",
+                  "url": "https://www.yugabyte.com/blog/tag/distributed-sql/",
+                  "name": "Distributed SQL Blogs | YugabyteDB",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "description": "Explore our catalog of blogs on all things distributed SQL database, including best practices, case studies, performance benchmarks, and customer chats.",
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/distributed-sql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/distributed-sql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Distributed SQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2231",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2231"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2168,
+          "link": "https://www.yugabyte.com/blog/tag/postgresql/",
+          "name": "PostgreSQL",
+          "slug": "postgresql",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Blogs | YugabyteDB</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/postgresql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Blogs | YugabyteDB\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/postgresql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql\\/\",\"name\":\"PostgreSQL Blogs | YugabyteDB\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"PostgreSQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "PostgreSQL Blogs | YugabyteDB",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/postgresql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "PostgreSQL Blogs | YugabyteDB",
+            "og_url": "https://www.yugabyte.com/blog/tag/postgresql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql/",
+                  "url": "https://www.yugabyte.com/blog/tag/postgresql/",
+                  "name": "PostgreSQL Blogs | YugabyteDB",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/postgresql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "PostgreSQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2168",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2168"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2402,
+          "link": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+          "name": "YugabyteDB",
+          "slug": "yugabytedb",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>YugabyteDB Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/yugabytedb/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"YugabyteDB Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/yugabytedb/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/\",\"name\":\"YugabyteDB Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"YugabyteDB\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "YugabyteDB Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "YugabyteDB Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+                  "url": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+                  "name": "YugabyteDB Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "YugabyteDB"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2402",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2402"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

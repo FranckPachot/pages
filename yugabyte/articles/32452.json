@@ -1,0 +1,1450 @@
+{
+  "id": 32452,
+  "date": "2024-06-17T04:30:00",
+  "date_gmt": "2024-06-17T11:30:00",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=32452"
+  },
+  "modified": "2024-06-16T14:09:21",
+  "modified_gmt": "2024-06-16T21:09:21",
+  "slug": "improving-sql-indexing-how-to-order-columns",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/",
+  "title": {
+    "rendered": "Improving Your SQL Indexing: How to Effectively Order Columns"
+  },
+  "content": {
+    "rendered": "<p>Users often find it hard to choose the best index for a query, especially figuring out the right order of columns.</p>\n<p>Imagine you have a large table and you need to filter it to get a specific set of data, which is still quite large. You can use simple conditions like equality or a single range to filter, but your WHERE clause might also include complex conditions with multiple values (IN) and combinations (OR).</p>\n<p>After filtering, you only want to show a few rows, ordered by some columns, and limit the results using LIMIT or FETCH FIRST ROWS, typical of pagination. Although indexes help find value ranges and sort results, it’s difficult to decide the best column order for the index when dealing with all these conditions.</p>\n<p>Let&#8217;s represent this as an SQL statement:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">SELECT col4, col5, col3, col6\n   FROM large_table\n   WHERE col1 = :a\n     AND col2 between :b and :c\n     AND col3 IN ( 1, 3, 5 ) \nORDER BY col4 ASC, col5 DESC\nLIMIT 10;</pre>\n<p>This article is divided into two parts. The first part, &#8220;How to Find the Best Index,&#8221; explains a method that is applicable to all SQL databases. The second part, &#8220;A Complete Example,&#8221; walks us through the process of optimizing a PostgreSQL query on YugabyteDB and measuring the results using EXPLAIN ANALYZE.</p>\n<h2>How to Find the Best Index</h2>\n<p>You should create an efficient index for each table that your query accesses, except for tables from which you need most of the rows, like lookup tables where you hit all keys.</p>\n<p>The order of the columns in the key of each index is crucial. It ensures you retrieve only the necessary data, sorted as required, in one or multiple ranges from the index entries stored in the index, which are ordered based on this key.</p>\n<h3>Column Ordering</h3>\n<p>When creating a multi-column index, the columns should follow this order from left to right:</p>\n<ol>\n<li>The first columns should be for <strong>selective equality predicates</strong>, and they can be HASH in YugabyteDB when there&#8217;s millions of values to distribute.<br />\nAn example in the query is: <code>WHERE col1 = :a</code></li>\n<li>Next, include columns used with a <strong>range predicates that results in a single range</strong>, such as an inequality, and they can be defined as ASC or DESC<br />\nAn example in the query is: <code>WHERE col2 between :b and :c</code></li>\n<li>If you want to avoid a sort, which is essential for pagination queries, include the <strong>columns to order on</strong> using the same ASC and DESC as in your ORDER BY<br />\nAn example in the query is: <code>ORDER BY col4 ASC, col5 DESC</code></li>\n<li>Finally, include the columns for <strong>other selective predicates</strong>, which would lead to <strong>multiple ranges</strong> if placed before the ordering columns, and then wouldn&#8217;t provide one globally ordered result. They can be in INCLUDE or at the end of the key<br />\nAn example in the query is: <code>WHERE col3 IN ( 1, 3, 5 )</code></li>\n<li>You can include all other columns to get all the results from the index<br />\nAn example in the query is: <code>SELECT col4, col5, col3, col6</code></li>\n</ol>\n<p>It&#8217;s important to consider trade-offs. For instance, you might have very selective multi-value criteria and decide to swap steps 3 and 4, to benefit from skip scan reading multiple ranges. However, this comes at the price of adding a sort operation during execution. Looking at the execution plan and execution statistics helps you to understand the difference, which I&#8217;ll show later in the example.</p>\n<h3>Index Scan Ranges</h3>\n<p>When using indexes to return rows in a specific order, it&#8217;s crucial to understand the difference between a single range and multiple ranges. Essentially, you can think of any index as being sorted based on the concatenation of the columns of its key.</p>\n<p>Some predicates allow you to seek to one key and read from there in order. YugabyteDB can seek to multiple ranges when you have a list of values for an IN predicate. It preserves the order of rows from the preceding columns. However, the columns after it will only be ordered within each range.</p>\n<p>Let&#8217;s take the following example:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">SELECT * from table \n WHERE C1 = 'd96a015a-3b4c-4666-b546-d7ca29e5a592' \n   AND C3 in ('Alpha','Gamma')\n ORDER BY C2</pre>\n<p>An index on <code>( C1, C2, C3, C4 )</code> will scan a single range of 9 rows. It will have to discard 3 rows later, but gets the result ordered without additional sort:</p>\n<figure id=\"attachment_32454\" aria-describedby=\"caption-attachment-32454\" style=\"width: 1684px\" class=\"wp-caption aligncenter\"><img loading=\"lazy\" decoding=\"async\" class=\"wp-image-32454 size-full loaded come-in\" src=\"https://www.yugabyte.com/wp-content/uploads/2024/06/single-range-index-scan-preserving-the-order-but-reading-more-entries.png\" alt=\"single range index scan preserving the order but reading more entries\" width=\"1684\" height=\"1068\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2024/06/single-range-index-scan-preserving-the-order-but-reading-more-entries.png 1684w, https://www.yugabyte.com/wp-content/uploads/2024/06/single-range-index-scan-preserving-the-order-but-reading-more-entries-600x381.png 600w, https://www.yugabyte.com/wp-content/uploads/2024/06/single-range-index-scan-preserving-the-order-but-reading-more-entries-1024x649.png 1024w, https://www.yugabyte.com/wp-content/uploads/2024/06/single-range-index-scan-preserving-the-order-but-reading-more-entries-768x487.png 768w, https://www.yugabyte.com/wp-content/uploads/2024/06/single-range-index-scan-preserving-the-order-but-reading-more-entries-1536x974.png 1536w, https://www.yugabyte.com/wp-content/uploads/2024/06/single-range-index-scan-preserving-the-order-but-reading-more-entries-1200x761.png 1200w\" sizes=\"auto, (max-width: 1684px) 100vw, 1684px\" /><figcaption id=\"caption-attachment-32454\" class=\"wp-caption-text\">single range index scan preserving the order but reading more entries</figcaption></figure>\n<p>An index on <code>( C1, C3, C2, C4 )</code> will scan scan two smaller ranges with no need for an additional filter, however it requires a sort operation because it is only partially ordered:</p>\n<figure id=\"attachment_32455\" aria-describedby=\"caption-attachment-32455\" style=\"width: 1664px\" class=\"wp-caption aligncenter\"><img loading=\"lazy\" decoding=\"async\" class=\"size-full wp-image-32455 loaded come-in\" src=\"https://www.yugabyte.com/wp-content/uploads/2024/06/multiple-ranges-index-skip-scan-to-read-less-entries-but-not-matching-the-order-by.png\" alt=\"multiple ranges index skip scan to read less entries, but not matching the order by\" width=\"1664\" height=\"1074\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2024/06/multiple-ranges-index-skip-scan-to-read-less-entries-but-not-matching-the-order-by.png 1664w, https://www.yugabyte.com/wp-content/uploads/2024/06/multiple-ranges-index-skip-scan-to-read-less-entries-but-not-matching-the-order-by-600x387.png 600w, https://www.yugabyte.com/wp-content/uploads/2024/06/multiple-ranges-index-skip-scan-to-read-less-entries-but-not-matching-the-order-by-1024x661.png 1024w, https://www.yugabyte.com/wp-content/uploads/2024/06/multiple-ranges-index-skip-scan-to-read-less-entries-but-not-matching-the-order-by-768x496.png 768w, https://www.yugabyte.com/wp-content/uploads/2024/06/multiple-ranges-index-skip-scan-to-read-less-entries-but-not-matching-the-order-by-1536x991.png 1536w, https://www.yugabyte.com/wp-content/uploads/2024/06/multiple-ranges-index-skip-scan-to-read-less-entries-but-not-matching-the-order-by-1200x775.png 1200w\" sizes=\"auto, (max-width: 1664px) 100vw, 1664px\" /><figcaption id=\"caption-attachment-32455\" class=\"wp-caption-text\">multiple ranges index skip scan to read less entries, but not matching the order by</figcaption></figure>\n<p>In this situation, the most efficient index will depend on your data. If the predicate on column <code>C3</code> is very selective, there&#8217;s a large benefit in skipping between multiple ranges rather than scanning one larger range. If the result is small, a sort operation is not a problem. If the scan result returns lot of rows that have to be ordered, like for pagination queries, the benefit of getting rows in order from a single range outweighs that of skipping few rows when reading.</p>\n<h3>Index Scan Capabilities</h3>\n<p>This method is applicable to most databases, with some exceptions. The HASH option is for distributed databases that support hash sharding in addition to range sharding (for example, YugabyteDB does, but Spanner, CockroachDB and TiDB do not).</p>\n<p>The multiple-range option is for databases that support skip scan (for example, YugabyteDB and Oracle do, but PostgreSQL does not).</p>\n<p>The INCLUDE option is for databases that support it (YugabyteDB and PostgreSQL do, but Oracle does not). It is easy to work around by putting the columns at the end of the key.</p>\n<p>The partial index option (WHERE) is for databases that support it (YugabyteDB and PostgreSQL do, but Oracle does not) and is more difficult to work around (with partitioning or function-based indexes).</p>\n<p>I&#8217;ll demonstrate how we can create the best index for a specific query using YugabyteDB, as it provides all the capabilities detailed above. I&#8217;ll do this in multiple steps because you do not need to use all capabilities. It is important to evaluate the benefit when creating a new index or adding a column to an existing index. You may create an index that is good enough for your performance criteria, especially if it can serve many other queries.</p>\n<h2>A Complete Example</h2>\n<p>To illustrate the method, I&#8217;ll go through an example, looking at the execution plan, trying some indexes, and showing the results. I used YugabyteDB 2.21 with the following table:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">drop schema if exists demo cascade;\n\nCREATE SCHEMA IF NOT EXISTS demo;\nCREATE TABLE demo.events (\n    id UUID NOT NULL,\n    system_id UUID NOT NULL,\n    event_type VARCHAR(100) NOT NULL,\n    created_at TIMESTAMPTZ NOT NULL,\n    updated_at TIMESTAMPTZ NOT NULL,\n    state VARCHAR(100) NOT NULL,\n    customer_id UUID,\n    device UUID,\n    PRIMARY KEY (id)\n);\nCREATE INDEX events_system_id ON demo.events\n (system_id);</pre>\n<p>An index has been created on &#8220;system_id&#8221; because we know that it is a selective criterion in many queries. We will look at one such query. I want to fetch a batch of events pertaining to a particular system, ordered by their creation date. I have some additional filters on type and state and will display only the first hundred rows.</p>\n<h3>Execution Plan</h3>\n<p>My query is simple: for one &#8220;system_id&#8221;, get the events with some &#8220;event_type&#8221; and &#8220;state&#8221;. I provide a list of values for those. The result might be large, but I&#8217;m interested in the Top-100 when ordered by &#8220;created_at&#8221; date. Here is the query and its execution plan:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                                                                                                                          QUERY PLAN\n-------------------------------------------------------------------------------\n Limit\n   -&gt;  Sort\n         Sort Key: created_at\n         -&gt;  Index Scan using events_system_id on events\n               Index Cond: (system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid)\n               Filter: (((event_type)::text = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])) AND ((state)::text = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])))</pre>\n<p>If you are used to reading execution plans, you already know the problem we need to solve. We have a good index for our most selective filter, the &#8220;system_id&#8221; being in the Index Condition. However, the most selective filtering, the LIMIT, occurs after the Sort operation, and a Sort operation has to read all rows and sort them before being able to return the first ones.</p>\n<p>In short, the response time will be proportional to the number of events for one &#8220;system_id,&#8221; but not to the result fetched by the user. This will not scale.</p>\n<h3>Testing With Data</h3>\n<p>When we have data in the table, we can run the query with EXPLAIN ANALYZE showing the number of rows. I&#8217;m inserting one million rows here (using non-transactional writes to make the bulk load faster as nobody queries it):</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">CREATE EXTENSION IF NOT EXISTS pgcrypto;\n\n--- Use non-transactional writes for fast bulk load in YugabyteDB\nset yb_disable_transactional_writes=on;\n\nINSERT INTO demo.events (id, system_id, event_type, created_at, updated_at, state, customer_id, device)\nSELECT\n    gen_random_uuid(), -- id\n    case when random()&gt;0.8 then '0188e8d7-dead-73c1-b218-7cf069921b5b' else gen_random_uuid() end, -- system_id\n    (ARRAY['ONBOARDING', 'MONITORING', 'TRANSFERRING', 'MAINTENANCE', 'UPGRADE'])[floor(random() * 5 + 1)], -- event_type\n    NOW() - interval '1 year' * random(), -- created_at (random time within the last year)\n    NOW() - interval '1 year' * random(), -- updated_at (random time within the last year)\n    (ARRAY['EVENT_NOT_STARTED', 'EVENT_IN_PROGRESS', 'EVENT_MONITORING_NOT_STARTED', 'EVENT_MONITORING_IN_PROGRESS', 'EVENT_PAYMENT_SCREENING_NOT_STARTED', 'EVENT_PAYMENT_SCREENING_IN_PROGRESS', 'EVENT_TRANSFERRING_NOT_STARTED', 'EVENT_TRANSFERRING_IN_PROGRESS', 'EVENT_COMPLETED', 'EVENT_CANCELLED'])[floor(random() * 10 + 1)], -- state\n    gen_random_uuid(), -- customer_id\n    gen_random_uuid() -- device\nFROM generate_series(1, 1000000);\n\n--- Reset the transactional writes to be fully ACID\nset yb_disable_transactional_writes=off;</pre>\n<p>The advantage of having data is being able to look at the execution statistics in terms of read requests and number of rows scanned and fetched. I don&#8217;t care about the total response time because it depends on many parameters, like the cache hits, which are different from production when I&#8217;m testing. My first run in a test environment starts with a cold cache, the next runs have an irrealistic cache hit ratio.</p>\n<h3>Explain Analyze</h3>\n<p>The most important metric to understand the actual cost of an execution plan, is the number of buffer reads by PostgreSQL, or the number of distributed read requests on YugabyteDB, respectively gathered with <code>EXPLAIN (ANALYZE, BUFFERS)</code> and <code>EXPLAIN (ANALYZE, DIST)</code>.</p>\n<p>My query takes one second to return a hundred rows. From a user point of view, this is difficult to understand, but with EXPLAIN ANALYZE, this time can be explained by the number of PostgreSQL Buffers or YugabyteDB Read Requests. I run it with YugabyteDB, which additionally shows the number of rows scanned from the index and the table so that we can understand exactly what happens:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, verbose, costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                                                                                                                                    QUERY PLAN\n-------------------------------------------------------------------------------        Limit (actual time=1100.385..1100.428 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Sort (actual time=1100.383..1100.398 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Sort Key: events.created_at\n         Sort Method: top-N heapsort  Memory: 71kB\n         -&gt;  Index Scan using events_system_id on demo.events (actual time=8.067..1084.709 rows=35989 loops=1)\n               Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n               Index Cond: (events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid)\n               Filter: (((events.event_type)::text = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])) AND ((events.state)::text = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])))\n               Rows Removed by Filter: 164551\n               Storage Table Read Requests: 196\n               Storage Table Read Execution Time: 872.751 ms\n               Storage Table Rows Scanned: 200540\n               Storage Index Read Requests: 196\n               Storage Index Read Execution Time: 2.413 ms\n               Storage Index Rows Scanned: 200540\n Planning Time: 0.119 ms\n Execution Time: 1100.717 ms</pre>\n<p>To return those hundred rows, we have read two hundred thousand index entries from the secondary index, and the same amount of rows from the table.</p>\n<p>If we look at the timings, reading from the table was much more expensive (800 milliseconds) than reading from the index (2 milliseconds). The reason for this is that we read a single range from the index, which starts with the index condition column, but the rows are scattered in the table, in the order where they arrived in PostgreSQL heap tables, or in the order of their primary key for YugabyteDB LSM Tree.</p>\n<p>Let&#8217;s address this point first, which is visible as &#8216;Rows Removed by Filter&#8217;. There are 164551 rows that are read and then discarded to get 35989 rows from the Index Scan operation. Can we discard them before going to the table? My optimization goal is to get no rows removed by filter, like this:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">Rows Removed by Filter: 0\nStorage Table Rows Scanned: 35989\nStorage Index Rows Scanned: 35989</pre>\n<h3>Read Less Rows From the Table</h3>\n<p>If the index has the value of &#8220;event_type&#8221; and &#8220;state&#8221; added to the index entry, the filter can be applied before going to the table. I can add them at the end of the index key or as additional INCLUDE&#8217;d columns. Here are the possible indexes I can create to achieve this goal:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">create index i1_ies  on demo.events (system_id, event_type, state);\ncreate index i1_ie_s on demo.events (system_id, event_type) include (state);\ncreate index i1_i_es on demo.events (system_id) include (event_type, state);\n\ncreate index i1_ise  on demo.events (system_id, state, event_type);\ncreate index i1_is_e on demo.events (system_id, state) include (event_type);\ncreate index i1_i_se on demo.events (system_id) include (state, event_type);\n\ncreate index i1_i_se on demo.events (system_id) include (state, event_type);</pre>\n<p>All those indexes achieve the same goals for this query. The choice depends on other queries and that&#8217;s why you should have a good overview of your access patterns.</p>\n<p>If the columns are frequently updated, it may be more efficient to have them in INCLUDE (and here the order of columns do not matter) rather than in the key. But, most important, you want indexes that are used for multiple queries to avoid creating too many of them. Adding a column to the key may help another query with a selective predicate, or ordering on it, after filtering on the previous key columns.</p>\n<p>Here I choose to put all in the key, with the &#8220;state&#8221; first, because I may have queries on one &#8220;system_id&#8221; and one &#8220;state&#8221; with low cardinality:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">-- access by single \"system_id\" and multi-value filter on \"state\" and \"event_type\" by query XYZ\ncreate index i1_ise  on demo.events (system_id, state, event_type);\n</pre>\n<p>Note: it is a good idea to document the choice of the index so that when you are tuning another query you know what you can change in the index, and what must be there. That&#8217;s why I&#8217;ve put a comment.</p>\n<p>With this index, I run my EXPLAIN ANALYZE again</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, verbose, costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                                                                                                                   QUERY PLAN\n------------------------------------------------------------------------------- Limit (actual time=285.903..285.946 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Sort (actual time=285.735..285.750 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Sort Key: events.created_at\n         Sort Method: top-N heapsort  Memory: 69kB\n         -&gt;  Index Scan using i1_ise on demo.events (actual time=16.487..273.870 rows=35989 loops=1)\n               Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n               Index Cond: ((events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid) AND ((events.state)::text = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])) AND ((events.event_type)::text = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])))\n               Storage Table Read Requests: 36\n               Storage Table Read Execution Time: 214.989 ms\n               Storage Table Rows Scanned: 35989\n               Storage Index Read Requests: 36\n               Storage Index Read Execution Time: 2.894 ms\n               Storage Index Rows Scanned: 35989\n Planning Time: 18.095 ms\n Execution Time: 287.947 ms</pre>\n<p>My goal is achieved: no more Rows Removed By Filter.</p>\n<p>The filtering happens when reading the index entries. This is good, but we can do better. At the end, we return 100 rows, so ideally, we should scan no more than those 100 rows. My new tuning goal is:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">Rows Removed by Filter: 0\nStorage Table Rows Scanned: 100\nStorage Index Rows Scanned: 100</pre>\n<h3>Index Condition: Access, Skip Scan, and Filter</h3>\n<p>Before looking at this optimization goal, I can reduce the time it takes to read 163539 index entries and filter them down to 36055.</p>\n<p>It is not visible in the PostgreSQL execution plan, but the Index Condition has two categories of predicates.</p>\n<ul>\n<li>One: the access condition, used to seek into the index to read a range, skipping the rows that do not verify the condition</li>\n<li>Two: the filtering that is applied after reading the rows.</li>\n</ul>\n<p>In my example, &#8220;system_id&#8221; is an access filter, and &#8220;state&#8221; and &#8220;event_type&#8221; are filters.</p>\n<p>With YugabyteDB, there&#8217;s an additional optimization where one access filter can read multiple ranges, often called Skip Scan or Loose Index Scan. This may influence the decision to put columns at the end of the key or in INCLUDE.</p>\n<p>Let&#8217;s forget about the ORDER BY for now. In addition to the DIST option of EXPLAIN ANALYZE, I use the DEBUG option that shows all details about the reads: the number of times we skip to a range in the index, visible as RocksDB &#8216;seek&#8217;, and the number of times we read the next row within the range, visible as RocksDB &#8216;next&#8217;.</p>\n<p>With a predicate on &#8220;system_id&#8221; only:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, debug, verbose, costs off, summary off)\nselect count(*) from demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b';\n \n\nQUERY PLAN\n------------------------------------------------------------------------------- \n Finalize Aggregate (actual time=96.487..96.487 rows=1 loops=1)\n   Output: count(*)\n   -&gt;  Index Only Scan using events_system_id on demo.events (actual time=96.471..96.474 rows=1 loops=1)\n         Index Cond: (events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid)\n         Heap Fetches: 0\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 96.121 ms\n         Storage Index Rows Scanned: 200540\n         Metric rocksdb_number_db_seek: 1.000\n         Metric rocksdb_number_db_next: 200540.000\n         Metric rocksdb_number_db_seek_found: 1.000\n         Metric rocksdb_number_db_next_found: 200540.000\n         Metric rocksdb_iter_bytes_read: 15180876.000\n         Metric docdb_keys_found: 200540.000\n         Metric ql_read_latency: sum: 94551.000, count: 1.000\n         Partial Aggregate: true</pre>\n<p>Because &#8220;system_id&#8221; is the first column of the index, I have to read a single range. This is visible with 1 &#8220;seek&#8221; into the LSM tree key. I read all rows within this range: 200540 &#8220;next&#8221; key-values are read.</p>\n<p>If I add the predicates on &#8220;event_type&#8221; and &#8220;state&#8221;, rather than reading one range and filtering afterwards, I can read multiple smaller ranges:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, debug, verbose, costs off, summary off)\nselect count(*) from demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\n;\n\nQUERY PLAN\n------------------------------------------------------------------------------- \n Finalize Aggregate (actual time=29.118..29.119 rows=1 loops=1)\n   Output: count(*)\n   -&gt;  Index Only Scan using i1_ise on demo.events (actual time=28.931..28.935 rows=1 loops=1)\n         Index Cond: ((events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid) AND (events.state = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])) AND (events.event_type = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])))\n         Heap Fetches: 0\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 26.137 ms\n         Storage Index Rows Scanned: 35989\n         Metric rocksdb_number_db_seek: 3.000\n         Metric rocksdb_number_db_next: 35993.000\n         Metric rocksdb_number_db_seek_found: 3.000\n         Metric rocksdb_number_db_next_found: 35993.000\n         Metric rocksdb_iter_bytes_read: 4060397.000\n         Metric docdb_keys_found: 35989.000\n         Metric ql_read_latency: sum: 23425.000, count: 1.000\n         Partial Aggregate: true</pre>\n<p>Here, instead of reading 200540 rows from one range, and filtering on &#8220;state&#8221; and &#8220;event_type&#8221; later, it has read 3 ranges and a total of 35993 because it has skipped the values that were not in the IN clause. YugabyteDB builds a combination of the possible ranges to minimize the read requests.</p>\n<p>To understand it better, the best way is to visualize the order of the index. To show it, I query the table with an ORDER BY that matches the index key. I also GROUP BY just to make the display smaller, and I add a CASE statement to show which rows verify the WHERE clause. Here is my query that visualizes my index content:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">select\n case when\n events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n) then '✅' else '❌' end keep\n,     system_id, state, event_type\n,count(*)\nfrom demo.events\nwhere system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\nGROUP BY system_id, state, event_type\nORDER BY system_id, state, event_type\n;</pre>\n<p>and here is the output:</p>\n<figure id=\"attachment_32456\" aria-describedby=\"caption-attachment-32456\" style=\"width: 1535px\" class=\"wp-caption aligncenter\"><img loading=\"lazy\" decoding=\"async\" class=\"size-full wp-image-32456 loaded come-in\" src=\"https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-and-three-ranges-that-verify-the-WHERE-clause.png\" alt=\"screenshot showing rows ordered like in the index, and three ranges that verify the WHERE clause\" width=\"1535\" height=\"1664\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-and-three-ranges-that-verify-the-WHERE-clause.png 1535w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-and-three-ranges-that-verify-the-WHERE-clause-553x600.png 553w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-and-three-ranges-that-verify-the-WHERE-clause-945x1024.png 945w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-and-three-ranges-that-verify-the-WHERE-clause-768x833.png 768w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-and-three-ranges-that-verify-the-WHERE-clause-1417x1536.png 1417w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-and-three-ranges-that-verify-the-WHERE-clause-1200x1301.png 1200w\" sizes=\"auto, (max-width: 1535px) 100vw, 1535px\" /><figcaption id=\"caption-attachment-32456\" class=\"wp-caption-text\">screenshot showing rows ordered like in the index, and three ranges that verify the WHERE clause</figcaption></figure>\n<p>This method makes it easy to understand the 3 seeks and 35993 next:</p>\n<ul>\n<li>one to go to <code>| 0188e8d7-dead-73c1-b218-7cf069921b5b | EVENT_IN_PROGRESS | MONITORING |</code> , reading 4058 + 4015 + 4034 = 12107 index entries</li>\n<li>one to go to <code>| 0188e8d7-dead-73c1-b218-7cf069921b5b | EVENT_MONITORING_NOT_STARTED | MONITORING |</code>, reading 4069 + 4015 + 3857 = 11941 index entries</li>\n<li>one to go to <code>| 0188e8d7-dead-73c1-b218-7cf069921b5b | EVENT_NOT_STARTED | MONITORING |</code> , reading 3974 + 4008 + 3959 = 11941 index entries</li>\n</ul>\n<p>There&#8217;s no magic. The number of &#8216;seek&#8217; and &#8216;next&#8217; comes directly from the physical order of the index and the ranges that verify the WHERE clause.</p>\n<p>The best access path is to get all rows with one or a few ranges without reading too much that is not needed for the result. The art of indexing is to provide a structure that stores index entries in this order.</p>\n<h3>Partial Index</h3>\n<p>If the list of values is fairly static, all queries using the same, we can skip them even earlier, before the execution, at planning time. With partial indexes, we can create an index that stores only the entries that validate a where clause.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">create index i1_i_partial  on demo.events (system_id) \nwhere (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n);</pre>\n<p>With this index, I run my COUNT(*) query from above to see that the three &#8220;seek&#8221; has been reduced to only one:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">EXPLAIN (analyze, dist, debug, verbose, costs off, summary off)\nselect count(*) from demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\n;\n                                             QUERY PLAN\n-------------------------------------------------------------------------------\n Finalize Aggregate (actual time=11.943..11.943 rows=1 loops=1)\n   Output: count(*)\n   -&gt;  Index Only Scan using i1_i_partial on demo.events (actual time=11.930..11.933 rows=1 loops=1)\n         Index Cond: (events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid)\n         Heap Fetches: 0\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 11.710 ms\n         Storage Index Rows Scanned: 35989\n         Metric rocksdb_number_db_seek: 1.000\n         Metric rocksdb_number_db_next: 35989.000\n         Metric rocksdb_number_db_seek_found: 1.000\n         Metric rocksdb_number_db_next_found: 35989.000\n         Metric rocksdb_iter_bytes_read: 2702969.000\n         Metric docdb_keys_found: 35989.000\n         Metric ql_read_latency: sum: 10997.000, count: 1.000\n         Partial Aggregate: true</pre>\n<p>You can see that the conditions on &#8220;state&#8221; and &#8220;event_type&#8221; are not even visible in the execution plan, because the partial index guarantees that all index entries validate this condition.</p>\n<p>The partial index has only one range that validates my condition, like this:</p>\n<figure id=\"attachment_32457\" aria-describedby=\"caption-attachment-32457\" style=\"width: 1514px\" class=\"wp-caption aligncenter\"><img loading=\"lazy\" decoding=\"async\" class=\"size-full wp-image-32457 loaded come-in\" src=\"https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-with-only-one-range-that-satisfies-the-where-clause.png\" alt=\"screenshot showing rows ordered like in the index, with only one range that satisfies the WHERE clause\" width=\"1514\" height=\"663\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-with-only-one-range-that-satisfies-the-where-clause.png 1514w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-with-only-one-range-that-satisfies-the-where-clause-600x263.png 600w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-with-only-one-range-that-satisfies-the-where-clause-1024x448.png 1024w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-with-only-one-range-that-satisfies-the-where-clause-768x336.png 768w, https://www.yugabyte.com/wp-content/uploads/2024/06/showing-rows-ordered-like-in-the-index-with-only-one-range-that-satisfies-the-where-clause-1200x525.png 1200w\" sizes=\"auto, (max-width: 1514px) 100vw, 1514px\" /><figcaption id=\"caption-attachment-32457\" class=\"wp-caption-text\">screenshot showing rows ordered like in the index, with only one range that satisfies the WHERE clause</figcaption></figure>\n<p>Back to my main query, with this partial index, to see how it benefits from it:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, verbose, costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                QUERY PLAN\n-------------------------------------------------------------------------------  Limit (actual time=239.850..239.893 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Sort (actual time=239.849..239.863 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Sort Key: events.created_at\n         Sort Method: top-N heapsort  Memory: 71kB\n         -&gt;  Index Scan using i1_i_partial on demo.events (actual time=8.853..227.843 rows=35989 loops=1)\n               Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n               Index Cond: (events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid)\n               Storage Table Read Requests: 36\n               Storage Table Read Execution Time: 192.771 ms\n               Storage Table Rows Scanned: 35989\n               Storage Index Read Requests: 36\n               Storage Index Read Execution Time: 2.210 ms\n               Storage Index Rows Scanned: 35989\n Planning Time: 0.431 ms\n Execution Time: 240.145 ms</pre>\n<p>Execution is a bit faster because the index is smaller. Partial indexes are also lighter to maintain because inserts that have other values do not have an entry to add. However, you should evaluate the benefits of it.</p>\n<p>If the non-partial index is still needed for other queries, then it is better to maintain one index that is good enough for both queries, rather than adding an index that saves a few milliseconds. In my case, I have no queries that need this access by &#8220;system_id&#8221; for other &#8220;state&#8221; or &#8220;event_type&#8221; so I can remove the non-partial one.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# drop index demo.i1_ise ;\nDROP INDEX</pre>\n<h3>Fetch Size</h3>\n<p>I have seen that the 35989 rows I&#8217;m reading fit in only one range, but if you run the query with the DEBUG option you will see 36 &#8216;seek&#8217;. The reason is that by default the rows are fetched by 1024, so that 36055 is fetched with 36 read requests and each one will seek to the next place with a new iterator. We will see later how to reduce the number of rows, which is the best approach, but if you cannot, you can reduce the number of fetches. The default fetch size is 1024:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# \\dconfig yb_fetch*\nList of configuration parameters\n      Parameter      | Value\n---------------------+-------\n yb_fetch_row_limit  | 1024\n yb_fetch_size_limit | 0\n(2 rows)</pre>\n<p>Here is my query after increasing the fetch size to 100000 to reduce the number of read requests to its minimum (but you must be aware that it increases the memory footprint).</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# set yb_fetch_row_limit = 100000;\nSET\n\nyugabyte=# EXPLAIN (analyze, dist, verbose, costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                 QUERY PLAN\n-------------------------------------------------------------------------------\n Limit (actual time=164.904..164.945 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Sort (actual time=164.902..164.913 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Sort Key: events.created_at\n         Sort Method: top-N heapsort  Memory: 71kB\n         -&gt;  Index Scan using i1_i_partial on demo.events (actual time=133.531..153.172 rows=35989 loops=1)\n               Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n               Index Cond: (events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid)\n               Storage Table Read Requests: 1\n               Storage Table Read Execution Time: 91.142 ms\n               Storage Table Rows Scanned: 35989\n               Storage Index Read Requests: 1\n               Storage Index Read Execution Time: 19.848 ms\n               Storage Index Rows Scanned: 35989\n Planning Time: 4.025 ms\n Execution Time: 165.420 ms</pre>\n<p>With a larger fetch size, I got all rows with a single read request (and one &#8216;seek&#8217; if you run it with DEBUG).</p>\n<p>But we can do better. If we read only what is needed, 100 rows, we don&#8217;t need to increase the fetch size. The problem is that I read 35989 rows, fetched them from the distributed storage, sorted them, and finally kept the Top-100 of them. Indexes store their entries in the order of the key, so it can help to avoid the sort operation.</p>\n<h3>Order-Preserving Index</h3>\n<p>I&#8217;ll add CREATED_AT in the index. The dilemma is where to place it.</p>\n<p>I don&#8217;t want to place it before &#8220;system_id&#8221; because then my index entries for one &#8220;system_id&#8221; would be scattered in the index, seeking too many ranges.</p>\n<p>I don&#8217;t want to place them after &#8220;state&#8221; and &#8220;event_type&#8221; because I read multiple values for them. If you remember that there are 3 ranges. Having each range in the right order doesn&#8217;t help to get the final result in this order. This would necessitate at least a merge sort.</p>\n<p>The best solution is to place &#8220;created_at&#8221; before the columns that split the range into multiple ones. I create this index:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">create index i1_icse \n on demo.events (system_id, created_at, state, event_type);</pre>\n<p>This will not benefit from skip scan on &#8220;state&#8221; and &#8220;event_type,&#8221; but it gets the rows in order and then filters them, preserving the order. It not only avoids the cost of sorting, but also avoids reading all rows.</p>\n<p>It may depends on the data distribution and selectivity, but in my case avoiding having to read and sort a large row set has a much greater benefit than filtering faster on &#8220;state&#8221; and &#8220;event_type&#8221;.</p>\n<p>Without the cost-based optimizer, the index is not picked up (the rules do not consider the cost of the Sort and Limit operation), but I can use a hint to force it:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, verbose, costs off)\n/*+ IndexScan(events i1_icse ) */\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                                                                                                                QUERY PLAN\n-------------------------------------------------------------------------------  Limit (actual time=7.066..7.148 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Index Scan using i1_icse on demo.events (actual time=7.063..7.118 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Index Cond: ((events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid) AND ((events.state)::text = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])) AND ((events.event_type)::text = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])))\n         Storage Table Read Requests: 1\n         Storage Table Read Execution Time: 2.151 ms\n         Storage Table Rows Scanned: 100\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 2.972 ms\n         Storage Index Rows Scanned: 100\n Planning Time: 16.009 ms\n Execution Time: 8.685 ms</pre>\n<p>This is exactly what I wanted to see: it reads only 100 rows from the index.</p>\n<p>With the tables analyzed and the Cost Based Optimizer enabled, the right index is chose without the need of a hint:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# analyze demo.events;\nANALYZE\n\nyugabyte=# set yb_enable_base_scans_cost_model=on;\nSET\n\nyugabyte=# EXPLAIN\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                                                                                                QUERY PLAN\n-------------------------------------------------------------------------------\n Limit  (cost=16.89..12358.54 rows=100 width=116)\n   -&gt;  Index Scan using i1_icse on events  (cost=16.89..123416541.94 rows=1000000 width=116)\n         Index Cond: ((system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid) AND ((state)::text = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])) AND ((event_type)::text = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])))</pre>\n<p>Here, I displayed the estimated cost. It shows exactly where our optimization comes from: the cost of this index scan is large but limiting to read only 100 rows it is 123416541 / 12358.54 = 10000x less expensive.</p>\n<p>In reality, I don&#8217;t need the hint because the other indexes are not required. Even with the rule based optimizer, my new index is picked up if I remove the partial index.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# drop index demo.i1_i_partial;\nDROP INDEX</pre>\n<p>With EXPLAIN I check that my index is picked up:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, verbose, costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                                                                                                                QUERY PLAN\n------------------------------------------------------------------------------- Limit (actual time=3.658..3.742 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Index Scan using i1_icse on demo.events (actual time=3.654..3.711 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Index Cond: ((events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid) AND ((events.state)::text = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])) AND ((events.event_type)::text = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])))\n         Storage Table Read Requests: 1\n         Storage Table Read Execution Time: 1.413 ms\n         Storage Table Rows Scanned: 100\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 1.730 ms\n         Storage Index Rows Scanned: 100\n Planning Time: 0.129 ms\n Execution Time: 3.815 ms</pre>\n<p>With this index, on this dataset, your optimization goal is probably reached, as the total execution time is less than 5 milliseconds. But, if you read more rows, you may want to avoid the read requests to the table rows with a covering index.</p>\n<p>The new challenge is:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">Rows Removed by Filter: 0\nStorage Table Rows Scanned: 0\nStorage Index Rows Scanned: 100</pre>\n<h3>Index Only Scan</h3>\n<p>I already mentioned that adding columns to the index, at the end of the key or in the INCLUDE clause, can optimize the scan by covering the columns used in the where clause.</p>\n<p>We have covered the columns used in the ORDER BY to avoid a sort. We can also cover all columns that are selected to aim for an Index Only Scan. If all columns used by the query are in the index entries, in the key or INCLUDE part,  there&#8217;s no need to read the table. This is often called &#8216;covering index,&#8217; but keep in mind that one index can cover one query and not another.</p>\n<p>Let&#8217;s include the columns that are not already in the key:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">create index i1_icse_covering  \non demo.events (system_id, created_at, state, event_type) \ninclude (id, updated_at, customer_id, device);\n</pre>\n<p>It is easy to know which columns to add because I&#8217;ve run the EXPLAIN with the VERBOSE options that list the columns in the Output of each operation.</p>\n<p>My query now shows an Index Only Scan which, in YugabyteDB, doesn&#8217;t read the table at all (that&#8217;s different from PostgreSQL):</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, debug, verbose, costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n                                                                                                                                        QUERY PLAN\n------------------------------------------------------------------------------- Limit (actual time=3.867..3.982 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Index Only Scan using i1_icse_covering on demo.events (actual time=3.865..3.947 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Index Cond: ((events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid) AND (events.state = ANY ('{EVENT_NOT_STARTED,EVENT_IN_PROGRESS,EVENT_MONITORING_NOT_STARTED}'::text[])) AND (events.event_type = ANY ('{ONBOARDING,MONITORING,TRANSFERRING}'::text[])))\n         Heap Fetches: 0\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 1.838 ms\n         Storage Index Rows Scanned: 100\n         Metric rocksdb_number_db_seek: 1.000\n         Metric rocksdb_number_db_next: 549.000\n         Metric rocksdb_number_db_seek_found: 1.000\n         Metric rocksdb_number_db_next_found: 549.000\n         Metric rocksdb_iter_bytes_read: 110843.000\n         Metric docdb_keys_found: 101.000\n         Metric ql_read_latency: sum: 1337.000, count: 1.000\n Planning Time: 11.230 ms\n Execution Time: 5.027 ms</pre>\n<p>I&#8217;ve reached my goal, scanning 100 index entries and no table rows.</p>\n<p>I&#8217;ve run EXPLAIN with the DEBUG option to bring one more challenge. I&#8217;ve actually read 549 index entries, from the range of my &#8220;system_id&#8221;, ordered by CREATED_DATE and then filtered on &#8220;state&#8221; and &#8220;event_type&#8221;. It stopped when having 100 rows to send to the result.</p>\n<p>Reading 549 index entries instead of 100 is not a big deal, but if your filtering is less selective, you may want to reduce it.</p>\n<p>The ultimate goal is to see only one &#8220;seek&#8221; and only 100 &#8220;next,&#8221; and then we will have reduced the cost to the maximum. &#8220;event_type&#8221; and &#8220;state&#8221; cannot be used as skip scan because they are after &#8220;created_at&#8221; which has many values. They also cannot be put before, because it would break the ordering. We have another solution if the condition on those columns is always the same.</p>\n<h3>The Best Index For This Query</h3>\n<p>We already have seen that a partial index can filter on &#8220;state&#8221; and &#8220;event_type&#8221; before the execution, so let&#8217;s apply this to our covering index:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">create index i1_icse_best on demo.events (system_id, created_at) include (id, updated_at, customer_id, device, event_type, state)\nWHERE (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n );\n</pre>\n<p>Here is the best execution plan you can have for this query, getting the 100 rows of the result directly from one range of the index, in the right order:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"sql\">yugabyte=# EXPLAIN (analyze, dist, debug, verbose, costs off)\nSELECT *\nFROM demo.events\nWHERE events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'\n AND (\n  events.event_type IN (\n   'ONBOARDING',\n   'MONITORING',\n   'TRANSFERRING'\n  )\n  AND\n  events.state IN (\n   'EVENT_NOT_STARTED',\n   'EVENT_IN_PROGRESS',\n   'EVENT_MONITORING_NOT_STARTED'\n  )\n)\nORDER BY events.created_at ASC LIMIT 100;\n\n                                             QUERY PLAN\n-------------------------------------------------------------------------------\n Limit (actual time=2.230..2.332 rows=100 loops=1)\n   Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n   -&gt;  Index Only Scan using i1_icse_best on demo.events (actual time=2.227..2.298 rows=100 loops=1)\n         Output: id, system_id, event_type, created_at, updated_at, state, customer_id, device\n         Index Cond: (events.system_id = '0188e8d7-dead-73c1-b218-7cf069921b5b'::uuid)\n         Heap Fetches: 0\n         Storage Index Read Requests: 1\n         Storage Index Read Execution Time: 1.095 ms\n         Storage Index Rows Scanned: 100\n         Metric rocksdb_number_db_seek: 1.000\n         Metric rocksdb_number_db_next: 101.000\n         Metric rocksdb_number_db_seek_found: 1.000\n         Metric rocksdb_number_db_next_found: 101.000\n         Metric rocksdb_iter_bytes_read: 20505.000\n         Metric docdb_keys_found: 101.000\n         Metric ql_read_latency: sum: 356.000, count: 1.000\n Planning Time: 4.845 ms\n Execution Time: 2.428 ms</pre>\n<p>That&#8217;s the best we can do: reading only the rows required for the result, with only the columns required for the result, and in the order required for the result. This index optimizes not only the WHERE clause but also the ORDER BY and the SELECT clauses.</p>\n<h2>Conclusion: You Don&#8217;t Need the Best Index</h2>\n<p>You don&#8217;t want to create one index per table for each of your queries because it makes modifications more expensive. You want a small set of indexes that are good enough for the performance criteria of all your queries. In my example, it is obvious that I want an index starting with &#8220;system_id,&#8221; and it will probably be used by many queries. The major optimization for the pagination was having &#8220;created_at&#8221; next to it to get rows in order.</p>\n<p>The index starting with those two columns can still be used by any query on &#8220;system_id&#8221; as it is the first column. Adding &#8220;state&#8221; and &#8220;event_type&#8221; makes it faster for the query we analyzed, but without a huge benefit, and the response time without them is probably already good.</p>\n<p>Your decision will depend on other queries. If some other queries filter on &#8220;system_id,&#8221; &#8220;created_at,&#8221; and &#8220;event_type,&#8221; then they can share the same index. But if another query filters on &#8220;system_id&#8221;, &#8220;created_at&#8221; and &#8220;customer_id,&#8221; an index on those columns will still be good for our query if it includes &#8220;state&#8221; and &#8220;event_type&#8221; after it.</p>\n<p>You need to identify the main access patterns in your tables and have one index for each. Then, when tuning specific queries, you can add more columns to them, and, rarely, add another index.</p>\n<p>It is a good practice to check whether some indexes can be removed if they are unused or whether another existing index can be used. Documenting the reason for the index you have created will lower the risks when you decide to remove an index that looks redundant.</p>\n<p>If you have any doubt about the column order, try to visualize how the index entries are stored physically: partitioned on the first columns with HASH, then within each partition, ordered on the whole key, ascending, or descending for DESC columns, and then having the INCLUDE columns at the end, with no specific order.</p>\n<p>Think about how it is scanned: seeking to the start of the ranges identified as index conditions, and reading the next entries within this range. If the filters or limits that happen later remove a lot of rows, then you should find an index that skips them earlier.</p>\n<p>In conclusion, optimizing SQL indexing involves carefully considering the column order, understanding index scan ranges, and leveraging the index scan capabilities of your database to ensure efficient query performance.</p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>Optimizing SQL indexing involves carefully considering the column order, understanding index scan ranges, and leveraging the index scan capabilities of your database to ensure efficient query performance. Discover how you can do this effectively by following the steps laid out in this new ‘How to’ guide.</p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 32473,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": false,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2172
+  ],
+  "tags": [
+    2792,
+    2791,
+    2160,
+    2402
+  ],
+  "class_list": [
+    "post-32452",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-how-to",
+    "tag-columns",
+    "tag-indexing",
+    "tag-sql",
+    "tag-yugabytedb"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Improving Your SQL Indexing: How to Effectively Order Columns | Yugabyte</title>\n<meta name=\"description\" content=\"Improve your SQL indexing by effectively ordering columns - follow the detailed instructions in this new ‘How to’ guide.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Improving Your SQL Indexing: How to Effectively Order Columns | Yugabyte\" />\n<meta property=\"og:description\" content=\"Improve your SQL indexing by effectively ordering columns - follow the detailed instructions in this new ‘How to’ guide.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2024-06-17T11:30:00+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-social.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-social.jpg\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"19 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"Improving Your SQL Indexing: How to Effectively Order Columns\",\"datePublished\":\"2024-06-17T11:30:00+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/\"},\"wordCount\":4134,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/06\\/improving-sql-indexing-how-to-order-columns-blog.jpg\",\"keywords\":[\"Columns\",\"Indexing\",\"SQL\",\"YugabyteDB\"],\"articleSection\":[\"How To\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/\",\"name\":\"Improving Your SQL Indexing: How to Effectively Order Columns | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/06\\/improving-sql-indexing-how-to-order-columns-blog.jpg\",\"datePublished\":\"2024-06-17T11:30:00+00:00\",\"description\":\"Improve your SQL indexing by effectively ordering columns - follow the detailed instructions in this new ‘How to’ guide.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/06\\/improving-sql-indexing-how-to-order-columns-blog.jpg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2024\\/06\\/improving-sql-indexing-how-to-order-columns-blog.jpg\",\"width\":480,\"height\":320,\"caption\":\"Improving Your SQL Indexing: How to Effectively Order Columns\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/improving-sql-indexing-how-to-order-columns\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Improving Your SQL Indexing: How to Effectively Order Columns\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "Improving Your SQL Indexing: How to Effectively Order Columns | Yugabyte",
+    "description": "Improve your SQL indexing by effectively ordering columns - follow the detailed instructions in this new ‘How to’ guide.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "Improving Your SQL Indexing: How to Effectively Order Columns | Yugabyte",
+    "og_description": "Improve your SQL indexing by effectively ordering columns - follow the detailed instructions in this new ‘How to’ guide.",
+    "og_url": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2024-06-17T11:30:00+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-social.jpg",
+        "type": "image/jpeg"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-social.jpg",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "19 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "Improving Your SQL Indexing: How to Effectively Order Columns",
+          "datePublished": "2024-06-17T11:30:00+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/"
+          },
+          "wordCount": 4134,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg",
+          "keywords": [
+            "Columns",
+            "Indexing",
+            "SQL",
+            "YugabyteDB"
+          ],
+          "articleSection": [
+            "How To"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/",
+          "url": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/",
+          "name": "Improving Your SQL Indexing: How to Effectively Order Columns | Yugabyte",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg",
+          "datePublished": "2024-06-17T11:30:00+00:00",
+          "description": "Improve your SQL indexing by effectively ordering columns - follow the detailed instructions in this new ‘How to’ guide.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg",
+          "width": 480,
+          "height": 320,
+          "caption": "Improving Your SQL Indexing: How to Effectively Order Columns"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "Improving Your SQL Indexing: How to Effectively Order Columns"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/32452",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=32452"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/32452/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/32473"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=32452"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=32452"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=32452"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 32473,
+        "date": "2024-06-13T02:51:27",
+        "slug": "improving-sql-indexing-how-to-order-columns-blog",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/improving-sql-indexing-how-to-order-columns/improving-sql-indexing-how-to-order-columns-blog/",
+        "title": {
+          "rendered": "Improving Your SQL Indexing: How to Effectively Order Columns"
+        },
+        "author": 75,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "Improving Your SQL Indexing: How to Effectively Order Columns",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg",
+          "filesize": 96571,
+          "sizes": {
+            "thumbnail": {
+              "file": "improving-sql-indexing-how-to-order-columns-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 12542,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-150x150.jpg"
+            },
+            "alm-thumbnail": {
+              "file": "improving-sql-indexing-how-to-order-columns-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 12542,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-150x150.jpg"
+            },
+            "authorship-box-avatar": {
+              "file": "improving-sql-indexing-how-to-order-columns-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 12542,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-150x150.jpg"
+            },
+            "authorship-box-related": {
+              "file": "improving-sql-indexing-how-to-order-columns-blog-70x70.jpg",
+              "width": 70,
+              "height": 70,
+              "filesize": 5711,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-70x70.jpg"
+            },
+            "fw-mobile": {
+              "file": "improving-sql-indexing-how-to-order-columns-blog-480x246.jpg",
+              "width": 480,
+              "height": 246,
+              "filesize": 46676,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-480x246.jpg"
+            },
+            "video-size": {
+              "file": "improving-sql-indexing-how-to-order-columns-blog-370x247.jpg",
+              "width": 370,
+              "height": 247,
+              "filesize": 34347,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog-370x247.jpg"
+            },
+            "full": {
+              "file": "improving-sql-indexing-how-to-order-columns-blog.jpg",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2024/06/improving-sql-indexing-how-to-order-columns-blog.jpg",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/32473",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/75"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=32473"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 32452,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/32452"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2172,
+          "link": "https://www.yugabyte.com/blog/category/how-to/",
+          "name": "How To",
+          "slug": "how-to",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>How To Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/how-to/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"How To Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/how-to/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/how-to\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/how-to\\/\",\"name\":\"How To Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/how-to\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/how-to\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"How To\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "How To Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/how-to/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "How To Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/how-to/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/how-to/",
+                  "url": "https://www.yugabyte.com/blog/category/how-to/",
+                  "name": "How To Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/how-to/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/how-to/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "How To"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2172",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2172"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2792,
+          "link": "https://www.yugabyte.com/blog/tag/columns/",
+          "name": "Columns",
+          "slug": "columns",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Columns Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/columns/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Columns Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/columns/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/columns\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/columns\\/\",\"name\":\"Columns Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/columns\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/columns\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Columns\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Columns Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/columns/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Columns Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/columns/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/columns/",
+                  "url": "https://www.yugabyte.com/blog/tag/columns/",
+                  "name": "Columns Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/columns/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/columns/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Columns"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2792",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2792"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2791,
+          "link": "https://www.yugabyte.com/blog/tag/indexing/",
+          "name": "Indexing",
+          "slug": "indexing",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Indexing Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/indexing/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Indexing Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/indexing/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/indexing\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/indexing\\/\",\"name\":\"Indexing Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/indexing\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/indexing\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Indexing\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Indexing Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/indexing/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Indexing Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/indexing/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/indexing/",
+                  "url": "https://www.yugabyte.com/blog/tag/indexing/",
+                  "name": "Indexing Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/indexing/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/indexing/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Indexing"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2791",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2791"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2160,
+          "link": "https://www.yugabyte.com/blog/tag/sql/",
+          "name": "SQL",
+          "slug": "sql",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>SQL Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/sql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"SQL Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/sql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/\",\"name\":\"SQL Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/sql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"SQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "SQL Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/sql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "SQL Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/sql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/sql/",
+                  "url": "https://www.yugabyte.com/blog/tag/sql/",
+                  "name": "SQL Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/sql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/sql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "SQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2160",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2160"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2402,
+          "link": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+          "name": "YugabyteDB",
+          "slug": "yugabytedb",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>YugabyteDB Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/yugabytedb/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"YugabyteDB Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/yugabytedb/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/\",\"name\":\"YugabyteDB Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/yugabytedb\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"YugabyteDB\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "YugabyteDB Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "YugabyteDB Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+                  "url": "https://www.yugabyte.com/blog/tag/yugabytedb/",
+                  "name": "YugabyteDB Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/yugabytedb/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "YugabyteDB"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2402",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2402"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

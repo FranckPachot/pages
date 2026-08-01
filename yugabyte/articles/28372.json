@@ -1,0 +1,1185 @@
+{
+  "id": 28372,
+  "date": "2023-06-26T04:56:00",
+  "date_gmt": "2023-06-26T11:56:00",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=28372"
+  },
+  "modified": "2023-07-06T06:21:58",
+  "modified_gmt": "2023-07-06T13:21:58",
+  "slug": "conditional-where-clause-postgresql",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/",
+  "title": {
+    "rendered": "How to Create a Conditional WHERE Clause in PostgreSQL"
+  },
+  "content": {
+    "rendered": "<p>Understanding the conditional WHERE clause in PostgreSQL is crucial when dealing with data that requires dynamic filtering, while keeping a single static SQL statement. You don&#8217;t want to write a prepared SQL statement for every use case scenario, but having the application generate a dynamic query (on the fly) is hard to maintain. Therefore, a conditional WHERE clause that depends on some user input (parameters) is ideal—say, when the user selects a specific country, you can show only rows for that country, but return all rows if the input parameter is empty.</p>\n<h2>An Example of the WHERE Clause in Action</h2>\n<p>As an example, I will be using the &#8220;<a href=\"https://www.kaggle.com/datasets/ankanhore545/cost-of-living-index-2022?resource=download\" target=\"_blank\" rel=\"noopener\">Cost of Living Index 2022&#8243; dataset</a>.</p>\n<p>I created a demo table to store one row per country and per consumer goods.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">create table demo (\n primary key (country, consumer_goods)\n , country text\n , consumer_goods text\n , index numeric(8,2)\n);\n</pre>\n<p>I used <code>awk</code> to unpivot the CSV file and load it into the table.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">awk -F, '\n\n# remove ending ^M if any\n     { sub(/\\r$/,\"\") }\n\n# get names from header (start at columns 3 to Number of Fields)\nNR==1{ for( i=3 ; i&lt;=NF ; i++ ) dim[i]=gensub(\" Index$\",\"\",1,$i) }\n\n# print country (column 2), price (value at column 3 to NF), and name\nNR&gt;1 { for( i=3 ; i&lt;=NF ; i++ ) print $2\"\\t\"$i\"\\t\"dim[i] }\n\n' Cost_of_Living_Index_2022.csv | \n tee /dev/stderr | \n psql -ec '\n\n-- load CSV into the table\ncopy demo(country, index, consumer_goods ) from stdin\n'</pre>\n<p>I queried the table for all countries…</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# select country, consumer_goods, index\n           from demo\n           order by index desc;\n\n    country    |      consumer_goods      | index\n---------------+--------------------------+--------\n Bermuda       | Restaurant Price         | 159.17\n Bermuda       | Groceries                | 148.66\n Bermuda       | Cost of Living           | 146.04\n Switzerland   | Groceries                | 128.13\n Bermuda       | Cost of Living Plus Rent | 123.80\n Switzerland   | Cost of Living           | 123.35\n Switzerland   | Restaurant Price         | 122.09\n Switzerland   | Local Purchasing Power   | 118.44\n United States | Local Purchasing Power   | 106.34\n Norway        | Restaurant Price         | 105.49\n...\n(834 rows)\n</pre>\n<p>…or for one country.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# select country, consumer_goods, index\n           from demo\n           where country='Switzerland'\n           order by index desc;\n\n   country   |      consumer_goods      | index\n-------------+--------------------------+--------\n Switzerland | Groceries                | 128.13\n Switzerland | Cost of Living           | 123.35\n Switzerland | Restaurant Price         | 122.09\n Switzerland | Local Purchasing Power   | 118.44\n Switzerland | Cost of Living Plus Rent |  90.62\n Switzerland | Rent                     |  53.54\n(6 rows)\n</pre>\n<p>*NOTE: YugabyteDB, a PostgreSQL-compatible database, is being used for illustration purposes.</p>\n<p>The first query obviously does a Seq Scan. It had to read all rows due to an absence of a filter. The second query can use an Index Scan, because it has a filter.</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# explain (analyze, costs off)\n           select country, consumer_goods, index\n           from demo\n           where country='Switzerland'\n           order by index desc;\n\n                                     QUERY PLAN\n------------------------------------------------------------------------------------\n Sort (actual time=0.823..0.823 rows=6 loops=1)\n   Sort Key: index DESC\n   Sort Method: quicksort  Memory: 25kB\n   -&gt;  Index Scan using demo_pkey on demo (actual time=0.792..0.799 rows=6 loops=1)\n         Index Cond: (country = 'Switzerland'::text)\n Planning Time: 0.067 ms\n Execution Time: 0.849 ms\n Peak Memory Usage: 34 kB\n(8 rows)\n</pre>\n<h2>To Simplify Use One statement for code reuse</h2>\n<p>To simplify my application, I can write one query that covers both cases. It will use the country as an input parameter. If no country is specified, then it will read all countries. This is typically done with a prepared statement on the application side or a stored procedure on the database side. For the demo, I&#8217;ll use <code>prepare</code> and <code>execute</code> from <code>plsql</code>. Here is an example:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# prepare query1(text) as\n           select country, consumer_goods, index\n           from demo\n           where ($1 is null) or (country=$1)\n           order by index desc;\n</pre>\n<p>If no country is passed as input parameter <code>$1</code>, the condition <code>($1 is null)</code> will be true for all rows. If a country is passed, the condition <code>($1 is null)</code> is not true and the where clause will be true only when <code>(country=$1)</code>. This logical disjunction can also be read as &#8216;if <code>($1 is not null)</code> then <code>(country=$1)</code>&#8216; according to the <strong><em>law of implication</em></strong> (the logical equivalence of &#8216;if A then B&#8217; is &#8216;not A or B&#8217;).</p>\n<p>Let&#8217;s look at the execution plans:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# explain (analyze, costs off)\n           execute query1(null);\n\n                             QUERY PLAN\n--------------------------------------------------------------------\n Sort (actual time=3.678..3.725 rows=834 loops=1)\n   Sort Key: index DESC\n   Sort Method: quicksort  Memory: 90kB\n   -&gt;  Seq Scan on demo (actual time=1.402..3.375 rows=834 loops=1)\n Planning Time: 0.129 ms\n Execution Time: 3.794 ms\n Peak Memory Usage: 184 kB\n(7 rows)\n\nyugabyte=# explain (analyze, costs off)\n           execute query1('Switzerland');\n\n                                     QUERY PLAN\n------------------------------------------------------------------------------------\n Sort (actual time=0.798..0.798 rows=6 loops=1)\n   Sort Key: index DESC\n   Sort Method: quicksort  Memory: 25kB\n   -&gt;  Index Scan using demo_pkey on demo (actual time=0.779..0.786 rows=6 loops=1)\n         Index Cond: (country = 'Switzerland'::text)\n Planning Time: 0.103 ms\n Execution Time: 0.822 ms\n Peak Memory Usage: 34 kB\n(8 rows)\n\n</pre>\n<p>So everything looks good. Seq Scan is used when we need to read all rows <code>(rows=834)</code> and Index Scan is used to filter for a specific country <code>(rows=6)</code>.</p>\n<p>Now let&#8217;s say that I have many executions of the first scenario. I&#8217;m using <code>\\watch</code> to run it several times (<code>count</code> is a nice addition in PostgreSQL version 16, currently in beta):</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# explain (analyze, costs off)\n           execute query1(null)\n           \\watch 0.1 count=100\n\n                             QUERY PLAN\n--------------------------------------------------------------------\n Sort (actual time=3.781..3.827 rows=834 loops=1)\n   Sort Key: index DESC\n   Sort Method: quicksort  Memory: 90kB\n   -&gt;  Seq Scan on demo (actual time=1.461..3.453 rows=834 loops=1)\n Planning Time: 0.094 ms\n Execution Time: 3.898 ms\n Peak Memory Usage: 168 kB\n(7 rows)\n\n\n...\n\n                             QUERY PLAN\n--------------------------------------------------------------------\n Sort (actual time=2.291..2.327 rows=834 loops=1)\n   Sort Key: index DESC\n   Sort Method: quicksort  Memory: 90kB\n   -&gt;  Seq Scan on demo (actual time=1.555..2.001 rows=834 loops=1)\n         Remote Filter: (($1 IS NULL) OR (country = $1))\n Planning Time: 0.018 ms\n Execution Time: 2.407 ms\n Peak Memory Usage: 216 kB\n(8 rows)\n</pre>\n<p>At some point, the execution plan switched to a generic plan. So now you see the original condition with parameters, which saves the planning phase for the next executions.</p>\n<p>However, there is a problem with the generic plan. There’s only one execution plan to cover both scenarios, so calling my query for a specific country will not initiate an Index Scan anymore:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# explain (analyze, costs off)\n           execute query1('Switzerland');\n\n                            QUERY PLAN\n------------------------------------------------------------------\n Sort (actual time=2.145..2.145 rows=6 loops=1)\n   Sort Key: index DESC\n   Sort Method: quicksort  Memory: 25kB\n   -&gt;  Seq Scan on demo (actual time=2.126..2.132 rows=6 loops=1)\n         Remote Filter: (($1 IS NULL) OR (country = $1))\n Planning Time: 0.014 ms\n Execution Time: 2.191 ms\n Peak Memory Usage: 40 kB\n(8 rows)\n</pre>\n<p>This is how PostgreSQL works. It’s done on purpose to avoid too many parse phases when a prepared statement is executed many times. This is typical for OLTP applications. Since the release of PostgreSQL 12, you can control that with <code>plan_cache_mode</code>, but there is a better solution that provides the best performance for custom and generic plans.</p>\n<h2>Better Performance with OR expansion with UNION ALL</h2>\n<p>The &#8220;is null or equal&#8221; predicate is nice but may not be easy to read by non-mathematicians. I can expand it to two queries, one for each case, depending on the parameter being set or not, concatenated by a UNION ALL:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# prepare query2(text) as\n select country, consumer_goods, index\n   from demo\n   -- filter on a specific country defined in the parameter\n   where ($1 is not null) and ($1 = country)\n  union all\n  select country, consumer_goods, index\n   from demo\n   -- get all countries when the parameter is undefined\n   where ($1 is     null) and ($1 = country) is not true\n  order by index desc;\n</pre>\n<p>Each branch condition starts with the criteria on the parameter ($1 being null or not). When not null, an additional condition on it will filter on its value.</p>\n<p>I&#8217;ve added the opposite condition, along with the &#8216;<code>is not true</code>&#8216; predicate, in the other branch. This is not needed here because it is implicit: if the parameter is null, the equality is never true. However, this is a good practice when expanding OR to UNION ALL in general to be sure that there&#8217;s no rows in double from both branches.</p>\n<p>With custom plans, where the planning is done for each execution, with the knowledge of the parameter values, the access path is optimized for each scenario, resulting to a Seq Scan for all rows, or an Index Scan for a specific value:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">yugabyte=# explain (analyze, costs off)\n           execute query2(null);\n\n                                QUERY PLAN\n--------------------------------------------------------------------------\n Sort (actual time=3.798..3.840 rows=834 loops=1)\n   Sort Key: demo.index DESC\n   Sort Method: quicksort  Memory: 90kB\n   -&gt;  Append (actual time=1.485..3.510 rows=834 loops=1)\n         -&gt;  Seq Scan on demo (actual time=1.484..3.435 rows=834 loops=1)\n Planning Time: 0.152 ms\n Execution Time: 3.909 ms\n Peak Memory Usage: 168 kB\n(8 rows)\n\nyugabyte=# explain (analyze, costs off)\n           execute query2('Switzerland');\n\n                                        QUERY PLAN\n------------------------------------------------------------------------------------------\n Sort (actual time=1.183..1.184 rows=6 loops=1)\n   Sort Key: demo.index DESC\n   Sort Method: quicksort  Memory: 25kB\n   -&gt;  Append (actual time=1.164..1.172 rows=6 loops=1)\n         -&gt;  Index Scan using demo_pkey on demo (actual time=1.163..1.170 rows=6 loops=1)\n               Index Cond: ('Switzerland'::text = country)\n Planning Time: 0.187 ms\n Execution Time: 1.215 ms\n Peak Memory Usage: 34 kB\n(9 rows)\n</pre>\n<p>Since PostgreSQL 12 we can also force a generic plan to validate that it is optimal for both scenarios and I prefer to use that to be sure that the plan is optimal in all cases, rather than repeating the query many times:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">postgres=# set plan_cache_mode=force_generic_plan;\nSET\n\npostgres=# explain (analyze, costs off)\n           execute query2(null)\n;\n                                      QUERY PLAN\n---------------------------------------------------------------------------------------\n Sort (actual time=0.488..0.527 rows=834 loops=1)\n   Sort Key: demo.index DESC\n   Sort Method: quicksort  Memory: 86kB\n   -&gt;  Append (actual time=0.013..0.242 rows=834 loops=1)\n         -&gt;  Result (actual time=0.002..0.002 rows=0 loops=1)\n               One-Time Filter: ($1 IS NOT NULL)\n               -&gt;  Index Scan using demo_pkey on demo (never executed)\n                     Index Cond: (country = $1)\n         -&gt;  Result (actual time=0.011..0.182 rows=834 loops=1)\n               One-Time Filter: ($1 IS NULL)\n               -&gt;  Seq Scan on demo demo_1 (actual time=0.010..0.097 rows=834 loops=1)\n                     Filter: (($1 = country) IS NOT TRUE)\n Planning Time: 0.128 ms\n Execution Time: 0.578 ms\n(14 rows)\n\npostgres=# explain (analyze, costs off)\n           execute query2('Switzerland')\n;\n\n                                           QUERY PLAN\n------------------------------------------------------------------------------------------------\n Sort (actual time=0.034..0.035 rows=6 loops=1)\n   Sort Key: demo.index DESC\n   Sort Method: quicksort  Memory: 25kB\n   -&gt;  Append (actual time=0.022..0.025 rows=6 loops=1)\n         -&gt;  Result (actual time=0.021..0.024 rows=6 loops=1)\n               One-Time Filter: ($1 IS NOT NULL)\n               -&gt;  Index Scan using demo_pkey on demo (actual time=0.019..0.021 rows=6 loops=1)\n                     Index Cond: (country = $1)\n         -&gt;  Result (actual time=0.000..0.000 rows=0 loops=1)\n               One-Time Filter: ($1 IS NULL)\n               -&gt;  Seq Scan on demo demo_1 (never executed)\n                     Filter: (($1 = country) IS NOT TRUE)\n Planning Time: 0.016 ms\n Execution Time: 0.063 ms\n(14 rows)\n\n</pre>\n<p>The generic plan has two branches, but only one is executed thanks to the <code> One-Time Filter</code>. Depending on this filter, the parameter being set or not, one branch is executed, and the other not, visible as &#8216;<code>(never executed)</code>&#8216;. Compared to custom plans, this choice is done at runtime, which may have a little CPU overhead, but it saves the whole planning time.</p>\n<p>Note that in PostgreSQL 16 you will be able to check the generic plan with its two branches and One-Time filters with EXPLAIN on the parameterized query:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"postgresql\">postgres=# explain (generic_plan, costs off)\n select country, consumer_goods, index\n   from demo\n   -- filter on a specific country\n   where ($1::text is not null) and ($1::text = country)\n union all\n select country, consumer_goods, index\n   from demo\n   -- get all countries\n   where ($1::text is     null) and ($1::text = country) is not true\n order by index desc;\n\n                        QUERY PLAN\n----------------------------------------------------------\n Sort\n   Sort Key: demo.index DESC\n   -&gt;  Append\n         -&gt;  Result\n               One-Time Filter: ($1 IS NOT NULL)\n               -&gt;  Index Scan using demo_pkey on demo\n                     Index Cond: (country = $1)\n         -&gt;  Result\n               One-Time Filter: ($1 IS NULL)\n               -&gt;  Seq Scan on demo demo_1\n                     Filter: (($1 = country) IS NOT TRUE)\n(11 rows)\n\n</pre>\n<p>I had to add the parameter data types (<code>$1::text</code>) in all places because the execution plan depends on it and without explicit casting they are known only at runtime.</p>\n<h2>A Word About YugabyteDB and Its PostgreSQL Behavior</h2>\n<p>This blog post was inspired by a question on the PostgreSQL Community Slack. As noted above, the execution plans were run on YugabyteDB, which behaves the same as PostgreSQL since it reuses the same code for the SQL processing layer. The only difference is that PostgreSQL may show a <code>Bitmap Heap Scan</code>. Because YugabyteDB stores the table in its primary key, rather than in a heap table and a separate primary key index, there&#8217;s no additional reads and an <code>Index Scan</code> returns all columns immediately as if it was an <code>Index Only Scan</code>.</p>\n<h2>To Summarize&#8230;</h2>\n<p>The best approach to get the optimal execution plan for each scenario is to build specific queries for each. Dynamic SQL, where the query is constructed by concatenating strings at runtime, can be a solution if the query depends on user input. However, this method is not easy to maintain, since searching for the query code monitored in tools like <code>pg_stat_activity</code> or <code>pg_stat_statements</code> is not possible, and there is a risk of SQL injection if parameters are not used when concatenating the query parts.</p>\n<p>One alternative is to do some math and use a complex OR condition that mimics a conditional statement. While effective, this approach may be difficult for future developers to read and optimize for the query planner. Alternatively, when dealing with a limited number of scenarios, concatenating different queries with UNION ALL offers the best performance.</p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>Let’s walk through some examples to see the importance of the conditional WHERE clause in PostgreSQL, especially when dealing with data that requires extensive filtering. </p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 28385,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": false,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2194
+  ],
+  "tags": [
+    2617,
+    2562
+  ],
+  "class_list": [
+    "post-28372",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-postgresql",
+    "tag-postgresql-tips-and-tricks",
+    "tag-query"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>How to Create a Conditional WHERE Clause in PostgreSQL</title>\n<meta name=\"description\" content=\"Discover the importance of conditional WHERE clause in PostgreSQL for dynamic data filtering. Balancing static and dynamic queries made easy.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/conditional-where-clause-postgresql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"How to Create a Conditional WHERE Clause in PostgreSQL\" />\n<meta property=\"og:description\" content=\"Discover the importance of conditional WHERE clause in PostgreSQL for dynamic data filtering. Balancing static and dynamic queries made easy.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/conditional-where-clause-postgresql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2023-06-26T11:56:00+00:00\" />\n<meta property=\"article:modified_time\" content=\"2023-07-06T13:21:58+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-Create-a-Conditional-WHERE-Clause-in-PostgreSQL.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-Create-a-Conditional-WHERE-Clause-in-PostgreSQL.jpg\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"10 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"How to Create a Conditional WHERE Clause in PostgreSQL\",\"datePublished\":\"2023-06-26T11:56:00+00:00\",\"dateModified\":\"2023-07-06T13:21:58+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/\"},\"wordCount\":1093,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/06\\/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg\",\"keywords\":[\"PostgreSQL Tips and Tricks\",\"Query\"],\"articleSection\":[\"PostgreSQL\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/\",\"name\":\"How to Create a Conditional WHERE Clause in PostgreSQL\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/06\\/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg\",\"datePublished\":\"2023-06-26T11:56:00+00:00\",\"dateModified\":\"2023-07-06T13:21:58+00:00\",\"description\":\"Discover the importance of conditional WHERE clause in PostgreSQL for dynamic data filtering. Balancing static and dynamic queries made easy.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/06\\/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/06\\/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg\",\"width\":480,\"height\":320,\"caption\":\"How to create a conditional WHERE clause in PostgreSQL - blog\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/conditional-where-clause-postgresql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"How to Create a Conditional WHERE Clause in PostgreSQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "How to Create a Conditional WHERE Clause in PostgreSQL",
+    "description": "Discover the importance of conditional WHERE clause in PostgreSQL for dynamic data filtering. Balancing static and dynamic queries made easy.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "How to Create a Conditional WHERE Clause in PostgreSQL",
+    "og_description": "Discover the importance of conditional WHERE clause in PostgreSQL for dynamic data filtering. Balancing static and dynamic queries made easy.",
+    "og_url": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2023-06-26T11:56:00+00:00",
+    "article_modified_time": "2023-07-06T13:21:58+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-Create-a-Conditional-WHERE-Clause-in-PostgreSQL.jpg",
+        "type": "image/jpeg"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-Create-a-Conditional-WHERE-Clause-in-PostgreSQL.jpg",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "10 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "How to Create a Conditional WHERE Clause in PostgreSQL",
+          "datePublished": "2023-06-26T11:56:00+00:00",
+          "dateModified": "2023-07-06T13:21:58+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/"
+          },
+          "wordCount": 1093,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg",
+          "keywords": [
+            "PostgreSQL Tips and Tricks",
+            "Query"
+          ],
+          "articleSection": [
+            "PostgreSQL"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/",
+          "url": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/",
+          "name": "How to Create a Conditional WHERE Clause in PostgreSQL",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg",
+          "datePublished": "2023-06-26T11:56:00+00:00",
+          "dateModified": "2023-07-06T13:21:58+00:00",
+          "description": "Discover the importance of conditional WHERE clause in PostgreSQL for dynamic data filtering. Balancing static and dynamic queries made easy.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg",
+          "width": 480,
+          "height": 320,
+          "caption": "How to create a conditional WHERE clause in PostgreSQL - blog"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "How to Create a Conditional WHERE Clause in PostgreSQL"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/28372",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=28372"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/28372/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/28385"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=28372"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=28372"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=28372"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 28385,
+        "date": "2023-06-23T10:12:14",
+        "slug": "how-to-create-a-conditional-where-clause-in-postgresql-blog",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/conditional-where-clause-postgresql/how-to-create-a-conditional-where-clause-in-postgresql-blog/",
+        "title": {
+          "rendered": "How to create a conditional WHERE clause in PostgreSQL &#8211; blog"
+        },
+        "author": 104,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "How to create a conditional WHERE clause in PostgreSQL - blog",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg",
+          "filesize": 118007,
+          "sizes": {
+            "thumbnail": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7082,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg"
+            },
+            "alm-thumbnail": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7082,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg"
+            },
+            "thumb_size_popular": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-80x80.jpg",
+              "width": 80,
+              "height": 80,
+              "filesize": 2620,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-80x80.jpg"
+            },
+            "thumb_size_latest": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-80x80.jpg",
+              "width": 80,
+              "height": 80,
+              "filesize": 2620,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-80x80.jpg"
+            },
+            "thumb_size_related": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-240x160.jpg",
+              "width": 240,
+              "height": 160,
+              "filesize": 10814,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-240x160.jpg"
+            },
+            "thumb_size_featured": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-80x80.jpg",
+              "width": 80,
+              "height": 80,
+              "filesize": 2620,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-80x80.jpg"
+            },
+            "authorship-box-avatar": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7082,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg"
+            },
+            "authorship-box-related": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-70x70.jpg",
+              "width": 70,
+              "height": 70,
+              "filesize": 2114,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-70x70.jpg"
+            },
+            "fw-mobile": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-480x246.jpg",
+              "width": 480,
+              "height": 246,
+              "filesize": 30984,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-480x246.jpg"
+            },
+            "popular-post-featured-image": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-60x60.jpg",
+              "width": 60,
+              "height": 60,
+              "filesize": 1765,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-60x60.jpg"
+            },
+            "rp4wp-thumbnail-post": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 7082,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog-150x150.jpg"
+            },
+            "full": {
+              "file": "How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/06/How-to-create-a-conditional-WHERE-clause-in-PostgreSQL-blog.jpg",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/28385",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/104"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=28385"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 28372,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/28372"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2194,
+          "link": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+          "name": "PostgreSQL",
+          "slug": "postgresql",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/databases/postgresql/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/databases/postgresql/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/\",\"name\":\"PostgreSQL Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/postgresql\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Databases\",\"item\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/\"},{\"@type\":\"ListItem\",\"position\":3,\"name\":\"PostgreSQL\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "PostgreSQL Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "PostgreSQL Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+                  "url": "https://www.yugabyte.com/blog/category/databases/postgresql/",
+                  "name": "PostgreSQL Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/postgresql/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Databases",
+                      "item": "https://www.yugabyte.com/blog/category/databases/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 3,
+                      "name": "PostgreSQL"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2194",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "up": [
+              {
+                "embeddable": true,
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2158"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2194"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2617,
+          "link": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+          "name": "PostgreSQL Tips and Tricks",
+          "slug": "postgresql-tips-and-tricks",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>PostgreSQL Tips and Tricks Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"PostgreSQL Tips and Tricks Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/\",\"name\":\"PostgreSQL Tips and Tricks Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/postgresql-tips-and-tricks\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"PostgreSQL Tips and Tricks\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "PostgreSQL Tips and Tricks Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "PostgreSQL Tips and Tricks Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+                  "url": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/",
+                  "name": "PostgreSQL Tips and Tricks Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/postgresql-tips-and-tricks/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "PostgreSQL Tips and Tricks"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2617",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2617"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2562,
+          "link": "https://www.yugabyte.com/blog/tag/query/",
+          "name": "Query",
+          "slug": "query",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Query Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/query/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Query Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/query/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/query\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/query\\/\",\"name\":\"Query Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/query\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/query\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Query\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Query Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/query/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Query Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/query/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/query/",
+                  "url": "https://www.yugabyte.com/blog/tag/query/",
+                  "name": "Query Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/query/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/query/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Query"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2562",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2562"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

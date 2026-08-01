@@ -1,0 +1,1613 @@
+{
+  "id": 28671,
+  "date": "2023-07-24T04:43:45",
+  "date_gmt": "2023-07-24T11:43:45",
+  "guid": {
+    "rendered": "https://www.yugabyte.com/?p=28671"
+  },
+  "modified": "2026-01-06T02:52:44",
+  "modified_gmt": "2026-01-06T10:52:44",
+  "slug": "troubleshoot-oracle-connection-errors",
+  "status": "publish",
+  "type": "post",
+  "link": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/",
+  "title": {
+    "rendered": "The Complete Guide to Troubleshooting Oracle Connection Errors"
+  },
+  "content": {
+    "rendered": "<p>In this blog post, I&#8217;ll demonstrate the different error messages you might encounter when a connection to Oracle database fails.&nbsp; The error messages are not always easy to troubleshoot.</p>\n<p>I will connect to Oracle using the:</p>\n<ol>\n<li><strong>JDBC Thin Driver,</strong> which is a simple JAR commonly used by Java applications since it requires no additional platform-specific libraries</li>\n<li><strong>JDBC OCI Driver</strong>, which uses the Oracle client library. Its behavior and error messages are the same, no matter if you call it from Java or another language.&nbsp;</li>\n</ol>\n<p>Clearly identifying different connection error scenarios makes troubleshooting complex situations much easier.</p>\n<h2>Why Troubleshoot Oracle Connection Errors?</h2>\n<p>Oracle DBAs, developers, and users often encounter issues where they cannot connect to an Oracle database and have to verify what&#8217;s wrong with their connection configuration. In terms of YugabyteDB, some of our customers have received connection errors as they <a href=\"https://www.yugabyte.com/blog/migrate-from-oracle-database-to-yugabytedb-using-voyager/\">migrate from </a><a href=\"https://www.yugabyte.com/blog/migrate-from-oracle-database-to-yugabytedb-using-voyager/\">Oracle to YugabyteDB</a>.</p>\n<p>This is because with our database migration tool, <a href=\"https://www.yugabyte.com/voyager/\">YugabyteDB Voyager</a>, they need to provide the connection information of the source Oracle database, using the parameters &#8211;source-db-user &#8211;source-db-password and &#8211;oracle-tns-alias. They also need a set of files with at least a tnsnames.ora and probably a wallet full of certificates.</p>\n<p>The bottom line is that they have to troubleshoot the Oracle database connection error messages so that they can provide the connection to migrate their data to YugabyteDB.</p>\n<h2>Testing the Oracle Database Connection From Java</h2>\n<p>To test the connection to an Oracle database from Java, you can use the following program (TestJDBC.java).&nbsp;</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">import java.sql.DriverManager;\nimport java.sql.Connection;\nimport java.sql.SQLException;\n\npublic class TestJDBC {\n public static void main(String[] args)\n throws SQLException,InterruptedException {\n  try (Connection c = (Connection) DriverManager.getConnection(\n    args[2],args[0],args[1]) // parameters are: user password url\n   ) { System.out.println(\" Connected to schema: \"+c.getSchema()); }\n }\n}</pre>\n<p>Then compile and run it with the Oracle Instant Client installed</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">CLASSPATH=\".:/usr/lib/oracle/19.10/client64/lib/ojdbc8.jar\" javac TestJDBC.java</pre>\n<p>Then define the CLASSPATH and, for the OCI driver which will need additional libraries, use the LD_LIBRARY_PATH:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">CLASSPATH=\".:/usr/lib/oracle/19.10/client64/lib/ojdbc8.jar\"\n\nLD_LIBRARY_PATH=/usr/lib/oracle/19.10/client64/lib</pre>\n<p>The program requires three arguments:</p>\n<ol>\n<li>Username</li>\n<li>Password</li>\n<li>JDBC URL</li>\n</ol>\n<p>To demonstrate different error messages, I will attempt to make connections using incorrect information, or try to connect to a database that is not opened to users.</p>\n<h2>Scenarios That Depend on Connection Environment</h2>\n<p>To begin with, here are two scenarios where my environment is not correctly set:</p>\n<ol>\n<li>no CLASSPATH defined to ojdbc.jar:\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">$ java TestJDBC  \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@xxx\"\n\nException in thread \"main\" java.sql.SQLException: No suitable driver found for jdbc:oracle:oci:@xxx</pre>\n</li>\n<li>no LD_LIBRARY_PATH for OCI:\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">$ java TestJDBC  \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@xxx\"\n\nException in thread \"main\" java.sql.SQLException: No suitable driver found for jdbc:oracle:oci:@xxx\n\nException in thread \"main\" java.lang.UnsatisfiedLinkError: no ocijdbc19 in java.library.path: [/usr/java/packages/lib, /lib, /usr/lib, /usr/lib64, /lib64]</pre>\n<p>Now that everything is set correctly in the environment, let&#8217;s explore other scenarios that depend on the connection settings.</p>\n<h3>JDBC Thin and JDBC OCI without TLS</h3>\n<p>A JDBC Thin connection uses a JDBC URL that starts with <code>'jdbc:oracle:thin:@'</code> and includes the necessary Oracle Client JARs in the CLASSPATH. The connection information that follows in the JDBC URL is interpreted in Java by this library. The JAR name depends on the Java version: <code>ojdbc8.jar</code> is compatible with JDK8, ojdbc11.jar with JDK11. The version of the driver itself is not visible in the name. For example, I&#8217;ve installed the InstantClient 19.10 and my JAR is <code>/usr/lib/oracle/19.10/client64/lib/ojdbc8.jar</code>.</p>\n<p>For a JDBC OCI connection, utilize a JDBC URL starting with <code>'jdbc:oracle:oci:@'</code>. The Oracle Client libraries (not Java) interpret the information. NOTE: I&#8217;m using the <a href=\"https://www.oracle.com/database/technologies/instant-client/linux-arm-aarch64-downloads.html\">InstantClient</a>). Those libraries are found by the Linux mechanism: LD_LIBRARY_PATH must be set (<code>/usr/lib/oracle/19.10/client64/lib</code> for me).</p>\n<p>Without TLS, no certificate is required, but transmission is unencrypted except for the password. This is not suitable for production data, but let’s start simple before adding complexity.</p>\n</li>\n</ol>\n<p><strong>Scenarios 1: If you try to connect with an incomplete connect identifier, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: Connect identifier was empty.\nCaused by: oracle.net.ns.NetException: Connect identifier was empty.</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12162: TNS:net service name is incorrectly specified</pre>\n<p>You already see that it can be useful to test with the Thin and the OCI driver: they don&#8217;t show the same messages.</p>\n<p><strong>Scenario 2: If you try to connect without the @ sign, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:xxx\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: Invalid Oracle URL specified</pre>\n<p>JDBC OCI Driver, use::</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:xxx\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: Invalid Oracle URL specified</pre>\n<p><strong>Scenario 3: If you try to connect with a typo in the connection string, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@host=xxx\" </pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: Invalid connection string format, a valid format is: \"host:port:sid\"\n\nCaused by: oracle.net.ns.NetException: Invalid connection string format, a valid format is: \"host:port:sid\"</pre>\n<p>Note that this message is misleading. There are many more complex valid formats that we will see later, and this one mentioning a sid should never be used from an application.</p>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@host=xxx\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12154: TNS:could not resolve the connect identifier specified</pre>\n<p><strong>Scenario 4: If the host is unknown for DNS resolution, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@xxx\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: Unknown host specified\nCaused by: oracle.net.ns.NetException: Unknown host specified</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@xxx\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12154: TNS:could not resolve the connect identifier specified</pre>\n<p><strong>Scenario 5: If the host is known by the DNS but not routable, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@170.61.112.206\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: The Network Adapter could not establish the connection\nCaused by: oracle.net.ns.NetException: The Network Adapter could not establish the connection\nCaused by: java.io.IOException: No route to host, socket connect lapse 11 ms. /170.61.112.206 1521 0 1 true\nCaused by: java.net.NoRouteToHostException: No route to host</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@170.61.112.206\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12543: TNS:destination host unreachable</pre>\n<p><strong>Scenario 6: If the IP address is routable but unknown (or the server or network is down) then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@192.168.42.42\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: The Network Adapter could not establish the connection\nCaused by: oracle.net.ns.NetException: The Network Adapter could not establish the connection\nCaused by: java.io.IOException: Connection timed out, socket connect lapse 130867 ms. /192.168.42.42 1521 0 1 true\nCaused by: java.net.ConnectException: Connection timed out</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@192.168.42.42\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12170: TNS:Connect timeout occurred</pre>\n<p><strong>Scenario 7: If the server answers but the port is not opened, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@localhost\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: The Network Adapter could not establish the connection\nCaused by: oracle.net.ns.NetException: The Network Adapter could not establish the connection\nCaused by: java.io.IOException: Connection refused, socket connect lapse 0 ms. /0:0:0:0:0:0:0:1 1521 0 1 true\nCaused by: java.net.ConnectException: Connection refused</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@localhost\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12541: TNS:no listener</pre>\n<p><strong>Scenario 8: If the port is opened but service is not provided, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@localhost:1522\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: Listener refused the connection with the following error:\nORA-12504, TNS:listener was not given the SERVICE_NAME in CONNECT_DATA\nCaused by: oracle.net.ns.NetException: Listener refused the connection with the following error:\nORA-12504, TNS:listener was not given the SERVICE_NAME in CONNECT_DATA</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@localhost:1522\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12504: TNS:listener was not given the SERVICE_NAME in CONNECT_DATA</pre>\n<p><strong>Scenario 9: If service is given but not known by the listener, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@localhost:1522/XXX\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: Listener refused the connection with the following error:\nORA-12514, TNS:listener does not currently know of service requested in connect descriptor\nCaused by: oracle.net.ns.NetException: Listener refused the connection with the following error:\nORA-12514, TNS:listener does not currently know of service requested in connect descriptor</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@localhost:1522/XXX\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: ORA-12514: TNS:listener does not currently know of service requested in connect descriptor</pre>\n<p><strong>Scenario 10: If service is known by the listener but the database does not open, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@localhost:1522/PDB2\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-01109: database not open</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@localhost:1522/PDB2\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-01109: database not open</pre>\n<p><strong>Scenario 11: If the database is opened but the username not known, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@localhost:1522/PDB1\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-01017: invalid username/password; logon denied</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@localhost:1522/PDB1\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-01017: invalid username/password; logon denied</pre>\n<p><strong>Scenario 12: If username exists but the wrong password is provided, then:</strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"my_password\" \"jdbc:oracle:thin:@localhost:1522/PDB1\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-01017: invalid username/password; logon denied</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"my_password\" \"jdbc:oracle:oci:@localhost:1522/PDB1\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-01017: invalid username/password; logon denied</pre>\n<p><strong>Finally, the best case scenario! If the username and password are correct, then:</strong></p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@localhost:1522/PDB1\"<br>\nConnected to schema: DEMO</pre>\n<p>While there are many other possible messages (e.g., expired password, locked account), these are not tied to the connection string. If you encounter an ORA- error instead of a TNS- error, it indicates a successful database connection. However, failure to connect with the correct account and password can also result from connecting to the wrong database. The error message remains the same whether the user is unknown or known with an invalid password.</p>\n<h2>Using a Network Service Name Defined in the tnsnames.ora</h2>\n<p>Instead of using a complete URL with hostname, port, and service (known as Easy Connect or EZCONNECT), you have the option to use a network service name defined in the tnsnames.ora file. This approach may introduce new error messages during the resolution process.</p>\n<p>The <code>tnsnames.ora</code> description uses the long format. You can get this from Easy Connect with the <code>tnsping</code> utility:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">$ tnsping localhost:1522/PDB1\n\nTNS Ping Utility for Linux: Version 19.0.0.0.0 - Production on 04-JUL-2023 08:58:53\n\nCopyright (c) 1997, 2019, Oracle.  All rights reserved.\n\nUsed parameter files:\n/u01/app/oracle/product/DB193/network/admin/sqlnet.ora\n\nUsed HOSTNAME adapter to resolve the alias\nAttempting to contact (DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=PDB1))(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=1522)))\nOK (0 msec)\n</pre>\n<p>If you like it, you can also use it directly in the JDBC URL:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=PDB1))(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=1522)))\"\nConnected to schema: DEMO\n</pre>\n<p>However, this may be where you prefer to set it in a tnsnames.ora to use an alias:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">mkdir /var/tmp/tns\necho \"mydb.mydomain=(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=PDB1))(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=1522)))\" &gt; /var/tmp/tns/tnsnames.ora\n</pre>\n<p>This name resolution makes the configuration simpler, but this surfaces a bunch of new scenarios with new possible errors.</p>\n<p><strong>Scenario #1: If you use the alias without specifying the <code>tnsnames.ora</code> location, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:thin:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: Unknown host specified\nCaused by: oracle.net.ns.NetException: Unknown host specified</pre>\n<p>Note: The JDBC Thin Driver will try to find <code>mydb.mydomain</code> from hostname resolution, ignoring any <code>tnsnames.ora</code> attempt.</p>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"my_user\" \"my_password\" \"jdbc:oracle:oci:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-12154: TNS:could not resolve the connect identifier specified</pre>\n<p>The Thin and OCI drivers differ significantly in this scenario. The Thin driver will not search for the <code>tnsnames.ora</code> file unless a location is specified. However, the OCI driver will search for this file in predefined locations. To view these locations, you can trace the system calls using:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">strace -fye trace=file -o /dev/stdout java TestJDBC \"my_user\" \"my_password\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">648429 faccessat(AT_FDCWD, \"/usr/lib/oracle/19.10/client64/lib/network/admin/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n648429 faccessat(AT_FDCWD, \"/home/opc/.sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n648429 faccessat(AT_FDCWD, \"/usr/lib/oracle/19.10/client64/lib/network/admin/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n648429 faccessat(AT_FDCWD, \"/home/opc/.tnsnames.ora\", F_OK) = -1 ENOENT (No such file or directory)\n648429 faccessat(AT_FDCWD, \"/etc/tnsnames.ora\", F_OK) = -1 ENOENT (No such file or directory)\n648429 faccessat(AT_FDCWD, \"/usr/lib/oracle/19.10/client64/lib/network/admin/tnsnames.ora\", F_OK) = -1 ENOENT (No such file or directory)\n\nException in thread \"main\" java.sql.SQLException: ORA-12154: TNS:could not resolve the connect identifier specified\n</pre>\n<p>The first attempt is <code>$ORACLE_HOME/network/admin/tnsnames.ora</code>. If not defined, ORACLE_HOME is where the library was found (so LD_LIBRARY_PATH). If not found, the second attempt is <code>$HOME/.tnsnames.ora</code>, in the Linux user’s home directory. The third attempt is in the system-wide configuration directory, <code>/etc/tnsnames.ora</code>. But wait, there&#8217;s a bit more.</p>\n<p>Prior to searching for <code>tnsnames.ora</code> it searches for <code>sqlnet.ora</code> in the same locations. The location where <code>sqlnet.ora</code> is found will determine where <code>tnsnames.ora</code> is read. In the <code>sqlnet.ora</code> file you can define the resolution method using <code>NAMES.DIRECTORY_PATH</code> specifying a list of methods in order (e.g. <code>EZCONNECT</code> to take the name in the connection string as a hostname; <code>TNSNAMES</code> to take it as a <code>tnsnames.ora</code> entry.)</p>\n<p>If this looks too complex, that is because it is. There&#8217;s 30 years of name resolution, network protocols and client drivers represented here.</p>\n<p><strong>Scenario 2: To look at a non-default location with the OCI driver, you need to define the TNS_ADMIN environment variable.</strong></p>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/var/tmp/tns java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Connected to schema: DEMO</pre>\n<p>This also works for the Thin driver. JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/var/tmp/tns java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Connected to schema: DEMO</pre>\n<p>There are more possibilities. For example, you could use the Thin driver with a Java variable:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java -Doracle.net.tns_admin=/var/tmp/tns TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Connected to schema: DEMO</pre>\n<p>Or you can even set it within the URL, using:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@mydb.mydomain?tns_admin=/var/tmp/tns\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Connected to schema: DEMO</pre>\n<p><strong>Note:</strong> 19c version of the drivers are being used here. Previous versions may not offer all those possibilities.</p>\n<h2>Scenarios With Incorrect TNS Name resolution</h2>\n<p>Now, let&#8217;s examine some error messages. The challenge lies in the fact that Oracle consistently returns the same error message, <code>'could not resolve the connect identifier'</code>, for different causes. To troubleshoot on Linux, trace the file opening attempts with:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">trace_tns_admin(){\nstrace -fye trace=file -o /dev/stdout $@ | grep \"$TNS_ADMIN\"\n}</pre>\n<p><strong>Scenario #1: If the directory is non-existent:</strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/xxx trace_tns_admin java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">634230 newfstatat(AT_FDCWD, \"/xxx/ojdbc.properties\", 0xfffdd504cce0, 0) = -1 ENOENT (No such file or directory)\n634230 faccessat(AT_FDCWD, \"/xxx/ojdbc.properties\", F_OK) = -1 ENOENT (No such file or directory)\n634230 newfstatat(AT_FDCWD, \"/xxx/tnsnames.ora\", 0xfffdd504d9d0, 0) = -1 ENOENT (No such file or directory)\n634230 newfstatat(AT_FDCWD, \"/xxx/tnsnames.ora\", 0xfffdd504d640, 0) = -1 ENOENT (No such file or directory)\n\nException in thread \"main\" java.sql.SQLRecoverableException: IO Error: could not resolve the connect identifier  \"mydb.mydomain\"\nCaused by: oracle.net.ns.NetException: could not resolve the connect identifier  \"mydb.mydomain\"\n</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/xxx trace_tns_admin java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">649543 newfstatat(AT_FDCWD, \"/xxx/ojdbc.properties\", 0xfffc5a5fcc70, 0) = -1 ENOENT (No such file or directory)\n649543 faccessat(AT_FDCWD, \"/xxx/ojdbc.properties\", F_OK) = -1 ENOENT (No such file or directory)\n649543 newfstatat(AT_FDCWD, \"/xxx/tnsnames.ora\", 0xfffc5a5fd9e0, 0) = -1 ENOENT (No such file or directory)\n649543 openat(AT_FDCWD, \"/xxx/oraaccess.xml\", O_RDONLY) = -1 ENOENT (No such file or directory)\n649543 faccessat(AT_FDCWD, \"/xxx/oraaccess.xml\", F_OK) = -1 ENOENT (No such file or directory)\n649543 faccessat(AT_FDCWD, \"/xxx/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649543 faccessat(AT_FDCWD, \"/xxx/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649543 faccessat(AT_FDCWD, \"/xxx/intchg.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649543 faccessat(AT_FDCWD, \"/xxx/tnsnav.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649543 faccessat(AT_FDCWD, \"/xxx/tnsnames.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649543 newfstatat(AT_FDCWD, \"/xxx/ldap.ora\", 0xfffc5a5ee2c0, 0) = -1 ENOENT (No such file or directory)\n\nException in thread \"main\" java.sql.SQLException: ORA-12154: TNS:could not resolve the connect identifier specified\n</pre>\n<p><strong>Scenario #2: If the directory has no tnsnames.ora file, then:</strong></p>\n<p>JDBC Thin Driver use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/home trace_tns_admin java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">634348 newfstatat(AT_FDCWD, \"/home/ojdbc.properties\", 0xfffcc29dcce0, 0) = -1 ENOENT (No such file or directory)\n634348 faccessat(AT_FDCWD, \"/home/ojdbc.properties\", F_OK) = -1 ENOENT (No such file or directory)\n634348 newfstatat(AT_FDCWD, \"/home/tnsnames.ora\", 0xfffcc29dd9d0, 0) = -1 ENOENT (No such file or directory)\n634348 newfstatat(AT_FDCWD, \"/home/tnsnames.ora\", 0xfffcc29dd640, 0) = -1 ENOENT (No such file or directory)\n\nException in thread \"main\" java.sql.SQLRecoverableException: IO Error: could not resolve the connect identifier  \"mydb.mydomain\"\nCaused by: oracle.net.ns.NetException: could not resolve the connect identifier  \"mydb.mydomain\"</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/home trace_tns_admin java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@mydb.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">649650 newfstatat(AT_FDCWD, \"/home/ojdbc.properties\", 0xffffa88bcc70, 0) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/ojdbc.properties\", F_OK) = -1 ENOENT (No such file or directory)\n649650 newfstatat(AT_FDCWD, \"/home/tnsnames.ora\", 0xffffa88bd9e0, 0) = -1 ENOENT (No such file or directory)\n649650 openat(AT_FDCWD, \"/home/oraaccess.xml\", O_RDONLY) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/oraaccess.xml\", F_OK) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/opc/.sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649650 newfstatat(AT_FDCWD, \"/home/opc\", {st_mode=S_IFDIR|0700, st_size=8192, ...}, 0) = 0\n649650 newfstatat(AT_FDCWD, \"/home/opc/oradiag_opc/diag/clients/user_opc/host_1175669419_110\", {st_mode=S_IFDIR|0775, st_size=179, ...}, 0) = 0\n649650 newfstatat(AT_FDCWD, \"/home/opc\", {st_mode=S_IFDIR|0700, st_size=8192, ...}, 0) = 0\n649650 faccessat(AT_FDCWD, \"/home/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/intchg.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/tnsnav.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/opc/.tnsnames.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649650 faccessat(AT_FDCWD, \"/home/tnsnames.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649650 newfstatat(AT_FDCWD, \"/home/ldap.ora\", 0xffffa88ae2c0, 0) = -1 ENOENT (No such file or directory)\n\nException in thread \"main\" java.sql.SQLException: ORA-12154: TNS:could not resolve the connect identifier specified\n</pre>\n<p><strong>Scenario #3: If the tnsnames.ora has no entry for the service name, then: </strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/var/tmp/tns trace_tns_admin java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@xxx.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">634435 newfstatat(AT_FDCWD, \"/var/tmp/tns/ojdbc.properties\", {st_mode=S_IFREG|0600, st_size=88, ...}, 0) = 0\n634435 newfstatat(AT_FDCWD, \"/var/tmp/tns/ojdbc.properties\", {st_mode=S_IFREG|0600, st_size=88, ...}, 0) = 0\n634435 openat(AT_FDCWD, \"/var/tmp/tns/ojdbc.properties\", O_RDONLY) = 9\n634435 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n634435 faccessat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", R_OK) = 0\n634435 openat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", O_RDONLY) = 9\n634435 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n634435 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n634435 faccessat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", R_OK) = 0\n634435 openat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", O_RDONLY) = 9\n634435 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n\nException in thread \"main\" java.sql.SQLRecoverableException: IO Error: could not resolve the connect identifier  \"mydb.mydomain\"\nCaused by: oracle.net.ns.NetException: could not resolve the connect identifier  \"mydb.mydomain\"\n</pre>\n<p><strong>NOTE:</strong> In this case, the file was found and opened, giving a clue that the directory was correctly set. The reason for the error is that the alias name was not found. Be careful with the tnsnames.ora syntax. It’s a tricky one.</p>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/var/tmp/tns trace_tns_admin java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@xxx.mydomain\"</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/ojdbc.properties\", {st_mode=S_IFREG|0600, st_size=88, ...}, 0) = 0\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/ojdbc.properties\", {st_mode=S_IFREG|0600, st_size=88, ...}, 0) = 0\n649740 openat(AT_FDCWD, \"/var/tmp/tns/ojdbc.properties\", O_RDONLY) = 6\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n649740 faccessat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", R_OK) = 0\n649740 openat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", O_RDONLY) = 6\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n649740 openat(AT_FDCWD, \"/var/tmp/tns/oraaccess.xml\", O_RDONLY) = -1 ENOENT (No such file or directory)\n649740 faccessat(AT_FDCWD, \"/var/tmp/tns/oraaccess.xml\", F_OK) = -1 ENOENT (No such file or directory)\n649740 faccessat(AT_FDCWD, \"/var/tmp/tns/sqlnet.ora\", F_OK) = 0\n649740 openat(AT_FDCWD, \"/var/tmp/tns/sqlnet.ora\", O_RDONLY) = 6\n649740 faccessat(AT_FDCWD, \"/var/tmp/tns/sqlnet.ora\", F_OK) = 0\n649740 openat(AT_FDCWD, \"/var/tmp/tns/sqlnet.ora\", O_RDONLY) = 8\n649740 faccessat(AT_FDCWD, \"/var/tmp/tns/intchg.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649740 faccessat(AT_FDCWD, \"/var/tmp/tns/tnsnav.ora\", F_OK) = -1 ENOENT (No such file or directory)\n649740 faccessat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", F_OK) = 0\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n649740 openat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", O_RDONLY) = 8\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/ldap.ora\", 0xfffc35cde2c0, 0) = -1 ENOENT (No such file or directory)\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n649740 newfstatat(AT_FDCWD, \"/var/tmp/tns/tnsnames.ora\", {st_mode=S_IFREG|0600, st_size=114, ...}, 0) = 0\n\nException in thread \"main\" java.sql.SQLException: ORA-12154: TNS:could not resolve the connect identifier specified\n</pre>\n<h2>Adding Transport Layer Security (TLS)</h2>\n<p>As you migrate the production data (say, if you are migrating to a new database), it is crucial to secure the network using Transport Layer Security (TLS)—previously known as SSL (Secure Sockets Layer).</p>\n<p>There two options available:</p>\n<ol>\n<li><strong>mTLS (Mutual TLS)</strong>, where both the client and the server provide an encrypted key, so that each can trust the other.</li>\n<li><strong>One-way TLS</strong>, where only the server holds the encryption key.</li>\n</ol>\n<p>Mutual TLS is necessary when the database is accessible through the public internet, ensuring client trust beyond user/password authentication. However, it requires the downloading of a client wallet. On the other hand, one-way TLS is suitable when the server is accessible only within a trusted network—simplifying the configuration process.</p>\n<p>Let’s test both using an Oracle Autonomous Database created in the cloud. The connection string was sourced from Database connection -&gt; Connection strings. I also used the &#8216;TP&#8217; service rather than the MEDIUM or HIGH services since I don&#8217;t want to use parallel query.</p>\n<figure class=\"wp-block-image size-full\"><img loading=\"lazy\" decoding=\"async\" width=\"800\" height=\"462\" src=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Autonomous-Database-connection-strings.png\" alt=\"\" class=\"wp-image-28684\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Autonomous-Database-connection-strings.png 800w, https://www.yugabyte.com/wp-content/uploads/2023/07/Autonomous-Database-connection-strings-600x347.png 600w, https://www.yugabyte.com/wp-content/uploads/2023/07/Autonomous-Database-connection-strings-768x444.png 768w\" sizes=\"auto, (max-width: 800px) 100vw, 800px\" /></figure>\n<h2 class=\"wp-block-heading\">JDBC Thin and JDBC OCI With One-Way TLS</h2>\n<p><strong>JDBC Thin and JDBC OCI With One-Way TLS</strong></p>\n<p>JDBC Thin Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@(description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-frankfurt-1.oraclecloud.com))(connect_data=(service_name=m0ve2yu64by73db_adb_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\"\n</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">oracle.net.ns.NetException: Listener refused the connection with the following error: ORA-12506, TNS:listener rejected connection based on service ACL filtering</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@(description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-frankfurt-1.oraclecloud.com))(connect_data=(service_name=m0ve2yu64by73db_adb_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\"</pre>\n<p>The result will be</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">651164 faccessat(AT_FDCWD&lt;/var/tmp&gt;, \"/usr/lib/oracle/19.10/client64/lib/network/admin/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n651164 faccessat(AT_FDCWD&lt;/var/tmp&gt;, \"/home/opc/.sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n651164 faccessat(AT_FDCWD&lt;/var/tmp&gt;, \"/usr/lib/oracle/19.10/client64/lib/network/admin/sqlnet.ora\", F_OK) = -1 ENOENT (No such file or directory)\n651164 newfstatat(AT_FDCWD&lt;/var/tmp&gt;, \"/etc/ORACLE/WALLETS/opc/ewallet.p12\", 0xfffd393da830, 0) = -1 ENOENT (No such file or directory)\n651164 newfstatat(AT_FDCWD&lt;/var/tmp&gt;, \"/etc/ORACLE/WALLETS/opc/cwallet.sso\", 0xfffd393da830, 0) = -1 ENOENT (No such file or directory)\n651164 newfstatat(AT_FDCWD&lt;/var/tmp&gt;, \"/etc/ORACLE/WALLETS/opc/ewallet.p12\", 0xfffd393da830, 0) = -1 ENOENT (No such file or directory)\n651164 newfstatat(AT_FDCWD&lt;/var/tmp&gt;, \"/etc/ORACLE/WALLETS/opc/cwallet.sso\", 0xfffd393da830, 0) = -1 ENOENT (No such file or directory)\n651164 newfstatat(AT_FDCWD&lt;/var/tmp&gt;, \"/etc/ORACLE/WALLETS/opc/ewallet.p12\", 0xfffd393da830, 0) = -1 ENOENT (No such file or directory)\n651164 newfstatat(AT_FDCWD&lt;/var/tmp&gt;, \"/etc/ORACLE/WALLETS/opc/cwallet.sso\", 0xfffd393da830, 0) = -1 ENOENT (No such file or directory)\n\n...\n\nException in thread \"main\" java.sql.SQLException: ORA-28759: failure to open file\n</pre>\n<p>To understand the error message better, I got the traces above the error message with <code>strace -fye trace=file -o /dev/stdout</code> and <code>grep -E \"wallet|sqlnet\"</code>. With the OCI driver and <code>(security=(ssl_server_dn_match=yes))</code> mentioned in the connection string the attempt to use One-Way TLS failed, but didn&#8217;t stop there. It tried to find a certificate for mTLS that we will see in the section below.</p>\n<p>As of right now, I do not want to connect with a wallet but with a one-way TLS and then add my IP address (which I will get from <code>curl ifconfig.me</code> to the Access Control List):</p>\n<figure class=\"wp-block-image size-full\"><img loading=\"lazy\" decoding=\"async\" width=\"800\" height=\"291\" src=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Network-Access-.png\" alt=\"\" class=\"wp-image-28685\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Network-Access-.png 800w, https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Network-Access--600x218.png 600w, https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Network-Access--768x279.png 768w\" sizes=\"auto, (max-width: 800px) 100vw, 800px\" /></figure>\n<p>Caption: Oracle Autonomous Database Network Access</p>\n<figure class=\"wp-block-image size-full\"><img loading=\"lazy\" decoding=\"async\" width=\"800\" height=\"251\" src=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Access-Control-List.png\" alt=\"\" class=\"wp-image-28686\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Access-Control-List.png 800w, https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Access-Control-List-600x188.png 600w, https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Access-Control-List-768x241.png 768w\" sizes=\"auto, (max-width: 800px) 100vw, 800px\" /></figure>\n<p>Caption: Oracle Autonomous Database Access Control List</p>\n<figure class=\"wp-block-image size-full\"><img loading=\"lazy\" decoding=\"async\" width=\"800\" height=\"282\" src=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Mutual-TLS-Authentication.png\" alt=\"\" class=\"wp-image-28687\" srcset=\"https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Mutual-TLS-Authentication.png 800w, https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Mutual-TLS-Authentication-600x212.png 600w, https://www.yugabyte.com/wp-content/uploads/2023/07/Oracle-Autonomous-Database-Mutual-TLS-Authentication-768x271.png 768w\" sizes=\"auto, (max-width: 800px) 100vw, 800px\" /></figure>\n<p>Caption: Oracle Autonomous Database Mutual TLS Authentication</p>\n<p><strong>Now the connection works, using One-Way TLS:</strong></p>\n<p>JDBC Thin Driver, use :</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@(description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-frankfurt-1.oraclecloud.com))(connect_data=(service_name=m0ve2yu64by73db_adb_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\".\n</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Connected to schema: DEMO</pre>\n<p>JDBC OCI Driver, use:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@(description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-frankfurt-1.oraclecloud.com))(connect_data=(service_name=m0ve2yu64by73db_adb_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\"\n</pre>\n<p>The result will be:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Connected to schema: DEMO</pre>\n<p>I added this connection description in the <code>tnsnames.ora</code>, as before. All service definitions are accessible in the credential wallet and you only need this file to establish a&nbsp; TLS connection (not mTLS).</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">cp /home/opc/wallet_oci_fra/tnsnames.ora /var/tmp/tns\njava TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@adb_tp?tns_admin=/var/tmp/tns\"\n</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Connected to schema: DEMO</pre>\n<h2 class=\"wp-block-heading\">JDBC Thin and JDBC OCI With Mutual TLS (mTLS)</h2>\n<p>Now, let&#8217;s say that I connect from another IP that I cannot trust being added to the list of allowed IPs in the Access Control List.</p>\n<p>One example is when someone connects from their university. Their allow list is open to anyone visiting or attending the university, unlike companies that only opens access to employees. The only protection that remains for the university’s database is password authentication, but that is not sufficient.</p>\n<p>This is the type of scenario where you would want to require a client-side certificate so that the server can authenticate the client with mutual TLS (mTLS). The place where the certificate is stored is different with the JDBC Thin and JDBC OCI drivers.</p>\n<p>Doing the same as above, without my IP allowed in Oracle’s Access Control List, doesn&#8217;t work, and you get the error message we saw above. Let&#8217;s start from there.</p>\n<p><strong>So, if you are using one-way TLS without being in the Access Control List (ACL), then: </strong></p>\n<p>JDBC Thin Driver:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/var/tmp/tns java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@adb_tp\"</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">oracle.net.ns.NetException: Listener refused the connection with the following error:\nORA-12506, TNS:listener rejected connection based on service ACL filtering\n</pre>\n<p>JDBC OCI Driver:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/var/tmp/tns java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@adb_tp\"</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-28759: failure to open file\n</pre>\n<h2>JDBC OCI Driver with mTLS</h2>\n<p>Let’s look first at the OCI driver since we have a message that says that a file is missing.</p>\n<p>Without being on the access list, I need mTLS (Mutual TLS) with a certificate on the client side, and&nbsp; I need more files from the wallet. I will download and unzip the wallet into <code>/var/tmp/tns</code> and try to connect with the OCI driver and the TNS_ADMIN set to this wallet:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">TNS_ADMIN=/var/tmp/tns java TestJDBC \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@adb_tp\"</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLException: ORA-28759: failure to open file</pre>\n<p>The reason for this error is that the <code>sqlnet.ora</code> mentions ?/network/admin which is a shortcut for the <code>/network/admin</code> under the ORACLE_HOME, which defaults to <code>/usr/lib/oracle/19.10/client64/lib.sql</code> in my configuration.</p>\n<p>Because I&#8217;ve not put the wallet files into this ORACLE_HOME but into a directory specified by the TNS_ADMIN environment variable, I need to modify the sqlnet.ora, but fortunately I can use the Linux environment variable with <code>${TNS_ADMIN}:</code></p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">WALLET_LOCATION = (SOURCE = (METHOD = file) (METHOD_DATA = (DIRECTORY=\"${TNS_ADMIN}\")))\nSSL_SERVER_DN_MATCH=yes\n</pre>\n<p>I&#8217;m now able to connect:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">$ TNS_ADMIN=/var/tmp/tns java TestJDBC  \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@adb_tp\"</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\"> Connected to schema: DEMO</pre>\n<p>There is actually only one file—the auto-login wallet <code>cwallet.sso</code> used for OCI connection—in addition to <code>sqlnet.ora</code> (to set the wallet location) and <code>tnsnames.ora</code> (to define the connection description):</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">$ ls /var/tmp/tns</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">cwallet.sso  sqlnet.ora  tnsnames.ora\n\n$ cat /var/tmp/tns/sqlnet.ora</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">WALLET_LOCATION = (SOURCE = (METHOD = file) (METHOD_DATA = (DIRECTORY=\"${TNS_ADMIN}\")))\nSSL_SERVER_DN_MATCH=yes\n\n$ cat tnsnames.ora</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">adb_tp = (description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1522)(host=adb.eu-frankfurt-1.oraclecloud.com))(connect_data=(service_name=m0ve2yu64by73db_adb_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\n\n$ TNS_ADMIN=/var/tmp/tns java TestJDBC  \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:oci:@adb_tp\"</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\"> Connected to schema: DEMO\n\n</pre>\n<p>So if the <code>cwallet.sso</code> is not accessible, you&#8217;ll get <code>ORA-28759: failure to open file</code> from the OCI driver. As far as I know, the <code>ewallet.p12</code> is useless here because it requires a password to be opened, and there&#8217;s no way to set a password in the connection string.</p>\n<h2>JDBC Thin with mTLS Using Java KeyStore</h2>\n<p>To use the Java Keystore, you need to update the file that’s read first by the JDBC Thin driver—<code>ojdbc.properties</code> with the location of the Keystore (<code>${TNS_ADMIN}/truststore.jks</code>). You also need the password you provided when downloading the wallet (<code>javax.net.ssl.trustStorePassword=</code>).</p>\n<p>There is actually only one file, <code>truststore.jks</code> used here, in addition to <code>ojdbc.properties</code> (to set the wallet location) and <code>tnsnames.ora</code> (to define the connection description):</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">$ ls /var/tmp/tns</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">keystore.jks  ojdbc.properties  tnsnames.ora\n\n$ cat /var/tmp/tns/ojdbc.properties\njavax.net.ssl.keyStore=${TNS_ADMIN}/keystore.jks\njavax.net.ssl.keyStorePassword=MyP4ssword\n\n$ cat tnsnames.ora</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">adb_tp = (description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1522)(host=adb.eu-frankfurt-1.oraclecloud.com))(connect_data=(service_name=m0ve2yu64by73db_adb_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\n\n$ TNS_ADMIN=/var/tmp/tns java TestJDBC  \"demo\" \"!!P455w0rd!!\" \"jdbc:oracle:thin:@adb_tp\"</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\"> Connected to schema: DEMO\n </pre>\n<h2>JDBC Thin with mTLS Using the Oracle Wallet</h2>\n<p>Another possibility is to use the same wallet used by the OCI driver, <code>cwallet.sso</code>, that doesn&#8217;t require a password, The definition in <code>ojdbc.properties</code> doesn&#8217;t have to change since it references the TNS_ADMIN environment variable:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">oracle.net.wallet_location=(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY=${TNS_ADMIN}))) </pre>\n<p>However, you may encounter these extremely unclear messages:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: The Network Adapter could not establish the connection\nCaused by: oracle.net.ns.NetException: The Network Adapter could not establish the connection\nCaused by: oracle.net.ns.NetException: Unable to initialize ssl context.\nCaused by: oracle.net.ns.NetException: Unable to initialize the key store.\nCaused by: java.security.KeyStoreException: SSO not found\nCaused by: java.security.NoSuchAlgorithmException: SSO KeyStore not available\n</pre>\n<p>You receive these messages because you require the <a href=\"https://www.oracle.com/database/technologies/appdev/jdbc-downloads.html\" target=\"_blank\" rel=\"noopener\">JDBC Companion JARs</a> in your CLASSPATH to read the Oracle Wallet. I use those from SQLcl:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">$ CLASSPATH=\".:/usr/lib/oracle/19.10/client64/lib/ojdbc8.jar:/home/opc/sqlcl/lib/oraclepki.jar:/home/opc/sqlcl/lib/osdt_cert.jar:/home/opc/sqlcl/lib/osdt_core.jar\"\n\n$ ls /var/tmp/tns</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">cwallet.sso  ojdbc.properties  tnsnames.ora\n\n$ cat /var/tmp/tns/ojdbc.properties</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">oracle.net.wallet_location=(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY=${TNS_ADMIN})))\n\n$ cat tnsnames.ora</pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">adb_tp = (description= (retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1522)(host=adb.eu-frankfurt-1.oraclecloud.com))(connect_data=(service_name=m0ve2yu64by73db_adb_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\n\n$ TNS_ADMIN=/var/tmp/tns java TestJDBC  \"demo\" \"!!P455w0rd!!\" </pre>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">\"jdbc:oracle:thin:@adb_tp\"\n Connected to schema: DEMO\n</pre>\n<p>If the CLASSPATH is correct but the wallet not found, the error message suddenly becomes more clear:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">Exception in thread \"main\" java.sql.SQLRecoverableException: IO Error: The Network Adapter could not establish the connection\nCaused by: oracle.net.ns.NetException: The Network Adapter could not establish the connection\nCaused by: oracle.net.ns.NetException: Unable to initialize ssl context.\nCaused by: oracle.net.ns.NetException: Unable to initialize the key store.\nCaused by: java.io.FileNotFoundException: /var/tmp/tns/cwallet.sso (No such file or directory)\n</pre>\n<h2>Connection Errors When Migrating from Oracle Database</h2>\n<p>When migrating from Oracle to YugabyteDB with YugabyteDB Voyager, you can test your connection with a small Java program as I did above. Once the connection works with the right username, password, JDBC OCI URL, and TNS_ADMIN environment variable you are ready to migrate.</p>\n<ul>\n<li>The username goes to &#8211;source-db-user</li>\n<li>The password goes to &#8211;source-db-password</li>\n<li>The tnsnames.ora alias that you have after &#8216;jdbc:oracle:thin:@&#8217; is the &#8211;oracle-tns-alias</li>\n</ul>\n<p>Here is an example starting YugabyteDB Voyager from my Windows laptop, with Docker Desktop. My wallet is unzipped in C:\\Downloads\\wallet and my working directory is <code>C:\\Downloads\\mig</code></p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">docker run -it --rm ^\n -v \"C:\\Downloads\\mig\":/mig  ^\n -v \"C:\\Downloads\\wallet\":/tns -e TNS_ADMIN=/tns ^\n yugabytedb/yb-voyager ^\n yb-voyager export --export-dir /mig schema ^\n --source-db-type oracle ^\n --oracle-tns-alias adb_tp ^\n --source-db-user demo ^\n --source-db-password \"!!P455w0rd!!\" ^\n --source-db-name=_this_is_ignored_ ^\n --source-db-schema=SH ^\n --start-clean\n</pre>\n<p>When I forgot to change the <code>?/rdbms/admin</code> to $TNS_ADMIN in <code>sqlnet.ora</code> I get:</p>\n<pre class=\"EnlighterJSRAW\" data-enlighter-language=\"generic\">GIT_COMMIT_HASH=a21fa577f599be2367aa5e8886760b41b48701fc\nNote: Using \"/mig\" as export directory\nUsing TNS Alias for export.\nexport of schema for source type as 'oracle'\n[WARNING] Failed to find character set of the source db: failed to query \"SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER = 'NLS_CHARACTERSET'\" for database encoding: params=user=demo password=\"SECRET-6GBy6mXoQjg=\" connectString=adb_tp timezone= poolIncrement=1 poolMaxSessions=1000 poolMinSessions=1 poolSessionMaxLifetime=1h0m0s\npoolSessionTimeout=5m0s poolWaitTimeout=30s extAuth=0: ORA-28759: failure to open file\nrun query \"SELECT BANNER FROM V$VERSION\" on source: params=user=demo password=\"SECRET-6GBy6mXoQjg=\" connectString=adb_tp timezone= poolIncrement=1 poolMaxSessions=1000 poolMinSessions=1 poolSessionMaxLifetime=1h0m0s\npoolSessionTimeout=5m0s poolWaitTimeout=30s extAuth=0: ORA-28759: failure to open file\n</pre>\n<p>The error message is there, <code>ORA-28759: failure to open file</code> but it is probably easier to get that from the small Java program above, fix any issue, and then go with YugabyteDB Voyager.</p>\n<p>On an additional note, the <code>tnsnames.ora</code> provided by Oracle Autonomous database defines 20 retries every 3 seconds in order to raise an error: <code>(retry_count=20)(retry_delay=3)</code>. You probably don&#8217;t want to wait an entire minute to get the error, especially if it adds the TCP timeout (i.e. when host is not found) or the logon delay (i.e. when username or password is wrong). I set it to: <code>(retry_count=1)(retry_delay=3)</code>.</p>\n<h2>To Summarize</h2>\n<p>Connecting to Oracle can be extremely challenging, but this blog post aims to help you dissect all possible error messages in order to troubleshoot your connection issues. We have seen these errors causing headaches for customers migrating from the Oracle Database to Yugabyte using YugabyteDB Voyager.</p>\n",
+    "protected": false
+  },
+  "excerpt": {
+    "rendered": "<p>Discover common Oracle connection errors and learn how to troubleshoot them effectively. Whether you&#8217;re migrating to YugabyteDB or facing general connection issues, this guide will help you identify and resolve the errors.</p>\n",
+    "protected": false
+  },
+  "author": 61,
+  "featured_media": 28695,
+  "comment_status": "closed",
+  "ping_status": "closed",
+  "sticky": false,
+  "template": "",
+  "format": "standard",
+  "meta": {
+    "_acf_changed": false,
+    "inline_featured_image": false,
+    "footnotes": ""
+  },
+  "categories": [
+    2158
+  ],
+  "tags": [
+    2552,
+    2347,
+    2230,
+    2253,
+    2375
+  ],
+  "class_list": [
+    "post-28671",
+    "post",
+    "type-post",
+    "status-publish",
+    "format-standard",
+    "has-post-thumbnail",
+    "hentry",
+    "category-databases",
+    "tag-jdbc",
+    "tag-mtls",
+    "tag-oracle",
+    "tag-oracle-migration",
+    "tag-tls-encryption"
+  ],
+  "acf": [],
+  "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Troubleshooting Oracle Connection Errors: A Complete Guide | Yugabyte</title>\n<meta name=\"description\" content=\"Effectively troubleshoot Oracle connection errors, when migrating to another database, like YugabyteDB. Bookmark this guide to help identify and resolve common connection errors.\" />\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Troubleshooting Oracle Connection Errors: A Complete Guide | Yugabyte\" />\n<meta property=\"og:description\" content=\"Effectively troubleshoot Oracle connection errors, when migrating to another database, like YugabyteDB. Bookmark this guide to help identify and resolve common connection errors.\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"article:published_time\" content=\"2023-07-24T11:43:45+00:00\" />\n<meta property=\"article:modified_time\" content=\"2026-01-06T10:52:44+00:00\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-social.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"author\" content=\"Franck Pachot\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-social.jpg\" />\n<meta name=\"twitter:creator\" content=\"@yugabyte\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<meta name=\"twitter:label1\" content=\"Written by\" />\n\t<meta name=\"twitter:data1\" content=\"Franck Pachot\" />\n\t<meta name=\"twitter:label2\" content=\"Est. reading time\" />\n\t<meta name=\"twitter:data2\" content=\"13 minutes\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":[\"Article\",\"BlogPosting\"],\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/#article\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/\"},\"author\":{\"name\":\"Franck Pachot\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\"},\"headline\":\"The Complete Guide to Troubleshooting Oracle Connection Errors\",\"datePublished\":\"2023-07-24T11:43:45+00:00\",\"dateModified\":\"2026-01-06T10:52:44+00:00\",\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/\"},\"wordCount\":2796,\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/07\\/troubleshoot-oracle-connection-errors.jpg\",\"keywords\":[\"JDBC\",\"mTLS\",\"Oracle\",\"Oracle Migration\",\"TLS Encryption\"],\"articleSection\":[\"Databases\"],\"inLanguage\":\"en-US\"},{\"@type\":\"WebPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/\",\"name\":\"Troubleshooting Oracle Connection Errors: A Complete Guide | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"primaryImageOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/#primaryimage\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/#primaryimage\"},\"thumbnailUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/07\\/troubleshoot-oracle-connection-errors.jpg\",\"datePublished\":\"2023-07-24T11:43:45+00:00\",\"dateModified\":\"2026-01-06T10:52:44+00:00\",\"description\":\"Effectively troubleshoot Oracle connection errors, when migrating to another database, like YugabyteDB. Bookmark this guide to help identify and resolve common connection errors.\",\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/\"]}]},{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/#primaryimage\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/07\\/troubleshoot-oracle-connection-errors.jpg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/07\\/troubleshoot-oracle-connection-errors.jpg\",\"width\":480,\"height\":320,\"caption\":\"The Complete Guide toTroubleshooting Oracle Connection Errors\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/troubleshoot-oracle-connection-errors\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"The Complete Guide to Troubleshooting Oracle Connection Errors\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}]}</script>\n<!-- / Yoast SEO plugin. -->",
+  "yoast_head_json": {
+    "title": "Troubleshooting Oracle Connection Errors: A Complete Guide | Yugabyte",
+    "description": "Effectively troubleshoot Oracle connection errors, when migrating to another database, like YugabyteDB. Bookmark this guide to help identify and resolve common connection errors.",
+    "robots": {
+      "index": "index",
+      "follow": "follow",
+      "max-snippet": "max-snippet:-1",
+      "max-image-preview": "max-image-preview:large",
+      "max-video-preview": "max-video-preview:-1"
+    },
+    "canonical": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/",
+    "og_locale": "en_US",
+    "og_type": "article",
+    "og_title": "Troubleshooting Oracle Connection Errors: A Complete Guide | Yugabyte",
+    "og_description": "Effectively troubleshoot Oracle connection errors, when migrating to another database, like YugabyteDB. Bookmark this guide to help identify and resolve common connection errors.",
+    "og_url": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/",
+    "og_site_name": "Yugabyte",
+    "article_published_time": "2023-07-24T11:43:45+00:00",
+    "article_modified_time": "2026-01-06T10:52:44+00:00",
+    "og_image": [
+      {
+        "width": 1200,
+        "height": 628,
+        "url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-social.jpg",
+        "type": "image/jpeg"
+      }
+    ],
+    "author": "Franck Pachot",
+    "twitter_card": "summary_large_image",
+    "twitter_image": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-social.jpg",
+    "twitter_creator": "@yugabyte",
+    "twitter_site": "@yugabyte",
+    "twitter_misc": {
+      "Written by": "Franck Pachot",
+      "Est. reading time": "13 minutes"
+    },
+    "schema": {
+      "@context": "https://schema.org",
+      "@graph": [
+        {
+          "@type": [
+            "Article",
+            "BlogPosting"
+          ],
+          "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/#article",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/"
+          },
+          "author": {
+            "name": "Franck Pachot",
+            "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce"
+          },
+          "headline": "The Complete Guide to Troubleshooting Oracle Connection Errors",
+          "datePublished": "2023-07-24T11:43:45+00:00",
+          "dateModified": "2026-01-06T10:52:44+00:00",
+          "mainEntityOfPage": {
+            "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/"
+          },
+          "wordCount": 2796,
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors.jpg",
+          "keywords": [
+            "JDBC",
+            "mTLS",
+            "Oracle",
+            "Oracle Migration",
+            "TLS Encryption"
+          ],
+          "articleSection": [
+            "Databases"
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "WebPage",
+          "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/",
+          "url": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/",
+          "name": "Troubleshooting Oracle Connection Errors: A Complete Guide | Yugabyte",
+          "isPartOf": {
+            "@id": "https://www.yugabyte.com/#website"
+          },
+          "primaryImageOfPage": {
+            "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/#primaryimage"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/#primaryimage"
+          },
+          "thumbnailUrl": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors.jpg",
+          "datePublished": "2023-07-24T11:43:45+00:00",
+          "dateModified": "2026-01-06T10:52:44+00:00",
+          "description": "Effectively troubleshoot Oracle connection errors, when migrating to another database, like YugabyteDB. Bookmark this guide to help identify and resolve common connection errors.",
+          "breadcrumb": {
+            "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/#breadcrumb"
+          },
+          "inLanguage": "en-US",
+          "potentialAction": [
+            {
+              "@type": "ReadAction",
+              "target": [
+                "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/"
+              ]
+            }
+          ]
+        },
+        {
+          "@type": "ImageObject",
+          "inLanguage": "en-US",
+          "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/#primaryimage",
+          "url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors.jpg",
+          "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors.jpg",
+          "width": 480,
+          "height": 320,
+          "caption": "The Complete Guide toTroubleshooting Oracle Connection Errors"
+        },
+        {
+          "@type": "BreadcrumbList",
+          "@id": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/#breadcrumb",
+          "itemListElement": [
+            {
+              "@type": "ListItem",
+              "position": 1,
+              "name": "Home",
+              "item": "https://www.yugabyte.com/"
+            },
+            {
+              "@type": "ListItem",
+              "position": 2,
+              "name": "The Complete Guide to Troubleshooting Oracle Connection Errors"
+            }
+          ]
+        },
+        {
+          "@type": "WebSite",
+          "@id": "https://www.yugabyte.com/#website",
+          "url": "https://www.yugabyte.com/",
+          "name": "Yugabyte",
+          "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+          "publisher": {
+            "@id": "https://www.yugabyte.com/#organization"
+          },
+          "potentialAction": [
+            {
+              "@type": "SearchAction",
+              "target": {
+                "@type": "EntryPoint",
+                "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+              },
+              "query-input": {
+                "@type": "PropertyValueSpecification",
+                "valueRequired": true,
+                "valueName": "search_term_string"
+              }
+            }
+          ],
+          "inLanguage": "en-US"
+        },
+        {
+          "@type": "Organization",
+          "@id": "https://www.yugabyte.com/#organization",
+          "name": "Yugabyte",
+          "alternateName": "YugabyteDB",
+          "url": "https://www.yugabyte.com/",
+          "logo": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+            "width": 963,
+            "height": 130,
+            "caption": "Yugabyte"
+          },
+          "image": {
+            "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+          },
+          "sameAs": [
+            "https://x.com/yugabyte",
+            "https://www.linkedin.com/company/yugabyte/",
+            "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+            "https://github.com/yugabyte/yugabyte-db",
+            "https://www.reddit.com/r/YugabyteDB/",
+            "https://www.twitch.tv/yugabytedb",
+            "https://discord.gg/GWcSST7GqZ"
+          ]
+        },
+        {
+          "@type": "Person",
+          "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+          "name": "Franck Pachot",
+          "image": {
+            "@type": "ImageObject",
+            "inLanguage": "en-US",
+            "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+            "caption": "Franck Pachot"
+          },
+          "url": "https://www.yugabyte.com/blog/author/fpachot/"
+        }
+      ]
+    }
+  },
+  "_links": {
+    "self": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/28671",
+        "targetHints": {
+          "allow": [
+            "GET"
+          ]
+        }
+      }
+    ],
+    "collection": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts"
+      }
+    ],
+    "about": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/types/post"
+      }
+    ],
+    "author": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61"
+      }
+    ],
+    "replies": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=28671"
+      }
+    ],
+    "version-history": [
+      {
+        "count": 0,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/28671/revisions"
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media/28695"
+      }
+    ],
+    "wp:attachment": [
+      {
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/media?parent=28671"
+      }
+    ],
+    "wp:term": [
+      {
+        "taxonomy": "category",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/categories?post=28671"
+      },
+      {
+        "taxonomy": "post_tag",
+        "embeddable": true,
+        "href": "https://www.yugabyte.com/wp-json/wp/v2/tags?post=28671"
+      }
+    ],
+    "curies": [
+      {
+        "name": "wp",
+        "href": "https://api.w.org/{rel}",
+        "templated": true
+      }
+    ]
+  },
+  "_embedded": {
+    "author": [
+      {
+        "id": 61,
+        "name": "Franck Pachot",
+        "url": "",
+        "description": "",
+        "link": "https://www.yugabyte.com/blog/author/fpachot/",
+        "slug": "fpachot",
+        "avatar_urls": {
+          "24": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "48": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+          "96": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png"
+        },
+        "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Franck Pachot, Author at Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"profile\" />\n<meta property=\"og:title\" content=\"Franck Pachot, Author at Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/author/fpachot/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png\" />\n\t<meta property=\"og:image:width\" content=\"60\" />\n\t<meta property=\"og:image:height\" content=\"60\" />\n\t<meta property=\"og:image:type\" content=\"image/png\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"ProfilePage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\",\"name\":\"Franck Pachot, Author at Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\"},\"inLanguage\":\"en-US\",\"potentialAction\":[{\"@type\":\"ReadAction\",\"target\":[\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"]}]},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Archives for Franck Pachot\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]},{\"@type\":\"Person\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/person\\/16e8408ffc32eccc1cf07b440cfae1ce\",\"name\":\"Franck Pachot\",\"image\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/08\\/franck-pachot.png\",\"caption\":\"Franck Pachot\"},\"mainEntityOfPage\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/author\\/fpachot\\/\"}}]}</script>\n<!-- / Yoast SEO plugin. -->",
+        "yoast_head_json": {
+          "title": "Franck Pachot, Author at Yugabyte",
+          "robots": {
+            "index": "index",
+            "follow": "follow",
+            "max-snippet": "max-snippet:-1",
+            "max-image-preview": "max-image-preview:large",
+            "max-video-preview": "max-video-preview:-1"
+          },
+          "canonical": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_locale": "en_US",
+          "og_type": "profile",
+          "og_title": "Franck Pachot, Author at Yugabyte",
+          "og_url": "https://www.yugabyte.com/blog/author/fpachot/",
+          "og_site_name": "Yugabyte",
+          "og_image": [
+            {
+              "width": 60,
+              "height": 60,
+              "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+              "type": "image/png"
+            }
+          ],
+          "twitter_card": "summary_large_image",
+          "twitter_site": "@yugabyte",
+          "schema": {
+            "@context": "https://schema.org",
+            "@graph": [
+              {
+                "@type": "ProfilePage",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/",
+                "url": "https://www.yugabyte.com/blog/author/fpachot/",
+                "name": "Franck Pachot, Author at Yugabyte",
+                "isPartOf": {
+                  "@id": "https://www.yugabyte.com/#website"
+                },
+                "breadcrumb": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb"
+                },
+                "inLanguage": "en-US",
+                "potentialAction": [
+                  {
+                    "@type": "ReadAction",
+                    "target": [
+                      "https://www.yugabyte.com/blog/author/fpachot/"
+                    ]
+                  }
+                ]
+              },
+              {
+                "@type": "BreadcrumbList",
+                "@id": "https://www.yugabyte.com/blog/author/fpachot/#breadcrumb",
+                "itemListElement": [
+                  {
+                    "@type": "ListItem",
+                    "position": 1,
+                    "name": "Home",
+                    "item": "https://www.yugabyte.com/"
+                  },
+                  {
+                    "@type": "ListItem",
+                    "position": 2,
+                    "name": "Archives for Franck Pachot"
+                  }
+                ]
+              },
+              {
+                "@type": "WebSite",
+                "@id": "https://www.yugabyte.com/#website",
+                "url": "https://www.yugabyte.com/",
+                "name": "Yugabyte",
+                "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                "publisher": {
+                  "@id": "https://www.yugabyte.com/#organization"
+                },
+                "potentialAction": [
+                  {
+                    "@type": "SearchAction",
+                    "target": {
+                      "@type": "EntryPoint",
+                      "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                    },
+                    "query-input": {
+                      "@type": "PropertyValueSpecification",
+                      "valueRequired": true,
+                      "valueName": "search_term_string"
+                    }
+                  }
+                ],
+                "inLanguage": "en-US"
+              },
+              {
+                "@type": "Organization",
+                "@id": "https://www.yugabyte.com/#organization",
+                "name": "Yugabyte",
+                "alternateName": "YugabyteDB",
+                "url": "https://www.yugabyte.com/",
+                "logo": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                  "width": 963,
+                  "height": 130,
+                  "caption": "Yugabyte"
+                },
+                "image": {
+                  "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                },
+                "sameAs": [
+                  "https://x.com/yugabyte",
+                  "https://www.linkedin.com/company/yugabyte/",
+                  "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                  "https://github.com/yugabyte/yugabyte-db",
+                  "https://www.reddit.com/r/YugabyteDB/",
+                  "https://www.twitch.tv/yugabytedb",
+                  "https://discord.gg/GWcSST7GqZ"
+                ]
+              },
+              {
+                "@type": "Person",
+                "@id": "https://www.yugabyte.com/#/schema/person/16e8408ffc32eccc1cf07b440cfae1ce",
+                "name": "Franck Pachot",
+                "image": {
+                  "@type": "ImageObject",
+                  "inLanguage": "en-US",
+                  "@id": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "url": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/08/franck-pachot.png",
+                  "caption": "Franck Pachot"
+                },
+                "mainEntityOfPage": {
+                  "@id": "https://www.yugabyte.com/blog/author/fpachot/"
+                }
+              }
+            ]
+          }
+        },
+        "acf": [],
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/61",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users"
+            }
+          ]
+        }
+      }
+    ],
+    "wp:featuredmedia": [
+      {
+        "id": 28695,
+        "date": "2023-07-26T05:48:19",
+        "slug": "troubleshoot-oracle-connection-errors-2",
+        "type": "attachment",
+        "link": "https://www.yugabyte.com/blog/troubleshoot-oracle-connection-errors/troubleshoot-oracle-connection-errors-2/",
+        "title": {
+          "rendered": "The Complete Guide toTroubleshooting Oracle Connection Errors"
+        },
+        "author": 75,
+        "featured_media": 0,
+        "acf": [],
+        "caption": {
+          "rendered": "<p class=\"attachment\"><a href='https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors.jpg'></a></p>\n<p>&#8230;</p>\n"
+        },
+        "alt_text": "The Complete Guide toTroubleshooting Oracle Connection Errors",
+        "media_type": "image",
+        "mime_type": "image/jpeg",
+        "media_details": {
+          "width": 480,
+          "height": 320,
+          "file": "2023/07/troubleshoot-oracle-connection-errors.jpg",
+          "filesize": 133473,
+          "sizes": {
+            "thumbnail": {
+              "file": "troubleshoot-oracle-connection-errors-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 6216,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-150x150.jpg"
+            },
+            "alm-thumbnail": {
+              "file": "troubleshoot-oracle-connection-errors-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 6216,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-150x150.jpg"
+            },
+            "authorship-box-avatar": {
+              "file": "troubleshoot-oracle-connection-errors-150x150.jpg",
+              "width": 150,
+              "height": 150,
+              "filesize": 6216,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-150x150.jpg"
+            },
+            "authorship-box-related": {
+              "file": "troubleshoot-oracle-connection-errors-70x70.jpg",
+              "width": 70,
+              "height": 70,
+              "filesize": 2099,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-70x70.jpg"
+            },
+            "fw-mobile": {
+              "file": "troubleshoot-oracle-connection-errors-480x246.jpg",
+              "width": 480,
+              "height": 246,
+              "filesize": 28078,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-480x246.jpg"
+            },
+            "video-size": {
+              "file": "troubleshoot-oracle-connection-errors-370x247.jpg",
+              "width": 370,
+              "height": 247,
+              "filesize": 19098,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors-370x247.jpg"
+            },
+            "full": {
+              "file": "troubleshoot-oracle-connection-errors.jpg",
+              "width": 480,
+              "height": 320,
+              "mime_type": "image/jpeg",
+              "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors.jpg"
+            }
+          },
+          "image_meta": {
+            "aperture": "0",
+            "credit": "",
+            "camera": "",
+            "caption": "",
+            "created_timestamp": "0",
+            "copyright": "",
+            "focal_length": "0",
+            "iso": "0",
+            "shutter_speed": "0",
+            "title": "",
+            "orientation": "0",
+            "keywords": []
+          }
+        },
+        "source_url": "https://www.yugabyte.com/wp-content/uploads/2023/07/troubleshoot-oracle-connection-errors.jpg",
+        "_links": {
+          "self": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media/28695",
+              "targetHints": {
+                "allow": [
+                  "GET"
+                ]
+              }
+            }
+          ],
+          "collection": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/media"
+            }
+          ],
+          "about": [
+            {
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/types/attachment"
+            }
+          ],
+          "author": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/users/75"
+            }
+          ],
+          "replies": [
+            {
+              "embeddable": true,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/comments?post=28695"
+            }
+          ],
+          "wp:attached-to": [
+            {
+              "embeddable": true,
+              "post_type": "post",
+              "id": 28671,
+              "href": "https://www.yugabyte.com/wp-json/wp/v2/posts/28671"
+            }
+          ],
+          "curies": [
+            {
+              "name": "wp",
+              "href": "https://api.w.org/{rel}",
+              "templated": true
+            }
+          ]
+        }
+      }
+    ],
+    "wp:term": [
+      [
+        {
+          "id": 2158,
+          "link": "https://www.yugabyte.com/blog/category/databases/",
+          "name": "Databases",
+          "slug": "databases",
+          "taxonomy": "category",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Databases Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/category/databases/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Databases Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/category/databases/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/\",\"name\":\"Databases Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/category\\/databases\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Databases\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Databases Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/category/databases/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Databases Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/category/databases/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/",
+                  "url": "https://www.yugabyte.com/blog/category/databases/",
+                  "name": "Databases Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/category/databases/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/category/databases/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Databases"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "acf": [],
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories/2158",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/categories"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/category"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?categories=2158"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ],
+      [
+        {
+          "id": 2552,
+          "link": "https://www.yugabyte.com/blog/tag/jdbc/",
+          "name": "JDBC",
+          "slug": "jdbc",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>JDBC Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/jdbc/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"JDBC Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/jdbc/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/jdbc\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/jdbc\\/\",\"name\":\"JDBC Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/jdbc\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/jdbc\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"JDBC\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "JDBC Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/jdbc/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "JDBC Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/jdbc/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/jdbc/",
+                  "url": "https://www.yugabyte.com/blog/tag/jdbc/",
+                  "name": "JDBC Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/jdbc/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/jdbc/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "JDBC"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2552",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2552"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2347,
+          "link": "https://www.yugabyte.com/blog/tag/mtls/",
+          "name": "mTLS",
+          "slug": "mtls",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>mTLS Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/mtls/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"mTLS Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/mtls/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/mtls\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/mtls\\/\",\"name\":\"mTLS Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/mtls\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/mtls\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"mTLS\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "mTLS Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/mtls/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "mTLS Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/mtls/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/mtls/",
+                  "url": "https://www.yugabyte.com/blog/tag/mtls/",
+                  "name": "mTLS Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/mtls/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/mtls/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "mTLS"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2347",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2347"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2230,
+          "link": "https://www.yugabyte.com/blog/tag/oracle/",
+          "name": "Oracle",
+          "slug": "oracle",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Oracle Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/oracle/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Oracle Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/oracle/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle\\/\",\"name\":\"Oracle Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Oracle\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Oracle Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/oracle/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Oracle Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/oracle/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/oracle/",
+                  "url": "https://www.yugabyte.com/blog/tag/oracle/",
+                  "name": "Oracle Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/oracle/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/oracle/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Oracle"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2230",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2230"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2253,
+          "link": "https://www.yugabyte.com/blog/tag/oracle-migration/",
+          "name": "Oracle Migration",
+          "slug": "oracle-migration",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>Oracle Migration Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/oracle-migration/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"Oracle Migration Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/oracle-migration/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle-migration\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle-migration\\/\",\"name\":\"Oracle Migration Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle-migration\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/oracle-migration\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"Oracle Migration\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "Oracle Migration Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/oracle-migration/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "Oracle Migration Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/oracle-migration/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/oracle-migration/",
+                  "url": "https://www.yugabyte.com/blog/tag/oracle-migration/",
+                  "name": "Oracle Migration Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/oracle-migration/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/oracle-migration/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "Oracle Migration"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2253",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2253"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        },
+        {
+          "id": 2375,
+          "link": "https://www.yugabyte.com/blog/tag/tls-encryption/",
+          "name": "TLS Encryption",
+          "slug": "tls-encryption",
+          "taxonomy": "post_tag",
+          "yoast_head": "<!-- This site is optimized with the Yoast SEO plugin v28.1 - https://yoast.com/product/yoast-seo-wordpress/ -->\n<title>TLS Encryption Library | Yugabyte</title>\n<meta name=\"robots\" content=\"index, follow, max-snippet:-1, max-image-preview:large, max-video-preview:-1\" />\n<link rel=\"canonical\" href=\"https://www.yugabyte.com/blog/tag/tls-encryption/\" />\n<meta property=\"og:locale\" content=\"en_US\" />\n<meta property=\"og:type\" content=\"article\" />\n<meta property=\"og:title\" content=\"TLS Encryption Library | Yugabyte\" />\n<meta property=\"og:url\" content=\"https://www.yugabyte.com/blog/tag/tls-encryption/\" />\n<meta property=\"og:site_name\" content=\"Yugabyte\" />\n<meta property=\"og:image\" content=\"https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg\" />\n\t<meta property=\"og:image:width\" content=\"1200\" />\n\t<meta property=\"og:image:height\" content=\"628\" />\n\t<meta property=\"og:image:type\" content=\"image/jpeg\" />\n<meta name=\"twitter:card\" content=\"summary_large_image\" />\n<meta name=\"twitter:site\" content=\"@yugabyte\" />\n<script type=\"application/ld+json\" class=\"yoast-schema-graph\">{\"@context\":\"https:\\/\\/schema.org\",\"@graph\":[{\"@type\":\"CollectionPage\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/tls-encryption\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/tls-encryption\\/\",\"name\":\"TLS Encryption Library | Yugabyte\",\"isPartOf\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\"},\"breadcrumb\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/tls-encryption\\/#breadcrumb\"},\"inLanguage\":\"en-US\"},{\"@type\":\"BreadcrumbList\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/blog\\/tag\\/tls-encryption\\/#breadcrumb\",\"itemListElement\":[{\"@type\":\"ListItem\",\"position\":1,\"name\":\"Home\",\"item\":\"https:\\/\\/www.yugabyte.com\\/\"},{\"@type\":\"ListItem\",\"position\":2,\"name\":\"TLS Encryption\"}]},{\"@type\":\"WebSite\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#website\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"name\":\"Yugabyte\",\"description\":\"High-Performance Distributed SQL Database for Global, Internet-Scale Apps\",\"publisher\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\"},\"potentialAction\":[{\"@type\":\"SearchAction\",\"target\":{\"@type\":\"EntryPoint\",\"urlTemplate\":\"https:\\/\\/www.yugabyte.com\\/?s={search_term_string}\"},\"query-input\":{\"@type\":\"PropertyValueSpecification\",\"valueRequired\":true,\"valueName\":\"search_term_string\"}}],\"inLanguage\":\"en-US\"},{\"@type\":\"Organization\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#organization\",\"name\":\"Yugabyte\",\"alternateName\":\"YugabyteDB\",\"url\":\"https:\\/\\/www.yugabyte.com\\/\",\"logo\":{\"@type\":\"ImageObject\",\"inLanguage\":\"en-US\",\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\",\"url\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"contentUrl\":\"https:\\/\\/www.yugabyte.com\\/wp-content\\/uploads\\/2023\\/04\\/yugabyte-logo.svg\",\"width\":963,\"height\":130,\"caption\":\"Yugabyte\"},\"image\":{\"@id\":\"https:\\/\\/www.yugabyte.com\\/#\\/schema\\/logo\\/image\\/\"},\"sameAs\":[\"https:\\/\\/x.com\\/yugabyte\",\"https:\\/\\/www.linkedin.com\\/company\\/yugabyte\\/\",\"https:\\/\\/www.youtube.com\\/channel\\/UCL9BhSLRowqQ1TyBndhiCEw\",\"https:\\/\\/github.com\\/yugabyte\\/yugabyte-db\",\"https:\\/\\/www.reddit.com\\/r\\/YugabyteDB\\/\",\"https:\\/\\/www.twitch.tv\\/yugabytedb\",\"https:\\/\\/discord.gg\\/GWcSST7GqZ\"]}]}</script>\n<!-- / Yoast SEO plugin. -->",
+          "yoast_head_json": {
+            "title": "TLS Encryption Library | Yugabyte",
+            "robots": {
+              "index": "index",
+              "follow": "follow",
+              "max-snippet": "max-snippet:-1",
+              "max-image-preview": "max-image-preview:large",
+              "max-video-preview": "max-video-preview:-1"
+            },
+            "canonical": "https://www.yugabyte.com/blog/tag/tls-encryption/",
+            "og_locale": "en_US",
+            "og_type": "article",
+            "og_title": "TLS Encryption Library | Yugabyte",
+            "og_url": "https://www.yugabyte.com/blog/tag/tls-encryption/",
+            "og_site_name": "Yugabyte",
+            "og_image": [
+              {
+                "width": 1200,
+                "height": 628,
+                "url": "https://www.yugabyte.com/wp-content/uploads/2023/11/yugabytedb_homepage-social-image.jpg",
+                "type": "image/jpeg"
+              }
+            ],
+            "twitter_card": "summary_large_image",
+            "twitter_site": "@yugabyte",
+            "schema": {
+              "@context": "https://schema.org",
+              "@graph": [
+                {
+                  "@type": "CollectionPage",
+                  "@id": "https://www.yugabyte.com/blog/tag/tls-encryption/",
+                  "url": "https://www.yugabyte.com/blog/tag/tls-encryption/",
+                  "name": "TLS Encryption Library | Yugabyte",
+                  "isPartOf": {
+                    "@id": "https://www.yugabyte.com/#website"
+                  },
+                  "breadcrumb": {
+                    "@id": "https://www.yugabyte.com/blog/tag/tls-encryption/#breadcrumb"
+                  },
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "BreadcrumbList",
+                  "@id": "https://www.yugabyte.com/blog/tag/tls-encryption/#breadcrumb",
+                  "itemListElement": [
+                    {
+                      "@type": "ListItem",
+                      "position": 1,
+                      "name": "Home",
+                      "item": "https://www.yugabyte.com/"
+                    },
+                    {
+                      "@type": "ListItem",
+                      "position": 2,
+                      "name": "TLS Encryption"
+                    }
+                  ]
+                },
+                {
+                  "@type": "WebSite",
+                  "@id": "https://www.yugabyte.com/#website",
+                  "url": "https://www.yugabyte.com/",
+                  "name": "Yugabyte",
+                  "description": "High-Performance Distributed SQL Database for Global, Internet-Scale Apps",
+                  "publisher": {
+                    "@id": "https://www.yugabyte.com/#organization"
+                  },
+                  "potentialAction": [
+                    {
+                      "@type": "SearchAction",
+                      "target": {
+                        "@type": "EntryPoint",
+                        "urlTemplate": "https://www.yugabyte.com/?s={search_term_string}"
+                      },
+                      "query-input": {
+                        "@type": "PropertyValueSpecification",
+                        "valueRequired": true,
+                        "valueName": "search_term_string"
+                      }
+                    }
+                  ],
+                  "inLanguage": "en-US"
+                },
+                {
+                  "@type": "Organization",
+                  "@id": "https://www.yugabyte.com/#organization",
+                  "name": "Yugabyte",
+                  "alternateName": "YugabyteDB",
+                  "url": "https://www.yugabyte.com/",
+                  "logo": {
+                    "@type": "ImageObject",
+                    "inLanguage": "en-US",
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/",
+                    "url": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "contentUrl": "https://www.yugabyte.com/wp-content/uploads/2023/04/yugabyte-logo.svg",
+                    "width": 963,
+                    "height": 130,
+                    "caption": "Yugabyte"
+                  },
+                  "image": {
+                    "@id": "https://www.yugabyte.com/#/schema/logo/image/"
+                  },
+                  "sameAs": [
+                    "https://x.com/yugabyte",
+                    "https://www.linkedin.com/company/yugabyte/",
+                    "https://www.youtube.com/channel/UCL9BhSLRowqQ1TyBndhiCEw",
+                    "https://github.com/yugabyte/yugabyte-db",
+                    "https://www.reddit.com/r/YugabyteDB/",
+                    "https://www.twitch.tv/yugabytedb",
+                    "https://discord.gg/GWcSST7GqZ"
+                  ]
+                }
+              ]
+            }
+          },
+          "_links": {
+            "self": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags/2375",
+                "targetHints": {
+                  "allow": [
+                    "GET"
+                  ]
+                }
+              }
+            ],
+            "collection": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/tags"
+              }
+            ],
+            "about": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/taxonomies/post_tag"
+              }
+            ],
+            "wp:post_type": [
+              {
+                "href": "https://www.yugabyte.com/wp-json/wp/v2/posts?tags=2375"
+              }
+            ],
+            "curies": [
+              {
+                "name": "wp",
+                "href": "https://api.w.org/{rel}",
+                "templated": true
+              }
+            ]
+          }
+        }
+      ]
+    ]
+  }
+}

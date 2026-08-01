@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Inventory local blog exports and incrementally archive Dev.to articles."""
+"""Inventory local blog exports and incrementally archive online articles."""
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import html
 import json
 import os
@@ -11,12 +12,15 @@ import random
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
 
 
 DEVTO_API = "https://dev.to/api"
+YUGABYTE_API = "https://www.yugabyte.com/wp-json/wp/v2"
+TECHCOMMUNITY_BASE = "https://techcommunity.microsoft.com"
 USER_AGENT = "FranckPachot-blog-archive/1.0"
 
 
@@ -36,6 +40,12 @@ def first_match(pattern: str, text: str) -> str:
 def write_json_atomic(path: Path, value: Any) -> None:
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     temporary_path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    os.replace(temporary_path, path)
+
+
+def write_text_atomic(path: Path, value: str) -> None:
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
+    temporary_path.write_text(value, encoding="utf-8")
     os.replace(temporary_path, path)
 
 
@@ -118,6 +128,33 @@ def api_get(path: str, retries: int = 5) -> Any:
     raise RuntimeError("unreachable")
 
 
+def web_get(url: str, retries: int = 5) -> str:
+    request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    last_error: Exception | None = None
+    for attempt in range(retries):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                return response.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as error:
+            if error.code != 429 and error.code < 500:
+                raise
+            last_error = error
+            retry_after = error.headers.get("Retry-After")
+            delay = float(retry_after) if retry_after and retry_after.isdigit() else 2**attempt
+        except (urllib.error.URLError, TimeoutError) as error:
+            last_error = error
+            delay = 2**attempt
+        if attempt == retries - 1:
+            assert last_error is not None
+            raise last_error
+        time.sleep(delay + random.random())
+    raise RuntimeError("unreachable")
+
+
+def web_get_json(url: str) -> Any:
+    return json.loads(web_get(url))
+
+
 def list_devto_articles(username: str) -> list[dict[str, Any]]:
     articles = []
     page = 1
@@ -191,6 +228,224 @@ def archive_devto(
     return inventory_devto(root)
 
 
+def yugabyte_manifest_entry(root: Path, path: Path, detail: dict[str, Any]) -> dict[str, Any]:
+    article_id = detail.get("id")
+    if not isinstance(article_id, int) or article_id <= 0:
+        raise ValueError(f"Invalid Yugabyte article ID in {path}")
+    term_groups = detail.get("_embedded", {}).get("wp:term", [])
+    tags = sorted(
+        {
+            term.get("name", "").strip()
+            for group in term_groups
+            for term in group
+            if term.get("taxonomy") in {"category", "post_tag"} and term.get("name", "").strip()
+        }
+    )
+    return {
+        "source": "yugabyte",
+        "source_id": str(article_id),
+        "title": clean_text(detail.get("title", {}).get("rendered", "")),
+        "published_at": detail.get("date_gmt") or detail.get("date", ""),
+        "canonical_url": detail.get("link", ""),
+        "archive_path": path.relative_to(root).as_posix(),
+        "tags": tags,
+    }
+
+
+def inventory_yugabyte(root: Path) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "yugabyte" / "articles").glob("*.json")):
+        try:
+            detail = json.loads(read_text(path))
+            articles.append(yugabyte_manifest_entry(root, path, detail))
+        except (json.JSONDecodeError, ValueError) as error:
+            print(f"Skipping invalid Yugabyte snapshot {path.relative_to(root)}: {error}")
+    return articles
+
+
+def list_yugabyte_articles(author_slug: str) -> list[dict[str, Any]]:
+    users = web_get_json(f"{YUGABYTE_API}/users?slug={urllib.parse.quote(author_slug)}")
+    if not isinstance(users, list) or len(users) != 1 or not isinstance(users[0].get("id"), int):
+        raise ValueError(f"Unable to resolve Yugabyte author {author_slug}")
+    author_id = users[0]["id"]
+    articles = []
+    page = 1
+    while True:
+        url = f"{YUGABYTE_API}/posts?author={author_id}&per_page=100&page={page}&_embed=1"
+        batch = web_get_json(url)
+        if not isinstance(batch, list):
+            raise ValueError(f"Unexpected Yugabyte article list response on page {page}")
+        articles.extend(batch)
+        if len(batch) < 100:
+            return articles
+        page += 1
+
+
+def archive_yugabyte(root: Path, author_slug: str, refresh: bool) -> list[dict[str, Any]]:
+    archive_dir = root / "yugabyte" / "articles"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    summaries = list_yugabyte_articles(author_slug)
+    for position, detail in enumerate(summaries, start=1):
+        article_id = detail.get("id")
+        if not isinstance(article_id, int) or article_id <= 0:
+            raise ValueError("Invalid Yugabyte article response")
+        path = archive_dir / f"{article_id}.json"
+        replace_snapshot = refresh or not path.exists()
+        if not replace_snapshot:
+            try:
+                yugabyte_manifest_entry(root, path, json.loads(read_text(path)))
+            except (json.JSONDecodeError, ValueError):
+                replace_snapshot = True
+        if replace_snapshot:
+            yugabyte_manifest_entry(root, path, detail)
+            write_json_atomic(path, detail)
+        print(f"Yugabyte {position}/{len(summaries)}: {clean_text(detail['title']['rendered'])}")
+    return inventory_yugabyte(root)
+
+
+def jsonld_values(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for nested in value for item in jsonld_values(nested)]
+    if not isinstance(value, dict):
+        return []
+    graph = value.get("@graph")
+    return jsonld_values(graph) if graph is not None else [value]
+
+
+def techcommunity_metadata(document: str) -> dict[str, Any] | None:
+    for raw_value in re.findall(
+        r'<script[^>]+type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+        document,
+        flags=re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            continue
+        for item in jsonld_values(value):
+            item_types = item.get("@type", [])
+            if isinstance(item_types, str):
+                item_types = [item_types]
+            if "BlogPosting" in item_types:
+                return item
+    return None
+
+
+def techcommunity_manifest_entry(
+    root: Path, path: Path, document: str, author_name: str, profile_id: str
+) -> dict[str, Any]:
+    metadata = techcommunity_metadata(document)
+    if not metadata:
+        raise ValueError("Missing BlogPosting metadata")
+    authors = metadata.get("author", [])
+    if isinstance(authors, dict):
+        authors = [authors]
+    if not isinstance(authors, list) or not any(
+        isinstance(author, dict) and author.get("name", "").casefold() == author_name.casefold()
+        for author in authors
+    ):
+        raise ValueError(f"Article is not authored by {author_name}")
+    if profile_id not in document:
+        raise ValueError(f"Article does not reference profile {profile_id}")
+    main_entity = metadata.get("mainEntityOfPage", "")
+    canonical = main_entity.get("@id", "") if isinstance(main_entity, dict) else main_entity
+    article_id_match = re.search(r"/(\d+)$", canonical)
+    if not article_id_match or article_id_match.group(1) != path.stem:
+        raise ValueError("Invalid Microsoft Tech Community article ID")
+    published = datetime.datetime.strptime(metadata["datePublished"], "%m/%d/%Y, %I:%M:%S %p")
+    return {
+        "source": "microsoft-techcommunity",
+        "source_id": path.stem,
+        "title": clean_text(metadata.get("headline", "")),
+        "published_at": published.isoformat(),
+        "canonical_url": canonical,
+        "archive_path": path.relative_to(root).as_posix(),
+        "tags": [],
+    }
+
+
+def inventory_techcommunity(
+    root: Path, author_name: str, profile_id: str
+) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "microsoft-techcommunity" / "articles").glob("*.html")):
+        try:
+            document = read_text(path)
+            articles.append(techcommunity_manifest_entry(root, path, document, author_name, profile_id))
+        except ValueError as error:
+            print(f"Skipping invalid Microsoft snapshot {path.relative_to(root)}: {error}")
+    return articles
+
+
+def list_techcommunity_articles(author_name: str) -> list[str]:
+    article_urls: set[str] = set()
+    expected_count: int | None = None
+    for page in range(1, 101):
+        query = urllib.parse.urlencode({"q": author_name, "page": page})
+        document = web_get(f"{TECHCOMMUNITY_BASE}/search?{query}")
+        count_match = re.search(r"\b(\d+)\s+Results?\b", document, re.IGNORECASE)
+        if count_match:
+            expected_count = int(count_match.group(1))
+        page_urls = {
+            urllib.parse.urljoin(TECHCOMMUNITY_BASE, value)
+            for value in re.findall(
+                r'href=["\']((?:https://techcommunity\.microsoft\.com)?/blog/[^"\']+?/\d+)["\']',
+                document,
+                re.IGNORECASE,
+            )
+        }
+        new_urls = page_urls - article_urls
+        article_urls.update(page_urls)
+        if expected_count is not None and len(article_urls) >= expected_count:
+            break
+        if not new_urls:
+            if expected_count is not None and len(article_urls) < expected_count:
+                raise ValueError(
+                    f"Microsoft search reported {expected_count} results but only "
+                    f"{len(article_urls)} article URLs were discovered"
+                )
+            break
+    return sorted(article_urls)
+
+
+def archive_techcommunity(
+    root: Path, author_name: str, profile_id: str, refresh: bool
+) -> list[dict[str, Any]]:
+    archive_dir = root / "microsoft-techcommunity" / "articles"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    candidates = list_techcommunity_articles(author_name)
+    for path in archive_dir.glob("*.html"):
+        metadata = techcommunity_metadata(read_text(path))
+        main_entity = metadata.get("mainEntityOfPage", "") if metadata else ""
+        canonical = main_entity.get("@id", "") if isinstance(main_entity, dict) else main_entity
+        if isinstance(canonical, str) and canonical.startswith(TECHCOMMUNITY_BASE):
+            candidates.append(canonical)
+    archived = 0
+    for url in sorted(set(candidates)):
+        article_id = url.rstrip("/").rsplit("/", 1)[-1]
+        if not article_id.isdigit():
+            continue
+        path = archive_dir / f"{article_id}.html"
+        replace_snapshot = refresh or not path.exists()
+        document = web_get(url) if replace_snapshot else read_text(path)
+        try:
+            entry = techcommunity_manifest_entry(root, path, document, author_name, profile_id)
+        except ValueError:
+            if replace_snapshot:
+                continue
+            document = web_get(url)
+            try:
+                entry = techcommunity_manifest_entry(root, path, document, author_name, profile_id)
+            except ValueError:
+                continue
+            replace_snapshot = True
+        if replace_snapshot:
+            write_text_atomic(path, document)
+        archived += 1
+        print(f"Microsoft Tech Community {archived}: {entry['title']}")
+    return inventory_techcommunity(root, author_name, profile_id)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -198,7 +453,20 @@ def main() -> None:
     parser.add_argument("--skip-devto", action="store_true")
     parser.add_argument("--refresh-devto", action="store_true")
     parser.add_argument("--max-devto", type=int, help="Limit Dev.to downloads for testing")
+    parser.add_argument("--skip-yugabyte", action="store_true")
+    parser.add_argument("--refresh-yugabyte", action="store_true")
+    parser.add_argument("--skip-techcommunity", action="store_true")
+    parser.add_argument("--refresh-techcommunity", action="store_true")
+    parser.add_argument("--yugabyte-author", default="fpachot")
+    parser.add_argument("--techcommunity-author", default="FranckPachot")
+    parser.add_argument("--techcommunity-profile-id", default="3595257")
+    parser.add_argument("--offline", action="store_true", help="Rebuild from local snapshots only")
     args = parser.parse_args()
+
+    if args.offline:
+        args.skip_devto = True
+        args.skip_yugabyte = True
+        args.skip_techcommunity = True
 
     root = args.root.resolve()
     articles = inventory_dbi(root) + inventory_medium(root)
@@ -206,6 +474,21 @@ def main() -> None:
         articles += archive_devto(root, args.username, args.refresh_devto, args.max_devto)
     else:
         articles += inventory_devto(root)
+    if not args.skip_yugabyte:
+        articles += archive_yugabyte(root, args.yugabyte_author, args.refresh_yugabyte)
+    else:
+        articles += inventory_yugabyte(root)
+    if not args.skip_techcommunity:
+        articles += archive_techcommunity(
+            root,
+            args.techcommunity_author,
+            args.techcommunity_profile_id,
+            args.refresh_techcommunity,
+        )
+    else:
+        articles += inventory_techcommunity(
+            root, args.techcommunity_author, args.techcommunity_profile_id
+        )
     articles.sort(key=lambda article: (article["published_at"], article["source"]), reverse=True)
 
     manifest = {
