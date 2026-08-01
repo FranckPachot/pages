@@ -300,7 +300,7 @@ def render_book(book: dict, sources: list[dict], technical_guide: list[dict]) ->
         <p class="hero__lede">{html.escape(book['description'])}</p>
         <div class="hero__meta"><span>Franck Pachot</span><span>{chapter_count} chapters</span><span>{html.escape(book['topics'])}</span></div>
       </header>
-      <section class="premise"><p>Build the mental model before choosing the mechanism.</p><span>Each guide synthesizes experiments from the article archive and links every source for deeper evidence.</span></section>
+    <section class="premise"><p>Build the mental model before choosing the mechanism.</p><span>This minibook was AI-generated from Franck Pachot's archived blog posts. Links to the original articles are included for source context and verification.</span></section>
 {chr(10).join(chapters)}
             <section class="chapter field-manual" id="field-manual">
                 <p class="chapter__number">{chapter_count:02d}</p><h2>Field manual</h2>
@@ -341,7 +341,7 @@ def render_index() -> str:
                 <small>{len(book['chapters']) + 1} chapters →</small>
             </a>''')
         volume_count = len(BOOKS) + 1
-        description = f"{volume_count} concise database field guides by Franck Pachot, covering SQL internals, performance, concurrency, recovery, high availability, and migration."
+        description = f"{volume_count} AI-generated database field guides based on Franck Pachot's archived blog posts, covering SQL internals, performance, concurrency, recovery, high availability, and migration."
         return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -351,7 +351,7 @@ def render_index() -> str:
     <header class="collection-nav"><a href="../"><img src="../franck-pachot-linkedin.jpg" alt="" width="42" height="42"><span><strong>Franck Pachot</strong><small>Database Developer Advocate</small></span></a><a href="../">Article archive</a></header>
     <main>
         <header class="collection-hero"><p>Database field guides · {volume_count} volumes</p><h1>Minibooks for<br>the systems<br>behind SQL.</h1><div><span>From physical storage to distributed transactions, each guide builds a compact mental model from tested database behavior.</span><strong>Read independently.<br>Connect the models.</strong></div></header>
-        <section class="collection-intro"><p>Not product documentation. Not generic recipes.</p><span>These are focused syntheses of experiments across Oracle, PostgreSQL, YugabyteDB, and other systems, with links back to the source articles.</span></section>
+        <section class="collection-intro"><p>AI-generated from the blog archive.</p><span>These minibooks were generated with AI from Franck Pachot's archived blog posts. Links to the original articles are retained for source context and verification.</span></section>
         <section class="collection-grid" aria-label="Minibook collection">
 {chr(10).join(cards)}
         </section>

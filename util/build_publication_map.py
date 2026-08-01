@@ -6,8 +6,11 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import math
 import os
 import re
+import shutil
+import subprocess
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
@@ -29,6 +32,7 @@ SOURCE_NAMES = {
 }
 
 DATABASE_RULES = {
+    "Microsoft HorizonDB": r"\b(?:microsoft\s+)?(?:azure\s+)?horizondb\b",
     "Oracle Database": r"\boracle(?: database)?\b|\bora-\d{4,5}\b|\b(?:9i|10g|11g|12c|18c|19c|21c|23c|23ai|26ai)\b",
     "PostgreSQL": r"\bpostgres(?:ql)?\b|\bpg_[a-z0-9_]+\b|\bpsql\b",
     "YugabyteDB": r"\byugabyte(?:db|d)?\b|\byb-[a-z0-9_-]+\b|\bycql\b|\bysql\b",
@@ -209,6 +213,9 @@ def build_catalog(root: Path) -> dict[str, Any]:
         title = normalize_text(article["title"])
         signal = " ".join([title, " ".join(tags), body[:1800]])
         databases = infer_databases(signal)
+        horizon_signal = " ".join([title, " ".join(tags), description])
+        if "Microsoft HorizonDB" in databases and not re.search(DATABASE_RULES["Microsoft HorizonDB"], horizon_signal, re.IGNORECASE):
+            databases.remove("Microsoft HorizonDB")
         versions = infer_versions(signal, databases)
         categories = infer_categories(signal)
         summary = description or body[:320]
@@ -322,6 +329,164 @@ def write_root_index(path: Path, catalog: dict[str, Any]) -> None:
     path.write_text(document, encoding="utf-8")
 
 
+def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
+    database_counts = {
+        name: count
+        for name, count in catalog["database_counts"].items()
+        if name != "Database agnostic"
+    }
+    chart_data = list(database_counts.items())
+    all_total = sum(database_counts.values())
+    brand_colors = {
+        "Oracle Database": "#c74634",
+        "PostgreSQL": "#336791",
+        "YugabyteDB": "#ff5f3b",
+        "MongoDB": "#47a248",
+        "Amazon Aurora": "#8c4fff",
+        "Amazon DynamoDB": "#4053d6",
+        "MySQL": "#4479a1",
+        "Microsoft SQL Server": "#cc2927",
+        "DocumentDB": "#c925d1",
+        "CockroachDB": "#6933ff",
+        "Db2": "#0f62fe",
+        "Cassandra": "#1287b1",
+        "Microsoft HorizonDB": "#0078d4",
+        "SQLite": "#003b57",
+    }
+    logo_files = {
+        "Oracle Database": "oracle.svg",
+        "PostgreSQL": "postgresql.svg",
+        "YugabyteDB": "yugabytedb.svg",
+        "MongoDB": "mongodb.svg",
+        "Amazon Aurora": "aurora.svg",
+        "Amazon DynamoDB": "dynamodb.svg",
+        "MySQL": "mysql.svg",
+        "Microsoft SQL Server": "sql-server.svg",
+        "DocumentDB": "documentdb.svg",
+        "CockroachDB": "cockroachdb.svg",
+        "Db2": "db2.svg",
+        "Cassandra": "cassandra.svg",
+        "Microsoft HorizonDB": "azure.svg",
+        "SQLite": "sqlite.svg",
+    }
+    short_names = {
+        "Oracle Database": "Oracle",
+        "Amazon Aurora": "Aurora",
+        "Amazon DynamoDB": "DynamoDB",
+        "Microsoft SQL Server": "SQL Server",
+        "Microsoft HorizonDB": "HorizonDB",
+    }
+    initials = {
+        "Oracle Database": "O", "PostgreSQL": "PG", "YugabyteDB": "YB", "MongoDB": "M",
+        "Amazon Aurora": "A", "Amazon DynamoDB": "D", "MySQL": "MY", "Microsoft SQL Server": "MS",
+        "DocumentDB": "D", "CockroachDB": "CR", "Db2": "2", "Cassandra": "C",
+        "Microsoft HorizonDB": "H", "SQLite": "SQ",
+    }
+    circumference = 2 * math.pi * 140
+    offset = 0.0
+    arcs = []
+    legend = []
+    for position, (name, count) in enumerate(chart_data):
+        color = brand_colors[name]
+        length = circumference * count / all_total
+        arcs.append(
+            f'<circle cx="865" cy="250" r="140" fill="none" stroke="{color}" stroke-width="52" '
+            f'stroke-dasharray="{length:.2f} {circumference - length:.2f}" stroke-dashoffset="{-offset:.2f}"/>'
+        )
+        offset += length
+        column = position % 3
+        row = position // 3
+        legend_x = 655 + column * 178
+        legend_y = 440 + row * 32
+        mark = initials.get(name, name[:2].upper())
+        logo_path = root / "home" / "database-logos" / logo_files[name]
+        if logo_path.exists():
+            logo = (
+                f'<rect x="{legend_x}" y="{legend_y - 17}" width="24" height="24" rx="5" fill="white" opacity=".92"/>'
+                f'<image href="database-logos/{logo_files[name]}" x="{legend_x + 2}" y="{legend_y - 15}" '
+                'width="20" height="20" preserveAspectRatio="xMidYMid meet"/>'
+            )
+        else:
+            logo = (
+                f'<g class="logo-mark"><rect x="{legend_x}" y="{legend_y - 16}" width="22" height="22" rx="6" fill="{color}"/>'
+                f'<text x="{legend_x + 11}" y="{legend_y - 1}" text-anchor="middle">{mark}</text></g>'
+            )
+        legend.append(
+            logo
+            + f'<text x="{legend_x + 29}" y="{legend_y}" class="legend">{html.escape(short_names.get(name, name))} {count:,}</text>'
+        )
+    svg = f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse"><path d="M32 0H0V32" fill="none" stroke="#d9dfdc" stroke-width="1" opacity=".45"/></pattern>
+    <style>
+      text {{ font-family: "Arial", "Helvetica", sans-serif; fill: #182522; }}
+      .eyebrow {{ font-size: 18px; font-weight: 700; letter-spacing: 3px; fill: #24706b; }}
+      .title {{ font-family: "Georgia", serif; font-size: 56px; font-weight: 700; }}
+      .count {{ font-size: 24px; font-weight: 700; fill: #c74634; }}
+      .word {{ font-weight: 700; fill: #3e514d; }}
+    .legend {{ font-size: 11px; font-weight: 700; fill: #4e5e5a; }}
+    .logo-mark text {{ font-size: 8px; font-weight: 800; fill: white; }}
+      .chart-label {{ font-size: 15px; font-weight: 700; letter-spacing: 1px; fill: #65736f; }}
+      .chart-total {{ font-family: "Georgia", serif; font-size: 44px; font-weight: 700; }}
+      .chart-note {{ font-size: 13px; fill: #65736f; }}
+    </style>
+  </defs>
+  <rect width="1200" height="630" fill="#f4f2ec"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+  <rect x="0" y="0" width="18" height="630" fill="#24706b"/>
+    <text x="70" y="76" class="eyebrow">FRANCK PACHOT · DATABASE BLOG ARCHIVE</text>
+    <text x="70" y="150" class="title">Database blog posts</text>
+    <text x="70" y="205" class="title">by Franck Pachot</text>
+    <text x="70" y="252" class="count">{catalog['publication_count']:,} posts · over 12 years</text>
+  <text x="70" y="325" class="word" font-size="32">INDEXES</text>
+  <text x="285" y="325" class="word" font-size="20">QUERY PLANS</text>
+  <text x="90" y="368" class="word" font-size="22">MVCC</text>
+  <text x="190" y="368" class="word" font-size="29">DISTRIBUTED SQL</text>
+  <text x="70" y="412" class="word" font-size="19">REPLICATION</text>
+  <text x="230" y="412" class="word" font-size="24">TRANSACTIONS</text>
+  <text x="86" y="453" class="word" font-size="27">STORAGE</text>
+  <text x="230" y="453" class="word" font-size="18">OBSERVABILITY</text>
+  <text x="70" y="492" class="word" font-size="18">MIGRATION</text>
+  <text x="190" y="492" class="word" font-size="24">VECTOR SEARCH</text>
+  <text x="92" y="530" class="word" font-size="20">JSON</text>
+  <text x="160" y="530" class="word" font-size="28">PERFORMANCE</text>
+    <text x="865" y="67" text-anchor="middle" class="chart-label">POSTS BY DATABASE · ALL TAGS</text>
+    <g transform="rotate(-90 865 250)">{''.join(arcs)}</g>
+    <circle cx="865" cy="250" r="112" fill="#f4f2ec"/>
+    <text x="865" y="242" text-anchor="middle" class="chart-total">{all_total:,}</text>
+    <text x="865" y="270" text-anchor="middle" class="chart-note">database mentions</text>
+    <text x="865" y="293" text-anchor="middle" class="chart-note">posts may have several tags</text>
+  {''.join(legend)}
+</svg>'''
+    svg_path = root / "home" / "social-card.svg"
+    png_path = root / "home" / "social-card.png"
+    svg_path.write_text(svg, encoding="utf-8")
+    browser_candidates = [
+        shutil.which("msedge"),
+        shutil.which("google-chrome"),
+        shutil.which("chromium"),
+        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+    ]
+    browser = next((Path(candidate) for candidate in browser_candidates if candidate and Path(candidate).exists()), None)
+    if browser:
+        subprocess.run(
+            [
+                str(browser),
+                "--headless",
+                "--disable-gpu",
+                "--hide-scrollbars",
+                "--window-size=1200,630",
+                f"--screenshot={png_path}",
+                svg_path.as_uri(),
+            ],
+            check=True,
+            capture_output=True,
+        )
+    elif not png_path.exists():
+        raise RuntimeError("Chrome or Edge is required to create home/social-card.png")
+
+
 def write_sitemap(path: Path, catalog: dict[str, Any]) -> None:
     local_pages = [
         publication for publication in catalog["publications"]
@@ -367,6 +532,7 @@ def main() -> None:
     catalog = build_catalog(root)
     write_catalog(output, catalog)
     write_root_index(root / "index.html", catalog)
+    write_social_preview(root, catalog)
     write_sitemap(root / "sitemap.xml", catalog)
     write_sitemap(root / "home" / "sitemap.xml", catalog)
     print(
