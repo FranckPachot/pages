@@ -1,0 +1,132 @@
+{
+  "type": "node--blog_post",
+  "id": "0d30a982-ceee-47f6-b754-d7c3f0372873",
+  "links": {
+    "self": {
+      "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873?resourceVersion=id%3A143"
+    }
+  },
+  "attributes": {
+    "drupal_internal__nid": 140,
+    "drupal_internal__vid": 143,
+    "langcode": "en",
+    "revision_timestamp": "2019-02-13T16:50:23+00:00",
+    "status": true,
+    "title": "Efficiently query DBA_EXTENTS for FILE_ID / BLOCK_ID",
+    "created": "2018-09-27T09:52:34+00:00",
+    "changed": "2020-12-29T21:44:43+00:00",
+    "promote": true,
+    "sticky": false,
+    "default_langcode": true,
+    "revision_translation_affected": true,
+    "path": {
+      "alias": "/blog/franck-pachot/2018-09-efficiently-query-dbaextents-fileid-blockid",
+      "pid": 471,
+      "langcode": "en"
+    },
+    "body": {
+      "value": "<p>Did you ever try to query DBA_EXTENTS on a very large database with LMT tablespaces? I had to, in the past, in order to find which segment a corrupt block belonged to. The information about extent allocation is stored in the datafiles headers, visible though X$KTFBUE, and queries on it can be very expensive. In addition to that, the optimizer tends to start with the segments and get to this X$KTFBUE for each of them. At this time, I had quickly created a view on the internal dictionary tables, forcing to start by X$KTFBUE with materialized CTE, to replace DBA_EXTENTS. I published this on <a href=\"https://www.dba-village.com/village/dvp_scripts.ScriptDetails?ScriptIdA=2543\" target=\"_blank\">dba-village</a> in 2006.</p>\r\n\r\n<p>I recently wanted to know the segment/extend for a hot block, identified by its file_id and block_id on a 900TB database with 7000 datafiles and 90000 extents, so I went back to this old query and I got my result in 1 second. The idea is to be sure that we start with the file (X$KCCFE) and then get to the extent allocation (X$KTFBUE) before going to the segments:</p>\r\n\r\n<p><img alt=\"\" data-entity-type=\"\" data-entity-uuid=\"\" src=\"http://db-blog-multimedia.web.cern.ch/db-blog-multimedia/fpachot/CaptureExtentMap.PNG\" /></p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<p>So here is the query:</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<pre>\r\ncolumn owner format a6\r\ncolumn segment_type format a20\r\ncolumn segment_name format a15\r\ncolumn partition_name format a15\r\nset linesize 200\r\nset timing on time on echo on autotrace on stat\r\nWITH\r\n l AS ( /* LMT extents indexed on ktfbuesegtsn,ktfbuesegfno,ktfbuesegbno */\r\n  SELECT ktfbuesegtsn segtsn,ktfbuesegfno segrfn,ktfbuesegbno segbid, ktfbuefno extrfn,\r\n         ktfbuebno fstbid,ktfbuebno + ktfbueblks - 1 lstbid,ktfbueblks extblks,ktfbueextno extno\r\n  FROM sys.x$ktfbue\r\n ),\r\n d AS ( /* DMT extents ts#, segfile#, segblock# */\r\n  SELECT ts# segtsn,segfile# segrfn,segblock# segbid, file# extrfn,\r\n         block# fstbid,block# + length - 1 lstbid,length extblks, ext# extno\r\n  FROM sys.uet$\r\n ),\r\n s AS ( /* segment information for the tablespace that contains afn file */\r\n  SELECT /*+ materialized */\r\n  f1.fenum afn,f1.ferfn rfn,s.ts# segtsn,s.FILE# segrfn,s.BLOCK# segbid ,s.TYPE# segtype,f2.fenum segafn,t.name tsname,blocksize\r\n  FROM sys.seg$ s, sys.ts$ t, sys.x$kccfe f1,sys.x$kccfe f2 \r\n  WHERE s.ts#=t.ts# AND t.ts#=f1.fetsn AND s.FILE#=f2.ferfn AND s.ts#=f2.fetsn\r\n ),\r\n m AS ( /* extent mapping for the tablespace that contains afn file */\r\nSELECT /*+ use_nl(e) ordered */\r\n s.afn,s.segtsn,s.segrfn,s.segbid,extrfn,fstbid,lstbid,extblks,extno, segtype,s.rfn, tsname,blocksize\r\n FROM s,l e\r\n WHERE e.segtsn=s.segtsn AND e.segrfn=s.segrfn AND e.segbid=s.segbid\r\n UNION ALL\r\n SELECT /*+ use_nl(e) ordered */ \r\n s.afn,s.segtsn,s.segrfn,s.segbid,extrfn,fstbid,lstbid,extblks,extno, segtype,s.rfn, tsname,blocksize\r\n FROM s,d e\r\n  WHERE e.segtsn=s.segtsn AND e.segrfn=s.segrfn AND e.segbid=s.segbid\r\n UNION ALL\r\n SELECT /*+ use_nl(e) use_nl(t) ordered */\r\n f.fenum afn,null segtsn,null segrfn,null segbid,f.ferfn extrfn,e.ktfbfebno fstbid,e.ktfbfebno+e.ktfbfeblks-1 lstbid,e.ktfbfeblks extblks,null extno, null segtype,f.ferfn rfn,name tsname,blocksize\r\n FROM sys.x$kccfe f,sys.x$ktfbfe e,sys.ts$ t\r\n WHERE t.ts#=f.fetsn and e.ktfbfetsn=f.fetsn and e.ktfbfefno=f.ferfn\r\n UNION ALL\r\n SELECT /*+ use_nl(e) use_nl(t) ordered */\r\n f.fenum afn,null segtsn,null segrfn,null segbid,f.ferfn extrfn,e.block# fstbid,e.block#+e.length-1 lstbid,e.length extblks,null extno, null segtype,f.ferfn rfn,name tsname,blocksize\r\n FROM sys.x$kccfe f,sys.fet$ e,sys.ts$ t\r\n WHERE t.ts#=f.fetsn and e.ts#=f.fetsn and e.file#=f.ferfn\r\n ),\r\n o AS (\r\n  SELECT s.tablespace_id segtsn,s.relative_fno segrfn,s.header_block   segbid,s.segment_type,s.owner,s.segment_name,s.partition_name\r\n  FROM SYS_DBA_SEGS s\r\n ),\r\ndatafile_map as (\r\nSELECT\r\n afn file_id,fstbid block_id,extblks blocks,nvl(segment_type,decode(segtype,null,'free space','type='||segtype)) segment_type,\r\n owner,segment_name,partition_name,extno extent_id,extblks*blocksize bytes,\r\n tsname tablespace_name,rfn relative_fno,m.segtsn,m.segrfn,m.segbid\r\n FROM m,o WHERE extrfn=rfn and m.segtsn=o.segtsn(+) AND m.segrfn=o.segrfn(+) AND m.segbid=o.segbid(+)\r\nUNION ALL\r\nSELECT\r\n file_id+(select to_number(value) from v$parameter WHERE name='db_files') file_id,\r\n 1 block_id,blocks,'tempfile' segment_type,\r\n '' owner,file_name segment_name,'' partition_name,0 extent_id,bytes,\r\n  tablespace_name,relative_fno,0 segtsn,0 segrfn,0 segbid\r\n FROM dba_temp_files\r\n)\r\nselect * from datafile_map where file_id=5495 and 11970455 between block_id and block_id+blocks\r\n</pre>\r\n\r\n<p>And here is the result, with execution statistics:</p>\r\n\r\n<pre>\r\n\r\n   FILE_ID   BLOCK_ID     BLOCKS SEGMENT_TYPE         OWNER  SEGMENT_NAME    PARTITION_NAME    EXTENT_ID      BYTES TABLESPACE_NAME      RELATIVE_FNO     SEGTSN     SEGRFN    SEGBID\r\n---------- ---------- ---------- -------------------- ------ --------------- ---------------- ---------- ---------- -------------------- ------------ ---------- ---------- ----------\r\n      5495   11964544            8192 INDEX PARTITION LHCLOG DN_PK           PART_DN_20161022 1342         67108864 LOG_DATA_20161022            1024       6364       1024        162\r\n\r\nElapsed: 00:00:01.25\r\n\r\nStatistics\r\n----------------------------------------------------------\r\n        103  recursive calls\r\n       1071  db block gets\r\n      21685  consistent gets\r\n        782  physical reads\r\n        840  redo size\r\n       1548  bytes sent via SQL*Net to client\r\n        520  bytes received via SQL*Net from client\r\n          2  SQL*Net roundtrips to/from client\r\n          0  sorts (memory)\r\n          0  sorts (disk)\r\n          1  rows processed\r\n</pre>\r\n\r\n<p>Knowing the segment from the block address is important in performance tuning, when we get the file_id/block_id from wait event parameters. It is even more important when a block corrution is detected ans having a fast query may help.</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<hr />\r\n<p><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href=\"https://twitter.com/Franckpachot\">@FranckPachot</a>)</strong></p>\r\n",
+      "format": "full_html",
+      "processed": "<p>Did you ever try to query DBA_EXTENTS on a very large database with LMT tablespaces? I had to, in the past, in order to find which segment a corrupt block belonged to. The information about extent allocation is stored in the datafiles headers, visible though X$KTFBUE, and queries on it can be very expensive. In addition to that, the optimizer tends to start with the segments and get to this X$KTFBUE for each of them. At this time, I had quickly created a view on the internal dictionary tables, forcing to start by X$KTFBUE with materialized CTE, to replace DBA_EXTENTS. I published this on <a href=\"https://www.dba-village.com/village/dvp_scripts.ScriptDetails?ScriptIdA=2543\" target=\"_blank\">dba-village</a> in 2006.</p>\n<p>I recently wanted to know the segment/extend for a hot block, identified by its file_id and block_id on a 900TB database with 7000 datafiles and 90000 extents, so I went back to this old query and I got my result in 1 second. The idea is to be sure that we start with the file (X$KCCFE) and then get to the extent allocation (X$KTFBUE) before going to the segments:</p>\n<p><img alt data-entity-type data-entity-uuid src=\"http://db-blog-multimedia.web.cern.ch/db-blog-multimedia/fpachot/CaptureExtentMap.PNG\"></p>\n<p>&nbsp;</p>\n<p>So here is the query:</p>\n<p>&nbsp;</p>\n<pre>\ncolumn owner format a6\ncolumn segment_type format a20\ncolumn segment_name format a15\ncolumn partition_name format a15\nset linesize 200\nset timing on time on echo on autotrace on stat\nWITH\n l AS ( /* LMT extents indexed on ktfbuesegtsn,ktfbuesegfno,ktfbuesegbno */\n  SELECT ktfbuesegtsn segtsn,ktfbuesegfno segrfn,ktfbuesegbno segbid, ktfbuefno extrfn,\n         ktfbuebno fstbid,ktfbuebno + ktfbueblks - 1 lstbid,ktfbueblks extblks,ktfbueextno extno\n  FROM sys.x$ktfbue\n ),\n d AS ( /* DMT extents ts#, segfile#, segblock# */\n  SELECT ts# segtsn,segfile# segrfn,segblock# segbid, file# extrfn,\n         block# fstbid,block# + length - 1 lstbid,length extblks, ext# extno\n  FROM sys.uet$\n ),\n s AS ( /* segment information for the tablespace that contains afn file */\n  SELECT /*+ materialized */\n  f1.fenum afn,f1.ferfn rfn,s.ts# segtsn,s.FILE# segrfn,s.BLOCK# segbid ,s.TYPE# segtype,f2.fenum segafn,t.name tsname,blocksize\n  FROM sys.seg$ s, sys.ts$ t, sys.x$kccfe f1,sys.x$kccfe f2 \n  WHERE s.ts#=t.ts# AND t.ts#=f1.fetsn AND s.FILE#=f2.ferfn AND s.ts#=f2.fetsn\n ),\n m AS ( /* extent mapping for the tablespace that contains afn file */\nSELECT /*+ use_nl(e) ordered */\n s.afn,s.segtsn,s.segrfn,s.segbid,extrfn,fstbid,lstbid,extblks,extno, segtype,s.rfn, tsname,blocksize\n FROM s,l e\n WHERE e.segtsn=s.segtsn AND e.segrfn=s.segrfn AND e.segbid=s.segbid\n UNION ALL\n SELECT /*+ use_nl(e) ordered */ \n s.afn,s.segtsn,s.segrfn,s.segbid,extrfn,fstbid,lstbid,extblks,extno, segtype,s.rfn, tsname,blocksize\n FROM s,d e\n  WHERE e.segtsn=s.segtsn AND e.segrfn=s.segrfn AND e.segbid=s.segbid\n UNION ALL\n SELECT /*+ use_nl(e) use_nl(t) ordered */\n f.fenum afn,null segtsn,null segrfn,null segbid,f.ferfn extrfn,e.ktfbfebno fstbid,e.ktfbfebno+e.ktfbfeblks-1 lstbid,e.ktfbfeblks extblks,null extno, null segtype,f.ferfn rfn,name tsname,blocksize\n FROM sys.x$kccfe f,sys.x$ktfbfe e,sys.ts$ t\n WHERE t.ts#=f.fetsn and e.ktfbfetsn=f.fetsn and e.ktfbfefno=f.ferfn\n UNION ALL\n SELECT /*+ use_nl(e) use_nl(t) ordered */\n f.fenum afn,null segtsn,null segrfn,null segbid,f.ferfn extrfn,e.block# fstbid,e.block#+e.length-1 lstbid,e.length extblks,null extno, null segtype,f.ferfn rfn,name tsname,blocksize\n FROM sys.x$kccfe f,sys.fet$ e,sys.ts$ t\n WHERE t.ts#=f.fetsn and e.ts#=f.fetsn and e.file#=f.ferfn\n ),\n o AS (\n  SELECT s.tablespace_id segtsn,s.relative_fno segrfn,s.header_block   segbid,s.segment_type,s.owner,s.segment_name,s.partition_name\n  FROM SYS_DBA_SEGS s\n ),\ndatafile_map as (\nSELECT\n afn file_id,fstbid block_id,extblks blocks,nvl(segment_type,decode(segtype,null,'free space','type='||segtype)) segment_type,\n owner,segment_name,partition_name,extno extent_id,extblks*blocksize bytes,\n tsname tablespace_name,rfn relative_fno,m.segtsn,m.segrfn,m.segbid\n FROM m,o WHERE extrfn=rfn and m.segtsn=o.segtsn(+) AND m.segrfn=o.segrfn(+) AND m.segbid=o.segbid(+)\nUNION ALL\nSELECT\n file_id+(select to_number(value) from v$parameter WHERE name='db_files') file_id,\n 1 block_id,blocks,'tempfile' segment_type,\n '' owner,file_name segment_name,'' partition_name,0 extent_id,bytes,\n  tablespace_name,relative_fno,0 segtsn,0 segrfn,0 segbid\n FROM dba_temp_files\n)\nselect * from datafile_map where file_id=5495 and 11970455 between block_id and block_id+blocks\n</pre><p>And here is the result, with execution statistics:</p>\n<pre>\n\n   FILE_ID   BLOCK_ID     BLOCKS SEGMENT_TYPE         OWNER  SEGMENT_NAME    PARTITION_NAME    EXTENT_ID      BYTES TABLESPACE_NAME      RELATIVE_FNO     SEGTSN     SEGRFN    SEGBID\n---------- ---------- ---------- -------------------- ------ --------------- ---------------- ---------- ---------- -------------------- ------------ ---------- ---------- ----------\n      5495   11964544            8192 INDEX PARTITION LHCLOG DN_PK           PART_DN_20161022 1342         67108864 LOG_DATA_20161022            1024       6364       1024        162\n\nElapsed: 00:00:01.25\n\nStatistics\n----------------------------------------------------------\n        103  recursive calls\n       1071  db block gets\n      21685  consistent gets\n        782  physical reads\n        840  redo size\n       1548  bytes sent via SQL*Net to client\n        520  bytes received via SQL*Net from client\n          2  SQL*Net roundtrips to/from client\n          0  sorts (memory)\n          0  sorts (disk)\n          1  rows processed\n</pre><p>Knowing the segment from the block address is important in performance tuning, when we get the file_id/block_id from wait event parameters. It is even more important when a block corrution is detected ans having a fast query may help.</p>\n<p>&nbsp;</p>\n<hr>\n<p><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href=\"https://twitter.com/Franckpachot\">@FranckPachot</a>)</strong></p>\n",
+      "summary": ""
+    },
+    "comment_node_blog_post": {
+      "status": 1,
+      "cid": 0,
+      "last_comment_timestamp": 1550076623,
+      "last_comment_name": null,
+      "last_comment_uid": 188,
+      "comment_count": 0
+    }
+  },
+  "relationships": {
+    "node_type": {
+      "data": {
+        "type": "node_type--node_type",
+        "id": "afc8a5ea-c19b-48d4-b689-22e0b706c73c",
+        "meta": {
+          "drupal_internal__target_id": "blog_post"
+        }
+      },
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/node_type?resourceVersion=id%3A143"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/relationships/node_type?resourceVersion=id%3A143"
+        }
+      }
+    },
+    "revision_uid": {
+      "data": {
+        "type": "user--user",
+        "id": "a60c3d34-a6c3-4aff-add4-d8dbb42c32b1",
+        "meta": {
+          "drupal_internal__target_id": 188
+        }
+      },
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/revision_uid?resourceVersion=id%3A143"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/relationships/revision_uid?resourceVersion=id%3A143"
+        }
+      }
+    },
+    "uid": {
+      "data": {
+        "type": "user--user",
+        "id": "a60c3d34-a6c3-4aff-add4-d8dbb42c32b1",
+        "meta": {
+          "drupal_internal__target_id": 188
+        }
+      },
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/uid?resourceVersion=id%3A143"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/relationships/uid?resourceVersion=id%3A143"
+        }
+      }
+    },
+    "feeds_item": {
+      "data": [],
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/feeds_item?resourceVersion=id%3A143"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/relationships/feeds_item?resourceVersion=id%3A143"
+        }
+      }
+    },
+    "field_tags": {
+      "data": [
+        {
+          "type": "taxonomy_term--tags",
+          "id": "d09e1042-207c-43f9-bb06-564470dda175",
+          "meta": {
+            "drupal_internal__target_id": 11
+          }
+        },
+        {
+          "type": "taxonomy_term--tags",
+          "id": "4db84981-3ba0-4b89-b052-47814c64971d",
+          "meta": {
+            "drupal_internal__target_id": 166
+          }
+        }
+      ],
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/field_tags?resourceVersion=id%3A143"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/0d30a982-ceee-47f6-b754-d7c3f0372873/relationships/field_tags?resourceVersion=id%3A143"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,146 @@
+{
+  "type": "node--blog_post",
+  "id": "03c52551-86d8-4a11-9b32-3dc3d8dd33a4",
+  "links": {
+    "self": {
+      "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4?resourceVersion=id%3A145"
+    }
+  },
+  "attributes": {
+    "drupal_internal__nid": 142,
+    "drupal_internal__vid": 145,
+    "langcode": "en",
+    "revision_timestamp": "2019-02-13T16:50:32+00:00",
+    "status": true,
+    "title": "Oracle write consistency bug and multi-thread de-queuing",
+    "created": "2018-09-27T14:48:23+00:00",
+    "changed": "2020-12-29T21:44:35+00:00",
+    "promote": true,
+    "sticky": false,
+    "default_langcode": true,
+    "revision_translation_affected": true,
+    "path": {
+      "alias": "/blog/franck-pachot/2018-09-oracle-write-consistency-bug-and-multi-thread-de-queuing",
+      "pid": 485,
+      "langcode": "en"
+    },
+    "body": {
+      "value": "<p>Here is a quick test I did after encountering an abnormal behavior in write consistency and before finding some references to a bug on <a href=\"https://stackoverflow.com/questions/7577836/write-consistency-with-nested-subquery-in-oracle\" target=\"_blank\">StackOverflow</a> (yes, write consistency questions on StackOverflow!) and <a href=\"https://asktom.oracle.com/pls/asktom/asktom.search?tag=write-consistency#3954570100346946285\" target=\"_blank\">AskTOM</a>. And a bug opened by Tom Kyte in 2011, that is still there in 18c.</p>\r\n\r\n<p>The original issue was with a task management system to run jobs. Here is the simple table where all rows have a 'NEW' status and the goal is to have several threads processing them by updating them to the 'HOLDING' status' and adding the process name.</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<pre>\r\nset echo on\r\ndrop table DEMO;\r\ncreate table DEMO (ID primary key,STATUS,NAME,CREATED)\r\n as select rownum,cast('NEW' as varchar2(10)),cast(null as varchar2(10)),sysdate+rownum/24/60 from xmltable('1 to 10')\r\n/\r\n</pre>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<p>Now here is the query that selects the 5 oldest rows in status 'NEW' and updates them to the 'HOLDING' status:</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<pre>\r\nUPDATE DEMO SET NAME = 'NUMBER1', STATUS = 'HOLDING' \r\nWHERE ID IN (\r\n SELECT ID FROM (\r\n  SELECT ID, rownum as counter \r\n  FROM DEMO \r\n  WHERE STATUS = 'NEW' \r\n  ORDER BY CREATED\r\n ) \r\nWHERE counter &lt;= 5) \r\n;\r\n</pre>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<p>Note that the update also sets the name of the session which has processed the rows, here 'NUMBER1'.</p>\r\n\r\n<p>Once the query started, and before the commit, I've run the same query from another session, but with 'NUMBER2'.</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<pre>\r\nUPDATE DEMO SET NAME = 'NUMBER2', STATUS = 'HOLDING' \r\nWHERE ID IN (\r\n SELECT ID FROM (\r\n  SELECT ID, rownum as counter \r\n  FROM DEMO \r\n  WHERE STATUS = 'NEW' \r\n  ORDER BY CREATED\r\n ) \r\nWHERE counter &lt;= 5) \r\n;</pre>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<p>Of course, this waits on row lock from the first session as it has selected the same rows. Then I commit the first session, and check, from the first session what has been updated:</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<pre>\r\ncommit;\r\nset pagesize 1000\r\nselect versions_operation,versions_xid,DEMO.* from DEMO versions between scn minvalue and maxvalue order by ID,2;\r\n\r\nV VERSIONS_XID             ID STATUS     NAME       CREATED        \r\n- ---------------- ---------- ---------- ---------- ---------------\r\nU 0500110041040000          1 HOLDING    NUMBER1    27-SEP-18 16:48\r\n                            1 NEW                   27-SEP-18 16:48\r\nU 0500110041040000          2 HOLDING    NUMBER1    27-SEP-18 16:49\r\n                            2 NEW                   27-SEP-18 16:49\r\nU 0500110041040000          3 HOLDING    NUMBER1    27-SEP-18 16:50\r\n                            3 NEW                   27-SEP-18 16:50\r\nU 0500110041040000          4 HOLDING    NUMBER1    27-SEP-18 16:51\r\n                            4 NEW                   27-SEP-18 16:51\r\nU 0500110041040000          5 HOLDING    NUMBER1    27-SEP-18 16:52\r\n                            5 NEW                   27-SEP-18 16:52\r\n                            6 NEW                   27-SEP-18 16:53\r\n                            7 NEW                   27-SEP-18 16:54\r\n                            8 NEW                   27-SEP-18 16:55\r\n                            9 NEW                   27-SEP-18 16:56\r\n                           10 NEW                   27-SEP-18 16:57</pre>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<p>I have used flashback query to see all versions of the rows. All 10 have been created and the the first 5 of them have been updated by NUMBER1.</p>\r\n\r\n<p>Now, my second session continues, updating to NUMBER2. I commit and look at the row versions again:</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<pre>\r\ncommit;\r\nset pagesize 1000\r\nselect versions_operation,versions_xid,DEMO.* from DEMO versions between scn minvalue and maxvalue order by ID,2;\r\n</pre>\r\n\r\n<pre>\r\nV VERSIONS_XID             ID STATUS     NAME       CREATED        \r\n- ---------------- ---------- ---------- ---------- ---------------\r\nU 04001B0057030000          1 HOLDING    NUMBER2    27-SEP-18 16:48\r\nU 0500110041040000          1 HOLDING    NUMBER1    27-SEP-18 16:48\r\n                            1 NEW                   27-SEP-18 16:48\r\nU 04001B0057030000          2 HOLDING    NUMBER2    27-SEP-18 16:49\r\nU 0500110041040000          2 HOLDING    NUMBER1    27-SEP-18 16:49\r\n                            2 NEW                   27-SEP-18 16:49\r\nU 04001B0057030000          3 HOLDING    NUMBER2    27-SEP-18 16:50\r\nU 0500110041040000          3 HOLDING    NUMBER1    27-SEP-18 16:50\r\n                            3 NEW                   27-SEP-18 16:50\r\nU 04001B0057030000          4 HOLDING    NUMBER2    27-SEP-18 16:51\r\nU 0500110041040000          4 HOLDING    NUMBER1    27-SEP-18 16:51\r\n                            4 NEW                   27-SEP-18 16:51\r\nU 04001B0057030000          5 HOLDING    NUMBER2    27-SEP-18 16:52\r\nU 0500110041040000          5 HOLDING    NUMBER1    27-SEP-18 16:52\r\n                            5 NEW                   27-SEP-18 16:52\r\n                            6 NEW                   27-SEP-18 16:53\r\n                            7 NEW                   27-SEP-18 16:54\r\n                            8 NEW                   27-SEP-18 16:55\r\n                            9 NEW                   27-SEP-18 16:56\r\n                           10 NEW                   27-SEP-18 16:57\r\n</pre>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<p>This is not what I expected. I wanted my second session to process the other rows, but here it seems that it has processed the same rows as the first one. What has been done by the NUMBER1 has been lost and overwritten by NUMBER2. This is inconsistent, violates ACID properties, and should not happen. An SQL statement must ensure write consistency: either by locking all the rows as soon as they are read (for non-MVCC databases where reads block writes), or re-starting the update when a mutating row is encountered. Oracle default behaviour is in the second case, NUMBER2 query&nbsp;reads the rows 1 to 5, because&nbsp;the changes by NUMBER1, not committed yet, are invisible from NUMBER2. But the execution should keep&nbsp;track of the columns referenced in the where clause. When attempting to update a row, now that the concurrent change is visible,&nbsp;the update is possible only if the WHERE clause used to select the rows still selects this row. If not, the database should raise an error (this is what happens in serializable&nbsp;isolation level) or re-start the update when in the default statement-level consistency.</p>\r\n\r\n<p>Here, probably because of the nested subquery, the write consistency is not guaranteed and this is a bug.</p>\r\n\r\n<p>One workaround is not to use subqueries. However, as we need to ORDER BY the rows in order to process the oldest first, we cannot avoid the subquery. The workaround for this&nbsp;is to add STATUS = 'NEW' in the WHERE clause of the update, so that the update restart works correctly.</p>\r\n\r\n<p>However, the goal of multithreading those processes is to be scalable, and multiple update restarts may finally serialize all those updates.</p>\r\n\r\n<p>The preferred solution for this is to ensure that the updates do not attempt to touch the same rows. This can be achieved by a SELECT ... FOR UPDATE SKIP LOCKED. As this cannot be added directly to the update statement, we need a cursor. Something like this can do the job:</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<pre>\r\ndeclare counter number:=5;\r\nbegin\r\n for c in (select /*+ first_rows(5) */ ID FROM DEMO \r\n&nbsp;          where STATUS = 'NEW' \r\n&nbsp;          order by CREATED\r\n           for update skip locked)\r\n loop\r\n  counter:=counter-1;\r\n  update DEMO set NAME = 'NUMBER1', STATUS = 'HOLDING'  where ID = c.ID and STATUS = 'NEW';\r\n  exit when counter=0;\r\n end loop;\r\nend;\r\n/\r\ncommit;\r\n</pre>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<p>This can be optimized further&nbsp;but just gives an idea of what is needed for a scalable solution. Waiting for locks is not scalable.</p>\r\n\r\n<p>&nbsp;</p>\r\n\r\n<hr />\r\n<p><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href=\"https://twitter.com/Franckpachot\">@FranckPachot</a>)</strong></p>\r\n",
+      "format": "full_html",
+      "processed": "<p>Here is a quick test I did after encountering an abnormal behavior in write consistency and before finding some references to a bug on <a href=\"https://stackoverflow.com/questions/7577836/write-consistency-with-nested-subquery-in-oracle\" target=\"_blank\">StackOverflow</a> (yes, write consistency questions on StackOverflow!) and <a href=\"https://asktom.oracle.com/pls/asktom/asktom.search?tag=write-consistency#3954570100346946285\" target=\"_blank\">AskTOM</a>. And a bug opened by Tom Kyte in 2011, that is still there in 18c.</p>\n<p>The original issue was with a task management system to run jobs. Here is the simple table where all rows have a 'NEW' status and the goal is to have several threads processing them by updating them to the 'HOLDING' status' and adding the process name.</p>\n<p>&nbsp;</p>\n<pre>\nset echo on\ndrop table DEMO;\ncreate table DEMO (ID primary key,STATUS,NAME,CREATED)\n as select rownum,cast('NEW' as varchar2(10)),cast(null as varchar2(10)),sysdate+rownum/24/60 from xmltable('1 to 10')\n/\n</pre><p>&nbsp;</p>\n<p>Now here is the query that selects the 5 oldest rows in status 'NEW' and updates them to the 'HOLDING' status:</p>\n<p>&nbsp;</p>\n<pre>\nUPDATE DEMO SET NAME = 'NUMBER1', STATUS = 'HOLDING' \nWHERE ID IN (\n SELECT ID FROM (\n  SELECT ID, rownum as counter \n  FROM DEMO \n  WHERE STATUS = 'NEW' \n  ORDER BY CREATED\n ) \nWHERE counter &lt;= 5) \n;\n</pre><p>&nbsp;</p>\n<p>Note that the update also sets the name of the session which has processed the rows, here 'NUMBER1'.</p>\n<p>Once the query started, and before the commit, I've run the same query from another session, but with 'NUMBER2'.</p>\n<p>&nbsp;</p>\n<pre>\nUPDATE DEMO SET NAME = 'NUMBER2', STATUS = 'HOLDING' \nWHERE ID IN (\n SELECT ID FROM (\n  SELECT ID, rownum as counter \n  FROM DEMO \n  WHERE STATUS = 'NEW' \n  ORDER BY CREATED\n ) \nWHERE counter &lt;= 5) \n;</pre><p>&nbsp;</p>\n<p>Of course, this waits on row lock from the first session as it has selected the same rows. Then I commit the first session, and check, from the first session what has been updated:</p>\n<p>&nbsp;</p>\n<pre>\ncommit;\nset pagesize 1000\nselect versions_operation,versions_xid,DEMO.* from DEMO versions between scn minvalue and maxvalue order by ID,2;\n\nV VERSIONS_XID             ID STATUS     NAME       CREATED        \n- ---------------- ---------- ---------- ---------- ---------------\nU 0500110041040000          1 HOLDING    NUMBER1    27-SEP-18 16:48\n                            1 NEW                   27-SEP-18 16:48\nU 0500110041040000          2 HOLDING    NUMBER1    27-SEP-18 16:49\n                            2 NEW                   27-SEP-18 16:49\nU 0500110041040000          3 HOLDING    NUMBER1    27-SEP-18 16:50\n                            3 NEW                   27-SEP-18 16:50\nU 0500110041040000          4 HOLDING    NUMBER1    27-SEP-18 16:51\n                            4 NEW                   27-SEP-18 16:51\nU 0500110041040000          5 HOLDING    NUMBER1    27-SEP-18 16:52\n                            5 NEW                   27-SEP-18 16:52\n                            6 NEW                   27-SEP-18 16:53\n                            7 NEW                   27-SEP-18 16:54\n                            8 NEW                   27-SEP-18 16:55\n                            9 NEW                   27-SEP-18 16:56\n                           10 NEW                   27-SEP-18 16:57</pre><p>&nbsp;</p>\n<p>I have used flashback query to see all versions of the rows. All 10 have been created and the the first 5 of them have been updated by NUMBER1.</p>\n<p>Now, my second session continues, updating to NUMBER2. I commit and look at the row versions again:</p>\n<p>&nbsp;</p>\n<pre>\ncommit;\nset pagesize 1000\nselect versions_operation,versions_xid,DEMO.* from DEMO versions between scn minvalue and maxvalue order by ID,2;\n</pre><pre>\nV VERSIONS_XID             ID STATUS     NAME       CREATED        \n- ---------------- ---------- ---------- ---------- ---------------\nU 04001B0057030000          1 HOLDING    NUMBER2    27-SEP-18 16:48\nU 0500110041040000          1 HOLDING    NUMBER1    27-SEP-18 16:48\n                            1 NEW                   27-SEP-18 16:48\nU 04001B0057030000          2 HOLDING    NUMBER2    27-SEP-18 16:49\nU 0500110041040000          2 HOLDING    NUMBER1    27-SEP-18 16:49\n                            2 NEW                   27-SEP-18 16:49\nU 04001B0057030000          3 HOLDING    NUMBER2    27-SEP-18 16:50\nU 0500110041040000          3 HOLDING    NUMBER1    27-SEP-18 16:50\n                            3 NEW                   27-SEP-18 16:50\nU 04001B0057030000          4 HOLDING    NUMBER2    27-SEP-18 16:51\nU 0500110041040000          4 HOLDING    NUMBER1    27-SEP-18 16:51\n                            4 NEW                   27-SEP-18 16:51\nU 04001B0057030000          5 HOLDING    NUMBER2    27-SEP-18 16:52\nU 0500110041040000          5 HOLDING    NUMBER1    27-SEP-18 16:52\n                            5 NEW                   27-SEP-18 16:52\n                            6 NEW                   27-SEP-18 16:53\n                            7 NEW                   27-SEP-18 16:54\n                            8 NEW                   27-SEP-18 16:55\n                            9 NEW                   27-SEP-18 16:56\n                           10 NEW                   27-SEP-18 16:57\n</pre><p>&nbsp;</p>\n<p>This is not what I expected. I wanted my second session to process the other rows, but here it seems that it has processed the same rows as the first one. What has been done by the NUMBER1 has been lost and overwritten by NUMBER2. This is inconsistent, violates ACID properties, and should not happen. An SQL statement must ensure write consistency: either by locking all the rows as soon as they are read (for non-MVCC databases where reads block writes), or re-starting the update when a mutating row is encountered. Oracle default behaviour is in the second case, NUMBER2 query&nbsp;reads the rows 1 to 5, because&nbsp;the changes by NUMBER1, not committed yet, are invisible from NUMBER2. But the execution should keep&nbsp;track of the columns referenced in the where clause. When attempting to update a row, now that the concurrent change is visible,&nbsp;the update is possible only if the WHERE clause used to select the rows still selects this row. If not, the database should raise an error (this is what happens in serializable&nbsp;isolation level) or re-start the update when in the default statement-level consistency.</p>\n<p>Here, probably because of the nested subquery, the write consistency is not guaranteed and this is a bug.</p>\n<p>One workaround is not to use subqueries. However, as we need to ORDER BY the rows in order to process the oldest first, we cannot avoid the subquery. The workaround for this&nbsp;is to add STATUS = 'NEW' in the WHERE clause of the update, so that the update restart works correctly.</p>\n<p>However, the goal of multithreading those processes is to be scalable, and multiple update restarts may finally serialize all those updates.</p>\n<p>The preferred solution for this is to ensure that the updates do not attempt to touch the same rows. This can be achieved by a SELECT ... FOR UPDATE SKIP LOCKED. As this cannot be added directly to the update statement, we need a cursor. Something like this can do the job:</p>\n<p>&nbsp;</p>\n<pre>\ndeclare counter number:=5;\nbegin\n for c in (select /*+ first_rows(5) */ ID FROM DEMO \n&nbsp;          where STATUS = 'NEW' \n&nbsp;          order by CREATED\n           for update skip locked)\n loop\n  counter:=counter-1;\n  update DEMO set NAME = 'NUMBER1', STATUS = 'HOLDING'  where ID = c.ID and STATUS = 'NEW';\n  exit when counter=0;\n end loop;\nend;\n/\ncommit;\n</pre><p>&nbsp;</p>\n<p>This can be optimized further&nbsp;but just gives an idea of what is needed for a scalable solution. Waiting for locks is not scalable.</p>\n<p>&nbsp;</p>\n<hr>\n<p><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href=\"https://twitter.com/Franckpachot\">@FranckPachot</a>)</strong></p>\n",
+      "summary": ""
+    },
+    "comment_node_blog_post": {
+      "status": 1,
+      "cid": 35363,
+      "last_comment_timestamp": 1543819292,
+      "last_comment_name": "Anonymous",
+      "last_comment_uid": 0,
+      "comment_count": 2
+    }
+  },
+  "relationships": {
+    "node_type": {
+      "data": {
+        "type": "node_type--node_type",
+        "id": "afc8a5ea-c19b-48d4-b689-22e0b706c73c",
+        "meta": {
+          "drupal_internal__target_id": "blog_post"
+        }
+      },
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/node_type?resourceVersion=id%3A145"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/relationships/node_type?resourceVersion=id%3A145"
+        }
+      }
+    },
+    "revision_uid": {
+      "data": {
+        "type": "user--user",
+        "id": "a60c3d34-a6c3-4aff-add4-d8dbb42c32b1",
+        "meta": {
+          "drupal_internal__target_id": 188
+        }
+      },
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/revision_uid?resourceVersion=id%3A145"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/relationships/revision_uid?resourceVersion=id%3A145"
+        }
+      }
+    },
+    "uid": {
+      "data": {
+        "type": "user--user",
+        "id": "a60c3d34-a6c3-4aff-add4-d8dbb42c32b1",
+        "meta": {
+          "drupal_internal__target_id": 188
+        }
+      },
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/uid?resourceVersion=id%3A145"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/relationships/uid?resourceVersion=id%3A145"
+        }
+      }
+    },
+    "feeds_item": {
+      "data": [],
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/feeds_item?resourceVersion=id%3A145"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/relationships/feeds_item?resourceVersion=id%3A145"
+        }
+      }
+    },
+    "field_tags": {
+      "data": [
+        {
+          "type": "taxonomy_term--tags",
+          "id": "d09e1042-207c-43f9-bb06-564470dda175",
+          "meta": {
+            "drupal_internal__target_id": 11
+          }
+        },
+        {
+          "type": "taxonomy_term--tags",
+          "id": "64dc48c9-bec1-4c2e-b234-a57f3787d636",
+          "meta": {
+            "drupal_internal__target_id": 175
+          }
+        },
+        {
+          "type": "taxonomy_term--tags",
+          "id": "1c5b3bc4-c8dd-42a2-a640-8b3e7d40b708",
+          "meta": {
+            "drupal_internal__target_id": 176
+          }
+        },
+        {
+          "type": "taxonomy_term--tags",
+          "id": "786f1cb9-db8d-4e63-b1f2-918b2f2cad23",
+          "meta": {
+            "drupal_internal__target_id": 177
+          }
+        }
+      ],
+      "links": {
+        "related": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/field_tags?resourceVersion=id%3A145"
+        },
+        "self": {
+          "href": "https://db-blog.web.cern.ch/jsonapi/node/blog_post/03c52551-86d8-4a11-9b32-3dc3d8dd33a4/relationships/field_tags?resourceVersion=id%3A145"
+        }
+      }
+    }
+  }
+}

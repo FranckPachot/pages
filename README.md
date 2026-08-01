@@ -2,11 +2,12 @@
 
 This repository preserves articles published across several platforms:
 
-- [DBI Services](https://franckpachot.github.io/pages/2013-2018/) exports, including the comments available when they were archived
+- [DBI Services](https://www.dbi-services.com/blog/) WordPress API snapshots filtered by the exact `By Franck Pachot` article heading; the older HTML exports remain under `2013-2018/`
 - [Medium](https://franckpachot.github.io/pages/2018-medium/posts) account export
 - [Dev.to](https://dev.to/franckpachot) API snapshots, including source Markdown and rendered HTML when supplied by the API
 - [Yugabyte](https://www.yugabyte.com/blog/author/fpachot/) WordPress API snapshots, including rendered article content
 - [Microsoft Tech Community](https://techcommunity.microsoft.com/users/franckpachot/3595257) HTML snapshots verified against the article's structured author metadata
+- [Databases at CERN](https://db-blog.web.cern.ch/users/franck-pachot) Drupal JSON:API snapshots, including rendered article content
 
 `archive-manifest.json` is the unified, machine-readable inventory. Each entry records its source, stable source ID, title, publication date, canonical URL, local archive path, and tags when available. The original exports remain unchanged.
 
@@ -18,9 +19,9 @@ Python 3 is the only prerequisite. From the repository root, run:
 python util/archive_articles.py
 ```
 
-The command rescans the local DBI Services and Medium exports; discovers current Dev.to, Yugabyte, and Microsoft Tech Community articles; downloads only snapshots that are not already present; and regenerates the manifest.
+The command discovers current DBI Services, Dev.to, Yugabyte, Microsoft Tech Community, and CERN articles; rescans the local Medium export; downloads only snapshots that are not already present; and regenerates the manifest.
 
-Use `--refresh-devto`, `--refresh-yugabyte`, or `--refresh-techcommunity` to replace existing snapshots from one source. The corresponding `--skip-*` options avoid contacting that source, while `--offline` rebuilds the manifest entirely from local snapshots.
+Use `--refresh-dbi`, `--refresh-devto`, `--refresh-yugabyte`, `--refresh-techcommunity`, or `--refresh-cern` to replace existing snapshots from one source. The corresponding `--skip-*` options avoid contacting that source, while `--offline` rebuilds the manifest entirely from local snapshots.
 
 ## Browse the publication index
 

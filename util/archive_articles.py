@@ -19,9 +19,20 @@ from typing import Any
 
 
 DEVTO_API = "https://dev.to/api"
+DBI_API = "https://www.dbi-services.com/blog/wp-json/wp/v2"
 YUGABYTE_API = "https://www.yugabyte.com/wp-json/wp/v2"
 TECHCOMMUNITY_BASE = "https://techcommunity.microsoft.com"
+CERN_API = "https://db-blog.web.cern.ch/jsonapi/node/blog_post"
+CERN_BASE = "https://db-blog.web.cern.ch"
 USER_AGENT = "FranckPachot-blog-archive/1.0"
+DBI_BYLINE_PATTERN = re.compile(
+    r"<h2[^>]*>\s*By Franck Pachot\s*</h2>", re.IGNORECASE
+)
+AWS_ACCESS_KEY_PATTERN = re.compile(r"AKIA[0-9A-Z]{16}")
+AWS_SECRET_KEY_PATTERN = re.compile(
+    r"((?:aws_secret_access_key|AWS Secret Access Key)(?:\s*\[None\])?\s*[:=]\s*)[A-Za-z0-9/+]{40,44}",
+    re.IGNORECASE,
+)
 
 
 def read_text(path: Path) -> str:
@@ -37,6 +48,14 @@ def first_match(pattern: str, text: str) -> str:
     return clean_text(match.group(1)) if match else ""
 
 
+def sanitize_dbi_detail(detail: dict[str, Any]) -> dict[str, Any]:
+    content = detail.get("content", {}).get("rendered", "")
+    content = AWS_ACCESS_KEY_PATTERN.sub("REDACTED_AWS_ACCESS_KEY_ID", content)
+    content = AWS_SECRET_KEY_PATTERN.sub(r"\1REDACTED_AWS_SECRET_ACCESS_KEY", content)
+    detail.get("content", {})["rendered"] = content
+    return detail
+
+
 def write_json_atomic(path: Path, value: Any) -> None:
     temporary_path = path.with_suffix(path.suffix + ".tmp")
     temporary_path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -49,7 +68,7 @@ def write_text_atomic(path: Path, value: str) -> None:
     os.replace(temporary_path, path)
 
 
-def inventory_dbi(root: Path) -> list[dict[str, Any]]:
+def inventory_legacy_dbi(root: Path) -> list[dict[str, Any]]:
     articles = []
     for path in sorted((root / "2013-2018").glob("*/index.html")):
         document = read_text(path)
@@ -71,6 +90,77 @@ def inventory_dbi(root: Path) -> list[dict[str, Any]]:
             }
         )
     return articles
+
+
+def dbi_manifest_entry(root: Path, path: Path, detail: dict[str, Any]) -> dict[str, Any]:
+    slug = detail.get("slug", "")
+    content = detail.get("content", {}).get("rendered", "")
+    if not slug or path.stem != slug:
+        raise ValueError(f"Invalid DBI article slug in {path}")
+    if not DBI_BYLINE_PATTERN.search(content):
+        raise ValueError("Missing exact 'By Franck Pachot' heading")
+    if not detail.get("date") or not detail.get("link") or not detail.get("title", {}).get("rendered"):
+        raise ValueError(f"Incomplete DBI article metadata in {path}")
+    return {
+        "source": "dbi-services",
+        "source_id": slug,
+        "title": clean_text(detail["title"]["rendered"]),
+        "published_at": detail["date"],
+        "canonical_url": detail["link"],
+        "archive_path": path.relative_to(root).as_posix(),
+        "tags": [],
+    }
+
+
+def inventory_dbi(root: Path) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "dbi-services" / "articles").glob("*.json")):
+        try:
+            detail = json.loads(read_text(path))
+            articles.append(dbi_manifest_entry(root, path, detail))
+        except (json.JSONDecodeError, ValueError) as error:
+            print(f"Skipping invalid DBI snapshot {path.relative_to(root)}: {error}")
+    return articles or inventory_legacy_dbi(root)
+
+
+def list_dbi_articles() -> list[dict[str, Any]]:
+    articles = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode(
+            {
+                "search": "Franck Pachot",
+                "per_page": 100,
+                "page": page,
+                "_fields": "slug,link,date,title,content",
+            }
+        )
+        batch = web_get_json(f"{DBI_API}/posts?{query}")
+        if not isinstance(batch, list):
+            raise ValueError(f"Unexpected DBI article list response on page {page}")
+        articles.extend(
+            article
+            for article in batch
+            if DBI_BYLINE_PATTERN.search(article.get("content", {}).get("rendered", ""))
+        )
+        if len(batch) < 100:
+            return articles
+        page += 1
+
+
+def archive_dbi(root: Path, refresh: bool) -> list[dict[str, Any]]:
+    archive_dir = root / "dbi-services" / "articles"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    articles = list_dbi_articles()
+    for position, detail in enumerate(articles, start=1):
+        detail = sanitize_dbi_detail(detail)
+        slug = detail.get("slug", "")
+        path = archive_dir / f"{slug}.json"
+        dbi_manifest_entry(root, path, detail)
+        if refresh or not path.exists():
+            write_json_atomic(path, detail)
+        print(f"DBI Services {position}/{len(articles)}: {clean_text(detail['title']['rendered'])}")
+    return inventory_dbi(root)
 
 
 def inventory_medium(root: Path) -> list[dict[str, Any]]:
@@ -446,10 +536,69 @@ def archive_techcommunity(
     return inventory_techcommunity(root, author_name, profile_id)
 
 
+def cern_manifest_entry(root: Path, path: Path, detail: dict[str, Any]) -> dict[str, Any]:
+    attributes = detail.get("attributes", {})
+    article_id = attributes.get("drupal_internal__nid")
+    alias = attributes.get("path", {}).get("alias", "")
+    if not isinstance(article_id, int) or article_id <= 0 or path.stem != str(article_id):
+        raise ValueError(f"Invalid CERN article ID in {path}")
+    if not attributes.get("title") or not attributes.get("created") or not alias.startswith("/blog/"):
+        raise ValueError(f"Incomplete CERN article metadata in {path}")
+    return {
+        "source": "cern",
+        "source_id": str(article_id),
+        "title": clean_text(attributes["title"]),
+        "published_at": attributes["created"],
+        "canonical_url": urllib.parse.urljoin(CERN_BASE, alias),
+        "archive_path": path.relative_to(root).as_posix(),
+        "tags": [],
+    }
+
+
+def inventory_cern(root: Path) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "cern" / "articles").glob("*.json")):
+        try:
+            detail = json.loads(read_text(path))
+            articles.append(cern_manifest_entry(root, path, detail))
+        except (json.JSONDecodeError, ValueError) as error:
+            print(f"Skipping invalid CERN snapshot {path.relative_to(root)}: {error}")
+    return articles
+
+
+def list_cern_articles(author_username: str) -> list[dict[str, Any]]:
+    query = urllib.parse.urlencode(
+        {"filter[uid.name]": author_username, "page[limit]": 50}
+    )
+    response = web_get_json(f"{CERN_API}?{query}")
+    articles = response.get("data") if isinstance(response, dict) else None
+    if not isinstance(articles, list) or response.get("links", {}).get("next"):
+        raise ValueError("Unexpected or paginated CERN article response")
+    return articles
+
+
+def archive_cern(root: Path, author_username: str, refresh: bool) -> list[dict[str, Any]]:
+    archive_dir = root / "cern" / "articles"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    articles = list_cern_articles(author_username)
+    for position, detail in enumerate(articles, start=1):
+        article_id = detail.get("attributes", {}).get("drupal_internal__nid")
+        if not isinstance(article_id, int) or article_id <= 0:
+            raise ValueError("Invalid CERN article response")
+        path = archive_dir / f"{article_id}.json"
+        cern_manifest_entry(root, path, detail)
+        if refresh or not path.exists():
+            write_json_atomic(path, detail)
+        print(f"CERN {position}/{len(articles)}: {clean_text(detail['attributes']['title'])}")
+    return inventory_cern(root)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--username", default="franckpachot")
+    parser.add_argument("--skip-dbi", action="store_true")
+    parser.add_argument("--refresh-dbi", action="store_true")
     parser.add_argument("--skip-devto", action="store_true")
     parser.add_argument("--refresh-devto", action="store_true")
     parser.add_argument("--max-devto", type=int, help="Limit Dev.to downloads for testing")
@@ -457,19 +606,28 @@ def main() -> None:
     parser.add_argument("--refresh-yugabyte", action="store_true")
     parser.add_argument("--skip-techcommunity", action="store_true")
     parser.add_argument("--refresh-techcommunity", action="store_true")
+    parser.add_argument("--skip-cern", action="store_true")
+    parser.add_argument("--refresh-cern", action="store_true")
     parser.add_argument("--yugabyte-author", default="fpachot")
     parser.add_argument("--techcommunity-author", default="FranckPachot")
     parser.add_argument("--techcommunity-profile-id", default="3595257")
+    parser.add_argument("--cern-author", default="fpachot")
     parser.add_argument("--offline", action="store_true", help="Rebuild from local snapshots only")
     args = parser.parse_args()
 
     if args.offline:
+        args.skip_dbi = True
         args.skip_devto = True
         args.skip_yugabyte = True
         args.skip_techcommunity = True
+        args.skip_cern = True
 
     root = args.root.resolve()
-    articles = inventory_dbi(root) + inventory_medium(root)
+    if not args.skip_dbi:
+        articles = archive_dbi(root, args.refresh_dbi)
+    else:
+        articles = inventory_dbi(root)
+    articles += inventory_medium(root)
     if not args.skip_devto:
         articles += archive_devto(root, args.username, args.refresh_devto, args.max_devto)
     else:
@@ -489,6 +647,10 @@ def main() -> None:
         articles += inventory_techcommunity(
             root, args.techcommunity_author, args.techcommunity_profile_id
         )
+    if not args.skip_cern:
+        articles += archive_cern(root, args.cern_author, args.refresh_cern)
+    else:
+        articles += inventory_cern(root)
     articles.sort(key=lambda article: (article["published_at"], article["source"]), reverse=True)
 
     manifest = {
