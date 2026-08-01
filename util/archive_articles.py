@@ -24,6 +24,9 @@ YUGABYTE_API = "https://www.yugabyte.com/wp-json/wp/v2"
 TECHCOMMUNITY_BASE = "https://techcommunity.microsoft.com"
 CERN_API = "https://db-blog.web.cern.ch/jsonapi/node/blog_post"
 CERN_BASE = "https://db-blog.web.cern.ch"
+DEVELOPPEZ_BASE = "http://blog.developpez.com/pachot/"
+DEVELOPPEZ_CAPTURE = "20120429040723"
+DEVELOPPEZ_REPLAY = f"https://web.archive.org/web/{DEVELOPPEZ_CAPTURE}id_/"
 USER_AGENT = "FranckPachot-blog-archive/1.0"
 DBI_BYLINE_PATTERN = re.compile(
     r"<h2[^>]*>\s*By Franck Pachot\s*</h2>", re.IGNORECASE
@@ -566,6 +569,83 @@ def inventory_cern(root: Path) -> list[dict[str, Any]]:
     return articles
 
 
+def developpez_manifest_entry(root: Path, path: Path, document: str) -> dict[str, Any]:
+    article_id_match = re.search(r"/p(\d+)/", document)
+    title = first_match(r'<h[1-4][^>]+class="[^"]*bTitle[^"]*"[^>]*>(.*?)</h[1-4]>', document)
+    if not title:
+        title = first_match(r"<title>\s*Article complet:\s*(.*?)</title>", document)
+    published_match = re.search(r"\b(\d{2})/(\d{2})/(\d{4})\b", document)
+    canonical = first_match(
+        r'<a[^>]+href="(http://blog\.developpez\.com/pachot/p\d+/[^"#?]+/)"[^>]+title="Lien permanent',
+        document,
+    )
+    if not article_id_match or path.stem != article_id_match.group(1):
+        raise ValueError(f"Invalid Developpez article ID in {path}")
+    if not title or not published_match or not canonical:
+        raise ValueError(f"Incomplete Developpez article metadata in {path}")
+    if "Pachot Franck" not in document or "French (FR" not in document:
+        raise ValueError(f"Unverified Developpez author or language in {path}")
+    day, month, year = published_match.groups()
+    return {
+        "source": "developpez",
+        "source_id": article_id_match.group(1),
+        "title": title,
+        "published_at": f"{year}-{month}-{day}",
+        "canonical_url": canonical,
+        "archive_path": path.relative_to(root).as_posix(),
+        "language": "fr",
+        "tags": [],
+    }
+
+
+def inventory_developpez(root: Path) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "developpez" / "articles").glob("*.html")):
+        try:
+            articles.append(developpez_manifest_entry(root, path, read_text(path)))
+        except ValueError as error:
+            print(f"Skipping invalid Developpez snapshot {path.relative_to(root)}: {error}")
+    return articles
+
+
+def list_developpez_articles() -> list[str]:
+    articles: set[str] = set()
+    month = datetime.date(2010, 3, 28)
+    final_month = datetime.date(2011, 6, 28)
+    while month <= final_month:
+        capture = month.strftime("%Y%m%d")
+        feed_url = "http://blog.developpez.com/xmlsrv/atom.php?blog=337"
+        document = web_get(f"https://web.archive.org/web/{capture}id_/{feed_url}")
+        articles.update(
+            match.rstrip("/") + "/"
+            for match in re.findall(
+                r"http://blog\.developpez\.com/pachot/p\d+/[^\"'?#< ]+", document
+            )
+        )
+        if month.month == 12:
+            month = datetime.date(month.year + 1, 1, 28)
+        else:
+            month = datetime.date(month.year, month.month + 1, 28)
+    if len(articles) != 41:
+        raise ValueError(f"Expected 41 Developpez articles, found {len(articles)}")
+    return sorted(articles, key=lambda url: int(re.search(r"/p(\d+)/", url).group(1)))
+
+
+def archive_developpez(root: Path, refresh: bool) -> list[dict[str, Any]]:
+    archive_dir = root / "developpez" / "articles"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    articles = list_developpez_articles()
+    for position, url in enumerate(articles, start=1):
+        article_id = re.search(r"/p(\d+)/", url).group(1)
+        path = archive_dir / f"{article_id}.html"
+        document = web_get(f"{DEVELOPPEZ_REPLAY}{url}") if refresh or not path.exists() else read_text(path)
+        entry = developpez_manifest_entry(root, path, document)
+        if refresh or not path.exists():
+            write_text_atomic(path, document)
+        print(f"Developpez {position}/{len(articles)}: {entry['title']}")
+    return inventory_developpez(root)
+
+
 def list_cern_articles(author_username: str) -> list[dict[str, Any]]:
     query = urllib.parse.urlencode(
         {"filter[uid.name]": author_username, "page[limit]": 50}
@@ -608,6 +688,8 @@ def main() -> None:
     parser.add_argument("--refresh-techcommunity", action="store_true")
     parser.add_argument("--skip-cern", action="store_true")
     parser.add_argument("--refresh-cern", action="store_true")
+    parser.add_argument("--skip-developpez", action="store_true")
+    parser.add_argument("--refresh-developpez", action="store_true")
     parser.add_argument("--yugabyte-author", default="fpachot")
     parser.add_argument("--techcommunity-author", default="FranckPachot")
     parser.add_argument("--techcommunity-profile-id", default="3595257")
@@ -621,6 +703,7 @@ def main() -> None:
         args.skip_yugabyte = True
         args.skip_techcommunity = True
         args.skip_cern = True
+        args.skip_developpez = True
 
     root = args.root.resolve()
     if not args.skip_dbi:
@@ -651,6 +734,10 @@ def main() -> None:
         articles += archive_cern(root, args.cern_author, args.refresh_cern)
     else:
         articles += inventory_cern(root)
+    if not args.skip_developpez:
+        articles += archive_developpez(root, args.refresh_developpez)
+    else:
+        articles += inventory_developpez(root)
     articles.sort(key=lambda article: (article["published_at"], article["source"]), reverse=True)
 
     manifest = {
