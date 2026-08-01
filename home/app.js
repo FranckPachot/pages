@@ -144,6 +144,16 @@
     return element;
   }
 
+  function databaseBadge(value) {
+    const element = badge(value, "database");
+    const logo = document.createElement("span");
+    const key = value.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    logo.className = `database-logo database-logo--${key}`;
+    logo.setAttribute("aria-hidden", "true");
+    element.prepend(logo);
+    return element;
+  }
+
   function publicationRow(publication) {
     const article = document.createElement("article");
     article.className = "publication";
@@ -173,7 +183,7 @@
     const metadata = document.createElement("div");
     metadata.className = "publication__meta";
     metadata.append(sourceBadge(publication));
-    publication.databases.slice(0, 3).forEach((value) => metadata.append(badge(value, "database")));
+    publication.databases.slice(0, 3).forEach((value) => metadata.append(databaseBadge(value)));
     publication.versions.slice(0, 2).forEach((value) => metadata.append(badge(value, "version")));
     publication.categories.slice(0, 2).forEach((value) => metadata.append(badge(value, "category")));
     if (publication.snapshot_url) {
