@@ -59,22 +59,6 @@
   }
 
   function renderSummary() {
-    const values = [
-      ["Publications", catalog.publication_count.toLocaleString()],
-      ["Years", `${catalog.year_min}–${catalog.year_max}`],
-      ["Sources", Object.keys(catalog.source_counts).length],
-      ["Database facets", Object.keys(catalog.database_counts).length - 1],
-    ];
-    const strip = document.querySelector("#summary-strip");
-    values.forEach(([label, value]) => {
-      const wrapper = document.createElement("div");
-      const term = document.createElement("dt");
-      const detail = document.createElement("dd");
-      term.textContent = label;
-      detail.textContent = value;
-      wrapper.append(term, detail);
-      strip.append(wrapper);
-    });
     document.querySelector("#header-count").textContent = catalog.publication_count.toLocaleString();
     document.querySelector("#header-years").textContent = `${catalog.year_min}–${catalog.year_max}`;
   }
