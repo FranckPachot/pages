@@ -36,6 +36,7 @@
         <li><a href="#chapter-5">Vacuum makes reuse safe</a></li>
         <li><a href="#chapter-6">Uniqueness consults visibility</a></li>
         <li><a href="#chapter-7">WAL recovers physical consistency</a></li>
+        <li><a href="#field-manual">Field manual</a></li>
         <li><a href="#sources">Sources</a></li>
       </ol><div class="contents__status"><span></span> Living minibook</div></aside>
     <main class="book">
@@ -44,7 +45,7 @@
         <h1>PostgreSQL MVCC Backstage</h1>
         <p class="hero__subtitle">Tuple versions, visibility, vacuum, and recovery</p>
         <p class="hero__lede">Look behind PostgreSQL snapshots to understand heap tuples, index behavior, vacuum, uniqueness, and crash recovery.</p>
-        <div class="hero__meta"><span>Franck Pachot</span><span>7 chapters</span><span>PostgreSQL · MVCC · vacuum</span></div>
+        <div class="hero__meta"><span>Franck Pachot</span><span>8 chapters</span><span>PostgreSQL · MVCC · vacuum</span></div>
       </header>
       <section class="premise"><p>Build the mental model before choosing the mechanism.</p><span>Each guide synthesizes experiments from the article archive and links every source for deeper evidence.</span></section>
       <section class="chapter" id="chapter-1">
@@ -89,9 +90,51 @@
         <p class="chapter__intro">Write-ahead logging records changes before corresponding data pages are considered durable. Full-page images protect recovery from torn pages after checkpoints, while crash recovery replays WAL and treats transactions without commit records as aborted.</p>
         <ul class="principles"><li>A backend crash and an operating-system crash have different blast radii.</li><li>fsync and storage guarantees are correctness settings.</li><li>Replication reuses the ordered WAL stream for change delivery.</li></ul>
       </section>
+            <section class="chapter field-manual" id="field-manual">
+                <p class="chapter__number">08</p><h2>Field manual</h2>
+                <p class="chapter__intro">Concrete mechanics, diagnostic evidence, and executable patterns to carry into a real system.</p>
+        <article class="technical-section">
+                    <span>01</span>
+                    <div><h3>Read tuple metadata cautiously</h3><p>xmin identifies the inserting transaction and xmax is overloaded for deletion, update, and row-lock state. They are 32-bit transaction identifiers interpreted with an epoch and commit-status data; they are not permanent business values. ctid identifies a block and item offset, and normally changes on update. Exposing them is useful for a controlled experiment, not an application contract.</p><pre><code>SELECT ctid, xmin, xmax, id, status
+FROM orders
+WHERE id = 42;
+
+UPDATE orders SET status = &#x27;paid&#x27; WHERE id = 42;
+SELECT ctid, xmin, xmax, id, status FROM orders WHERE id = 42;</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>02</span>
+                    <div><h3>Measure HOT rather than assuming it</h3><p>A HOT update requires that no indexed column changes and that the heap page has room for the new tuple. The old index entry leads to the root of an on-page tuple chain. Lower fillfactor reserves update space but increases table size and scan work. Compare n_tup_hot_upd with n_tup_upd after a representative interval.</p><pre><code>SELECT relname, n_tup_upd, n_tup_hot_upd, n_dead_tup
+FROM pg_stat_user_tables
+WHERE relname = &#x27;orders&#x27;;
+
+ALTER TABLE orders SET (fillfactor = 80);
+-- A rewrite is needed for existing pages to adopt the space layout.</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>03</span>
+                    <div><h3>Understand the two visibility-map bits</h3><p>Each heap page has all-visible and all-frozen state. All-visible allows index-only scans to skip heap visibility checks; all-frozen means tuples no longer need future freezing. Any modification clears all-visible for the page. Vacuum can set it only after proving every tuple is globally visible, which is why write-heavy tables still show Heap Fetches in an Index Only Scan.</p><pre><code>CREATE EXTENSION IF NOT EXISTS pg_visibility;
+SELECT * FROM pg_visibility_map_summary(&#x27;orders&#x27;);
+
+EXPLAIN (ANALYZE, BUFFERS)
+SELECT id FROM orders WHERE customer_id = 42;</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>04</span>
+                    <div><h3>Tune autovacuum from change volume</h3><p>Vacuum trigger thresholds combine a fixed threshold and a fraction of estimated table rows. A 20 percent scale factor is too slow for many large, high-churn tables. Per-table settings let vacuum start after a bounded number of dead tuples. Also monitor transaction age: anti-wraparound vacuum is a correctness deadline and can ignore normal cost delays.</p><pre><code>ALTER TABLE orders SET (
+  autovacuum_vacuum_threshold = 5000,
+  autovacuum_vacuum_scale_factor = 0.01,
+  autovacuum_analyze_scale_factor = 0.005
+);
+
+SELECT relname, n_dead_tup, last_autovacuum,
+       age(relfrozenxid) AS xid_age
+FROM pg_stat_user_tables JOIN pg_class USING (relname);</code></pre></div>
+                </article>
+            </section>
       <section class="chapter resources" id="sources">
-        <p class="chapter__number">08</p><h2>Source articles</h2>
-        <p class="chapter__intro">The experiments and comparisons behind this guide.</p>
+                <p class="chapter__number">09</p><h2>Source articles</h2>
+                <p class="chapter__intro">Optional deep dives with the complete experiments and product-version context behind this guide.</p>
         <div class="source-grid">        <a href="https://dev.to/franckpachot/postgresql-resolves-uniqueness-through-heap-tuple-visibility-bkp"><strong>“PostgreSQL resolves uniqueness through heap tuple visibility”</strong><span>dev.to · 2026-07-09</span></a>
         <a href="https://www.dbi-services.com/blog/postgres-vs-oracle-access-paths-ii/"><strong>Postgres vs. Oracle access paths II – Index Only Scan</strong><span>dbi-services · 2017-08-02</span></a>
         <a href="https://www.dbi-services.com/blog/postgres-vs-oracle-access-paths-x-update/"><strong>Postgres vs. Oracle access paths X – Update</strong><span>dbi-services · 2017-08-24</span></a>

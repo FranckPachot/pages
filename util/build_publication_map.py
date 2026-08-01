@@ -21,6 +21,7 @@ SITE_URL = "https://franckpachot.github.io/pages/"
 SOURCE_NAMES = {
     "cern": "CERN",
     "dbi-services": "DBI Services",
+    "developpez": "Developpez.com",
     "dev.to": "Dev.to",
     "medium": "Medium",
     "microsoft-techcommunity": "Microsoft Tech Community",
@@ -116,7 +117,7 @@ def normalize_text(value: str) -> str:
 def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
     path = root / article["archive_path"]
     source = article["source"]
-    if source in {"medium", "microsoft-techcommunity"} or (
+    if source in {"developpez", "medium", "microsoft-techcommunity"} or (
         source == "dbi-services" and path.suffix.casefold() == ".html"
     ):
         document = path.read_text(encoding="utf-8", errors="replace")
@@ -340,6 +341,14 @@ def write_sitemap(path: Path, catalog: dict[str, Any]) -> None:
         "minibook/postgresql-mvcc-backstage/",
         "minibook/schema-design-for-concurrency/",
         "minibook/oracle-to-postgresql/",
+        "minibook/wal-redo-and-durability/",
+        "minibook/sql-plan-management/",
+        "minibook/oracle-multitenant-internals/",
+        "minibook/locks-blocking-and-deadlocks/",
+        "minibook/partitioning-and-sharding/",
+        "minibook/optimizer-statistics/",
+        "minibook/replication-and-high-availability/",
+        "minibook/database-observability/",
     ]
     entries = [f"  <url><loc>{SITE_URL}{page}</loc></url>" for page in static_pages]
     for publication in local_pages:
@@ -359,6 +368,7 @@ def main() -> None:
     write_catalog(output, catalog)
     write_root_index(root / "index.html", catalog)
     write_sitemap(root / "sitemap.xml", catalog)
+    write_sitemap(root / "home" / "sitemap.xml", catalog)
     print(
         f"Wrote {output} with {catalog['publication_count']} publications, "
         f"{len(catalog['database_counts'])} database facets, and "

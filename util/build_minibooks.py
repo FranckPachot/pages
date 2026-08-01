@@ -7,6 +7,9 @@ import html
 import json
 from pathlib import Path
 
+from minibook_expansion import EXTRA_BOOKS, EXTRA_TECHNICAL_GUIDES
+from minibook_details import TECHNICAL_GUIDES
+
 SITE_URL = "https://franckpachot.github.io/pages/"
 
 BOOKS = [
@@ -196,6 +199,9 @@ BOOKS = [
     },
 ]
 
+BOOKS.extend(EXTRA_BOOKS)
+TECHNICAL_GUIDES.update(EXTRA_TECHNICAL_GUIDES)
+
 
 def normalize(value: str) -> str:
     return " ".join(value.casefold().replace("–", "-").replace("—", "-").split())
@@ -244,9 +250,11 @@ def page_head(title: str, description: str, canonical: str, page_type: str = "Te
   <script type="application/ld+json">{json.dumps(schema, ensure_ascii=False, separators=(",", ":"))}</script>'''
 
 
-def render_book(book: dict, sources: list[dict]) -> str:
+def render_book(book: dict, sources: list[dict], technical_guide: list[dict]) -> str:
     canonical = f"{SITE_URL}minibook/{book['slug']}/"
+    chapter_count = len(book["chapters"]) + 1
     toc = "\n".join(f'        <li><a href="#chapter-{position}">{html.escape(chapter[0])}</a></li>' for position, chapter in enumerate(book["chapters"], 1))
+    toc += f'\n        <li><a href="#field-manual">Field manual</a></li>'
     chapters = []
     for position, (title, lead, points) in enumerate(book["chapters"], 1):
         point_markup = "".join(f"<li>{html.escape(point)}</li>" for point in points)
@@ -256,6 +264,13 @@ def render_book(book: dict, sources: list[dict]) -> str:
         <p class="chapter__intro">{html.escape(lead)}</p>
         <ul class="principles">{point_markup}</ul>
       </section>''')
+        technical_markup = "\n".join(
+                f'''        <article class="technical-section">
+                    <span>{position:02d}</span>
+                    <div><h3>{html.escape(section['title'])}</h3><p>{html.escape(section['body'])}</p><pre><code>{html.escape(section['code'])}</code></pre></div>
+                </article>'''
+                for position, section in enumerate(technical_guide, 1)
+        )
     source_markup = "\n".join(
         f'''        <a href="{html.escape(source['canonical_url'], quote=True)}"><strong>{html.escape(source['title'])}</strong><span>{html.escape(source.get('source', 'Article'))} · {html.escape(source.get('published_at', '')[:10])}</span></a>'''
         for source in sources
@@ -283,13 +298,18 @@ def render_book(book: dict, sources: list[dict]) -> str:
         <h1>{html.escape(book['title'])}</h1>
         <p class="hero__subtitle">{html.escape(book['subtitle'])}</p>
         <p class="hero__lede">{html.escape(book['description'])}</p>
-        <div class="hero__meta"><span>Franck Pachot</span><span>{len(book['chapters'])} chapters</span><span>{html.escape(book['topics'])}</span></div>
+        <div class="hero__meta"><span>Franck Pachot</span><span>{chapter_count} chapters</span><span>{html.escape(book['topics'])}</span></div>
       </header>
       <section class="premise"><p>Build the mental model before choosing the mechanism.</p><span>Each guide synthesizes experiments from the article archive and links every source for deeper evidence.</span></section>
 {chr(10).join(chapters)}
+            <section class="chapter field-manual" id="field-manual">
+                <p class="chapter__number">{chapter_count:02d}</p><h2>Field manual</h2>
+                <p class="chapter__intro">Concrete mechanics, diagnostic evidence, and executable patterns to carry into a real system.</p>
+{technical_markup}
+            </section>
       <section class="chapter resources" id="sources">
-        <p class="chapter__number">{len(book['chapters']) + 1:02d}</p><h2>Source articles</h2>
-        <p class="chapter__intro">The experiments and comparisons behind this guide.</p>
+                <p class="chapter__number">{chapter_count + 1:02d}</p><h2>Source articles</h2>
+                <p class="chapter__intro">Optional deep dives with the complete experiments and product-version context behind this guide.</p>
         <div class="source-grid">{source_markup}</div>
       </section>
       <footer class="book-footer"><div><strong>Franck Pachot</strong><span>🇨🇭 Database Developer Advocate</span></div><p>Product behavior changes across versions. Verify every physical claim on the system you operate.</p><a href="../">Continue through the minibook collection →</a></footer>
@@ -318,9 +338,10 @@ def render_index() -> str:
                 cards.append(f'''      <a class="collection-card" href="{book['slug']}/" style="--card-accent:{book['accent']}">
                 <span class="collection-card__number">{book['number']}</span>
                 <div><p>{html.escape(book['topics'])}</p><h2>{html.escape(book['title'])}</h2><strong>{html.escape(book['subtitle'])}</strong><span>{html.escape(book['description'])}</span></div>
-                <small>{len(book['chapters'])} chapters →</small>
+                <small>{len(book['chapters']) + 1} chapters →</small>
             </a>''')
-        description = "Eleven concise database field guides by Franck Pachot, covering SQL isolation, indexes, PostgreSQL internals, distributed SQL, concurrency, and migration."
+        volume_count = len(BOOKS) + 1
+        description = f"{volume_count} concise database field guides by Franck Pachot, covering SQL internals, performance, concurrency, recovery, high availability, and migration."
         return f'''<!doctype html>
 <html lang="en">
 <head>
@@ -329,7 +350,7 @@ def render_index() -> str:
 <body>
     <header class="collection-nav"><a href="../"><img src="../franck-pachot-linkedin.jpg" alt="" width="42" height="42"><span><strong>Franck Pachot</strong><small>Database Developer Advocate</small></span></a><a href="../">Article archive</a></header>
     <main>
-        <header class="collection-hero"><p>Database field guides · 11 volumes</p><h1>Minibooks for<br>the systems<br>behind SQL.</h1><div><span>From physical storage to distributed transactions, each guide builds a compact mental model from tested database behavior.</span><strong>Read independently.<br>Connect the models.</strong></div></header>
+        <header class="collection-hero"><p>Database field guides · {volume_count} volumes</p><h1>Minibooks for<br>the systems<br>behind SQL.</h1><div><span>From physical storage to distributed transactions, each guide builds a compact mental model from tested database behavior.</span><strong>Read independently.<br>Connect the models.</strong></div></header>
         <section class="collection-intro"><p>Not product documentation. Not generic recipes.</p><span>These are focused syntheses of experiments across Oracle, PostgreSQL, YugabyteDB, and other systems, with links back to the source articles.</span></section>
         <section class="collection-grid" aria-label="Minibook collection">
 {chr(10).join(cards)}
@@ -348,7 +369,10 @@ def build(root: Path) -> None:
         output = output_root / book["slug"]
         output.mkdir(parents=True, exist_ok=True)
         sources = resolve_sources(manifest, book["sources"])
-        (output / "index.html").write_text(render_book(book, sources), encoding="utf-8")
+        technical_guide = TECHNICAL_GUIDES.get(book["slug"], [])
+        if len(technical_guide) < 4:
+            raise ValueError(f"Technical guide requires at least four sections: {book['slug']}")
+        (output / "index.html").write_text(render_book(book, sources, technical_guide), encoding="utf-8")
     (output_root / "index.html").write_text(render_index(), encoding="utf-8")
     print(f"Built the collection index and {len(BOOKS)} minibooks")
 

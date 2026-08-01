@@ -35,6 +35,7 @@
         <li><a href="#chapter-4">Queues need claim semantics</a></li>
         <li><a href="#chapter-5">Indexes define conflict precision</a></li>
         <li><a href="#chapter-6">Serializable still requires retries</a></li>
+        <li><a href="#field-manual">Field manual</a></li>
         <li><a href="#sources">Sources</a></li>
       </ol><div class="contents__status"><span></span> Living minibook</div></aside>
     <main class="book">
@@ -43,7 +44,7 @@
         <h1>Schema Design for Concurrency</h1>
         <p class="hero__subtitle">Make invariants executable</p>
         <p class="hero__lede">Move correctness from timing assumptions into keys, constraints, indexes, queues, and retryable transactions.</p>
-        <div class="hero__meta"><span>Franck Pachot</span><span>6 chapters</span><span>schema design · invariants · contention</span></div>
+        <div class="hero__meta"><span>Franck Pachot</span><span>7 chapters</span><span>schema design · invariants · contention</span></div>
       </header>
       <section class="premise"><p>Build the mental model before choosing the mechanism.</p><span>Each guide synthesizes experiments from the article archive and links every source for deeper evidence.</span></section>
       <section class="chapter" id="chapter-1">
@@ -82,9 +83,49 @@
         <p class="chapter__intro">Serializable isolation detects executions that cannot safely coexist and aborts one participant. The schema should minimize false contention through precise predicates and indexes, while the application treats a serialization failure as a request to replay the transaction.</p>
         <ul class="principles"><li>Retry from a clean transaction boundary.</li><li>Use bounded backoff and preserve request identity.</li><li>Test the invariant under concurrent load, not only the happy path.</li></ul>
       </section>
+            <section class="chapter field-manual" id="field-manual">
+                <p class="chapter__number">07</p><h2>Field manual</h2>
+                <p class="chapter__intro">Concrete mechanics, diagnostic evidence, and executable patterns to carry into a real system.</p>
+        <article class="technical-section">
+                    <span>01</span>
+                    <div><h3>Encode one active row as a unique fact</h3><p>If only one active reservation may exist per seat, a partial unique index makes competing inserts arbitrate on one key. The application no longer relies on a prior absence check. One transaction succeeds; the other waits and then receives a unique violation or follows ON CONFLICT behavior. This works at Read Committed because the index is the coordination point.</p><pre><code>CREATE UNIQUE INDEX one_active_reservation_per_seat
+ON reservation (show_id, seat_id)
+WHERE cancelled_at IS NULL;</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>02</span>
+                    <div><h3>Use compare-and-set for state transitions</h3><p>An UPDATE predicate can combine validation and mutation atomically. A zero row count means another transaction changed the expected state or the business condition is false. This avoids a lost update without holding an application-side value between SELECT and UPDATE. RETURNING gives the committed candidate state to the caller in the same round trip.</p><pre><code>UPDATE account
+SET balance = balance - $1, version = version + 1
+WHERE account_id = $2
+  AND version = $3
+  AND balance &gt;= $1
+RETURNING balance, version;</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>03</span>
+                    <div><h3>Claim queue rows without convoying</h3><p>FOR UPDATE SKIP LOCKED lets workers ignore rows already claimed by concurrent transactions. Keep selection and state transition in one statement so the lock cannot escape between calls. SKIP LOCKED does not provide fairness and a failed worker still requires lease expiry or transaction rollback. Processing outside the transaction requires an idempotency key.</p><pre><code>WITH claim AS (
+  SELECT job_id FROM job
+  WHERE state = &#x27;ready&#x27; AND run_after &lt;= now()
+  ORDER BY priority DESC, job_id
+  FOR UPDATE SKIP LOCKED LIMIT 10
+)
+UPDATE job j SET state = &#x27;running&#x27;, worker_id = $1, started_at = now()
+FROM claim WHERE j.job_id = claim.job_id
+RETURNING j.*;</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>04</span>
+                    <div><h3>Retry a transaction, not a statement fragment</h3><p>Deadlock victims and serialization failures roll back the transaction&#x27;s logical decision. Retrying only the final UPDATE reuses observations from a failed snapshot and is incorrect. Begin again, repeat every read and check, preserve a request id for deduplication, and bound retries with jittered backoff. PostgreSQL reports serialization failure as 40001 and deadlock detected as 40P01.</p><pre><code>retry transaction on SQLSTATE in (&#x27;40001&#x27;, &#x27;40P01&#x27;):
+  BEGIN
+  read invariant state
+  perform conditional writes
+  COMMIT
+-- External messages use an outbox row committed with the data.</code></pre></div>
+                </article>
+            </section>
       <section class="chapter resources" id="sources">
-        <p class="chapter__number">07</p><h2>Source articles</h2>
-        <p class="chapter__intro">The experiments and comparisons behind this guide.</p>
+                <p class="chapter__number">08</p><h2>Source articles</h2>
+                <p class="chapter__intro">Optional deep dives with the complete experiments and product-version context behind this guide.</p>
         <div class="source-grid">        <a href="https://medium.com/@FranckPachot/oracle-write-consistency-bug-and-scalable-multi-thread-de-queuing-abb00ed5bae7"><strong>Oracle write consistency, bug, and scalable multi-thread de-queuing</strong><span>medium · 2018-09-27</span></a>
         <a href="https://www.dbi-services.com/blog/oracle-partitioned-sequences-a-future-new-feature-in-12c/"><strong>Oracle Partitioned Sequences – a future new feature in 12c?</strong><span>dbi-services · 2014-02-20</span></a>
         <a href="https://dev.to/yugabyte/dirty-writes-insert-on-conflict-do-update-read-committed-isolation-level-and-lost-update-13hk"><strong>Dirty Writes, INSERT ... ON CONFLICT DO UPDATE, Read Committed Isolation Level and Lost Update</strong><span>dev.to · 2023-11-08</span></a>

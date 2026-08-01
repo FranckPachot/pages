@@ -35,6 +35,7 @@
         <li><a href="#chapter-4">The index is the pagination engine</a></li>
         <li><a href="#chapter-5">Joins need bounded inner work</a></li>
         <li><a href="#chapter-6">Partitions need a global order</a></li>
+        <li><a href="#field-manual">Field manual</a></li>
         <li><a href="#sources">Sources</a></li>
       </ol><div class="contents__status"><span></span> Living minibook</div></aside>
     <main class="book">
@@ -43,7 +44,7 @@
         <h1>Scalable Pagination</h1>
         <p class="hero__subtitle">Stable pages without counting from zero</p>
         <p class="hero__lede">Design deterministic, index-backed pagination that remains fast and understandable across joins, partitions, and distributed SQL.</p>
-        <div class="hero__meta"><span>Franck Pachot</span><span>6 chapters</span><span>keyset pagination · indexes · distributed queries</span></div>
+        <div class="hero__meta"><span>Franck Pachot</span><span>7 chapters</span><span>keyset pagination · indexes · distributed queries</span></div>
       </header>
       <section class="premise"><p>Build the mental model before choosing the mechanism.</p><span>Each guide synthesizes experiments from the article archive and links every source for deeper evidence.</span></section>
       <section class="chapter" id="chapter-1">
@@ -82,9 +83,47 @@
         <p class="chapter__intro">Each partition can return its local top rows, but a merge must choose the global next row. LIMIT pushdown reduces work only when partition ranges and ordering allow the executor to prove which candidates matter.</p>
         <ul class="principles"><li>Align time partitions with time-oriented cursor keys.</li><li>Expect a merge step across active partitions.</li><li>Retain the partition key in cursors when it narrows routing.</li></ul>
       </section>
+            <section class="chapter field-manual" id="field-manual">
+                <p class="chapter__number">07</p><h2>Field manual</h2>
+                <p class="chapter__intro">Concrete mechanics, diagnostic evidence, and executable patterns to carry into a real system.</p>
+        <article class="technical-section">
+                    <span>01</span>
+                    <div><h3>Seek from the last tuple</h3><p>For descending order, the next page predicate must be lexicographically less than the final tuple of the current page. PostgreSQL row-value comparison implements this directly. The index uses equality on tenant_id, then seeks into created_at and id. LIMIT 51 returns fifty visible rows plus one look-ahead row without a separate count.</p><pre><code>SELECT id, created_at, summary
+FROM event
+WHERE tenant_id = $1
+  AND (created_at, id) &lt; ($2, $3)
+ORDER BY created_at DESC, id DESC
+LIMIT 51;</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>02</span>
+                    <div><h3>Design the matching index</h3><p>The B-tree key must follow predicate and order semantics. An equality prefix can be followed by the ordered cursor tuple. INCLUDE carries small payload columns without changing order. PostgreSQL can scan a B-tree backward, but mixed directions must match the index definition or require a sort. Null cursor values need explicit policy because row comparison with null is unknown.</p><pre><code>CREATE INDEX event_page_ix
+ON event (tenant_id, created_at DESC, id DESC)
+INCLUDE (summary);</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>03</span>
+                    <div><h3>Page parent entities before joining children</h3><p>A one-to-many join changes the unit from orders to order items. Applying LIMIT after the join can return only part of the desired parent set, while applying it carelessly before filters changes semantics. Select the bounded parent keys in a materialized CTE, then join their children. This also bounds distributed inner lookups.</p><pre><code>WITH page AS MATERIALIZED (
+  SELECT id, created_at FROM orders
+  WHERE customer_id = $1
+    AND (created_at, id) &lt; ($2, $3)
+  ORDER BY created_at DESC, id DESC LIMIT 20
+)
+SELECT p.id, p.created_at, i.sku, i.quantity
+FROM page p LEFT JOIN order_item i ON i.order_id = p.id
+ORDER BY p.created_at DESC, p.id DESC, i.line_no;</code></pre></div>
+                </article>
+        <article class="technical-section">
+                    <span>04</span>
+                    <div><h3>Define consistency between page requests</h3><p>Keyset pagination prevents duplicates caused by ordinal shifts before the cursor, but it is not a transaction snapshot across HTTP requests. Rows inserted behind the cursor may be omitted and updates to ordering columns can move rows. For a stable export, hold a database snapshot or materialize identifiers. For an activity feed, document live semantics and keep cursor columns immutable where possible.</p><pre><code>-- PostgreSQL stable export pattern
+BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY;
+SELECT pg_export_snapshot();
+-- Worker transactions import the snapshot before their first query.</code></pre></div>
+                </article>
+            </section>
       <section class="chapter resources" id="sources">
-        <p class="chapter__number">07</p><h2>Source articles</h2>
-        <p class="chapter__intro">The experiments and comparisons behind this guide.</p>
+                <p class="chapter__number">08</p><h2>Source articles</h2>
+                <p class="chapter__intro">Optional deep dives with the complete experiments and product-version context behind this guide.</p>
         <div class="source-grid">        <a href="https://dev.to/franckpachot/pagination-with-an-offset-is-better-without-offset-5fah"><strong>Pagination with an OFFSET is better without OFFSET</strong><span>dev.to · 2023-12-09</span></a>
         <a href="https://www.dbi-services.com/blog/result-cache-and-12c-fetch-first-n-rows/"><strong>Result Cache and 12c ‘fetch first n rows’</strong><span>dbi-services · 2015-10-04</span></a>
         <a href="https://dev.to/yugabyte/batched-nested-loop-for-join-with-pagination-621"><strong>Batched Nested Loop for Join With Large Pagination</strong><span>dev.to · 2023-12-06</span></a>
