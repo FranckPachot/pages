@@ -371,20 +371,13 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         "Microsoft HorizonDB": "azure.svg",
         "SQLite": "sqlite.svg",
     }
-    short_names = {
-        "Oracle Database": "Oracle",
-        "Amazon Aurora": "Aurora",
-        "Amazon DynamoDB": "DynamoDB",
-        "Microsoft SQL Server": "SQL Server",
-        "Microsoft HorizonDB": "HorizonDB",
-    }
     initials = {
         "Oracle Database": "O", "PostgreSQL": "PG", "YugabyteDB": "YB", "MongoDB": "M",
         "Amazon Aurora": "A", "Amazon DynamoDB": "D", "MySQL": "MY", "Microsoft SQL Server": "MS",
         "DocumentDB": "D", "CockroachDB": "CR", "Db2": "2", "Cassandra": "C",
         "Microsoft HorizonDB": "H", "SQLite": "SQ",
     }
-    circumference = 2 * math.pi * 140
+    circumference = 2 * math.pi * 126
     offset = 0.0
     arcs = []
     legend = []
@@ -392,30 +385,31 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         color = brand_colors[name]
         length = circumference * count / all_total
         arcs.append(
-            f'<circle cx="865" cy="250" r="140" fill="none" stroke="{color}" stroke-width="52" '
+            f'<circle cx="865" cy="230" r="126" fill="none" stroke="{color}" stroke-width="48" '
             f'stroke-dasharray="{length:.2f} {circumference - length:.2f}" stroke-dashoffset="{-offset:.2f}"/>'
         )
         offset += length
-        column = position % 3
-        row = position // 3
-        legend_x = 655 + column * 178
-        legend_y = 440 + row * 32
+        column = position % 7
+        row = position // 7
+        legend_x = 638 + column * 74
+        legend_y = 410 + row * 74
         mark = initials.get(name, name[:2].upper())
         logo_path = root / "home" / "database-logos" / logo_files[name]
         if logo_path.exists():
             logo = (
-                f'<rect x="{legend_x}" y="{legend_y - 17}" width="24" height="24" rx="5" fill="white" opacity=".92"/>'
-                f'<image href="database-logos/{logo_files[name]}" x="{legend_x + 2}" y="{legend_y - 15}" '
-                'width="20" height="20" preserveAspectRatio="xMidYMid meet"/>'
+                f'<image href="database-logos/{logo_files[name]}" x="{legend_x + 14}" y="{legend_y + 7}" '
+                'width="42" height="36" preserveAspectRatio="xMidYMid meet"/>'
             )
         else:
             logo = (
-                f'<g class="logo-mark"><rect x="{legend_x}" y="{legend_y - 16}" width="22" height="22" rx="6" fill="{color}"/>'
-                f'<text x="{legend_x + 11}" y="{legend_y - 1}" text-anchor="middle">{mark}</text></g>'
+                f'<g class="logo-mark"><rect x="{legend_x + 17}" y="{legend_y + 8}" width="36" height="34" fill="{color}"/>'
+                f'<text x="{legend_x + 35}" y="{legend_y + 30}" text-anchor="middle">{mark}</text></g>'
             )
         legend.append(
-            logo
-            + f'<text x="{legend_x + 29}" y="{legend_y}" class="legend">{html.escape(short_names.get(name, name))} {count:,}</text>'
+            f'<g class="logo-tile"><title>{html.escape(name)}: {count:,} posts</title>'
+            f'<rect x="{legend_x}" y="{legend_y}" width="70" height="70" fill="#fff" fill-opacity=".78" stroke="{color}" stroke-width="2.5"/>'
+            + logo
+            + f'<text x="{legend_x + 35}" y="{legend_y + 61}" text-anchor="middle" class="tile-count">{count:,}</text></g>'
         )
     svg = f'''<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1200" height="630" viewBox="0 0 1200 630">
   <defs>
@@ -426,8 +420,8 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
       .title {{ font-family: "Georgia", serif; font-size: 56px; font-weight: 700; }}
       .count {{ font-size: 24px; font-weight: 700; fill: #c74634; }}
       .word {{ font-weight: 700; fill: #3e514d; }}
-    .legend {{ font-size: 11px; font-weight: 700; fill: #4e5e5a; }}
-    .logo-mark text {{ font-size: 8px; font-weight: 800; fill: white; }}
+    .tile-count {{ font-size: 13px; font-weight: 800; fill: #273a36; }}
+    .logo-mark text {{ font-size: 9px; font-weight: 800; fill: white; }}
       .chart-label {{ font-size: 15px; font-weight: 700; letter-spacing: 1px; fill: #65736f; }}
       .chart-total {{ font-family: "Georgia", serif; font-size: 44px; font-weight: 700; }}
       .chart-note {{ font-size: 13px; fill: #65736f; }}
@@ -453,11 +447,11 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
   <text x="92" y="530" class="word" font-size="20">JSON</text>
   <text x="160" y="530" class="word" font-size="28">PERFORMANCE</text>
     <text x="865" y="67" text-anchor="middle" class="chart-label">POSTS BY DATABASE · ALL TAGS</text>
-    <g transform="rotate(-90 865 250)">{''.join(arcs)}</g>
-    <circle cx="865" cy="250" r="112" fill="#f4f2ec"/>
-    <text x="865" y="242" text-anchor="middle" class="chart-total">{all_total:,}</text>
-    <text x="865" y="270" text-anchor="middle" class="chart-note">database mentions</text>
-    <text x="865" y="293" text-anchor="middle" class="chart-note">posts may have several tags</text>
+    <g transform="rotate(-90 865 230)">{''.join(arcs)}</g>
+    <circle cx="865" cy="230" r="102" fill="#f4f2ec"/>
+    <text x="865" y="222" text-anchor="middle" class="chart-total">{all_total:,}</text>
+    <text x="865" y="248" text-anchor="middle" class="chart-note">database mentions</text>
+    <text x="865" y="271" text-anchor="middle" class="chart-note">posts may have several tags</text>
   {''.join(legend)}
 </svg>'''
     svg_path = root / "home" / "social-card.svg"
