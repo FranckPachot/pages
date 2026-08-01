@@ -17,6 +17,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from google_analytics import install_google_tags
+
 
 DEVTO_API = "https://dev.to/api"
 DBI_API = "https://www.dbi-services.com/blog/wp-json/wp/v2"
@@ -751,7 +753,9 @@ def main() -> None:
     }
     manifest_path = root / "archive-manifest.json"
     write_json_atomic(manifest_path, manifest)
+    analytics_changed, analytics_tagged = install_google_tags(root)
     print(f"Wrote {manifest_path} with {len(articles)} articles")
+    print(f"Google tag: updated {analytics_changed} pages; {analytics_tagged} pages tagged")
 
 
 if __name__ == "__main__":

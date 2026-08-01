@@ -7,6 +7,7 @@ import html
 import json
 from pathlib import Path
 
+from google_analytics import add_google_tag
 from minibook_expansion import EXTRA_BOOKS, EXTRA_TECHNICAL_GUIDES
 from minibook_details import TECHNICAL_GUIDES
 
@@ -372,8 +373,8 @@ def build(root: Path) -> None:
         technical_guide = TECHNICAL_GUIDES.get(book["slug"], [])
         if len(technical_guide) < 4:
             raise ValueError(f"Technical guide requires at least four sections: {book['slug']}")
-        (output / "index.html").write_text(render_book(book, sources, technical_guide), encoding="utf-8")
-    (output_root / "index.html").write_text(render_index(), encoding="utf-8")
+        (output / "index.html").write_text(add_google_tag(render_book(book, sources, technical_guide)), encoding="utf-8")
+    (output_root / "index.html").write_text(add_google_tag(render_index()), encoding="utf-8")
     print(f"Built the collection index and {len(BOOKS)} minibooks")
 
 

@@ -17,6 +17,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from google_analytics import install_google_tags
+
 
 SITE_URL = "https://franckpachot.github.io/pages/"
 
@@ -535,11 +537,13 @@ def main() -> None:
     write_social_preview(root, catalog)
     write_sitemap(root / "sitemap.xml", catalog)
     write_sitemap(root / "home" / "sitemap.xml", catalog)
+    analytics_changed, analytics_tagged = install_google_tags(root)
     print(
         f"Wrote {output} with {catalog['publication_count']} publications, "
         f"{len(catalog['database_counts'])} database facets, and "
         f"{len(catalog['category_counts'])} categories"
     )
+    print(f"Google tag: updated {analytics_changed} pages; {analytics_tagged} pages tagged")
 
 
 if __name__ == "__main__":
