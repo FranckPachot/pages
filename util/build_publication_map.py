@@ -52,6 +52,20 @@ DATABASE_RULES = {
     "SAP HANA": r"\bsap hana\b|\bhana database\b",
 }
 
+
+def load_ai_descriptions(root: Path) -> dict[str, str]:
+    descriptions: dict[str, str] = {}
+    description_dir = root / "util" / "publication_descriptions"
+    for path in sorted(description_dir.glob("*.json")):
+        batch = json.loads(path.read_text(encoding="utf-8"))
+        if "descriptions" in batch:
+            for source, source_descriptions in batch["descriptions"].items():
+                for source_id, description in source_descriptions.items():
+                    descriptions[f"{source}:{source_id}"] = description
+        else:
+            descriptions.update(batch)
+    return descriptions
+
 CATEGORY_RULES = {
     "Query Optimization": r"\boptimizer\b|\bquery planner\b|\bexecution plan\b|\bexplain plan\b|\bcardinality\b|\bcbo\b|\bjoin order\b",
     "Indexing": r"\bindex(?:es|ing)?\b|\bb[+-]?tree\b|\bbitmap scan\b|\bindex scan\b",
@@ -222,6 +236,7 @@ def publication_urls(root: Path, article: dict[str, Any]) -> tuple[str, str]:
 
 def build_catalog(root: Path) -> dict[str, Any]:
     manifest = json.loads((root / "archive-manifest.json").read_text(encoding="utf-8"))
+    ai_descriptions = load_ai_descriptions(root)
     publications = []
     for article in manifest["articles"]:
         body, description = load_snapshot(root, article)
@@ -234,7 +249,8 @@ def build_catalog(root: Path) -> dict[str, Any]:
             databases.remove("Microsoft HorizonDB")
         versions = infer_versions(signal, databases)
         categories = infer_categories(signal)
-        summary = description or body[:320]
+        article_id = f"{article['source']}:{article['source_id']}"
+        summary = ai_descriptions.get(article_id) or description or body[:320]
         date = article["published_at"][:10]
         archive_url = article["archive_path"]
         read_url, snapshot_url = publication_urls(root, article)
@@ -243,7 +259,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         ).casefold()
         publications.append(
             {
-                "id": f"{article['source']}:{article['source_id']}",
+                "id": article_id,
                 "title": title,
                 "date": date,
                 "year": int(date[:4]),
