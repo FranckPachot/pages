@@ -12,6 +12,10 @@ from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
+
+
+SITE_URL = "https://franckpachot.github.io/pages/"
 
 
 SOURCE_NAMES = {
@@ -199,8 +203,9 @@ def build_catalog(root: Path) -> dict[str, Any]:
         categories = infer_categories(signal)
         summary = description or body[:320]
         date = article["published_at"][:10]
-        archive_url = "../" + article["archive_path"]
+        archive_url = article["archive_path"]
         read_url = archive_url if article["source"] in {"dbi-services", "medium"} else article["canonical_url"]
+        snapshot_url = archive_url if archive_url.endswith((".html", "/index.html")) and read_url != archive_url else ""
         search_text = normalize_text(
             " ".join([title, summary, " ".join(tags + categories + databases + versions), body[:3500]])
         ).casefold()
@@ -214,6 +219,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
                 "source_key": article["source"],
                 "read_url": read_url,
                 "archive_url": archive_url,
+                "snapshot_url": snapshot_url,
                 "canonical_url": article["canonical_url"],
                 "summary": summary[:360],
                 "tags": tags,
@@ -250,6 +256,75 @@ def write_catalog(path: Path, catalog: dict[str, Any]) -> None:
     os.replace(temporary_path, path)
 
 
+def publication_markup(publication: dict[str, Any]) -> str:
+    title = html.escape(publication["title"])
+    summary = html.escape(publication["summary"])
+    url = html.escape(publication["read_url"], quote=True)
+    external = ' target="_blank" rel="noopener"' if publication["read_url"].startswith("http") else ""
+    summary_markup = f'\n          <p class="publication__summary">{summary}</p>' if summary else ""
+    source_key = html.escape(publication["source_key"], quote=True)
+    source = html.escape(publication["source"])
+    snapshot_markup = ""
+    if publication["snapshot_url"]:
+        snapshot_url = html.escape(publication["snapshot_url"], quote=True)
+        snapshot_markup = f'<a class="snapshot-link" href="{snapshot_url}">Archived copy ↗</a>'
+    return (
+        '      <article class="publication">\n'
+        f'        <time class="publication__date" datetime="{publication["date"]}">{publication["date"]}</time>\n'
+        '        <div>\n'
+        f'          <a class="publication__title" href="{url}"{external}>{title}</a>{summary_markup}\n'
+        '        </div>\n'
+        f'        <div class="publication__meta"><span class="badge badge--source"><span class="source-logo source-logo--{source_key}" aria-hidden="true"></span>{source}</span>{snapshot_markup}</div>\n'
+        '      </article>'
+    )
+
+
+def replace_generated_block(document: str, name: str, content: str) -> str:
+    pattern = rf"(?s)(<!-- GENERATED_{name}_START -->).*?(<!-- GENERATED_{name}_END -->)"
+    updated, count = re.subn(pattern, lambda match: f"{match.group(1)}\n{content}\n        {match.group(2)}", document)
+    if count != 1:
+        raise ValueError(f"Expected one generated {name} block, found {count}")
+    return updated
+
+
+def write_root_index(path: Path, catalog: dict[str, Any]) -> None:
+    document = path.read_text(encoding="utf-8")
+    recent = sorted(catalog["publications"], key=lambda publication: publication["date"], reverse=True)[:80]
+    results = "\n".join(publication_markup(publication) for publication in recent)
+    item_list = {
+        "@context": "https://schema.org",
+        "@type": "ItemList",
+        "name": "Recent database articles by Franck Pachot",
+        "numberOfItems": len(catalog["publications"]),
+        "itemListElement": [
+            {
+                "@type": "ListItem",
+                "position": position,
+                "url": publication["canonical_url"],
+                "name": publication["title"],
+            }
+            for position, publication in enumerate(recent[:20], 1)
+        ],
+    }
+    structured_data = f'  <script type="application/ld+json">{json.dumps(item_list, ensure_ascii=False, separators=(",", ":"))}</script>'
+    document = replace_generated_block(document, "RESULTS", results)
+    document = replace_generated_block(document, "ITEM_LIST", structured_data)
+    path.write_text(document, encoding="utf-8")
+
+
+def write_sitemap(path: Path, catalog: dict[str, Any]) -> None:
+    local_pages = [
+        publication for publication in catalog["publications"]
+        if publication["source_key"] in {"dbi-services", "medium"}
+    ]
+    entries = [f"  <url><loc>{SITE_URL}</loc></url>"]
+    for publication in local_pages:
+        url = SITE_URL + quote(publication["archive_url"], safe="/-._~")
+        entries.append(f"  <url><loc>{html.escape(url)}</loc><lastmod>{publication['date']}</lastmod></url>")
+    sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + "\n".join(entries) + "\n</urlset>\n"
+    path.write_text(sitemap, encoding="utf-8")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
@@ -258,6 +333,8 @@ def main() -> None:
     output = root / "home" / "publications.js"
     catalog = build_catalog(root)
     write_catalog(output, catalog)
+    write_root_index(root / "index.html", catalog)
+    write_sitemap(root / "sitemap.xml", catalog)
     print(
         f"Wrote {output} with {catalog['publication_count']} publications, "
         f"{len(catalog['database_counts'])} database facets, and "

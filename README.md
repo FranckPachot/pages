@@ -22,9 +22,9 @@ The command rescans the local DBI Services and Medium exports; discovers current
 
 Use `--refresh-devto`, `--refresh-yugabyte`, or `--refresh-techcommunity` to replace existing snapshots from one source. The corresponding `--skip-*` options avoid contacting that source, while `--offline` rebuilds the manifest entirely from local snapshots.
 
-## Browse the publication map
+## Browse the publication index
 
-The searchable map in [`home/`](home/) groups all publications by year, source, database, version, category, and tag. It also provides full-text search across titles, summaries, tags, and archived article text.
+The searchable index at the [site root](index.html) groups all publications by year, source, database, version, category, and tag. It also provides full-text search across titles, summaries, tags, and archived article text. The generated root page includes crawlable recent article links and structured data; `sitemap.xml` and `robots.txt` support search-engine discovery.
 
 Regenerate its browser catalog after refreshing the archive:
 
@@ -32,4 +32,4 @@ Regenerate its browser catalog after refreshing the archive:
 python util/build_publication_map.py
 ```
 
-Then open `home/index.html` directly or serve the repository with any static HTTP server.
+Then open `index.html` directly or serve the repository with any static HTTP server.

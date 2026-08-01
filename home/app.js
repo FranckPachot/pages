@@ -135,6 +135,15 @@
     return element;
   }
 
+  function sourceBadge(publication) {
+    const element = badge(publication.source, "source");
+    const logo = document.createElement("span");
+    logo.className = `source-logo source-logo--${publication.source_key}`;
+    logo.setAttribute("aria-hidden", "true");
+    element.prepend(logo);
+    return element;
+  }
+
   function publicationRow(publication) {
     const article = document.createElement("article");
     article.className = "publication";
@@ -163,15 +172,17 @@
 
     const metadata = document.createElement("div");
     metadata.className = "publication__meta";
-    metadata.append(badge(publication.source, "source"));
+    metadata.append(sourceBadge(publication));
     publication.databases.slice(0, 3).forEach((value) => metadata.append(badge(value, "database")));
     publication.versions.slice(0, 2).forEach((value) => metadata.append(badge(value, "version")));
     publication.categories.slice(0, 2).forEach((value) => metadata.append(badge(value, "category")));
-    const snapshot = document.createElement("a");
-    snapshot.className = "snapshot-link";
-    snapshot.href = publication.archive_url;
-    snapshot.textContent = "Snapshot ↗";
-    metadata.append(snapshot);
+    if (publication.snapshot_url) {
+      const snapshot = document.createElement("a");
+      snapshot.className = "snapshot-link";
+      snapshot.href = publication.snapshot_url;
+      snapshot.textContent = "Archived copy ↗";
+      metadata.append(snapshot);
+    }
 
     article.append(date, body, metadata);
     return article;
@@ -240,7 +251,7 @@
     elements.results.replaceChildren(...publications.slice(0, state.visible).map(publicationRow));
     elements.emptyState.hidden = publications.length !== 0;
     elements.loadMore.hidden = publications.length <= state.visible;
-    elements.loadMore.textContent = `Show ${Math.min(pageSize, publications.length - state.visible)} more`;
+    elements.loadMore.textContent = `Show ${Math.min(pageSize, Math.max(0, publications.length - state.visible))} more`;
     renderActiveFilters();
     renderTimeline(publications);
     updateUrl();
