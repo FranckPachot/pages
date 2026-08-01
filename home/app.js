@@ -37,6 +37,22 @@
   const sourceNames = Object.fromEntries(
     catalog.publications.map((publication) => [publication.source_key, publication.source]),
   );
+  const databaseLogoFiles = {
+    "Amazon Aurora": "aurora.svg",
+    "Amazon DynamoDB": "dynamodb.svg",
+    Cassandra: "cassandra.svg",
+    CockroachDB: "cockroachdb.svg",
+    Db2: "db2.svg",
+    DocumentDB: "documentdb.svg",
+    "Microsoft HorizonDB": "azure.svg",
+    "Microsoft SQL Server": "sql-server.svg",
+    MongoDB: "mongodb.svg",
+    MySQL: "mysql.svg",
+    "Oracle Database": "oracle.svg",
+    PostgreSQL: "postgresql.svg",
+    SQLite: "sqlite.svg",
+    YugabyteDB: "yugabytedb.svg",
+  };
 
   function option(select, value, label) {
     const element = document.createElement("option");
@@ -134,6 +150,18 @@
     const key = value.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
     logo.className = `database-logo database-logo--${key}`;
     logo.setAttribute("aria-hidden", "true");
+    const logoFile = databaseLogoFiles[value];
+    if (logoFile) {
+      const image = document.createElement("img");
+      image.src = `home/database-logos/${logoFile}`;
+      image.alt = "";
+      image.width = 16;
+      image.height = 16;
+      image.decoding = "async";
+      logo.append(image);
+    } else {
+      logo.classList.add("database-logo--fallback");
+    }
     element.prepend(logo);
     return element;
   }

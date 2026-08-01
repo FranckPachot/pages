@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import json
 import math
@@ -206,6 +207,19 @@ def infer_versions(signal: str, databases: list[str]) -> list[str]:
     return unique_strings(versions)
 
 
+def publication_urls(root: Path, article: dict[str, Any]) -> tuple[str, str]:
+    archive_url = article["archive_path"]
+    if article["source"] == "dbi-services" and archive_url.endswith(".json"):
+        legacy_url = f"2013-2018/{article['source_id']}/index.html"
+        if (root / legacy_url).is_file():
+            return legacy_url, ""
+        return article["canonical_url"], ""
+
+    read_url = archive_url if article["source"] == "medium" else article["canonical_url"]
+    snapshot_url = archive_url if archive_url.endswith((".html", "/index.html")) and read_url != archive_url else ""
+    return read_url, snapshot_url
+
+
 def build_catalog(root: Path) -> dict[str, Any]:
     manifest = json.loads((root / "archive-manifest.json").read_text(encoding="utf-8"))
     publications = []
@@ -223,8 +237,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         summary = description or body[:320]
         date = article["published_at"][:10]
         archive_url = article["archive_path"]
-        read_url = archive_url if article["source"] in {"dbi-services", "medium"} else article["canonical_url"]
-        snapshot_url = archive_url if archive_url.endswith((".html", "/index.html")) and read_url != archive_url else ""
+        read_url, snapshot_url = publication_urls(root, article)
         search_text = normalize_text(
             " ".join([title, summary, " ".join(tags + categories + databases + versions), body[:3500]])
         ).casefold()
@@ -267,12 +280,14 @@ def build_catalog(root: Path) -> dict[str, Any]:
     }
 
 
-def write_catalog(path: Path, catalog: dict[str, Any]) -> None:
+def write_catalog(path: Path, catalog: dict[str, Any]) -> str:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(catalog, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    content = f"window.PUBLICATION_CATALOG={payload};\n"
     temporary_path = path.with_suffix(path.suffix + ".tmp")
-    temporary_path.write_text(f"window.PUBLICATION_CATALOG={payload};\n", encoding="utf-8")
+    temporary_path.write_text(content, encoding="utf-8")
     os.replace(temporary_path, path)
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()[:12]
 
 
 def publication_markup(publication: dict[str, Any]) -> str:
@@ -306,7 +321,7 @@ def replace_generated_block(document: str, name: str, content: str) -> str:
     return updated
 
 
-def write_root_index(path: Path, catalog: dict[str, Any]) -> None:
+def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) -> None:
     document = path.read_text(encoding="utf-8")
     recent = sorted(catalog["publications"], key=lambda publication: publication["date"], reverse=True)[:80]
     results = "\n".join(publication_markup(publication) for publication in recent)
@@ -328,6 +343,13 @@ def write_root_index(path: Path, catalog: dict[str, Any]) -> None:
     structured_data = f'  <script type="application/ld+json">{json.dumps(item_list, ensure_ascii=False, separators=(",", ":"))}</script>'
     document = replace_generated_block(document, "RESULTS", results)
     document = replace_generated_block(document, "ITEM_LIST", structured_data)
+    document, count = re.subn(
+        r'(<script\s+src="home/publications\.js)(?:\?v=[^"]*)?("></script>)',
+        lambda match: f"{match.group(1)}?v={catalog_version}{match.group(2)}",
+        document,
+    )
+    if count != 1:
+        raise ValueError(f"Expected one publications.js script, found {count}")
     path.write_text(document, encoding="utf-8")
 
 
@@ -483,34 +505,16 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         raise RuntimeError("Chrome or Edge is required to create home/social-card.png")
 
 
-def write_sitemap(path: Path, catalog: dict[str, Any]) -> None:
+def write_sitemap(path: Path, catalog: dict[str, Any], root: Path) -> None:
     local_pages = [
         publication for publication in catalog["publications"]
         if publication["source_key"] in {"dbi-services", "medium"}
     ]
-    static_pages = [
-        "",
-        "minibook/",
-        "minibook/sql-isolation/",
-        "minibook/indexes-and-access-paths/",
-        "minibook/postgresql-query-planning/",
-        "minibook/distributed-sql-for-postgresql/",
-        "minibook/foreign-keys-and-concurrency/",
-        "minibook/sql-statement-lifecycle/",
-        "minibook/database-time-and-ordering/",
-        "minibook/scalable-pagination/",
-        "minibook/postgresql-mvcc-backstage/",
-        "minibook/schema-design-for-concurrency/",
-        "minibook/oracle-to-postgresql/",
-        "minibook/wal-redo-and-durability/",
-        "minibook/sql-plan-management/",
-        "minibook/oracle-multitenant-internals/",
-        "minibook/locks-blocking-and-deadlocks/",
-        "minibook/partitioning-and-sharding/",
-        "minibook/optimizer-statistics/",
-        "minibook/replication-and-high-availability/",
-        "minibook/database-observability/",
+    minibook_pages = [
+        f"{index_path.parent.relative_to(root).as_posix()}/"
+        for index_path in sorted((root / "minibook").glob("*/index.html"))
     ]
+    static_pages = ["", "minibook/", *minibook_pages]
     entries = [f"  <url><loc>{SITE_URL}{page}</loc></url>" for page in static_pages]
     for publication in local_pages:
         url = SITE_URL + quote(publication["archive_url"], safe="/-._~")
@@ -526,11 +530,11 @@ def main() -> None:
     root = args.root.resolve()
     output = root / "home" / "publications.js"
     catalog = build_catalog(root)
-    write_catalog(output, catalog)
-    write_root_index(root / "index.html", catalog)
+    catalog_version = write_catalog(output, catalog)
+    write_root_index(root / "index.html", catalog, catalog_version)
     write_social_preview(root, catalog)
-    write_sitemap(root / "sitemap.xml", catalog)
-    write_sitemap(root / "home" / "sitemap.xml", catalog)
+    write_sitemap(root / "sitemap.xml", catalog, root)
+    write_sitemap(root / "home" / "sitemap.xml", catalog, root)
     analytics_changed, analytics_tagged = install_google_tags(root)
     print(
         f"Wrote {output} with {catalog['publication_count']} publications, "
