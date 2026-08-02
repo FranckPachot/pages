@@ -42,9 +42,9 @@
     "Amazon DynamoDB": "dynamodb.svg",
     Cassandra: "cassandra.svg",
     CockroachDB: "cockroachdb.svg",
-    Db2: "db2.svg",
+    Db2: "db2.png",
     DocumentDB: "documentdb.png",
-    "Microsoft HorizonDB": "azure.svg",
+    "Azure HorizonDB": "azure.svg",
     "Microsoft SQL Server": "sql-server.svg",
     MongoDB: "mongodb.svg",
     MySQL: "mysql.svg",
@@ -53,6 +53,7 @@
     SQLite: "sqlite.svg",
     YugabyteDB: "yugabytedb.svg",
   };
+  const databaseColors = catalog.database_colors;
 
   function option(select, value, label) {
     const element = document.createElement("option");
@@ -86,8 +87,19 @@
     }, {});
   }
 
+  function yearDatabaseCounts(publications = catalog.publications) {
+    return publications.reduce((counts, publication) => {
+      counts[publication.year] ||= {};
+      publication.databases.forEach((database) => {
+        counts[publication.year][database] = (counts[publication.year][database] || 0) + 1;
+      });
+      return counts;
+    }, {});
+  }
+
   function renderTimeline(publications = catalog.publications) {
     const counts = yearCounts(publications);
+    const databaseCounts = yearDatabaseCounts(publications);
     const maximum = Math.max(...Object.values(counts), 1);
     elements.timeline.replaceChildren();
     for (let year = catalog.year_min; year <= catalog.year_max; year += 1) {
@@ -98,7 +110,25 @@
       button.classList.toggle("is-active", state.yearFrom === year && state.yearTo === year);
       button.setAttribute("role", "listitem");
       button.setAttribute("aria-label", `${year}: ${count} publications`);
-      button.innerHTML = `<span class="year-bar__count">${count}</span><span class="year-bar__column" style="height:${Math.max(4, (count / maximum) * 100)}%"></span><span>${year}</span>`;
+      const countLabel = document.createElement("span");
+      countLabel.className = "year-bar__count";
+      countLabel.textContent = count;
+      const column = document.createElement("span");
+      column.className = "year-bar__column";
+      column.style.height = `${Math.max(4, (count / maximum) * 100)}%`;
+      Object.entries(databaseCounts[year] || {})
+        .sort(([left], [right]) => Object.keys(databaseColors).indexOf(left) - Object.keys(databaseColors).indexOf(right))
+        .forEach(([database, mentions]) => {
+          const segment = document.createElement("span");
+          segment.className = "year-bar__segment";
+          segment.style.backgroundColor = databaseColors[database] || databaseColors["Database agnostic"];
+          segment.style.flexGrow = mentions;
+          segment.title = `${database}: ${mentions} ${mentions === 1 ? "mention" : "mentions"}`;
+          column.append(segment);
+        });
+      const yearLabel = document.createElement("span");
+      yearLabel.textContent = year;
+      button.append(countLabel, column, yearLabel);
       button.addEventListener("click", () => {
         state.yearFrom = year;
         state.yearTo = year;
@@ -107,6 +137,17 @@
       });
       elements.timeline.append(button);
     }
+    const visibleDatabases = new Set(publications.flatMap((publication) => publication.databases));
+    document.querySelector("#timeline-legend").replaceChildren(
+      ...Object.entries(databaseColors)
+        .filter(([database]) => visibleDatabases.has(database))
+        .map(([database, color]) => {
+          const item = document.createElement("span");
+          item.className = "timeline-legend__item";
+          item.innerHTML = `<i style="background:${color}"></i>${database}`;
+          return item;
+        }),
+    );
   }
 
   function matches(publication) {

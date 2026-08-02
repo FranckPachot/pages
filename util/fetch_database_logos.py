@@ -12,6 +12,9 @@ ICONIFY_URL = "https://api.iconify.design/{collection}/{name}.svg"
 DIRECT_LOGOS = {
     "documentdb.png": "https://documentdb.io/images/DocumentDB%20Logo%20-%20background%20removed.png",
 }
+CURATED_LOGOS = {
+    "db2.png": "https://www.ibm.com/content/adobe-cms/us/en/products/instana/supported-technologies/db2-monitoring/jcr:content/root/table_of_contents/body/content_section_styled/content-section-body/complex_narrative/logoimage.coreimg.png/1773950316806/ibm-db2.png",
+}
 LOGOS = {
     "postgresql.svg": [("logos", "postgresql")],
     "yugabytedb.svg": [("devicon", "yugabytedb")],
@@ -21,7 +24,6 @@ LOGOS = {
     "mysql.svg": [("logos", "mysql-icon")],
     "sql-server.svg": [("devicon", "microsoftsqlserver")],
     "cockroachdb.svg": [("logos", "cockroachdb"), ("simple-icons", "cockroachlabs")],
-    "db2.svg": [("carbon", "ibm-db2")],
     "cassandra.svg": [("logos", "cassandra")],
     "azure.svg": [("logos", "microsoft-azure")],
     "sqlite.svg": [("logos", "sqlite")],
@@ -47,6 +49,10 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     output = root / "home" / "database-logos"
     output.mkdir(parents=True, exist_ok=True)
+    for filename, source in CURATED_LOGOS.items():
+        if not (output / filename).is_file():
+            raise RuntimeError(f"Missing curated logo: {output / filename}")
+        print(f"{filename}: {source} (curated crop)")
     for filename, source in DIRECT_LOGOS.items():
         request = Request(source, headers={"User-Agent": "FranckPachot-pages-builder/1.0"})
         with urlopen(request, timeout=20) as response:

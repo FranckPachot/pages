@@ -35,7 +35,7 @@ SOURCE_NAMES = {
 }
 
 DATABASE_RULES = {
-    "Microsoft HorizonDB": r"\b(?:microsoft\s+)?(?:azure\s+)?horizondb\b",
+    "Azure HorizonDB": r"\b(?:microsoft\s+)?(?:azure\s+)?horizondb\b",
     "Oracle Database": r"\boracle(?: database)?\b|\bora-\d{4,5}\b|\b(?:9i|10g|11g|12c|18c|19c|21c|23c|23ai|26ai)\b",
     "PostgreSQL": r"\bpostgres(?:ql)?\b|\bpg_[a-z0-9_]+\b|\bpsql\b",
     "YugabyteDB": r"\byugabyte(?:db|d)?\b|\byb-[a-z0-9_-]+\b|\bycql\b|\bysql\b",
@@ -50,6 +50,23 @@ DATABASE_RULES = {
     "SQLite": r"\bsqlite\b",
     "Db2": r"\bdb2\b",
     "SAP HANA": r"\bsap hana\b|\bhana database\b",
+}
+DATABASE_COLORS = {
+    "Oracle Database": "#c74634",
+    "PostgreSQL": "#336791",
+    "YugabyteDB": "#ff5f3b",
+    "MongoDB": "#47a248",
+    "Amazon Aurora": "#8c4fff",
+    "Amazon DynamoDB": "#4053d6",
+    "MySQL": "#4479a1",
+    "Microsoft SQL Server": "#cc2927",
+    "DocumentDB": "#c925d1",
+    "CockroachDB": "#6933ff",
+    "Db2": "#0f62fe",
+    "Cassandra": "#1287b1",
+    "Azure HorizonDB": "#0078d4",
+    "SQLite": "#003b57",
+    "Database agnostic": "#aeb8b4",
 }
 
 
@@ -245,8 +262,8 @@ def build_catalog(root: Path) -> dict[str, Any]:
         signal = " ".join([title, " ".join(tags), body[:1800]])
         databases = infer_databases(signal)
         horizon_signal = " ".join([title, " ".join(tags), description])
-        if "Microsoft HorizonDB" in databases and not re.search(DATABASE_RULES["Microsoft HorizonDB"], horizon_signal, re.IGNORECASE):
-            databases.remove("Microsoft HorizonDB")
+        if "Azure HorizonDB" in databases and not re.search(DATABASE_RULES["Azure HorizonDB"], horizon_signal, re.IGNORECASE):
+            databases.remove("Azure HorizonDB")
         versions = infer_versions(signal, databases)
         categories = infer_categories(signal)
         article_id = f"{article['source']}:{article['source_id']}"
@@ -289,6 +306,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         "year_max": max(item["year"] for item in publications),
         "source_counts": manifest["sources"],
         "database_counts": dict(database_counts.most_common()),
+        "database_colors": DATABASE_COLORS,
         "category_counts": dict(category_counts.most_common()),
         "version_counts": dict(version_counts.most_common()),
         "tag_counts": dict(tag_counts.most_common()),
@@ -340,6 +358,7 @@ def replace_generated_block(document: str, name: str, content: str) -> str:
 def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) -> None:
     document = path.read_text(encoding="utf-8")
     app_version = hashlib.sha256((path.parent / "home" / "app.js").read_bytes()).hexdigest()[:12]
+    style_version = hashlib.sha256((path.parent / "home" / "style.css").read_bytes()).hexdigest()[:12]
     recent = sorted(catalog["publications"], key=lambda publication: publication["date"], reverse=True)[:80]
     results = "\n".join(publication_markup(publication) for publication in recent)
     item_list = {
@@ -374,6 +393,13 @@ def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) 
     )
     if count != 1:
         raise ValueError(f"Expected one app.js script, found {count}")
+    document, count = re.subn(
+        r'(<link\s+rel="stylesheet"\s+href="home/style\.css)(?:\?v=[^"]*)?("[^>]*>)',
+        lambda match: f"{match.group(1)}?v={style_version}{match.group(2)}",
+        document,
+    )
+    if count != 1:
+        raise ValueError(f"Expected one style.css link, found {count}")
     path.write_text(document, encoding="utf-8")
 
 
@@ -385,22 +411,7 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
     }
     chart_data = list(database_counts.items())
     all_total = sum(database_counts.values())
-    brand_colors = {
-        "Oracle Database": "#c74634",
-        "PostgreSQL": "#336791",
-        "YugabyteDB": "#ff5f3b",
-        "MongoDB": "#47a248",
-        "Amazon Aurora": "#8c4fff",
-        "Amazon DynamoDB": "#4053d6",
-        "MySQL": "#4479a1",
-        "Microsoft SQL Server": "#cc2927",
-        "DocumentDB": "#c925d1",
-        "CockroachDB": "#6933ff",
-        "Db2": "#0f62fe",
-        "Cassandra": "#1287b1",
-        "Microsoft HorizonDB": "#0078d4",
-        "SQLite": "#003b57",
-    }
+    brand_colors = DATABASE_COLORS
     logo_files = {
         "Oracle Database": "oracle-o.svg",
         "PostgreSQL": "postgresql.svg",
@@ -412,16 +423,16 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         "Microsoft SQL Server": "sql-server.svg",
         "DocumentDB": "documentdb.png",
         "CockroachDB": "cockroachdb.svg",
-        "Db2": "db2.svg",
+        "Db2": "db2.png",
         "Cassandra": "cassandra.svg",
-        "Microsoft HorizonDB": "azure.svg",
+        "Azure HorizonDB": "azure.svg",
         "SQLite": "sqlite.svg",
     }
     initials = {
         "Oracle Database": "O", "PostgreSQL": "PG", "YugabyteDB": "YB", "MongoDB": "M",
         "Amazon Aurora": "A", "Amazon DynamoDB": "D", "MySQL": "MY", "Microsoft SQL Server": "MS",
         "DocumentDB": "D", "CockroachDB": "CR", "Db2": "2", "Cassandra": "C",
-        "Microsoft HorizonDB": "H", "SQLite": "SQ",
+        "Azure HorizonDB": "H", "SQLite": "SQ",
     }
     circumference = 2 * math.pi * 126
     offset = 0.0
