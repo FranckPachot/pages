@@ -9,8 +9,10 @@ from urllib.request import Request, urlopen
 
 
 ICONIFY_URL = "https://api.iconify.design/{collection}/{name}.svg"
+DIRECT_LOGOS = {
+    "documentdb.png": "https://documentdb.io/images/DocumentDB%20Logo%20-%20background%20removed.png",
+}
 LOGOS = {
-    "oracle.svg": [("logos", "oracle")],
     "postgresql.svg": [("logos", "postgresql")],
     "yugabytedb.svg": [("devicon", "yugabytedb")],
     "mongodb.svg": [("logos", "mongodb-icon")],
@@ -18,7 +20,6 @@ LOGOS = {
     "dynamodb.svg": [("logos", "aws-dynamodb"), ("simple-icons", "amazondynamodb")],
     "mysql.svg": [("logos", "mysql-icon")],
     "sql-server.svg": [("devicon", "microsoftsqlserver")],
-    "documentdb.svg": [("logos", "aws-documentdb"), ("logos", "aws")],
     "cockroachdb.svg": [("logos", "cockroachdb"), ("simple-icons", "cockroachlabs")],
     "db2.svg": [("carbon", "ibm-db2")],
     "cassandra.svg": [("logos", "cassandra")],
@@ -46,6 +47,11 @@ def main() -> None:
     root = Path(__file__).resolve().parent.parent
     output = root / "home" / "database-logos"
     output.mkdir(parents=True, exist_ok=True)
+    for filename, source in DIRECT_LOGOS.items():
+        request = Request(source, headers={"User-Agent": "FranckPachot-pages-builder/1.0"})
+        with urlopen(request, timeout=20) as response:
+            (output / filename).write_bytes(response.read())
+        print(f"{filename}: {source}")
     for filename, candidates in LOGOS.items():
         content, source = fetch_logo(candidates)
         (output / filename).write_bytes(content)

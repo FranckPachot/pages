@@ -339,6 +339,7 @@ def replace_generated_block(document: str, name: str, content: str) -> str:
 
 def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) -> None:
     document = path.read_text(encoding="utf-8")
+    app_version = hashlib.sha256((path.parent / "home" / "app.js").read_bytes()).hexdigest()[:12]
     recent = sorted(catalog["publications"], key=lambda publication: publication["date"], reverse=True)[:80]
     results = "\n".join(publication_markup(publication) for publication in recent)
     item_list = {
@@ -366,6 +367,13 @@ def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) 
     )
     if count != 1:
         raise ValueError(f"Expected one publications.js script, found {count}")
+    document, count = re.subn(
+        r'(<script\s+src="home/app\.js)(?:\?v=[^"]*)?("[^>]*></script>)',
+        lambda match: f"{match.group(1)}?v={app_version}{match.group(2)}",
+        document,
+    )
+    if count != 1:
+        raise ValueError(f"Expected one app.js script, found {count}")
     path.write_text(document, encoding="utf-8")
 
 
@@ -394,7 +402,7 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         "SQLite": "#003b57",
     }
     logo_files = {
-        "Oracle Database": "oracle.svg",
+        "Oracle Database": "oracle-o.svg",
         "PostgreSQL": "postgresql.svg",
         "YugabyteDB": "yugabytedb.svg",
         "MongoDB": "mongodb.svg",
@@ -402,7 +410,7 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         "Amazon DynamoDB": "dynamodb.svg",
         "MySQL": "mysql.svg",
         "Microsoft SQL Server": "sql-server.svg",
-        "DocumentDB": "documentdb.svg",
+        "DocumentDB": "documentdb.png",
         "CockroachDB": "cockroachdb.svg",
         "Db2": "db2.svg",
         "Cassandra": "cassandra.svg",
