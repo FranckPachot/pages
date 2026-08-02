@@ -37,3 +37,15 @@ python util/build_publication_map.py
 ```
 
 Then open `index.html` directly or serve the repository with any static HTTP server.
+
+## Build the agent knowledge base
+
+`db-skills.md` combines the curated database field manuals with an exhaustive, deduplicated registry of archived publications. The workspace skill at `.github/skills/database-experience/SKILL.md` tells agents when and how to consult it.
+
+Regenerate it after refreshing publications or changing a minibook:
+
+```shell
+python3.13 util/generate_db_skills.py
+```
+
+The companion [database lab guide](how-to-build-a-db-lab.md) turns the publication method into reproducible PostgreSQL, Oracle Database, YugabyteDB, and MongoDB experiments with shared fixtures and source links.
