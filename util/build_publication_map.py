@@ -29,6 +29,7 @@ SOURCE_NAMES = {
     "dbi-services": "DBI Services",
     "developpez": "Developpez.com",
     "dev.to": "Dev.to",
+    "linkedin": "LinkedIn",
     "medium": "Medium",
     "microsoft-techcommunity": "Microsoft Tech Community",
     "yugabyte": "Yugabyte",
@@ -175,6 +176,8 @@ def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
     if source == "cern":
         body = html_text(value.get("attributes", {}).get("body", {}).get("processed", ""))
         return body, ""
+    if source == "linkedin":
+        return html_text(value.get("body_html", "")), ""
     return "", ""
 
 
@@ -255,7 +258,17 @@ def build_catalog(root: Path) -> dict[str, Any]:
     manifest = json.loads((root / "archive-manifest.json").read_text(encoding="utf-8"))
     ai_descriptions = load_ai_descriptions(root)
     publications = []
+    linkedin_canonicals = {
+        article["canonical_url"].rstrip("/")
+        for article in manifest["articles"]
+        if article["source"] == "linkedin"
+    }
     for article in manifest["articles"]:
+        if (
+            article["source"] != "linkedin"
+            and article["canonical_url"].rstrip("/") in linkedin_canonicals
+        ):
+            continue
         body, description = load_snapshot(root, article)
         tags = unique_strings([normalize_text(tag) for tag in article.get("tags", [])])
         title = normalize_text(article["title"])
@@ -304,7 +317,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         "publication_count": len(publications),
         "year_min": min(item["year"] for item in publications),
         "year_max": max(item["year"] for item in publications),
-        "source_counts": manifest["sources"],
+        "source_counts": dict(Counter(item["source_key"] for item in publications)),
         "database_counts": dict(database_counts.most_common()),
         "database_colors": DATABASE_COLORS,
         "category_counts": dict(category_counts.most_common()),

@@ -53,6 +53,14 @@ def first_match(pattern: str, text: str) -> str:
     return clean_text(match.group(1)) if match else ""
 
 
+def normalize_canonical_url(url: str) -> str:
+    decoded = urllib.parse.unquote(url)
+    parsed = urllib.parse.urlsplit(decoded)
+    if parsed.hostname and parsed.hostname.endswith("linkedin.com") and parsed.path.startswith("/pulse/"):
+        return f"https://www.linkedin.com{parsed.path.rstrip('/')}"
+    return url
+
+
 def sanitize_dbi_detail(detail: dict[str, Any]) -> dict[str, Any]:
     content = detail.get("content", {}).get("rendered", "")
     content = AWS_ACCESS_KEY_PATTERN.sub("REDACTED_AWS_ACCESS_KEY_ID", content)
@@ -277,7 +285,9 @@ def devto_manifest_entry(root: Path, path: Path, detail: dict[str, Any]) -> dict
         "source_id": str(article_id),
         "title": detail.get("title", ""),
         "published_at": detail.get("published_at", ""),
-        "canonical_url": detail.get("canonical_url") or detail.get("url", ""),
+        "canonical_url": normalize_canonical_url(
+            detail.get("canonical_url") or detail.get("url", "")
+        ),
         "archive_path": path.relative_to(root).as_posix(),
         "tags": tags,
     }
@@ -610,6 +620,42 @@ def inventory_developpez(root: Path) -> list[dict[str, Any]]:
     return articles
 
 
+def linkedin_manifest_entry(root: Path, path: Path, detail: dict[str, Any]) -> dict[str, Any]:
+    article_id = detail.get("id", "")
+    canonical = detail.get("canonical_url", "")
+    published = detail.get("published_at", "")
+    if not article_id or path.stem != article_id:
+        raise ValueError(f"Invalid LinkedIn article ID in {path}")
+    if detail.get("author") != "Franck Pachot":
+        raise ValueError(f"Unverified LinkedIn author in {path}")
+    if not detail.get("title") or not detail.get("body_html"):
+        raise ValueError(f"Incomplete LinkedIn article content in {path}")
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", published):
+        raise ValueError(f"Invalid LinkedIn publication date in {path}")
+    if not re.fullmatch(r"https://www\.linkedin\.com/pulse/[^?#]+/?", canonical):
+        raise ValueError(f"Invalid LinkedIn canonical URL in {path}")
+    return {
+        "source": "linkedin",
+        "source_id": article_id,
+        "title": clean_text(detail["title"]),
+        "published_at": published,
+        "canonical_url": canonical.rstrip("/"),
+        "archive_path": path.relative_to(root).as_posix(),
+        "tags": detail.get("tags", []),
+    }
+
+
+def inventory_linkedin(root: Path) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "linkedin" / "articles").glob("*.json")):
+        try:
+            detail = json.loads(read_text(path))
+            articles.append(linkedin_manifest_entry(root, path, detail))
+        except (json.JSONDecodeError, ValueError) as error:
+            print(f"Skipping invalid LinkedIn snapshot {path.relative_to(root)}: {error}")
+    return articles
+
+
 def list_developpez_articles() -> list[str]:
     articles: set[str] = set()
     month = datetime.date(2010, 3, 28)
@@ -740,6 +786,7 @@ def main() -> None:
         articles += archive_developpez(root, args.refresh_developpez)
     else:
         articles += inventory_developpez(root)
+    articles += inventory_linkedin(root)
     articles.sort(key=lambda article: (article["published_at"], article["source"]), reverse=True)
 
     manifest = {
