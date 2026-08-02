@@ -62,7 +62,7 @@ DATABASE_COLORS = {
     "Microsoft SQL Server": "#cc2927",
     "DocumentDB": "#c925d1",
     "CockroachDB": "#6933ff",
-    "Db2": "#0f62fe",
+    "Db2": "#009a2b",
     "Cassandra": "#1287b1",
     "Azure HorizonDB": "#0078d4",
     "SQLite": "#003b57",
