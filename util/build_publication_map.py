@@ -359,6 +359,7 @@ def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) 
     document = path.read_text(encoding="utf-8")
     app_version = hashlib.sha256((path.parent / "home" / "app.js").read_bytes()).hexdigest()[:12]
     style_version = hashlib.sha256((path.parent / "home" / "style.css").read_bytes()).hexdigest()[:12]
+    minibook_count = sum(1 for index_path in (path.parent / "minibook").glob("*/index.html"))
     recent = sorted(catalog["publications"], key=lambda publication: publication["date"], reverse=True)[:80]
     results = "\n".join(publication_markup(publication) for publication in recent)
     item_list = {
@@ -400,6 +401,13 @@ def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) 
     )
     if count != 1:
         raise ValueError(f"Expected one style.css link, found {count}")
+    document, count = re.subn(
+        r"(Database field guides · )\d+( volumes)",
+        rf"\g<1>{minibook_count}\2",
+        document,
+    )
+    if count != 1:
+        raise ValueError(f"Expected one minibook volume count, found {count}")
     path.write_text(document, encoding="utf-8")
 
 
