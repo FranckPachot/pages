@@ -333,6 +333,18 @@ def archive_devto(
     return inventory_devto(root)
 
 
+def archive_devto_id(root: Path, article_id: int) -> list[dict[str, Any]]:
+    archive_dir = root / "devto" / "articles"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    detail = api_get(f"/articles/{article_id}")
+    if not isinstance(detail, dict) or detail.get("id") != article_id:
+        raise ValueError(f"Unexpected Dev.to detail response for article {article_id}")
+    path = archive_dir / f"{article_id}.json"
+    write_json_atomic(path, detail)
+    print(f"Dev.to: {detail.get('title', article_id)}")
+    return inventory_devto(root)
+
+
 def yugabyte_manifest_entry(root: Path, path: Path, detail: dict[str, Any]) -> dict[str, Any]:
     article_id = detail.get("id")
     if not isinstance(article_id, int) or article_id <= 0:
@@ -730,6 +742,7 @@ def main() -> None:
     parser.add_argument("--skip-devto", action="store_true")
     parser.add_argument("--refresh-devto", action="store_true")
     parser.add_argument("--max-devto", type=int, help="Limit Dev.to downloads for testing")
+    parser.add_argument("--devto-id", type=int, help="Archive one Dev.to article by ID")
     parser.add_argument("--skip-yugabyte", action="store_true")
     parser.add_argument("--refresh-yugabyte", action="store_true")
     parser.add_argument("--skip-techcommunity", action="store_true")
@@ -760,7 +773,10 @@ def main() -> None:
         articles = inventory_dbi(root)
     articles += inventory_medium(root)
     if not args.skip_devto:
-        articles += archive_devto(root, args.username, args.refresh_devto, args.max_devto)
+        if args.devto_id is not None:
+            articles += archive_devto_id(root, args.devto_id)
+        else:
+            articles += archive_devto(root, args.username, args.refresh_devto, args.max_devto)
     else:
         articles += inventory_devto(root)
     if not args.skip_yugabyte:
