@@ -37,7 +37,7 @@ SOURCE_NAMES = {
 
 DATABASE_RULES = {
     "Azure HorizonDB": r"\b(?:microsoft\s+)?(?:azure\s+)?horizondb\b",
-    "Oracle Database": r"\boracle(?: database)?\b|\bora-\d{4,5}\b|\b(?:9i|10g|11g|12c|18c|19c|21c|23c|23ai|26ai)\b",
+    "Oracle Database": r"\boracle(?: database|text)?\b|\bora-\d{4,5}\b|\b(?:9i|10g|11g|12c|18c|19c|21c|23c|23ai|26ai)(?:r[12])?\b|\b(?:v|gv|x)\$[a-z0-9_$#]+\b|\b(?:dba|cdb)_[a-z0-9_$#]+\b|\b(?:dbms|utl|owa|ctx|sdo)_[a-z0-9_$#]+\b|\b(?:sql\*plus|sqlplus|sqlcl|rman|data\s*guard|golden\s*gate|exadata|awr|statspack|pl/sql|varchar2|sysdate|systimestamp|rownum|connect by|match_recognize|pluggable database|flashback table|asm iostats)\b|\basm_[a-z0-9_$#]+\b|\b(?:cdb|pdb)\$root\b",
     "PostgreSQL": r"\bpostgres(?:ql)?\b|\bpg_[a-z0-9_]+\b|\bpsql\b",
     "YugabyteDB": r"\byugabyte(?:db|d)?\b|\byb-[a-z0-9_-]+\b|\bycql\b|\bysql\b",
     "MongoDB": r"\bmongodb\b|\bmongosh\b",
