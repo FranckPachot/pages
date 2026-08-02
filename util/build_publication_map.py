@@ -26,7 +26,7 @@ SITE_URL = "https://franckpachot.github.io/pages/"
 
 SOURCE_NAMES = {
     "cern": "CERN",
-    "dbi-services": "DBI Services",
+    "dbi-services": "dbi services",
     "developpez": "Developpez.com",
     "dev.to": "Dev.to",
     "linkedin": "LinkedIn",
