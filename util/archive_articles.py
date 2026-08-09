@@ -668,6 +668,32 @@ def inventory_linkedin(root: Path) -> list[dict[str, Any]]:
     return articles
 
 
+def inventory_slideshare(root: Path) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "slideshare" / "articles").glob("*/index.html")):
+        document = read_text(path)
+        title = first_match(r"<title>(.*?)</title>", document)
+        published = first_match(
+            r'<meta\s+name="published_at"\s+content="([^"]+)"', document
+        )
+        canonical = first_match(r'<link\s+rel="canonical"\s+href="([^"]+)"', document)
+        if not title or not published or not canonical:
+            print(f"Skipping malformed SlideShare snapshot: {path.relative_to(root)}")
+            continue
+        articles.append(
+            {
+                "source": "slideshare",
+                "source_id": path.parent.name,
+                "title": title,
+                "published_at": published,
+                "canonical_url": canonical,
+                "archive_path": path.relative_to(root).as_posix(),
+                "tags": ["oracle", "publication"],
+            }
+        )
+    return articles
+
+
 def list_developpez_articles() -> list[str]:
     articles: set[str] = set()
     month = datetime.date(2010, 3, 28)
@@ -803,6 +829,7 @@ def main() -> None:
     else:
         articles += inventory_developpez(root)
     articles += inventory_linkedin(root)
+    articles += inventory_slideshare(root)
     articles.sort(key=lambda article: (article["published_at"], article["source"]), reverse=True)
 
     manifest = {

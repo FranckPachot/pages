@@ -32,6 +32,7 @@ SOURCE_NAMES = {
     "linkedin": "LinkedIn",
     "medium": "Medium",
     "microsoft-techcommunity": "Microsoft Tech Community",
+    "slideshare": "SlideShare",
     "yugabyte": "Yugabyte",
 }
 
@@ -156,7 +157,7 @@ def normalize_text(value: str) -> str:
 def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
     path = root / article["archive_path"]
     source = article["source"]
-    if source in {"developpez", "medium", "microsoft-techcommunity"} or (
+    if source in {"developpez", "medium", "microsoft-techcommunity", "slideshare"} or (
         source == "dbi-services" and path.suffix.casefold() == ".html"
     ):
         document = path.read_text(encoding="utf-8", errors="replace")
