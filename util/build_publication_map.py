@@ -415,6 +415,13 @@ def write_root_index(path: Path, catalog: dict[str, Any], catalog_version: str) 
     if count != 1:
         raise ValueError(f"Expected one style.css link, found {count}")
     document, count = re.subn(
+        r"(https://franckpachot\.github\.io/pages/home/social-card\.png)(?:\?v=[^\"']*)?",
+        rf"\g<1>?v={catalog_version}",
+        document,
+    )
+    if count < 2:
+        raise ValueError(f"Expected at least two social-card URLs, found {count}")
+    document, count = re.subn(
         r"(Database field guides · )\d+( volumes)",
         rf"\g<1>{minibook_count}\2",
         document,
