@@ -42,6 +42,7 @@
     "Amazon DynamoDB": "dynamodb.svg",
     Cassandra: "cassandra.svg",
     CockroachDB: "cockroachdb.svg",
+    "Database agnostic": "generic-database.svg",
     Db2: "db2.png",
     DocumentDB: "documentdb.png",
     "Azure HorizonDB": "azure.svg",
@@ -73,6 +74,26 @@
       option(elements.yearFrom, String(year), String(year));
       option(elements.yearTo, String(year), String(year));
     }
+  }
+
+  function databaseLogo(value) {
+    const logo = document.createElement("span");
+    const key = value.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+    logo.className = `database-logo database-logo--${key}`;
+    logo.setAttribute("aria-hidden", "true");
+    const logoFile = databaseLogoFiles[value];
+    if (logoFile) {
+      const image = document.createElement("img");
+      image.src = `home/database-logos/${logoFile}`;
+      image.alt = "";
+      image.width = 16;
+      image.height = 16;
+      image.decoding = "async";
+      logo.append(image);
+    } else {
+      logo.classList.add("database-logo--fallback");
+    }
+    return logo;
   }
 
   function renderSummary() {
@@ -144,7 +165,11 @@
         .map(([database, color]) => {
           const item = document.createElement("span");
           item.className = "timeline-legend__item";
-          item.innerHTML = `<i style="background:${color}"></i>${database}`;
+          item.style.borderColor = color;
+          item.setAttribute("role", "img");
+          item.setAttribute("aria-label", database);
+          item.title = database;
+          item.append(databaseLogo(database));
           return item;
         }),
     );
@@ -187,23 +212,7 @@
 
   function databaseBadge(value) {
     const element = badge(value, "database");
-    const logo = document.createElement("span");
-    const key = value.toLocaleLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
-    logo.className = `database-logo database-logo--${key}`;
-    logo.setAttribute("aria-hidden", "true");
-    const logoFile = databaseLogoFiles[value];
-    if (logoFile) {
-      const image = document.createElement("img");
-      image.src = `home/database-logos/${logoFile}`;
-      image.alt = "";
-      image.width = 16;
-      image.height = 16;
-      image.decoding = "async";
-      logo.append(image);
-    } else {
-      logo.classList.add("database-logo--fallback");
-    }
-    element.prepend(logo);
+    element.prepend(databaseLogo(value));
     return element;
   }
 
