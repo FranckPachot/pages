@@ -1,0 +1,276 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/adaptive-plan-how-much-can-statistics-collector-buffer/">
+<title>Adaptive Plan: How much can STATISTICS COLLECTOR buffer?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/adaptive-plan-how-much-can-statistics-collector-buffer/">https://www.dbi-services.com/blog/adaptive-plan-how-much-can-statistics-collector-buffer/</a> (2016-05-04)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Adaptive Plan: How much can STATISTICS COLLECTOR buffer?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+The 12c adaptive plan prepares two join methods (Hash Join and Nested Loop), actives the one that has the better cost for the estimated cardinality and computes the point of inflection in cardinality estimation where the best cost changes to the other join method. At execution time, rows are buffered by a STATISTICS COLLECTOR operation in order to see if the point of inflection is reached. If it doesn&#8217;t, the plan continues as planned. If it does, the alternative join method is activated. But buffering has a limit&#8230;<br />
+<!--more--></p>
+<blockquote class="twitter-tweet" data-width="500" data-dnt="true">
+<p lang="en" dir="ltr"><a href="https://twitter.com/ChrisAntognini?ref_src=twsrc%5Etfw">@ChrisAntognini</a> <a href="https://twitter.com/FranckPachot?ref_src=twsrc%5Etfw">@FranckPachot</a> True, Chris. Do you know the internal algorithm or an underscore parameter that controls the buffering limit?</p>
+<p>&mdash; Stefan Koehler (@OracleSK) <a href="https://twitter.com/OracleSK/status/727390667555627008?ref_src=twsrc%5Etfw">May 3, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>Let&#8217;s try to find this limit empirically.</p>
+<p>I create a table with enough rows:</p>
+<pre><code>
+SQL&gt; create table demo1 (n constraint demo1pk primary key,x1) as select 0 , cast('x' as varchar2(4000)) from dual;
+Table created.
+SQL&gt; insert --+ append
+    into demo1 select 1e7+rownum ,'x' from xmltable('1 to 200000');
+200000 rows created.
+</code></pre>
+<p>and a second table to join:</p>
+<pre><code>
+SQL&gt; create table demo2 (n constraint demo2pk primary key,x2) as select 0 , 'x' from dual;
+Table created.
+</code></pre>
+<p>I filled the DEMO1 table in two steps. First, CTAS with one row so that the statistics (online statistics gathering) favors nested loops. And I inserted lot of rows later because I want to fill the Adaptive Plan buffer. DEMO2 is a small table but I want the FULL TABLE SCAN on it to be a bit more expensive or hash join will be always choosen. I do that by faking the number of blocks:</p>
+<pre><code>
+SQL&gt; exec dbms_stats.set_table_stats(user,'DEMO2',numblks=3000,no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>If I check the execution plan I see that NESTED LOOP is chosen because estimated number of rows is small (artificially set to 1 row):</p>
+<pre><code>
+SQL&gt; explain plan for
+  2  select max(x1),max(x2) from demo1 join demo2 using(n);
+&nbsp;
+Explained.
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'+adaptive'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+Plan hash value: 604214593
+&nbsp;
+--------------------------------------------------------------------------------------------
+|   Id  | Operation                      | Name    | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------------------------
+|     0 | SELECT STATEMENT               |         |     1 |     8 |     4   (0)| 00:00:01 |
+|     1 |  SORT AGGREGATE                |         |     1 |     8 |            |          |
+|- *  2 |   HASH JOIN                    |         |     1 |     8 |     4   (0)| 00:00:01 |
+|     3 |    NESTED LOOPS                |         |     1 |     8 |     4   (0)| 00:00:01 |
+|     4 |     NESTED LOOPS               |         |     1 |     8 |     4   (0)| 00:00:01 |
+|-    5 |      STATISTICS COLLECTOR      |         |       |       |            |          |
+|     6 |       TABLE ACCESS FULL        | DEMO1   |     1 |     4 |     3   (0)| 00:00:01 |
+|  *  7 |      INDEX UNIQUE SCAN         | DEMO2PK |     1 |       |     0   (0)| 00:00:01 |
+|     8 |     TABLE ACCESS BY INDEX ROWID| DEMO2   |     1 |     4 |     1   (0)| 00:00:01 |
+|-    9 |    TABLE ACCESS FULL           | DEMO2   |     1 |     4 |     1   (0)| 00:00:01 |
+--------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - access("DEMO1"."N"="DEMO2"."N")
+   7 - access("DEMO1"."N"="DEMO2"."N")
+&nbsp;
+Note
+-----
+   - this is an adaptive plan (rows marked '-' are inactive)
+&nbsp;
+</code></pre>
+<p>But the plan is adaptive and can switch to HASH JOIN of more rows than expected are encountered by STATISTICS COLLECTOR.</p>
+<p>I run it and gather run time statistics</p>
+<pre><code>
+SQL&gt; alter session set statistics_level=all;
+Session altered.
+SQL&gt; select max(x1),max(x2) from demo1 join demo2 using(n);
+MAX(X1)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+M
+-
+x
+x
+</code></pre>
+<p>And here is the adaptive plan: Hash Join is activated because we have actually lot of rows (200000): </p>
+<pre><code>
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  d2y436sr1cx3r, child number 0
+-------------------------------------
+select max(x1),max(x2) from demo1 join demo2 using(n)
+&nbsp;
+Plan hash value: 740165205
+&nbsp;
+----------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name  | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  | Writes |  OMem |  1Mem | Used-Mem | Used-Tmp|
+----------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |       |      1 |        |      1 |00:00:02.04 |     372 |    423 |    483 |       |       |          |         |
+|   1 |  SORT AGGREGATE     |       |      1 |      1 |      1 |00:00:02.04 |     372 |    423 |    483 |       |       |          |         |
+|*  2 |   HASH JOIN         |       |      1 |      1 |      1 |00:00:02.04 |     372 |    423 |    483 |    11M|  4521K| 1262K (1)|    4096 |
+|   3 |    TABLE ACCESS FULL| DEMO1 |      1 |      1 |    200K|00:00:00.20 |     369 |    360 |      0 |       |       |          |         |
+|   4 |    TABLE ACCESS FULL| DEMO2 |      1 |      1 |      1 |00:00:00.01 |       3 |      0 |      0 |       |       |          |         |
+----------------------------------------------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - access("DEMO1"."N"="DEMO2"."N")
+   7 - access("DEMO1"."N"="DEMO2"."N")
+&nbsp;
+Note
+-----
+   - this is an adaptive plan
+</code></pre>
+<p>The point of inflection is 814:</p>
+<pre><code>
+SQL&gt; column tracefile new_value tracefile
+SQL&gt; alter session set tracefile_identifier='cbo_trace';
+Session altered.
+&nbsp;
+SQL&gt; select tracefile from v$process where addr=(select paddr from v$session where sid=sys_context('userenv','sid'));
+&nbsp;
+TRACEFILE
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/cdb/CDB/trace/CDB_ora_3979_cbo_trace.trc
+&nbsp;
+SQL&gt; host &gt; &amp;tracefile.
+&nbsp;
+SQL&gt; exec dbms_sqldiag.dump_trace(p_sql_id=&gt;'d2y436sr1cx3r',p_child_number=&gt;0,p_component=&gt;'Compiler',p_file_id=&gt;'');
+PL/SQL procedure successfully completed.
+&nbsp;
+SQL&gt; host grep -E "^DP" &amp;tracefile. | tail
+DP - distinct placement
+DP: Found point of inflection for NLJ vs. HJ: card = 814.00
+</code></pre>
+<h3>Filling the buffer</h3>
+<p>So here, 814 rows were buffered and the plan switched to HASH JOIN. I want to know how many rows can be buffered, so I want to increase the point of inflection. Easy, if the cost of DEMO2 full table scan is higher then the NESTED LOOP will be cheaper than HASH JOIN even with more rows. Let&#8217;s fake the DEMO2 statistics to show a larger table:</p>
+<pre><code>
+SQL&gt; exec dbms_stats.set_table_stats(user,'DEMO2',numblks=4000,no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>And let&#8217;s run that again:</p>
+<pre><code>
+SQL&gt; select max(x1),max(x2) from demo1 join demo2 using(n);
+&nbsp;
+MAX(X1)
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+M
+-
+x
+x
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  d2y436sr1cx3r, child number 0
+-------------------------------------
+select max(x1),max(x2) from demo1 join demo2 using(n)
+&nbsp;
+Plan hash value: 604214593
+&nbsp;
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name    | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |
+------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |         |      1 |        |      1 |00:00:01.57 |     374 |    360 |
+|   1 |  SORT AGGREGATE               |         |      1 |      1 |      1 |00:00:01.57 |     374 |    360 |
+|   2 |   NESTED LOOPS                |         |      1 |      1 |      1 |00:00:01.57 |     374 |    360 |
+|   3 |    NESTED LOOPS               |         |      1 |      1 |      1 |00:00:01.57 |     373 |    360 |
+|   4 |     TABLE ACCESS FULL         | DEMO1   |      1 |      1 |    200K|00:00:00.20 |     369 |    360 |
+|*  5 |     INDEX UNIQUE SCAN         | DEMO2PK |    200K|      1 |      1 |00:00:00.42 |       4 |      0 |
+|   6 |    TABLE ACCESS BY INDEX ROWID| DEMO2   |      1 |      1 |      1 |00:00:00.01 |       1 |      0 |
+------------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   5 - access("DEMO1"."N"="DEMO2"."N")
+&nbsp;
+Note
+-----
+   - this is an adaptive plan
+&nbsp;
+27 rows selected.
+&nbsp;
+SQL&gt; column tracefile new_value tracefile
+SQL&gt; alter session set tracefile_identifier='cbo_trace';
+Session altered.
+&nbsp;
+SQL&gt; select tracefile from v$process where addr=(select paddr from v$session where sid=sys_context('userenv','sid'));
+&nbsp;
+TRACEFILE
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/cdb/CDB/trace/CDB_ora_4083_cbo_trace.trc
+&nbsp;
+SQL&gt; host &gt; &amp;tracefile.
+SQL&gt; exec dbms_sqldiag.dump_trace(p_sql_id=&gt;'d2y436sr1cx3r',p_child_number=&gt;0,p_component=&gt;'Compiler',p_file_id=&gt;'');
+PL/SQL procedure successfully completed.
+&nbsp;
+SQL&gt; host grep -E "^DP" &amp;tracefile. | tail
+DP - distinct placement
+DP: Found point of inflection for NLJ vs. HJ: card = 1086.00
+</code></pre>
+<p>Read it from the end:</p>
+<ol>
+<li>The inflection point is higher: 1086, which was my goal</li>
+<li>The number of rows from DEMO1 is still 200000 rows, so it&#8217;s higher than the inflection point.</li>
+<li>We expect a HASH JOIN because the number of rows is higher than the inflection point</li>
+<li>But the plan stayed with NESTED LOOP because the buffering in STATISTICS COLLECTOR never reached the inflection point</li>
+</ol>
+<h3>Dichotomy</h3>
+<p>By Dichotomy, I&#8217;ve scripted similar tests to find the point where reaching the point of inflection do not trigger a plan switch.<br />
+&#8216;JOIN&#8217; is the method chosen (from dbms_xplan.display_cursor after execution), &#8216;INFLECTION POINT&#8217; is the one gathered from 10053 trace and &#8216;STATBLKS&#8217; is the numblks I set for DEMO2 in order to vary the point of inflection.</p>
+<pre><code>
+                JOIN     INFLECTION POINT       HASH_AREA_SIZE               BUFFER             STATBLKS                 LPAD
+              NESTED               271889              1000000              2175117              1000000                    1
+              NESTED               135823              1000000              1086590               500000                    1
+              NESTED                67789              1000000               542319               250000                    1
+              NESTED                33885              1000000               271087               125000                    1
+              NESTED                16943              1000000               135551                62500                    1
+              NESTED                 8471              1000000                67775                31250                    1
+              NESTED                 4238              1000000                33904                15625                    1
+              NESTED                 2120              1000000                16960                 7813                    1
+              NESTED                 1060              1000000                 8480                 3907                    1
+                HASH                  532              1000000                 4256                 1954                    1
+                HASH                  796              1000000                 6368                 2930                    1
+                HASH                  928              1000000                 7424                 3418                    1
+                HASH                  994              1000000                 7952                 3662                    1
+                HASH                 1026              1000000                 8208                 3784                    1
+              NESTED                 1044              1000000                 8352                 3845                    1
+                HASH                 1036              1000000                 8288                 3814                    1
+                HASH                 1040              1000000                 8320                 3829                    1
+              NESTED                 1042              1000000                 8336                 3837                    1
+                HASH                 1040              1000000                 8320                 3833                    1
+                HASH                 1040              1000000                 8320                 3835                    1
+              NESTED                 1042              1000000                 8336                 3836                    1
+</code></pre>
+<p>I&#8217;ve added some variations on hash_area_size (my bad guess that it makes sense to buffer up to that amount because this is what will go to hash area size at least, if hash join is finally chosen) and on the DEMO1 row size (by varying an lpad on column X).<br />
+For the moment, when point of inflection is less than 1041 a plan switch occurs and when it is higher than 1042 no plan switch occurs.</p>
+<p>But there are probably other parameters influencing because:</p>
+<blockquote class="twitter-tweet" data-width="500" data-dnt="true">
+<p lang="en" dir="ltr"><a href="https://twitter.com/FranckPachot?ref_src=twsrc%5Etfw">@FranckPachot</a> <a href="https://twitter.com/OracleSK?ref_src=twsrc%5Etfw">@OracleSK</a> I just modified/run an example I have and I can confirm to see a switch with an inflection point at 21216.</p>
+<p>&mdash; Chris Antognini (@ChrisAntognini) <a href="https://twitter.com/ChrisAntognini/status/727908553961418752?ref_src=twsrc%5Etfw">May 4, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>Any idea welcome&#8230;</p>
+<h3>Update 30 mins. later</h3>
+<p>Thanks to Chris Antognini. It appears the parameter that influences the number of rows buffered is not the actual size of the row. The number of rows to buffer is calculated from the theoretical size of the columns. Which is very bad in my opinion given the number of applications that declares column size at their maximum. And I see no reason why this has to be set like that. Rows are of variable size and allocating buffers on column definition is not a good idea. That reminds <a href="https://recurrentnull.wordpress.com/2015/11/20/raising-the-fetch-size-good-or-bad-memory-management-in-oracle-jdbc-12c/" target="_blank" rel="noopener noreferrer">jdbc fetch size</a> very well described by Sigrid Keydana.</p>
+<p>Here is the limit for different size of the varchar2:</p>
+<pre><code>
+                JOIN     INFLECTION POINT       HASH_AREA_SIZE          BUFFER SIZE             STATBLKS         VARCHAR SIZE
+              NESTED               155345                65536              3572954               572641                    1
+              NESTED                74899                65536              3894796               276092                   30
+              NESTED                63551                65536              3940220               234258                   40
+              NESTED                33289                65536              4061376               122802                  100
+              NESTED                12865                65536              4142848                47453                  300
+              NESTED                 7973                65536              4162422                29409                  500
+              NESTED                 4090                65536              4179980                15079                 1000
+              NESTED                 2072                65536              4189584                 7635                 2000
+              NESTED                 1388                65536              4194536                 5110                 3000
+</code></pre>
+<p>So it looks like oracle allocates a buffer of about few MB, calculates how many rows can fit there given their column definition, and limits the buffering to that number of rows.<br />
+The nonsense in my opinion is that size calculated from column definition can be calculated at parse time, when the point of inflection is determined. It makes no sense to set a point of inflection higher than the number of rows that can be buffered.</p>
+
+</div>
+</body>
+</html>

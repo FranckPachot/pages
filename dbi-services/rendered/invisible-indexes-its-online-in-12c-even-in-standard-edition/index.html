@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/invisible-indexes-its-online-in-12c-even-in-standard-edition/">
+<title>Invisible indexes: it&#8217;s online in 12c &#8211; even in Standard Edition</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/invisible-indexes-its-online-in-12c-even-in-standard-edition/">https://www.dbi-services.com/blog/invisible-indexes-its-online-in-12c-even-in-standard-edition/</a> (2015-09-14)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Invisible indexes: it&#8217;s online in 12c &#8211; even in Standard Edition</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Do you think that online operations are available only on Enterprise Edition?<br />
+That changed in 12c, there is an operation that is online (without the need for the ONLINE keyword) and available in Standard Edition and a very important feature for performance tuning: invisible indexes.<br />
+<!--more--></p>
+<h1>Example</h1>
+<p>I&#8217;ll show it from the SCOTT schema where I&#8217;ve added an index on EMP(HIREDATE):</p>
+<pre><code>
+SQL&gt; info+ EMP
+TABLE: EMP
+         LAST ANALYZED:
+         ROWS         :
+         SAMPLE SIZE  :
+         INMEMORY     :DISABLED
+         COMMENTS     :
+&nbsp;
+Columns
+NAME         DATA TYPE           NULL  DEFAULT    LOW_VALUE   HIGH_VALUE   NUM_DISTINCT   HISTOGRAM
+----------  -------------------  ----  ---------  ----------- -----------  -------------  ---------
+*EMPNO       NUMBER(4,0)         No
+ ENAME       VARCHAR2(10 BYTE)   Yes
+ JOB         VARCHAR2(9 BYTE)    Yes
+ MGR         NUMBER(4,0)         Yes
+ HIREDATE    DATE                Yes                  .....       .....
+ SAL         NUMBER(7,2)         Yes
+ COMM        NUMBER(7,2)         Yes
+ DEPTNO      NUMBER(2,0)         Yes
+&nbsp;
+Indexes
+INDEX_NAME          UNIQUENESS  STATUS  FUNCIDX_STATUS  COLUMNS   COLUMN_EXPRESSION
+------------------  ----------  ------  --------------  --------  -----------------
+SCOTT.PK_EMP        UNIQUE      VALID                   EMPNO
+SCOTT.EMP_HIREDATE  NONUNIQUE   VALID                   HIREDATE
+</code></pre>
+<p>If you don&#8217;t know where that &#8216;info+&#8217; is coming from, then you should read about <a href="http://www.thatjeffsmith.com/archive/2015/01/sqlcl-commands-info-info-the-new-desc/trackback">sqlcl</a>.</p>
+<h1>It&#8217;s always good to remove unnecessary indexes</h1>
+<p>Ok, imagine that you think that this EMP_HIREDATE index is not useful. Do you drop it? Or the fear of unexpected regression wins against the will to clean up. If you drop it and you see a regression, then you will have to create it back. It can take a lot of time on a big table. Do you choose to create it offline, blocking everybody, but trying to have the index back as quickly as possible?<br />
+How long will it take? Are you sure that you have enough temp space?</p>
+<p>Well, since 11g you have a very nice feature: invisible index. It&#8217;s still maintained but invisible to the optimizer. Just make the index invisible and if you see any regression you can bring it back in seconds. But are you sure of that? </p>
+<p>In 11g, ALTER INDEX VISIBLE requires an exclusive lock. It can be quick and nobody see it. But imagine that you have a lot of DML activity on the table, and on tables linked to it by referential integrity. That DML activity acquires Row-X locks. Your ALTER INDEX VISIBLE will wait. But it requests an exclusive lock. Then all new sessions that wants to have activity on those tables will be blocked. This is not good. Especially in that situation: if you want to bring back the index as visible, that&#8217;s probably because you had some performance problems. It not the right time to add lock issues&#8230;</p>
+<h1>12c</h1>
+<p>In 12c, new feature, it&#8217;s online. which means that we don&#8217;t need any Share or Exclusive lock.<br />
+Let&#8217;s prove it.<br />
+I&#8217;m tracing sql_trace and enqueues</p>
+<pre><code>
+SQL&gt; alter session set events='10046 trace name context forever, level 1 : 10704 trace name context forever, level 3' tracefile_identifier='InvisibleIndex';
+Session altered.
+</code></pre>
+<p>I have some queries using the index:</p>
+<pre><code>
+SQL&gt; select count(*) from EMP where HIREDATE&gt;sysdate-1;
+&nbsp;
+COUNT(*)
+--------
+0
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor);
+&nbsp;
+PLAN_TABLE_OUTPUT
+SQL_ID  gy8sag39zkrxr, child number 0
+-------------------------------------
+select count(*) from EMP where HIREDATE&gt;sysdate-1
+&nbsp;
+Plan hash value: 3798098543
+&nbsp;
+----------------------------------------------------------------------------------
+| Id  | Operation         | Name         | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |              |       |       |     1 (100)|          |
+|   1 |  SORT AGGREGATE   |              |     1 |     9 |            |          |
+|*  2 |   INDEX RANGE SCAN| EMP_HIREDATE |     1 |     9 |     1   (0)| 00:00:01 |
+----------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - access("HIREDATE"&gt;SYSDATE@!-1)
+</code></pre>
+<p>the query is here:</p>
+<pre><code>
+SQL&gt; select sql_id,child_number,invalidations,plan_hash_value from V$SQL where plan_hash_value=3798098543;
+&nbsp;
+SQL_ID         CHILD_NUMBER  INVALIDATIONS  PLAN_HASH_VALUE
+-------------  ------------  -------------  ---------------
+gy8sag39zkrxr  0             0              3,798,098,543
+</code></pre>
+<p>But I didn&#8217;t noticed it and think the index is not useful.<br />
+I minimize the risks: I make it invisible.</p>
+<pre><code>
+SQL&gt; alter index EMP_HIREDATE invisible;
+&nbsp;
+Index EMP_HIREDATE altered.
+</code></pre>
+<p>Now future queries are doing a full table scan:</p>
+<pre><code>
+SQL&gt; select count(*) from EMP where HIREDATE&gt;sysdate-1;
+&nbsp;
+COUNT(*)
+--------
+0
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor);
+&nbsp;
+PLAN_TABLE_OUTPUT
+SQL_ID  gy8sag39zkrxr, child number 0
+-------------------------------------
+select count(*) from EMP where HIREDATE&gt;sysdate-1
+&nbsp;
+Plan hash value: 2083865914
+&nbsp;
+---------------------------------------------------------------------------
+| Id  | Operation          | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+---------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |      |       |       |     3 (100)|          |
+|   1 |  SORT AGGREGATE    |      |     1 |     9 |            |          |
+|*  2 |   TABLE ACCESS FULL| EMP  |     1 |     9 |     3   (0)| 00:00:01 |
+---------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+   2 - filter("HIREDATE"&gt;SYSDATE@!-1)
+</code></pre>
+<p>We see that the cursor has been invalidated:</p>
+<pre><code>
+SQL&gt; select sql_id,child_number,invalidations,plan_hash_value from V$SQL where sql_id='gy8sag39zkrxr';
+&nbsp;
+SQL_ID         CHILD_NUMBER  INVALIDATIONS  PLAN_HASH_VALUE
+-------------  ------------  -------------  ---------------
+gy8sag39zkrxr  0             1              2,083,865,914
+</code></pre>
+<p>If I have any issue with that, I can bring back the index visible:</p>
+<pre><code>
+SQL&gt; alter index EMP_HIREDATE visible;
+&amp;nbsp
+Index EMP_HIREDATE altered.
+</code></pre>
+<p>and after running the query again, I can check that the cursor has been invalidated again and is now using the range scan:</p>
+<pre><code>
+SQL&gt; select sql_id,child_number,invalidations,plan_hash_value from V$SQL where sql_id='gy8sag39zkrxr';
+&nbsp;
+SQL_ID         CHILD_NUMBER  INVALIDATIONS  PLAN_HASH_VALUE
+-------------  ------------  -------------  ---------------
+gy8sag39zkrxr  0             2              3,798,098,543
+</code></pre>
+<h3>It&#8217;s online</h3>
+<p>Nothing new here if you know the 12c new features (and if you don&#8217;t we have a <a href="https://www.dbi-services.com/trainings/oracle-12c-new-features-workshop/">training</a> for that). But let&#8217;s stop the trace and grep the &#8216;get lock&#8217; from the dump:</p>
+<pre><code>
+SQL&gt; alter session set events='10046 trace name context off : 10704 trace name context off ';
+&nbsp;
+Session altered.
+</code></pre>
+<p>I need the OBJECT_ID of my table in hexadecimal to find it in the dump:</p>
+<pre><code>
+SQL&gt; column object_id new_value object_id
+SQL&gt; select object_name,to_char(object_id,'FM0XXXXXXX') object_id from dba_objects where owner='SCOTT';
+&nbsp;
+OBJECT_NAME   OBJECT_ID
+------------  ---------
+PK_DEPT       0001677D
+DEPT          0001677C
+EMP           0001677E
+PK_EMP        0001677F
+BONUS         00016780
+SALGRADE      00016781
+EMP_HIREDATE  00016782
+</code></pre>
+<p>Get the tracefile</p>
+<pre><code>
+SQL&gt; column tracefile new_value tracefile
+SQL&gt; select tracefile from v$process where addr=(select paddr from v$session where sid=sys_context('USERENV','SID'));
+&nbsp;
+TRACEFILE
+------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/se2/SE2/trace/SE2_ora_6710_InvisibleIndex.trc
+&nbsp;
+SQL&gt; host mv &amp;tracefile last.trc
+</code></pre>
+<p>and filter what I&#8217;m looking for: &#8216;get lock&#8217; for my tables:</p>
+<pre><code>
+host grep -A 0 -E 'ksqgtl [*]{3} TM-000167|ksqrcl: TM-000167|ksqcnv: TM-000167|^alter' last.trc
+ksqgtl *** TM-0001677E-00000000-00000003-00000000 mode=2 flags=0x400 timeout=0 ***
+alter index EMP_HIREDATE invisible
+ksqrcl: TM-0001677E-00000000-00000003-00000000
+ksqgtl *** TM-0001677E-00000000-00000003-00000000 mode=2 flags=0x400 timeout=0 ***
+alter index EMP_HIREDATE visible
+ksqrcl: TM-0001677E-00000000-00000003-00000000
+</code></pre>
+<p>This is the proof that both statements require only the lowest table lock: mode=2 is Row-S which is compatible with all concurrent DML.<br />
+this is an only operation. But there is more.</p>
+<h3>It&#8217;s available in SE</h3>
+<p>Yes, I&#8217;m in Standard Edition here:</p>
+<pre><code>
+SQL&gt; exit
+Disconnected from Oracle Database 12c Standard Edition Release 12.1.0.2.0 - 64bit Production
+</code></pre>
+<h1>11g</h1>
+<p>If you want to see the behaviour in 11g:</p>
+<pre><code>
+ksqgtl *** TM-0001bf64-00000000 mode=6 flags=0x401 timeout=0 ***
+alter index EMP_HIREDATE invisible
+ksqgtl *** TM-0001bf64-00000000 mode=6 flags=0x401 timeout=0 ***
+alter index EMP_HIREDATE visible
+</code></pre>
+<p>mode=6 is exclusive lock. You don&#8217;t want to do that when DML is running, especially when you already have a problem to fix &#8211; and this is the goal of ALTER INDEX VISIBLE.</p>
+<h1>DROP INDEX ONLINE</h1>
+<p>Still in the 12c new features, you can drop an index online, requiring only a Row-S lock on the table instead of eXclusive lock.<br />
+Here is the 10704 trace:</p>
+<pre><code>
+drop index EMP_HIREDATE online
+ksqgtl *** TM-0001677E-00000000-00000003-00000000 mode=2 flags=0x400 timeout=0 ***
+ksqrcl: TM-0001677E-00000000-00000003-00000000
+ksqrcl: TM-0001677E-00000000-00000003-00000000
+</code></pre>
+<p>And you know what? I&#8217;m still in Standard Edition.</p>
+<h1>So what?</h1>
+<p>We can get rid of indexes that are not needed. We can make them invisible for a while and then drop them.<br />
+And we can do it online, even it Standard Edition.<br />
+However, be careful. Indexes are not used only by the optimizer. They serve as a structure to lock a range of values when you delete from a parent table, in order to prevent any current insert to become orphans. If you make the index invisible, they are still used for that. When you drop them, a table lock will be needed for those cases. More about that at <a href="https://www.doag.org/konferenz/konferenzplaner/b.php?id=473721&amp;locS=1&amp;q=pachot">#DOAG2015</a> or at <a href="http://www.tech15.ukoug.org/default.asp?p=12861&amp;dlgact=shwprs&amp;prs_prsid=10654&amp;day_dayid=93">#TECH15</a>.</p>
+
+</div>
+</body>
+</html>

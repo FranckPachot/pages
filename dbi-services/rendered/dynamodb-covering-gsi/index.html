@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/dynamodb-covering-gsi/">
+<title>DynamoDB: adding a Global covering index to reduce the cost</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/dynamodb-covering-gsi/">https://www.dbi-services.com/blog/dynamodb-covering-gsi/</a> (2020-03-16)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">DynamoDB: adding a Global covering index to reduce the cost</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+People often think of indexes as a way to optimize row filtering (&#8220;get item&#8221; faster and cheaper). But indexes are also about columns (&#8220;attribute projection&#8221;) like some kind of vertical partitioning. In relational (&#8220;SQL&#8221;) databases we often add more columns to the indexed key. This is called &#8220;covering&#8221; or &#8220;including&#8221; indexes, to avoid reading the whole row. The same is true in NoSQL. I&#8217;ll show in this post how, even when an index is not required to filter the items, because the primary key partitioning is sufficient, we may have to create a secondary index to reduce the cost of partial access to the item. Here is an example with AWS DynamoDB where the cost depends on I/O throughput.</p>
+<h3>Create table</h3>
+<p>I create a Demo table with a generic name for the key columns: MyKeyPart is the partition key and MyKeySort is the sort key. This is a (HASH,RANGE) partitioning where rows (&#8220;items&#8221;) with same MyKeyPart and close MyKeySort are clustered together. Different MyKeyPart are scattered across the storage.<br />
+Those keys are numbers (AttributeType=N) and I have defined the provisioned read and write IOPS throughput (in RCU/WCU units) at their maximum for the free tier (25).</p>
+<pre><code>
+aws dynamodb create-table \
+ --attribute-definitions \
+  AttributeName=MyKeyPart,AttributeType=N \
+  AttributeName=MyKeySort,AttributeType=N \
+ --key-schema \
+  AttributeName=MyKeyPart,KeyType=HASH \
+  AttributeName=MyKeySort,KeyType=RANGE \
+ --billing-mode PROVISIONED \
+ --provisioned-throughput ReadCapacityUnits=25,WriteCapacityUnits=25 \
+ --table-name Demo
+</code></pre>
+<pre><code>
+---------------------------------------------------------------------------------
+|                                  CreateTable                                  |
++-------------------------------------------------------------------------------+
+||                              TableDescription                               ||
+|+-------------------+---------------------------------------------------------+|
+||  CreationDateTime |  1584271061.57                                          ||
+||  ItemCount        |  0                                                      ||
+||  TableArn         |  arn:aws:dynamodb:eu-central-1:802756008554:table/Demo  ||
+||  TableId          |  557cd9b8-a739-4c4a-9aea-cdae4d8cc6c2                   ||
+||  TableName        |  Demo                                                   ||
+||  TableSizeBytes   |  0                                                      ||
+||  TableStatus      |  CREATING                                               ||
+|+-------------------+---------------------------------------------------------+|
+|||                           AttributeDefinitions                            |||
+||+------------------------------------+--------------------------------------+||
+|||            AttributeName           |            AttributeType             |||
+||+------------------------------------+--------------------------------------+||
+|||  MyKeyPart                         |  N                                   |||
+|||  MyKeySort                         |  N                                   |||
+||+------------------------------------+--------------------------------------+||
+|||                                 KeySchema                                 |||
+||+---------------------------------------------+-----------------------------+||
+|||                AttributeName                |           KeyType           |||
+||+---------------------------------------------+-----------------------------+||
+|||  MyKeyPart                                  |  HASH                       |||
+|||  MyKeySort                                  |  RANGE                      |||
+||+---------------------------------------------+-----------------------------+||
+|||                           ProvisionedThroughput                           |||
+||+-------------------------------------------------------------+-------------+||
+|||  NumberOfDecreasesToday                                     |  0          |||
+|||  ReadCapacityUnits                                          |  25         |||
+|||  WriteCapacityUnits                                         |  25         |||
+||+-------------------------------------------------------------+-------------+||
+</code></pre>
+<p>Here is how I wait for the creation to be completed because I like asynchronous operations but my mind is synchronous:</p>
+<pre><code>
+while aws --output json dynamodb describe-table --table-name Demo | grep '"TableStatus": "CREATING"' ; do sleep 1 ; done 2&gt;/dev/null | awk '{printf "."}END{print}'
+
+...        "TableStatus": "CREATING",
+</code></pre>
+<h3>Put items</h3>
+<p>I&#8217;ll insert (&#8220;put&#8221;) 8 rows (&#8220;items&#8221;) which contain one small column (&#8220;attribute&#8221;): MyInfo001. And a large one (150000 random characters text, which is 245KB): MyData001. I build an &#8220;item.json&#8221; file to load them through &#8220;aws dynamodb put-item &#8211;item file://item.json&#8221;.</p>
+<p>I have 2 different MyKeyPart with 4 different MyKeySort each. As many examples for DynamoDB are taken from retail (because it was built by Amazon for their e-commerce business) you can think of it as customer transactions. You want to distribute customers to many nodes for scalability and you want to get the history of each customer grouped and ordered. </p>
+<p>Here is my script:</p>
+<pre><code>
+for CusID in {1..2} ; do
+for Xdate in {1..4} ; do
+cat &gt; item.json &lt;&lt;CAT
+{
+ &quot;MyKeyPart&quot;:{&quot;N&quot;:&quot;$CusID&quot;},
+ &quot;MyKeySort&quot;:{&quot;N&quot;:&quot;$Xdate&quot;},
+ &quot;MyInfo001&quot;:{&quot;S&quot;:&quot;$SECONDS&quot;},
+ &quot;MyData001&quot;:{&quot;S&quot;:&quot;$(tr -cd &quot;[:alnum:]&quot;&lt;/dev/urandom|head -c250000)&quot;}
+}
+CAT
+
+du -h item.json
+aws dynamodb put-item \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --return-item-collection-metrics SIZE \
+ --item file://item.json\
+ --table-name Demo
+done
+done
+</code></pre>
+<p>Each put-item execution returns:</p>
+<pre><code>
+----------------------------------
+|             PutItem            |
++--------------------------------+
+||       ConsumedCapacity       ||
+|+----------------+-------------+|
+||  CapacityUnits |  TableName  ||
+|+----------------+-------------+|
+||  245.0         |  Demo       ||
+|+----------------+-------------+|
+|||            Table           |||
+||+------------------+---------+||
+|||  CapacityUnits   |  245.0  |||
+||+------------------+---------+||
+</code></pre>
+<p>Look at the consumed capacity for the table: 245 WCU. I &#8220;inserted&#8221; eight 245KB items. I&#8217;m in the default &#8220;standard&#8221; (aka non-transactional aka no ACID) write where 1KB is 1 WCU, and that is the &#8220;cost&#8221; of those writes: 245 WCU. This cost becomes money because you pay for the maximum throughput capacity. Here I didn&#8217;t see it with 8 items inserted in a few seconds. But my reserved capacity is 25 per second which means that if I continue to insert I&#8217;ll wait for retries and get ProvisionedThroughputExceededException after the retries are exhausted. So either I pay for more provisioned WCU (reserving them or through auto-scaling) or I choose on-demand, or I accept some write throttling affecting the response time, which has also a cost in your business.</p>
+<p>So, basically, if you read and write fewer items and smaller items, you save money. Like in any IT system but here the performance metric is easily converted to dollars. There&#8217;s not a lot I can do here, as I have to insert those items, but let&#8217;s see the read scenario now.</p>
+<h3>Query without index</h3>
+<p>I have two read use-cases in my scenario. One is reading the customer transaction history with all info like the MyInfo001 attribute here. The second one is reading the detail for one transaction, like the large MyData001 attribute here. For both of them, I don&#8217;t need any index to access the specific items because I am partitioned on the filtering attributes. But, in NoSQL as in Relational databases, indexes are required not only to filter rows (row selection) but also to filter attributes (column projection). And this is what I&#8217;ll show here</p>
+<p>I&#8217;m reading all attributes here (&#8211;select ALL_ATTRIBUTES) for one customer (&#8211;key-condition-expression &#8220;MyKeyPart = :k&#8221;) and evaluating the cost (-return-consumed-capacity):</p>
+<pre><code>aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select ALL_ATTRIBUTES \
+ --table-name Demo | cut -c 1-80
+...
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 122.5,
+        "TableName": "Demo",
+        "Table": {
+            "CapacityUnits": 122.5
+        }
+    }
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-15-133238.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-15-133238.jpg" alt="" width="1024" height="762" class="aligncenter size-large wp-image-38189" /></a></p>
+<p>The read cost in capacity units is 122.5 RCU. Why a fraction? Because reads are cheaper than writes and reading 8KB is only 1 RCU where writing it is 1 WCU for each KiloByte. All is &#8220;eventually consistent&#8221; read here, and would be the double (1 RCU for 4KB) with &#8220;strongly consistent&#8221; reads (because it needs to read 2 copies to get the quorum on the 3 copies). It can even double again (1 RCU for 2KB) for &#8220;transactional reads&#8221;. So, in this case, I&#8217;ve consumed 122.5 to read the 4 items.</p>
+<p>Now if I do not query for the large MyData001 attribute, including only the MyInfo001 in the projection:</p>
+<pre><code>aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyKeySort","MyInfo001" \
+ --table-name Demo
+
+...
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 122.5,
+        "TableName": "Demo",
+        "Table": {
+            "CapacityUnits": 122.5
+        }
+    }
+}
+</code></pre>
+<p>The cost is still the same. Because even if the large MyData001 was not in my query projection I had to read the full item before discarding it.</p>
+<p>I mentioned earlier that if you want strong consistency (&#8211;consistent-read) it is more expensive:</p>
+<pre><code>aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyKeySort","MyInfo001" \
+ --consistent-read \
+ --table-name Demo
+
+...
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 245.0,
+        "TableName": "Demo",
+        "Table": {
+            "CapacityUnits": 245.0
+        }
+    }
+}
+</code></pre>
+<p>The read capacity unit has doubled to 245 RCU for strong consistency: 1RCU every 4KB and I had to read 4 items that are 245 KB each.</p>
+<h3>Global Secondary Index</h3>
+<p>I&#8217;ll show that creating an index can help with this. Technically, as I access by the partition key (MyKeyPart) I can create a Local Secondary Index. But this comes with some restrictions, like the need to re-create the table, and I&#8217;ll show it later. Creating a global index is much easier and then can be a solution even when prefixed by the partition key. </p>
+<pre><code>
+aws dynamodb update-table \
+ --attribute-definitions \
+    AttributeName=MyKeyPart,AttributeType=N \
+    AttributeName=MyKeySort,AttributeType=N \
+ --global-secondary-index-updates ' [{"Create":{
+  "IndexName": "DemoGSI",
+  "KeySchema":[
+   {"AttributeName":"MyKeyPart","KeyType":"HASH"},
+   {"AttributeName":"MyKeySort","KeyType":"RANGE"}
+  ],
+  "ProvisionedThroughput":{"ReadCapacityUnits":10,"WriteCapacityUnits":5},
+  "Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["MyInfo001"]}
+  }}] ' \
+ --table-name Demo
+
+-----------------------------------------------------------------------------------------------
+|                                         UpdateTable                                         |
++---------------------------------------------------------------------------------------------+
+||                                     TableDescription                                      ||
+|+----------------------+--------------------------------------------------------------------+|
+||  CreationDateTime    |  1584277665.92                                                     ||
+||  ItemCount           |  8                                                                 ||
+||  TableArn            |  arn:aws:dynamodb:eu-central-1:802756008554:table/Demo             ||
+||  TableId             |  d8238050-556c-4158-85e8-bf90d483d9e2                              ||
+||  TableName           |  Demo                                                              ||
+||  TableSizeBytes      |  2000331                                                           ||
+||  TableStatus         |  UPDATING                                                          ||
+|+----------------------+--------------------------------------------------------------------+|
+|||                                  AttributeDefinitions                                   |||
+||+-------------------------------------------+---------------------------------------------+||
+|||               AttributeName               |                AttributeType                |||
+||+-------------------------------------------+---------------------------------------------+||
+|||  MyKeyPart                                |  N                                          |||
+|||  MyKeySort                                |  N                                          |||
+||+-------------------------------------------+---------------------------------------------+||
+|||                                 GlobalSecondaryIndexes                                  |||
+||+----------------+------------------------------------------------------------------------+||
+|||  Backfilling   |  False                                                                 |||
+|||  IndexArn      |  arn:aws:dynamodb:eu-central-1:802756008554:table/Demo/index/DemoGSI   |||
+|||  IndexName     |  DemoGSI                                                               |||
+|||  IndexSizeBytes|  0                                                                     |||
+|||  IndexStatus   |  CREATING                                                              |||
+|||  ItemCount     |  0                                                                     |||
+||+----------------+------------------------------------------------------------------------+||
+||||                                       KeySchema                                       ||||
+|||+----------------------------------------------------+----------------------------------+|||
+||||                    AttributeName                   |             KeyType              ||||
+|||+----------------------------------------------------+----------------------------------+|||
+||||  MyKeyPart                                         |  HASH                            ||||
+||||  MyKeySort                                         |  RANGE                           ||||
+|||+----------------------------------------------------+----------------------------------+|||
+||||                                      Projection                                       ||||
+|||+-----------------------------------------------------+---------------------------------+|||
+||||  ProjectionType                                     |  INCLUDE                        ||||
+|||+-----------------------------------------------------+---------------------------------+|||
+|||||                                  NonKeyAttributes                                   |||||
+||||+-------------------------------------------------------------------------------------+||||
+|||||  MyInfo001                                                                          |||||
+||||+-------------------------------------------------------------------------------------+||||
+||||                                 ProvisionedThroughput                                 ||||
+|||+----------------------------------------------------------------------+----------------+|||
+||||  NumberOfDecreasesToday                                              |  0             ||||
+||||  ReadCapacityUnits                                                   |  10            ||||
+||||  WriteCapacityUnits                                                  |  5             ||||
+|||+----------------------------------------------------------------------+----------------+|||
+|||                                        KeySchema                                        |||
+||+-----------------------------------------------------+-----------------------------------+||
+|||                    AttributeName                    |              KeyType              |||
+||+-----------------------------------------------------+-----------------------------------+||
+|||  MyKeyPart                                          |  HASH                             |||
+|||  MyKeySort                                          |  RANGE                            |||
+||+-----------------------------------------------------+-----------------------------------+||
+|||                                  ProvisionedThroughput                                  |||
+||+------------------------------------------------------------------------+----------------+||
+|||  NumberOfDecreasesToday                                                |  0             |||
+|||  ReadCapacityUnits                                                     |  25            |||
+|||  WriteCapacityUnits                                                    |  25            |||
+||+------------------------------------------------------------------------+----------------+||
+</code></pre>
+<p>Building the index takes some time with my free tier capacity units limitation:</p>
+<pre><code>
+while aws --output json dynamodb describe-table --table-name Demo | grep '"TableStatus": "UPDATING"' ; do sleep 1 ; done 2&gt;/dev/null | awk '{printf "."}END{print}'
+while aws --output json dynamodb describe-table --table-name Demo | grep '"IndexStatus": "CREATING"' ; do sleep 1 ; done 2&gt;/dev/null | awk '{printf "."}END{print}'
+
+....        "TableStatus": "UPDATING",
+.................................................................................................................................                "IndexStatus": "CREATING",
+</code></pre>
+<p>This index has the same HASH/RANGE keys as the table be it will be smaller because the only additional attribute is MyInfo001 ( &#8220;Projection&#8221;:{&#8220;ProjectionType&#8221;:&#8221;INCLUDE&#8221;,&#8221;NonKeyAttributes&#8221;:[&#8220;MyInfo001&#8221;]} )</p>
+<p>Note that I mentioned a ProvisionedThoughput in the index create: this is mandatory. Global indexes have their own provisioning and that means that you need to think about the frequency of queries which will use them as the goal is to reduce the table&#8217;s provisioning in order to reduce the cost.</p>
+<p>We are not in the SQL / relational nirvana where you create an index and transparently all queries that can benefit from it will do: </p>
+<pre><code>aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyInfo001" \
+ --no-consistent-read \
+ --table-name Demo
+...
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 122.5,
+        "TableName": "Demo",
+        "Table": {
+            "CapacityUnits": 122.5
+        }
+    }
+}</code></pre>
+<p>Same cost as without the index: 4 items read from the table, that&#8217;s 4x245KB and each 8KB takes 1 RCU with eventual consistent reads (&#8211;no-consistent-read) so that&#8217;s 122.5 RCI.</p>
+<p>There&#8217;s no optimizer or query planner here, we need to explicitly mention the index usage (&#8211;index-name DemoGSI ):</p>
+<pre><code>aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyInfo001" \
+ --no-consistent-read \
+ --index-name DemoGSI \
+ --table-name Demo
+...
+   ],
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 0.5,
+        "GlobalSecondaryIndexes": {
+            "DemoGSI": {
+                "CapacityUnits": 0.5
+            }
+        },
+        "TableName": "Demo",
+        "Table": {
+            "CapacityUnits": 0.0
+        }
+    }
+}
+</code></pre>
+<p>No RCU consumed from the table and only 0.5 RCU consumed from the index: 4 entries that are smaller than 4KB, which is only 0.5 RCU. That is the huge benefit from this index which does not contain the large MyData001 attribute.</p>
+<p>The key columns were not displayed, so I can add them in the projection (&#8211;projection-expression=&#8221;MyKeyPart&#8221;,&#8221;MyKeySort&#8221;,&#8221;MyInfo001&#8243;):</p>
+<pre><code>aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyKeyPart","MyKeySort","MyInfo001" \
+ --no-consistent-read \
+ --index-name DemoGSI \
+ --table-name Demo
+...
+   "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 0.5,
+        "GlobalSecondaryIndexes": {
+            "DemoGSI": {
+                "CapacityUnits": 0.5
+            }
+        },
+        "TableName": "Demo",
+        "Table": {
+            "CapacityUnits": 0.0
+        }
+    }
+}</code></pre>
+<p>This is the same cost because all is there in the index.</p>
+<p>One drawback with Global Secondary Indexes is that they support eventual consistency only. Trying a &#8211;consistent-read:</p>
+<pre><code>aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyKeyPart","MyKeySort","MyInfo001" \
+ --consistent-read \
+ --index-name DemoGSI \
+ --table-name Demo
+
+An error occurred (ValidationException) when calling the Query operation: Consistent reads are not supported on global secondary indexes</code></pre>
+<p>This raises an error. Global Secondary Indexes are like another table and DynamoDB does not ensure multi-table consistency.  </p>
+<p>I mentioned that the index is like another table, and that I have to mention it to read it (&#8211;index-name). But there is worse (when compared with Relational SQL databases). An index is supposed to be a pointer to a table row but that is not the case here. If I want to get more attributes from the table I have to do it in another query. I cannot just add those attributes in the projection (&#8211;projection-expression) if they are not present in the index:</p>
+<pre><code>
+aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyKeyPart","MyKeySort","MyInfo001","MyData001" \
+ --no-consistent-read \
+ --index-name DemoGSI \
+ --table-name Demo
+
+An error occurred (ValidationException) when calling the Query operation: One or more parameter values were invalid: Global secondary index DemoGSI does not project [MyData001]
+</code></pre>
+<p>&nbsp;<br />
+Here, because the index is prefixed with the partition key I can also choose a local index. This may have some advantages (like allowing strong consistency) but also many drawbacks which makes them no so friendly. I&#8217;ll continue on that in the next post on <a href="https://www.dbi-services.com/blog/dynamodb-covering-lsi" rel="noopener noreferrer" target="_blank">DynamoDB: adding a Local covering index to reduce the cost</a>.</p>
+
+</div>
+</body>
+</html>

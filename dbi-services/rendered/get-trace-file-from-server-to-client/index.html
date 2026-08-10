@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/get-trace-file-from-server-to-client/">
+<title>Get trace file from server to client</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/get-trace-file-from-server-to-client/">https://www.dbi-services.com/blog/get-trace-file-from-server-to-client/</a> (2017-08-20)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Get trace file from server to client</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+The old way to get a user dump trace file, for sql_trace (10046), Optimizer compilation trace (10053), lock trace (10704), Optimizer execution trace (10507),&#8230; is to go to the server trace directory. But if you don&#8217;t have access to the server (as in the &#9729;) the modern (12<em>c</em>R2) way is to select from V$DIAG_TRACE_FILE_CONTENTS. Before everybody is on 12.2 I&#8217;m sharing here a sqlplus script that I use for a long time to get the trace file to the client.<br />
+<!--more--><br />
+This is a script to run with sqlplus passing as a parameter the name of the trace file you want to write to (because the original name on the server is not very meaningful). I close all cursors to get all info such as STAT lines. I get the trace file name from v$diag_info. If a directory exists I use it. If not I create one, named UDUMP, which I&#8217;ll remove at the end. Then the file is read by utl_file and spooled on client though dbms_output. At the end, I remove the trace file from the server.</p>
+<p>Here is the script &#8211; comments welcome.</p>
+<pre><code>set serveroutput on feedback off verify off termout off linesize 1024 trimspool on echo off
+spool &amp;1..trc
+declare
+ fd utl_file.file_type;
+ line varchar2(1024);
+ l_tracename varchar2(512);
+ l_directory_path all_directories.directory_path%TYPE;
+ l_directory_name all_directories.directory_name%TYPE;
+ l_directory_created boolean;
+ procedure t (msg in varchar2) is begin dbms_output.put_line(msg); end;
+begin
+ /* use old parameter _cached_open_cursors to close all open cursors */
+ for r in (select 1 from v$session_cursor_cache where count&gt;0) loop
+  dbms_session.set_close_cached_open_cursors(true);
+  rollback;
+  commit;
+  dbms_session.set_close_cached_open_cursors(false);
+ end loop;
+ /* get trace directory and trace file name */
+ select value into l_directory_path from v$diag_info where name='Diag Trace';
+ select substr(replace(value,l_directory_path,''),2) into l_tracename from v$diag_info where name='Default Trace File';
+ /* get directory name for it, or try to create it */
+ l_directory_created:=false;
+ begin
+  select directory_name into l_directory_name from all_directories where directory_path = l_directory_path and rownum=1;
+ exception
+  when no_data_found then
+   begin
+    l_directory_name:='UDUMP';
+    execute immediate 'create directory '||l_directory_name||' as '''||l_directory_path||'''';
+    l_directory_created:=true;
+   exception when others then
+    raise_application_error(-20000,'You must CREATE DIRECTORY '||l_directory_name||' as ''' ||l_directory_path||'''; or be granted CREATE DIRECTORY.');
+   end;
+ end;
+ /* opens the trace file */
+ begin
+  fd:=utl_file.fopen(l_directory_name,l_tracename,'R');
+ exception when others then
+    raise_application_error(-20001,'Impossible to open file: '||l_tracename||' in '||l_directory_name||' ( '||l_directory_path||' )');
+ end;
+ /* read the trace file and prints it */
+ begin
+  loop
+   begin
+    utl_file.get_line(fd,line);
+    dbms_output.put_line(line);
+   exception
+    when no_data_found then exit;
+    when others then
+     dbms_output.put_line('!!! error while reading file '||l_tracename||' in '||l_directory_name||' ( '||l_directory_path||' )');
+   end;
+  end loop;
+  /* close and remove the file from the server */
+  utl_file.fclose(fd);
+  utl_file.fremove(l_directory_name,l_tracename);
+ exception
+  when others then
+   raise_application_error(-20002,'Impossible to remove: '||l_tracename||' in '||l_directory_name||' ( '||l_directory_path||' )');
+ end;
+ begin
+  /* drop directory if created */
+  if l_directory_created then execute immediate 'drop directory '||l_directory_name; end if;
+ exception
+  when others then
+   raise_application_error(-20002,'Impossible to remove directory: '||l_directory_name||' ( '||l_directory_path||' )'||sqlerrm);
+ end;
+end;
+/
+spool off
+</code></pre>
+
+</div>
+</body>
+</html>

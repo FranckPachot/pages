@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/histograms-on-character-strings-between-11-2-0-3-and-11-2-0-4/">
+<title>Histograms on character strings between 11.2.0.3 and 11.2.0.4</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/histograms-on-character-strings-between-11-2-0-3-and-11-2-0-4/">https://www.dbi-services.com/blog/histograms-on-character-strings-between-11-2-0-3-and-11-2-0-4/</a> (2016-11-30)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Histograms on character strings between 11.2.0.3 and 11.2.0.4</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In short, when have statistics gathered in 11.2.0.3 but the query is now running with the 11.2.0.4 optimizer, you may have wrong cardinality estimation on histograms, leading to sub-optimal plans.<br />
+<!--more--><br />
+I had a table with a flag that has two values &#8216;Y&#8217; and &#8216;N&#8217; with even distribution between them. It&#8217;s a good case for frequency histograms. I had frequency histograms and expected exact cardinality estimation for a WHERE FLAG=&#8217;Y&#8217; predicate. But that was not the case: very low estimation leading to very bad execution plan. Because the cardinality estimation was far from what we have in histograms and far from what we would have without histograms, I checked a 10053 trace and this is what I&#8217;ve find:</p>
+<pre><code> Using prorated density: 0.004557 of col #97 as selectivity of out-of-range/non-existent value pred</code></pre>
+<p>This is linear decay because of out-of-range predicate (I&#8217;ll show that next Wednesday at UKOUG TECH16) but I don&#8217;t expect an out-of-range condition when I provide one of the two values that are in the frequency histogram.</p>
+<h3>Here is my testcase</h3>
+<pre><code>
+SQL&gt; create table DEMO ( flag char);
+Table created.
+&nbsp;
+SQL&gt; select count(*) from DEMO where flag='Y';
+&nbsp;
+  COUNT(*)
+----------
+         0
+&nbsp;
+SQL&gt; insert into DEMO select 'Y' from xmltable('1 to 100000');
+100000 rows created.
+&nbsp;
+SQL&gt; insert into DEMO select 'N' from xmltable('1 to   1000');
+1000 rows created.
+&nbsp;
+SQL&gt; select flag,to_char(ascii(flag),'XX'),count(*) from DEMO group by flag;
+&nbsp;
+FLAG  TO_CHAR(ASCII(FLAG),'XX')  COUNT(*)
+----  -------------------------  --------
+Y      59                          100000
+N      4E                            1000
+</code></pre>
+<p>100000 rows with &#8216;Y&#8217; and 1000 rows with &#8216;N&#8217;.</p>
+<h3>11.2.0.3</h3>
+<p>I gather statistics in 11.2.0.3</p>
+<pre><code>
+SQL&gt; alter session set optimizer_features_enable='11.2.0.3';
+Session altered.
+&nbsp;
+SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO',no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>And run a query looking for rows where flag is &#8216;Y&#8217;</p>
+<pre><code>
+SQL&gt; explain plan for select count(*) from DEMO where flag='Y';
+Explained.
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'basic +rows'));
+PLAN_TABLE_OUTPUT
+Plan hash value: 2180342005
+&nbsp;
+-------------------------------------------
+| Id  | Operation          | Name | Rows  |
+-------------------------------------------
+|   0 | SELECT STATEMENT   |      |     1 |
+|   1 |  SORT AGGREGATE    |      |     1 |
+|   2 |   TABLE ACCESS FULL| DEMO |   100K|
+-------------------------------------------
+</code></pre>
+<p>The estimate is perfect thanks to the histograms.</p>
+<h3>11.2.0.4</h3>
+<p>Now the CBO will running in 11.2.0.4 but statistics have not been gathered since 11.2.0.3</p>
+<pre><code>
+SQL&gt; alter session set optimizer_features_enable='11.2.0.4';
+Session altered.
+&nbsp;
+SQL&gt; explain plan for select count(*) from DEMO where flag='Y';
+Explained.
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'basic +rows'));
+PLAN_TABLE_OUTPUT
+Plan hash value: 2180342005
+&nbsp;
+-------------------------------------------
+| Id  | Operation          | Name | Rows  |
+-------------------------------------------
+|   0 | SELECT STATEMENT   |      |     1 |
+|   1 |  SORT AGGREGATE    |      |     1 |
+|   2 |   TABLE ACCESS FULL| DEMO |   500 |
+-------------------------------------------
+</code></pre>
+<p>Bad estimation here. Were those 500 come from?<br />
+It&#8217;s not from the histogram that knows that 100K rows have value &#8216;Y&#8217;<br />
+Without histograms the estimation would be based on 2 distinct values among 101000 so that would be 50500.<br />
+CBO trace says:</p>
+<pre><code>Access path analysis for DEMO
+***************************************
+SINGLE TABLE ACCESS PATH
+  Single Table Cardinality Estimation for DEMO[DEMO]
+  SPD: Return code in qosdDSDirSetup: NOCTX, estType = TABLE
+&nbsp;
+ kkecdn: Single Table Predicate:"DEMO"."FLAG"='Y'
+  Column (#1):
+    NewDensity:0.004950, OldDensity:0.000005 BktCnt:101000.000000, PopBktCnt:101000.000000, PopValCnt:2, NDV:2
+  Column (#1): FLAG(CHARACTER)
+    AvgLen: 2 NDV: 2 Nulls: 0 Density: 0.004950
+    Histogram: Freq  #Bkts: 2  UncompBkts: 101000  EndPtVals: 2  ActualVal: no
+  Using density: 0.004950 of col #1 as selectivity of pred having unreasonably low value
+  Table: DEMO  Alias: DEMO
+    Card: Original: 101000.000000  Rounded: 500  Computed: 500.000000  Non Adjusted: 500.000000</code></pre>
+<p>Predicate having unreasonably low value&#8230;</p>
+<p>Time to look at the histograms.</p>
+<h3>ENDPOINT_VALUE</h3>
+<p>You can get the histogram entries. For CHAR datatype (my case here) the endpoint value is hashed through their ASCII representation put in decimal. Or at least with first characters. </p>
+<pre><code>SQL&gt; select endpoint_number,endpoint_value
+  2  ,to_char(endpoint_value,rpad('FM',65,'X'))
+  3  ,utl_raw.cast_to_varchar2(hextoraw(to_char(endpoint_value,rpad('FM',65,'X'))))
+  4  from user_histograms h where table_name='DEMO';
+ENDPOINT_NUMBER  ENDPOINT_VALUE                        TO_CHAR(ENDPOINT_VALUE,RPAD('FM',65,'X'))  UTL_RAW.CAST_TO_VARCHAR2(HEXTORAW(TO_CHAR(ENDPOINT_VALUE,RPAD('FM',65,'X'))))
+---------------  ------------------------------------  ----------------------------------------- ------------------------------------------------------------------------------
+1000             405650737316592000000000000000000000  4E20202020203A7BB119D5F6000000             N     :{��
+101000           462766002760475000000000000000000000  59202020202034D998FF0B5AE00000             Y     4٘�
+                                                                                                          Z�
+</code></pre>
+<p>Looks good. I can see the &#8216;N&#8217; and &#8216;Y&#8217; values here. But obviously the CBO sees that as different than &#8216;Y&#8217;.</p>
+<p>Let&#8217;s gather statistics again (I&#8217;m now with 11.2.0.4 CBO):</p>
+<pre><code>SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO',no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.</code></pre>
+<p>And look at the difference:</p>
+<pre><code>SQL&gt; select endpoint_number,endpoint_value
+  2  ,to_char(endpoint_value,rpad('FM',65,'X'))
+  3  ,utl_raw.cast_to_varchar2(hextoraw(to_char(endpoint_value,rpad('FM',65,'X'))))
+  4  from user_histograms h where table_name='DEMO';
+ENDPOINT_NUMBER  ENDPOINT_VALUE                        TO_CHAR(ENDPOINT_VALUE,RPAD('FM',65,'X'))  UTL_RAW.CAST_TO_VARCHAR2(HEXTORAW(TO_CHAR(ENDPOINT_VALUE,RPAD('FM',65,'X'))))
+---------------  ------------------------------------  ----------------------------------------- ------------------------------------------------------------------------------
+1000             404999154965717000000000000000000000  4E0000000000181F436C7BBB200000             NCl{�
+101000           462114420409600000000000000000000000  590000000000127D2B51B120000000             Y}+Q�</code></pre>
+<p>In 11.2.0.3 the characters (&#8216;Y&#8217; is ASCII 0x59) were padded with spaces (ASCII 0x20). But In 11.2.0.4 they are padded with nulls (ASCII 0x00).<br />
+This is the reason why it was considered different. The ENDPOINT_VALUE for &#8216;Y&#8217; calculated by the 11.2.0.4 version of the CDB is different from the one calculated by the 11.2.0.3 dbms_stats. </p>
+<p>Now, the estimation is good again:</p>
+<pre><code>
+SQL&gt; explain plan for select count(*) from DEMO where flag='Y';
+Explained.
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display(format=&gt;'basic +rows'));
+PLAN_TABLE_OUTPUT
+Plan hash value: 2180342005
+&nbsp;
+-------------------------------------------
+| Id  | Operation          | Name | Rows  |
+-------------------------------------------
+|   0 | SELECT STATEMENT   |      |     1 |
+|   1 |  SORT AGGREGATE    |      |     1 |
+|   2 |   TABLE ACCESS FULL| DEMO |   100K|
+-------------------------------------------
+</code></pre>
+<h3>char_value</h3>
+<p>The ENDPOINT_VALUE function has been described by Jonathan Lewis in <a href="https://www.amazon.com/gp/product/1590596366" target="_blank" rel="noopener noreferrer">Cost-Based Oracle Fundamentals</a> and the script to encode a character string is downloadable rom <a href="//www.jlcomp.demon.co.uk/cbo_book/book_cbo_scripts.zip" target="_blank" rel="noopener noreferrer">http://www.jlcomp.demon.co.uk/cbo_book/book_cbo_scripts.zip</a>. I use it (as an inline function because I&#8217;m running that in 12<em>c</em>) to show the values calculated from &#8216;Y&#8217; and &#8216;N&#8217; as well as the values calculated from same strings right-padded with spaces:</p>
+<pre><code>
+SQL&gt; with function char_value(i_vc varchar2) return number
+     -- function coming from Jonathan Lewis char_value.sql http://www.jlcomp.demon.co.uk/cbo_book/book_cbo_scripts.zip
+     is
+        m_vc varchar2(15) := substr(rpad(i_vc,15,chr(0)),1,15);
+        m_n number := 0;
+     begin
+        for i in 1..15 loop
+                m_n := m_n + power(256,15-i) * ascii(substr(m_vc,i,1));
+        end loop;
+        m_n := round(m_n, -21);
+        return m_n;
+     end;
+     select flag,char_value(flag),cast(flag as char(32)),char_value(cast(flag as char(32))),count(*) from DEMO.DEMO group by flag
+/
+&nbsp;
+FLAG  CHAR_VALUE(FLAG)                      CAST(FLAGASCHAR(32))              CHAR_VALUE(CAST(FLAGASCHAR(32)))      COUNT(*)
+----  ------------------------------------  --------------------------------  ------------------------------------  --------
+Y     462114420409600000000000000000000000  Y                                 462766002760475000000000000000000000  100000
+N     404999154965717000000000000000000000  N                                 405650737316592000000000000000000000    1000
+</code></pre>
+<p>Comparing the calculated values with the ENDPOINT_VALUE I had above, we can see that the function has not changed but the input string was padded with spaces before which is not the case anymore.</p>
+<h3>So what?</h3>
+<p>Be careful when upgrading from &lt;= 11.2.0.3 to higher version. You should re-gather the statistics (but then read <a href="http://dbi-services.com/blog/a-migration-pitfall-with-all-column-size-auto/">http://dbi-services.com/blog/a-migration-pitfall-with-all-column-size-auto/</a> as there&#8217;s another pitfall). Don&#039;t set optimizer_features_enable to lower version as the scope is very wide and many things may be different. It is always better to take the time to focus on the features you want to disable. And never give up. The weirdest situations can be troubleshooted. Oracle Database has lot of ways to understand what happens, from the debugging tools provided with the software, and from the excellent literature about it.</p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,235 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12cr2-application-containers-and-foreign-keys/">
+<title>12cR2 Application Containers and Foreign Keys</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12cr2-application-containers-and-foreign-keys/">https://www.dbi-services.com/blog/12cr2-application-containers-and-foreign-keys/</a> (2017-06-19)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12cR2 Application Containers and Foreign Keys</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Application Container brings a new way to share data among databases, and adds a new dimension to referential integrity. A foreign key in an application PDB can reference a row belonging to a root data link table. But then, should a delete on the root validate that there are no orpheans in the application PDBs? And what if those PDBs are closed at the time of this delete? Here is a small example.<br />
+<!--more--><br />
+If you run this in 12.2.0.1 you will get an error because the search for parent key is done only on the current container. This is considered as a bug: 21955394: CDB:ORA-02291 WHEN FOREIGN KEY REFERS TO THE PRIMARY KEY IN DATA LINK</p>
+<p>The example that follows is run with the <a href="https://updates.oracle.com/download/21955394.html" target="_blank" rel="noopener noreferrer">patch</a> applied to fix this bug.</p>
+<p>I&#8217;m connecting to root where I have no user PDB yet.</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/CDB1A as sysdba
+Connected.
+&nbsp;
+SQL&gt; select con_id, name, application_root application_root, application_pdb application_pdb,application_root_con_id application_root_con_id from v$containers;
+&nbsp;
+CON_ID  NAME      APPLICATION_ROOT  APPLICATION_PDB  APPLICATION_ROOT_CON_ID
+------  ----      ----------------  ---------------  -----------------------
+1       CDB$ROOT  NO                NO
+2       PDB$SEED  NO                NO
+</code></pre>
+<p>I create the application container root</p>
+<pre><code>
+SQL&gt; create pluggable database SCOTT_ROOT as application container admin user SCOTT_ADMIN identified by oracle roles=(DBA);
+Pluggable database SCOTT_ROOT created.
+&nbsp;
+SQL&gt; alter pluggable database SCOTT_ROOT open;
+Pluggable database SCOTT_ROOT altered.
+&nbsp;
+SQL&gt; select con_id, name, application_root application_root, application_pdb application_pdb,application_root_con_id application_root_con_id from v$containers;
+&nbsp;
+CON_ID  NAME        APPLICATION_ROOT  APPLICATION_PDB  APPLICATION_ROOT_CON_ID
+------  ----        ----------------  ---------------  -----------------------
+1       CDB$ROOT    NO                NO
+2       PDB$SEED    NO                NO
+</code></pre>
+<p>I connect to this application root and start the installation of the application</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/SCOTT_ROOT as sysdba
+Connected.
+&nbsp;
+SQL&gt; alter pluggable database application SCOTT begin install '1.0';
+Pluggable database APPLICATION altered.
+</code></pre>
+<p>I&#8217;m installing SCOTT tables DEPT and EMP tables but I changed their definition from utlsampl.sql:</p>
+<ul>
+<li>DEPT is an EXTENDED DATA LINK where a set of row is common, inserted on application root and visible by all application PDBs</li>
+<li>EMP is a METADATA LINK where each application PDB has its own data isolated from others, but having the same structure</li>
+</ul>
+<pre><code>
+SQL&gt; GRANT CONNECT,RESOURCE,UNLIMITED TABLESPACE TO SCOTT IDENTIFIED BY tiger container=all;
+Grant succeeded.
+&nbsp;
+SQL&gt; alter session set current_schema=SCOTT;
+Session altered.
+&nbsp;
+SQL&gt; CREATE TABLE DEPT sharing=extended data
+  2         (DEPTNO NUMBER(2) CONSTRAINT PK_DEPT PRIMARY KEY,
+  3     DNAME VARCHAR2(14) ,
+  4     LOC VARCHAR2(13) ) ;
+Table DEPT created.
+&nbsp;
+SQL&gt; CREATE TABLE EMP sharing=metadata
+  2         (EMPNO NUMBER(4) CONSTRAINT PK_EMP PRIMARY KEY,
+  3     ENAME VARCHAR2(10),
+  4     JOB VARCHAR2(9),
+  5     MGR NUMBER(4),
+  6     HIREDATE DATE,
+  7     SAL NUMBER(7,2),
+  8     COMM NUMBER(7,2),
+  9     DEPTNO NUMBER(2) CONSTRAINT FK_DEPTNO REFERENCES DEPT);
+Table EMP created.
+&nbsp;
+SQL&gt; INSERT INTO DEPT VALUES
+  2     (10,'ACCOUNTING','NEW YORK');
+1 row inserted.
+&nbsp;
+SQL&gt; INSERT INTO DEPT VALUES (20,'RESEARCH','DALLAS');
+1 row inserted.
+&nbsp;
+SQL&gt; INSERT INTO DEPT VALUES
+  2     (30,'SALES','CHICAGO');
+1 row inserted.
+&nbsp;
+SQL&gt; INSERT INTO DEPT VALUES
+  2     (40,'OPERATIONS','BOSTON');
+1 row inserted.
+&nbsp;
+SQL&gt; COMMIT;
+Commit complete.
+&nbsp;
+SQL&gt; alter pluggable database application SCOTT end   install '1.0';
+Pluggable database APPLICATION altered.
+</code></pre>
+<p>The application root has departments 10, 20, 30 and 40 in DEPT shared with all PDBs and has defined that EMP has a foreign key to it.</p>
+<p>I create an application PDB from this application root</p>
+<pre><code>
+SQL&gt; create pluggable database SCOTT_ONE admin user SCOTT_ONE_ADMIN identified by covfefe;
+Pluggable database SCOTT_ONE created.
+&nbsp;
+SQL&gt; alter pluggable database SCOTT_ONE open;
+Pluggable database SCOTT_ONE altered.
+</code></pre>
+<p>I sync it to get common DDL and DML applied</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/SCOTT_ONE as sysdba
+Connected.
+&nbsp;
+SQL&gt; alter pluggable database application SCOTT sync;
+Pluggable database APPLICATION altered.
+&nbsp;
+SQL&gt; select name,con_id,application_pdb,application_root_con_id from v$containers;
+&nbsp;
+NAME       CON_ID  APPLICATION_PDB  APPLICATION_ROOT_CON_ID
+----       ------  ---------------  -----------------------
+SCOTT_ONE  8       YES              6
+</code></pre>
+<p>Now let&#8217;s connect to the application PDB. I can see the DEPT rows inserted from root because it is a DATA LINK.</p>
+<pre><code>
+SQL&gt; connect scott/tiger@//localhost/SCOTT_ONE
+Connected.
+&nbsp;
+SQL&gt; select * from dept;
+&nbsp;
+DEPTNO  DNAME       LOC
+------  -----       ---
+10      ACCOUNTING  NEW YORK
+20      RESEARCH    DALLAS
+30      SALES       CHICAGO
+40      OPERATIONS  BOSTON
+</code></pre>
+<p>EMP is empty here</p>
+<pre><code>
+SQL&gt; select * from emp;
+&nbsp;
+no rows selected
+</code></pre>
+<p>I insert an EMP row in the application PDB which references a DEPT row in the application root:</p>
+<pre><code>
+SQL&gt; INSERT INTO EMP VALUES
+  2  (7369,'SMITH','CLERK',7902,to_date('17-12-1980','dd-mm-yyyy'),800,NULL,20);
+&nbsp;
+1 row inserted.
+</code></pre>
+<p>As DEPT is and EXTENDED DATA LINK, I can add new rows in my PDB:</p>
+<pre><code>
+SQL&gt; INSERT INTO DEPT VALUES
+  2     (50,'MY LOCAL DEPT','LAUSANNE');
+&nbsp;
+1 row inserted.
+</code></pre>
+<p>And I can have an EMP row referencing this local parent:</p>
+<pre><code>
+SQL&gt; INSERT INTO EMP VALUES
+  2  (7499,'ALLEN','SALESMAN',7698,to_date('20-2-1981','dd-mm-yyyy'),1600,300,50);
+1 row inserted.
+&nbsp;
+SQL&gt; commit;
+Commit complete.
+</code></pre>
+<p>This looks good. Now what happens of we delete all rows from DEPT in the application root?</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/SCOTT_ROOT as sysdba
+Connected.
+SQL&gt; delete from SCOTT.DEPT;
+4 rows deleted.
+&nbsp;
+SQL&gt; commit;
+Commit complete.
+</code></pre>
+<p>No error here. But then, I have orphans in my application PDB:</p>
+<pre><code>
+SQL&gt; connect scott/tiger@//localhost/SCOTT_ONE
+Connected.
+SQL&gt; select * from dept;
+&nbsp;
+    DEPTNO DNAME          LOC
+---------- -------------- -------------
+        50 MY LOCAL DEPT  LAUSANNE
+&nbsp;
+SQL&gt; select * from emp;
+&nbsp;
+     EMPNO ENAME      JOB              MGR HIREDATE         SAL       COMM     DEPTNO
+---------- ---------- --------- ---------- --------- ---------- ---------- ----------
+      7369 SMITH      CLERK           7902 17-DEC-80        800                    20
+      7499 ALLEN      SALESMAN        7698 20-FEB-81       1600        300         50
+</code></pre>
+<h3>So what?</h3>
+<p>Referential integrity works across containers: an application PDB can reference parent key in the application root (according that bug is fixed). However, no ORA-02292 (child record found) is raised when child records are not in the current container. This one makes sense. Enforcing the verification of child records in all PDBs would require that they are opened, and may require locking the table in all containers. We must be aware that doing DML on the application root can lead to inconsistency if not done correctly. </p>
+<p>Operations on the application root are application releases (upgrades and patches) and must be validated and tested carefully. For the example above, deleting all rows from DEPT can be done as an application patch which deletes from the EMP table as well:</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/SCOTT_ROOT as sysdba
+Connected.
+SQL&gt; alter pluggable database application SCOTT begin patch 1 ;
+Pluggable database APPLICATION altered.
+SQL&gt; delete from scott.emp;
+0 rows deleted.
+SQL&gt; delete from scott.dept where deptno in (10,20,30,40);
+4 rows deleted.
+SQL&gt; alter pluggable database application SCOTT end patch 1 ;
+Pluggable database APPLICATION altered.
+</code></pre>
+<p>The delete from EMP does nothing in the application root here, but it will be done on the PDB when applying the patch:</p>
+<pre><code>
+SQL&gt; select * from dept;
+&nbsp;
+    DEPTNO DNAME          LOC
+---------- -------------- -------------
+        50 MY LOCAL DEPT  LAUSANNE
+&nbsp;
+SQL&gt; select * from emp;
+&nbsp;
+     EMPNO ENAME      JOB              MGR HIREDATE         SAL       COMM     DEPTNO
+---------- ---------- --------- ---------- --------- ---------- ---------- ----------
+      7499 ALLEN      SALESMAN        7698 20-FEB-81       1600        300         50
+</code></pre>
+<p>Note that I&#8217;ve defined exactly which rows from DEPT I wanted to delete in the where clause of </p>
+<pre><code>delete from scott.dept where deptno in (10,20,30,40);</code></pre>
+<p>You may be tempted to do something like: </p>
+<pre><code>delete from scott.dept where deptno in (select deptno from scott.dept);</code></pre>
+<p>But keep in mind that the statements you run in the root are re-played as-is in the PDBs. And when you sync the PDB, you can see no rows from DEPT because there were already purged from the root. Actually, what you want is to delete from EMP the rows which refer to the rows you have deleted from the root. It is not possible to get them with a subquery, except if you have stored them into another data link table before deleting them. Changes in the application root must be managed like application patches.</p>
+
+</div>
+</body>
+</html>

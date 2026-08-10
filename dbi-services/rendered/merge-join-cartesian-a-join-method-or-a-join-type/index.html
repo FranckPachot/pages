@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/merge-join-cartesian-a-join-method-or-a-join-type/">
+<title>MERGE JOIN CARTESIAN: a join method or a join type?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/merge-join-cartesian-a-join-method-or-a-join-type/">https://www.dbi-services.com/blog/merge-join-cartesian-a-join-method-or-a-join-type/</a> (2018-08-08)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">MERGE JOIN CARTESIAN: a join method or a join type?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+I&#8217;ll present about join methods at POUG and DOAG. I&#8217;ll show how the different join methods work in order to better understand them. The idea is to show Nested Loops, Hash Join, Sort Merge Join, Merge Join Cartesian on the same query. I&#8217;ll run a simple join between DEPT and EMP with the USE_NL, USE_HASH, USE_MERGE and USE_MERGE_CARTESIAN hints. I&#8217;ll show the execution plan, with SQL Monitoring in text mode. And I&#8217;ll put some gdb breakpoints on the &#8216;qer&#8217; (query execution rowsource) functions to run the plan operations step by step. Then I&#8217;ll do the same on a different query in order to show in detail the 12c adaptive plans.</p>
+<p>But wait, I listed Nested Loops, Hash Join, Sort Merge Join, Merge Join Cartesian&#8230; but is Merge Cartesian Join really a join method? I mean, my query is not a cartesian join. I have all join predicates here. But for sure you can also do an inner join by starting with a cartesian join and then filter on the join predicate. As if doing physically what the old join syntax of Oracle is doing logically: by not putting any predicates in the from clause and add the join predicates in the where clause to filter over it.<br />
+<!--more--><br />
+If I look at the 12.2 documentation, it is a Join method<br />
+<a href="https://docs.oracle.com/en/database/oracle/oracle-database/12.2/tgsql/joins.html#GUID-54F957FB-3568-499A-BCD2-B242BFFF913D"><img loading="lazy" decoding="async" src="../../assets/CaptureJoinMethods122.png" alt="CaptureJoinMethods122" width="1024" height="614" class="aligncenter size-large wp-image-26879" /></a></p>
+<p>For the definition, a Join Method is how the join will be executed. It is not a decision of the SQL developer because SQL is declarative: you declare the result you want, and the optimizer will decide how to do it. And this is why hints are in comments: they are not part of the declarative syntax. Forcing how to do it is not part of SQL.</p>
+<p>Just after listing the join methods, the documentation lists the join types which are part of the SQL because it declares the join result you expect. Inner join to get all matching rows. Semi join to get only the first matching row. Anti Join to get all rows which do not match. Outer join to get all matching rows in addition to those which matches. The syntax is INNER JOIN, OUTER JOIN, EXISTS or IN, NOT EXISTS or NOT IN. Join type is not &#8216;how&#8217; but &#8216;what&#8217;.</p>
+<p>Ok, so back to the join method. Let&#8217;s force it on my inner join between DEPT and EMP:</p>
+<h3>11g</h3>
+<pre><code>
+SQL&gt; alter session set current_schema=SCOTT statistics_level=all;
+Session altered.
+&nbsp;
+SQL&gt; select /*+ leading(DEPT) USE_MERGE_CARTESIAN(EMP) FULL(DEPT) */ * from DEPT join EMP using(deptno);
+&nbsp;
+    DEPTNO DNAME          LOC                EMPNO ENAME      JOB              MGR HIREDATE         SAL       COMM
+---------- -------------- ------------- ---------- ---------- --------- ---------- --------- ---------- ----------
+        10 ACCOUNTING     NEW YORK            7782 CLARK      MANAGER         7839 09-JUN-81       2450
+        10 ACCOUNTING     NEW YORK            7839 KING       PRESIDENT            17-NOV-81       5000
+        10 ACCOUNTING     NEW YORK            7934 MILLER     CLERK           7782 23-JAN-82       1300
+        10 RESEARCH       DALLAS              7782 CLARK      MANAGER         7839 09-JUN-81       2450
+        10 RESEARCH       DALLAS              7839 KING       PRESIDENT            17-NOV-81       5000
+        10 RESEARCH       DALLAS              7934 MILLER     CLERK           7782 23-JAN-82       1300
+        10 SALES          CHICAGO             7782 CLARK      MANAGER         7839 09-JUN-81       2450
+        10 SALES          CHICAGO             7839 KING       PRESIDENT            17-NOV-81       5000
+        10 SALES          CHICAGO             7934 MILLER     CLERK           7782 23-JAN-82       1300
+        10 OPERATIONS     BOSTON              7782 CLARK      MANAGER         7839 09-JUN-81       2450
+        10 OPERATIONS     BOSTON              7839 KING       PRESIDENT            17-NOV-81       5000
+        10 OPERATIONS     BOSTON              7934 MILLER     CLERK           7782 23-JAN-82       1300
+&nbsp;
+12 rows selected.
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------
+SQL_ID  1xpfxq6pc30vq, child number 0
+-------------------------------------
+select /*+ leading(DEPT) USE_MERGE_CARTESIAN(EMP) FULL(DEPT) */ * from
+DEPT join EMP using(deptno)
+&nbsp;
+Plan hash value: 2034389985
+&nbsp;
+------------------------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |      |      1 |        |     12 |00:00:00.01 |       7 |       |       |          |
+|   1 |  MERGE JOIN CARTESIAN|      |      1 |     14 |     12 |00:00:00.01 |       7 |       |       |          |
+|   2 |   TABLE ACCESS FULL  | DEPT |      1 |      4 |      4 |00:00:00.01 |       4 |       |       |          |
+|   3 |   BUFFER SORT        |      |      4 |      4 |     12 |00:00:00.01 |       3 |  2048 |  2048 | 2048  (0)|
+|*  4 |    TABLE ACCESS FULL | EMP  |      1 |      4 |      3 |00:00:00.01 |       3 |       |       |          |
+------------------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   4 - filter("DEPT"."DEPTNO"="EMP"."DEPTNO")
+&nbsp;
+</code></pre>
+<p>Ok, then I declared my result with an inner join query, and I forced the join method with a hint to show that it is possible. But look at the result. 12 rows? Only DEPTNO 10 where the SCOTT schema has employees in 10, 20 and 30? And only 3 employees here, repeated 4 times for each department name? That&#8217;s wrong result.</p>
+<p>NEVER FORCE A CARTESIAN JOIN WITH USE_MERGE_CARTESIAN!</p>
+<p>That&#8217;s a very old bug: <a href="https://support.oracle.com/epmos/faces/DocContentDisplay?id=17064391.8" target="_blank" rel="noopener noreferrer">Bug 17064391  Wrong result with USE_MERGE_CARTESIAN hint</a> finally fixed in 12c (12.2 and backported in 12.1 PSU)</p>
+<p>Then how is it fixed? </p>
+<h3>18c</h3>
+<p>With the fix, the hint is just ignored and a SORT MERGE JOIN is used here:</p>
+<pre><code>
+SQL&gt; alter session set current_schema=SCOTT statistics_level=all;
+Session altered.
+&nbsp;
+SQL&gt; select /*+ leading(DEPT) USE_MERGE_CARTESIAN(EMP) FULL(DEPT) */ * from DEPT join EMP using(deptno);
+&nbsp;
+    DEPTNO DNAME          LOC                EMPNO ENAME      JOB              MGR HIREDATE         SAL       COMM
+---------- -------------- ------------- ---------- ---------- --------- ---------- --------- ---------- ----------
+        10 ACCOUNTING     NEW YORK            7782 CLARK      MANAGER         7839 09-JUN-81       2450
+        10 ACCOUNTING     NEW YORK            7839 KING       PRESIDENT            17-NOV-81       5000
+        10 ACCOUNTING     NEW YORK            7934 MILLER     CLERK           7782 23-JAN-82       1300
+        20 RESEARCH       DALLAS              7566 JONES      MANAGER         7839 02-APR-81       2975
+        20 RESEARCH       DALLAS              7902 FORD       ANALYST         7566 03-DEC-81       3000
+        20 RESEARCH       DALLAS              7876 ADAMS      CLERK           7788 23-MAY-87       1100
+        20 RESEARCH       DALLAS              7369 SMITH      CLERK           7902 17-DEC-80        800
+        20 RESEARCH       DALLAS              7788 SCOTT      ANALYST         7566 19-APR-87       3000
+        30 SALES          CHICAGO             7521 WARD       SALESMAN        7698 22-FEB-81       1250        500
+        30 SALES          CHICAGO             7844 TURNER     SALESMAN        7698 08-SEP-81       1500          0
+        30 SALES          CHICAGO             7499 ALLEN      SALESMAN        7698 20-FEB-81       1600        300
+        30 SALES          CHICAGO             7900 JAMES      CLERK           7698 03-DEC-81        950
+        30 SALES          CHICAGO             7698 BLAKE      MANAGER         7839 01-MAY-81       2850
+        30 SALES          CHICAGO             7654 MARTIN     SALESMAN        7698 28-SEP-81       1250       1400
+&nbsp;
+14 rows selected.
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1xpfxq6pc30vq, child number 0
+-------------------------------------
+select /*+ leading(DEPT) USE_MERGE_CARTESIAN(EMP) FULL(DEPT) */ * from
+DEPT join EMP using(deptno)
+&nbsp;
+Plan hash value: 1407029907
+&nbsp;
+--------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation           | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads  |  OMem |  1Mem | Used-Mem |
+--------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |      |      1 |        |     14 |00:00:00.01 |      12 |     12 |       |       |          |
+|   1 |  MERGE JOIN         |      |      1 |     14 |     14 |00:00:00.01 |      12 |     12 |       |       |          |
+|   2 |   SORT JOIN         |      |      1 |      4 |      4 |00:00:00.01 |       6 |      6 |  2048 |  2048 | 2048  (0)|
+|   3 |    TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |00:00:00.01 |       6 |      6 |       |       |          |
+|*  4 |   SORT JOIN         |      |      4 |     14 |     14 |00:00:00.01 |       6 |      6 |  2048 |  2048 | 2048  (0)|
+|   5 |    TABLE ACCESS FULL| EMP  |      1 |     14 |     14 |00:00:00.01 |       6 |      6 |       |       |          |
+--------------------------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   4 - access("DEPT"."DEPTNO"="EMP"."DEPTNO")
+       filter("DEPT"."DEPTNO"="EMP"."DEPTNO")
+</code></pre>
+<p>So here the result is good, thanks to the fix, and we clearly see how it is fixed: the USE_MERGE_CARTESIAN hint has been ignored.</p>
+<p>And the funny thing is that when you look at the 18c documentation, the Merge Join Cartesian is not a join method anymore but a join type:<br />
+<a href="https://docs.oracle.com/en/database/oracle/oracle-database/18/tgsql/joins.html#GUID-8E7760A6-48D6-4794-BF2F-290349C019B9"><img loading="lazy" decoding="async" src="../../assets/CaptureJoinMethods183.png" alt="CaptureJoinMethods183" width="1024" height="649" class="aligncenter size-large wp-image-26885" /></a></p>
+<p>Exactly the same paragraph, but now in join types (the &#8216;what&#8217;) rather than in join methods (the &#8216;when&#8217;).</p>
+<h3>What or How?</h3>
+<p>Actually, in my opinion, it is both. When you explicitly want a cartesian join, that&#8217;s a join type described by the CROSS JOIN in the ANSI join syntax, or the lack of related predicates in the old syntax. This is &#8216;what&#8217;. But you may also encounter a MERGE JOIN CARTESIAN for a non-cartesian join just because the optimizer decides it is more efficient. When you have very few rows on both sides, it may be faster to start with a cartesian product on small rowsources. This can be part of star transformation where fact rows are joined back to the cartesian product of filtered dimensions in order to project the dimension attributes. This is &#8216;how&#8217; it will be executed. We also see it when the optimizer underestimates the cardinalities and is followed by a long nested loop.</p>
+<h3>When?</h3>
+<p>So, let&#8217;s look at the documentation &#8220;When the Optimizer Considers Cartesian Joins&#8221;:<br />
+<a href="https://docs.oracle.com/en/database/oracle/oracle-database/18/tgsql/joins.html#GUID-11E7100E-1316-4963-83C5-A85940BE9BB6"><img loading="lazy" decoding="async" src="../../assets/CaptureJoinMethods183-when.png" alt="CaptureJoinMethods183-when" width="1024" height="410" class="aligncenter size-large wp-image-26887" /></a></p>
+<ul>
+<li>No join condition exists: that&#8217;s when cartesian product is what we want</li>
+<li>The ORDERED hint specifies a table before its join table is specified: that&#8217;s when it is the only join method possible with the specified join order</li>
+<li>A Cartesian join is an efficient method: then it is a method there, even if documented in join types.</li>
+</ul>
+<p>In conclusion, cartesian join is a join type. It can also be used as a join method when the optimizer decides to. But you cannot decide it yourself by hinting since 12c, and trying to do so in previous version is a very bad idea and can returns wrong results.</p>
+<p>So, for this one I&#8217;ll explicitely run a CROSS JOIN:<br />
+<a href="../../assets/CaptureUSEMERGECARTESIAN.png"><img loading="lazy" decoding="async" src="../../assets/CaptureUSEMERGECARTESIAN.png" alt="CaptureUSEMERGECARTESIAN" width="1024" height="736" class="aligncenter size-large wp-image-26897" /></a></p>
+<p>The query is on top. The SQL monitor in the middle, showing that we are currently active on reading rows from EMP. The bottom shows the &#8216;qer&#8217; functions backtrace: the fetch call is propagated from opifch2 for the SELECT STATEMENT, through the MERGE JOIN CARTESIAN (querjo), the BUFFER SORT (qerso), to the TABLE ACCESS (qertb). </p>
+<p>So basically, the goal of this full-demo presentation is to show how to read the execution plan by understanding how it is executed. This qertbFetch on the inner table EMP is executed only on the first row coming from the outer table DEPT. As the rows are returned to a buffer, the further iterations will fetch only from this buffer and will not go further than qersoFetchSimple. The qersoProcessULS (&#8216;process underlying row source&#8217; &#8211; see <a href="http://https://gitlab.com/FritsHoogland/ora_functions/blob/master/functions.csv" target="_blank" rel="noopener noreferrer">Frits Hoogland annotations</a>) is run only once. This is the big difference with Nested Loop where the inner loop on the underlying rowsource is run for each outer loop iteration: those two loops are nested &#8211; thus the name. But the function for the join part is the same for Nested Loop, Sort Merge Join and Merge Join Cartesian: qerjo. Only the underlying operations differenciate the join methods.</p>
+<p>Last comment, we don&#8217;t see any function which really sort the rows in this buffer (as we will see for the Sort Merge Join method) because there is no sorting despites the name of the BUFFER SORT operation. More info on <a href="https://jonathanlewis.wordpress.com/2006/12/17/buffer-sorts/" target="_blank" rel="noopener noreferrer">Jonathan Lewis blog</a>.</p>
+
+</div>
+</body>
+</html>

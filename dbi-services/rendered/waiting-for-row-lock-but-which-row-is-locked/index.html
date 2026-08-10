@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/waiting-for-row-lock-but-which-row-is-locked/">
+<title>Waiting for row lock. But which row is locked?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/waiting-for-row-lock-but-which-row-is-locked/">https://www.dbi-services.com/blog/waiting-for-row-lock-but-which-row-is-locked/</a> (2015-09-13)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Waiting for row lock. But which row is locked?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+When you are waiting on a locked row, the locked resource is the transaction that has locked the row. We have no information about which row is locked. Here is how to get it from V$SESSION.<br />
+<!--more--><br />
+In a first session I lock a row in the SCOTT schema:</p>
+<pre><code>
+SQL&gt; select * from SCOTT.SALGRADE where grade=1 for update ;
+&nbsp;
+     GRADE      LOSAL      HISAL
+---------- ---------- ----------
+         1        700       1200
+</code></pre>
+<p>And in another session:</p>
+<pre><code>
+SQL&gt; delete from SCOTT.SALGRADE;
+</code></pre>
+<p>Of course it&#8217;s waiting. </p>
+<p>Let&#8217;s see the wait event:</p>
+<pre><code>
+SQL&gt; select sid,state,event,p1raw,p1text from v$session where event like 'enq: %'
+&nbsp;
+   SID STATE   EVENT                          P1RAW            P1TEXT
+------ ------- ------------------------------ ---------------- ---------
+    54 WAITING enq: TX - row lock contention  0000000054580006 name|mode
+</code></pre>
+<p>So I&#8217;ve a row lock contention.</p>
+<p>Here is more information from V$SESSION about the row that is locked:</p>
+<pre><code>
+SQL&gt; select row_wait_obj#,row_wait_file#,row_wait_block#,row_wait_row# from v$session where event like 'enq: %';
+&nbsp;
+ROW_WAIT_OBJ# ROW_WAIT_FILE# ROW_WAIT_BLOCK# ROW_WAIT_ROW#
+------------- -------------- --------------- -------------
+       116760              6             211             0
+</code></pre>
+<p>From there you can find which row is locked. It&#8217;s straightforward, but I&#8217;ve two warnings about it.</p>
+<p>First warning is that the ROW_WAIT_OBJ# is not the OBJECT_ID but the DATA_OBJECT_ID.<br />
+You have to join with DBA_OBJECT and get the DATA_OBJECT_ID if you want to get the ROWID.</p>
+<pre><code>
+SQL&gt; select owner,object_name,data_object_id from dba_objects where object_id=116760;
+&nbsp;
+OWNER      OBJECT_NAM DATA_OBJECT_ID
+---------- ---------- --------------
+SCOTT      SALGRADE           116760
+</code></pre>
+<p>The ROW_WAIT_OBJ# is the OBJECT_ID but I need the DATA_OBJECT_ID to get the ROWID. Here it is the same, but just try to truncate the table (and insert back the data) and you will see that it is different. </p>
+<p>The second warning is about the ROW_WAIT_FILE# which is the the absolute file number.<br />
+But you need the relative file number if you want to get the ROWID. </p>
+<p>We have to go though DBA_DATA_FILES to get it.</p>
+<pre><code>
+SQL&gt; select relative_fno from dba_data_files where file_id=6;
+&nbsp;
+RELATIVE_FNO
+------------
+           6
+</code></pre>
+<p>It&#8217;s the same number here, but if you have transported datafiles (or have more than 1024 datafiles), then you will see different numbers.</p>
+<p>Remember, the ROWID must change when a table is truncated (in order to be sure that we don&#8217;t read old data) and the ROWID must not change when we transport tablespaces (so that we don&#8217;t have to update all the blocks in the tablespace).</p>
+<p>So now, I can get the ROWID with dbms_rowid and get the row that is locked:</p>
+<pre><code>
+SQL&gt; select * from SCOTT.SALGRADE where rowid=dbms_rowid.rowid_create(1,116760,6,211,0);
+&nbsp;
+     GRADE      LOSAL      HISAL
+---------- ---------- ----------
+         1        700       1200
+</code></pre>
+<p>This is the ideal case. You find the row that is locked.<br />
+For most of the mode 6 TX lock (exclusive) you will have that information because the session went to the row in order to see the lock, and that information was registered in V$SESSION.<br />
+If you have a mode 4 TX lock (share) that can be different. You find those when the lock is at higher level than the row. For example ITL wait, or unique index entry, or referential integrity (I&#8217;m talking about TX mode 4 here, not TM locks). Then the information gotten from V$SESSION is incomplete. There is no row number, it can be an index block, etc.</p>
+<p>More information about locks at <a href="https://www.doag.org/konferenz/konferenzplaner/b.php?id=473721&amp;locS=1&amp;q=lock">DOAG 2015</a>.</p>
+<p>As a summary, here is the query to get the ROWID for which sessions are waiting on TX locks:<br />
+<em>(fixed thanks to comment below.)</em></p>
+<pre><code>
+select s.p1raw,o.owner,o.object_name,
+dbms_rowid.rowid_create(1,o.data_object_id,f.relative_fno,s.row_wait_block#,s.row_wait_row#) row_id
+from v$session s
+join dba_objects o on s.row_wait_obj#=o.object_id
+join dba_segments m on o.owner=m.owner and o.object_name=m.segment_name
+join dba_data_files f on s.row_wait_file#=f.file_id and m.tablespace_name=f.tablespace_name
+where s.event like 'enq: TX%'
+</code></pre>
+<p>From P1RAW, you have the lock type (5458 is TX in ascii) and the lock mode: 54580006 is mode 6 (exclusive) and 54580004 is mode 4 (share).</p>
+
+</div>
+</body>
+</html>

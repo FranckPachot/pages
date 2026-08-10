@@ -1,0 +1,336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/column-level-collate/">
+<title>Oracle non-linguistic varchar2 columns to order by without sorting</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/column-level-collate/">https://www.dbi-services.com/blog/column-level-collate/</a> (2020-06-16)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle non-linguistic varchar2 columns to order by without sorting</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Sorting data is an expensive operation and many queries declare an ORDER BY. To avoid the sort operation you can build an index as it maintains a sorted structure. This helps with Top-N queries as you don&#8217;t have to read all rows but only those from a range of index entries. However, indexes are sorted by binary values. For NUMBER or DATE datatypes, the internal storage ensures that the order is preserved in the binary format. For character strings, the binary format is ASCII, which follows the English alphabet. That&#8217;s fine when your session language, NLS_LANGUAGE, defines an NLS_SORT that follows this BINARY order. But as soon as you set a language that has some specific alphabetical order, having an index on a VARCHAR2 or CHAR column does not help to avoid a SORT operation. However, in Oracle 12.2 we can define the sort order at column level with the SQL Standard COLLATE. One use case is for alpha-numeric columns that have nothing to do with any language. Like some natural keys combining letters and numbers. The user expects them to be listed in alphabetical order but, storing only 7-bits ASCII characters, you don&#8217;t care about linguistic collation.</p>
+<p>I am running this on the Oracle 20c preview in the Oracle Cloud.</p>
+<h3>VARCHAR2</h3>
+<p>It can happen that a primary key is not a NUMBER but a CHAR or VARCHAR2, like this:</p>
+<pre><code>
+SQL&gt; create table demo (ID constraint demp_pk primary key) as
+  2  select cast(dbms_random.string('U',1)||to_char(rownum,'FM0999') as varchar2(5)) ID
+  3  from xmltable('1 to 10');
+
+Table created.
+
+SQL&gt; select * from demo order by ID;
+
+      ID
+________
+K0003
+K0009
+L0007
+L0010
+M0008
+O0002
+S0001
+W0005
+Y0006
+Z0004
+
+10 rows selected.
+</code></pre>
+<p>I query with ORDER BY because sorting can make sense on a natural key.</p>
+<h3>Index</h3>
+<p>I have an index on this column, which is sorted, and then the execution plan is optimized:</p>
+<pre><code>
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'basic');
+
+                      PLAN_TABLE_OUTPUT
+_______________________________________
+EXPLAINED SQL STATEMENT:
+------------------------
+select * from demo order by ID
+
+Plan hash value: 1955576728
+
+------------------------------------
+| Id  | Operation        | Name    |
+------------------------------------
+|   0 | SELECT STATEMENT |         |
+|   1 |  INDEX FULL SCAN | DEMP_PK |
+------------------------------------
+
+13 rows selected.
+</code></pre>
+<p>There&#8217;s no SORT operation because the INDEX FULL SCAN follows the index entries in order.</p>
+<h3>NLS_LANGUAGE</h3>
+<p>However, there are many countries where we don&#8217;t speak English:</p>
+<pre><code>
+SQL&gt; alter session set nls_language='French';
+
+Session altered.
+</code></pre>
+<p>In French, like in many languages, we have accentuated characters and other specificities so that the language-alphabetical order does not always follow the ASCII order.</p>
+<p>I&#8217;m running exactly the same query:</p>
+<pre><code>
+SQL&gt; select * from demo order by ID;
+
+      ID
+________
+K0003
+K0009
+L0007
+L0010
+M0008
+O0002
+S0001
+W0005
+Y0006
+Z0004
+
+10 rows selected.
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'basic');
+
+                      PLAN_TABLE_OUTPUT
+_______________________________________
+EXPLAINED SQL STATEMENT:
+------------------------
+select * from demo order by ID
+
+Plan hash value: 2698718808
+
+------------------------------------
+| Id  | Operation        | Name    |
+------------------------------------
+|   0 | SELECT STATEMENT |         |
+|   1 |  SORT ORDER BY   |         |
+|   2 |   INDEX FULL SCAN| DEMP_PK |
+------------------------------------
+
+14 rows selected.
+</code></pre>
+<p>This time, there&#8217;s a SORT operation. even if I&#8217;m still reading with INDEX FULL SCAN.</p>
+<h3>NLS_SORT</h3>
+<p>The reason is that, by setting the &#8216;French&#8217; language, I&#8217;ve also set the French sort collating sequence.</p>
+<pre><code>
+SQL&gt; select * from nls_session_parameters;
+                 PARAMETER                           VALUE
+__________________________ _______________________________
+NLS_LANGUAGE               FRENCH
+NLS_SORT                   FRENCH
+</code></pre>
+<p>And this is different from the BINARY one that I had when my language was &#8216;American&#8217;. </p>
+<p>Actually, only a few languages follow the BINARY order of the ASCII table:</p>
+<pre><code>
+SQL&gt;
+  declare
+   val varchar2(64);
+  begin
+    for i in (select VALUE from V$NLS_VALID_VALUES where PARAMETER='LANGUAGE') loop
+    execute immediate 'alter session set nls_language='''||i.value||'''';
+    select value into val from NLS_SESSION_PARAMETERS where PARAMETER='NLS_SORT';
+    if val='BINARY' then dbms_output.put(i.value||' '); end if;
+    end loop;
+    dbms_output.put_line('');
+  end;
+/
+
+AMERICAN JAPANESE KOREAN SIMPLIFIED CHINESE TRADITIONAL CHINESE ENGLISH HINDI TAMIL KANNADA TELUGU ORIYA MALAYALAM ASSAMESE GUJARATI MARATHI PUNJABI BANGLA MACEDONIAN LATIN SERBIAN IRISH
+
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>This is ok for real text but not for my primary key where ASCII order is ok. I can set the NLS_SORT=BINARY for my session, but that&#8217;s too wide as my problem is only with a column.</p>
+<p>Or I can create an index for the French collation. Actually, this is what is used internally:</p>
+<pre><code>
+SQL&gt; explain plan for select * from demo order by ID;
+Explained.
+
+SQL&gt; select * from dbms_xplan.display(format=&gt;'basic +projection');
+                                                      PLAN_TABLE_OUTPUT
+_______________________________________________________________________
+Plan hash value: 2698718808
+
+------------------------------------
+| Id  | Operation        | Name    |
+------------------------------------
+|   0 | SELECT STATEMENT |         |
+|   1 |  SORT ORDER BY   |         |
+|   2 |   INDEX FULL SCAN| DEMP_PK |
+------------------------------------
+
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+
+   1 - (#keys=1) NLSSORT("DEMO"."ID",'nls_sort=''GENERIC_M''')[50],
+       "DEMO"."ID"[VARCHAR2,5]
+   2 - "DEMO"."ID"[VARCHAR2,5]
+</code></pre>
+<p>GENERIC_M is the sort collation for many European languages.</p>
+<p>But that again, does not fit the scope of my problem as I don&#8217;t want to create an index for any possible NLS_SORT setting.</p>
+<h3>COLLATE</h3>
+<p>The good solution is to define the collation for my table column: this ID is a character string, but it is an ASCII character string which has nothing to do with my language. In 18c I can do that:</p>
+<pre><code>
+SQL&gt; alter table demo modify ID collate binary;
+
+Table altered.
+</code></pre>
+<p>The COLLATE is a SQL Standard syntax that exists in other databases, and it came to Oracle in 12cR2.</p>
+<p>And that&#8217;s all:</p>
+<pre><code>
+SQL&gt; explain plan for select * from demo order by ID;
+
+Explained.
+
+SQL&gt; select * from dbms_xplan.display(format=&gt;'basic +projection');
+
+                                             PLAN_TABLE_OUTPUT
+______________________________________________________________
+Plan hash value: 1955576728
+
+------------------------------------
+| Id  | Operation        | Name    |
+------------------------------------
+|   0 | SELECT STATEMENT |         |
+|   1 |  INDEX FULL SCAN | DEMP_PK |
+------------------------------------
+
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - "DEMO"."ID"[VARCHAR2,5]
+</code></pre>
+<p>No SORT operation needed, whatever the language I set for my session.</p>
+<p>Here is the DDL for my table:</p>
+<pre><code>
+SQL&gt; ddl demo
+
+  CREATE TABLE "SYS"."DEMO"
+   (    "ID" VARCHAR2(5) COLLATE "BINARY",
+         CONSTRAINT "DEMP_PK" PRIMARY KEY ("ID")
+  USING INDEX  ENABLE
+   )  DEFAULT COLLATION "USING_NLS_COMP" ;
+
+</code></pre>
+<p>My column explicitly follows the BINARY collation.</p>
+<h3>Extended Data Types</h3>
+<p>Now, all seems easy, but there&#8217;s a prerequisite:</p>
+<pre><code>
+SQL&gt; show parameter max_string_size
+
+NAME            TYPE   VALUE
+--------------- ------ --------
+max_string_size string EXTENDED
+</code></pre>
+<p>I have set my PDB to EXTENDED string size.</p>
+<p>If I try the same in a PDB with the &#8216;old&#8217; limit of 4000 bytes:</p>
+<pre><code>
+SQL&gt; alter session set container=PDB1;
+
+Session altered.
+
+SQL&gt; show parameter max_string_size
+
+NAME            TYPE   VALUE
+--------------- ------ --------
+max_string_size string STANDARD
+
+SQL&gt; drop table demo;
+
+Table dropped.
+
+SQL&gt; create table demo (ID varchar2(5) collate binary constraint demp_pk primary key);
+
+create table demo (ID varchar2(5) collate binary constraint demp_pk primary key)
+ *
+ERROR at line 1:
+ORA-43929: Collation cannot be specified if parameter MAX_STRING_SIZE=STANDARD is set.
+</code></pre>
+<p>This new feature is allowed only with the Extended Data Types introduced in 12c release 2.</p>
+<h3>ORDER BY COLLATE</h3>
+<p>Ok, let&#8217;s create the table with the default collation:</p>
+<pre><code>
+SQL&gt; create table demo (ID constraint demp_pk primary key) as
+  2  select cast(dbms_random.string('U',1)||to_char(rownum,'FM0999') as varchar2(5)) ID
+  3  from xmltable('1 to 10');
+
+Table created.
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'basic +projection');
+
+                                                   PLAN_TABLE_OUTPUT
+____________________________________________________________________
+EXPLAINED SQL STATEMENT:
+------------------------
+select * from demo order by ID
+
+Plan hash value: 2698718808
+
+------------------------------------
+| Id  | Operation        | Name    |
+------------------------------------
+|   0 | SELECT STATEMENT |         |
+|   1 |  SORT ORDER BY   |         |
+|   2 |   INDEX FULL SCAN| DEMP_PK |
+------------------------------------
+
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+
+   1 - (#keys=1) NLSSORT("DEMO"."ID",'nls_sort=''FRENCH''')[50],
+       "DEMO"."ID"[VARCHAR2,5]
+   2 - "DEMO"."ID"[VARCHAR2,5]
+
+</code></pre>
+<p>As my NLS_SORT is &#8216;French&#8217; there is a SORT operation.</p>
+<p>But I can explicitly request a BINARY sort for this:</p>
+<pre><code>
+SQL&gt; select * from demo order by ID collate binary;
+
+      ID
+________
+D0003
+H0002
+L0009
+N0008
+P0010
+Q0005
+R0004
+W0007
+Y0001
+Z0006
+
+10 rows selected.
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'basic +projection');
+
+                                             PLAN_TABLE_OUTPUT
+______________________________________________________________
+EXPLAINED SQL STATEMENT:
+------------------------
+select * from demo order by ID collate binary
+
+Plan hash value: 2698718808
+
+------------------------------------
+| Id  | Operation        | Name    |
+------------------------------------
+|   0 | SELECT STATEMENT |         |
+|   1 |  SORT ORDER BY   |         |
+|   2 |   INDEX FULL SCAN| DEMP_PK |
+------------------------------------
+
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+
+   1 - (#keys=1) "DEMO"."ID" COLLATE "BINARY"[5],
+       "DEMO"."ID"[VARCHAR2,5]
+   2 - "DEMO"."ID"[VARCHAR2,5]
+
+</code></pre>
+<p>I have no idea why there is still a sort operation. I think that the INDEX FULL SCAN returns already the rows in binary order. And that should require additional sorting for the ORDER BY &#8230; COLLATE BINARY.</p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-acfs-du-df/">
+<title>Oracle ACFS: &#8220;du&#8221; vs. &#8220;df&#8221; and &#8220;acfsutil info&#8221;</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-acfs-du-df/">https://www.dbi-services.com/blog/oracle-acfs-du-df/</a> (2020-07-03)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle ACFS: &#8220;du&#8221; vs. &#8220;df&#8221; and &#8220;acfsutil info&#8221;</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+This is a demo about Oracle ACFS snapshots, and how to understand the used and free space, as displayed by &#8220;df&#8221;, when there are modifications in the base parent or the snapshot children. The important concept to understand is that, when you take a snapshot, any modification to the child or parent will</p>
+<pre><code>
+[grid@cloud ~]$ asmcmd lsdg DATAC1
+
+<u>State    Type  Rebal  Sector  Logical_Sector  Block       AU   Total_MB    Free_MB  Req_mir_free_MB  Usable_file_MB  Offline_disks  Voting_files  Name</u>
+MOUNTED  HIGH  N         512             512   4096  4194304  214991104  191881152         11943936        59979016              0             Y  DATAC1/
+</code></pre>
+<p>On a database machine in the Oracle Cloud I have a diskgroup with lot of free space. I&#8217;ll use this DATAC1 diskgroup to store my ACFS filesystem. the size in MegaByte is not easy to read.<br />
+I can have a friendly overview from acfsutil with human readable sizes (in TeraByte there).</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info storage -u TB -l DATAC1
+
+Diskgroup: DATAC1 (83% free)
+  total disk space:         205.03
+  ASM file space:            22.04
+  total free space:         182.99
+  net free with mirroring:   60.99
+  usable after reservation:  57.20
+  redundancy type:          HIGH
+
+    Total space used by ASM non-volume files:
+      used:                     19.03
+      mirror used:               6.34
+
+    volume: /dev/asm/dump-19
+      total:                     1.00
+      free:                      0.22
+      redundancy type:         high
+      file system:             /u03/dump
+----
+unit of measurement: TB
+</code></pre>
+<p>There&#8217;s already a volume here (/dev/asm/dump-19) which is named &#8216;DUMP&#8217; and mounted as an ACFS filesystem (/u03/dump) but I&#8217;ll create a now one for this demo and will remove.</p>
+<h3>Logical volume: asmcmd volcreate</h3>
+<p>I have a diskgroup which exposes disk space to ASM. The first thing to do, in order to build a filesystem on it, is to create a logical volume, which is called ADVM for &#8220;ASM Dynamic Volume Manager&#8221;.</p>
+<pre><code>
+[grid@cloud ~]$ asmcmd volcreate -G DATAC1 -s 100G MYADVM
+</code></pre>
+<p>I&#8217;m creating a 100GB new volume, identified by its name (MYADVM) within the diskgroup (DATAC1). The output is not verbose at all but I can check it with volinfo.</p>
+<pre><code>
+[grid@cloud ~]$ asmcmd volinfo -G DATAC1 -a
+
+Diskgroup Name: DATAC1
+
+         Volume Name: DUMP
+         Volume Device: /dev/asm/dump-19
+         State: ENABLED
+         Size (MB): 1048576
+         Resize Unit (MB): 512
+         Redundancy: HIGH
+         Stripe Columns: 8
+         Stripe Width (K): 1024
+         Usage: ACFS
+         Mountpath: /u03/dump
+
+         Volume Name: MYADVM
+         Volume Device: /dev/asm/myadvm-19
+         State: ENABLED
+         Size (MB): 102400
+         Resize Unit (MB): 512
+         Redundancy: HIGH
+         Stripe Columns: 8
+         Stripe Width (K): 1024
+         Usage:
+         Mountpath:
+</code></pre>
+<p>With &#8220;-a&#8221; I show all volumes on the diskgroup, but I could have mentioned the volume name. This is what we will do later.</p>
+<p>&#8220;Usage&#8221; is empty because there&#8217;s no filesystem created yet, and &#8220;Mountpath&#8221; is empty because it is not mounted. The information I need is the Volume Device (/dev/asm/myadvm-19) as I&#8217;ll have access to it from the OS.</p>
+<pre><code>
+[grid@cloud ~]$ lsblk -a /dev/asm/myadvm-19
+
+NAME          MAJ:MIN  RM  SIZE RO TYPE MOUNTPOINT
+asm!myadvm-19 248:9731  0  100G  0 disk
+
+[grid@cloud ~]$ lsblk -t /dev/asm/myadvm-19
+
+NAME          ALIGNMENT MIN-IO OPT-IO PHY-SEC LOG-SEC ROTA SCHED    RQ-SIZE   RA
+asm!myadvm-19         0    512      0     512     512    1 deadline     128  128
+
+[grid@cloud ~]$ fdisk -l /dev/asm/myadvm-19
+
+Disk /dev/asm/myadvm-19: 107.4 GB, 107374182400 bytes
+255 heads, 63 sectors/track, 13054 cylinders
+Units = cylinders of 16065 * 512 = 8225280 bytes
+Sector size (logical/physical): 512 bytes / 512 bytes
+I/O size (minimum/optimal): 512 bytes / 512 bytes
+Disk identifier: 0x00000000
+</code></pre>
+<p>Visible from the OS, I have a 100GB volume with nothing there: I need to format it.</p>
+<h3>Filesystem: Linux mkfs</h3>
+<pre><code>
+[grid@cloud ~]$ grep -v nodev /proc/filesystems
+
+        iso9660
+        ext4
+        fuseblk
+        acfs
+</code></pre>
+<p>ACFS is a filesystem supported by the kernel. I can use &#8220;mkfs&#8221; to format the volume to ACFS.</p>
+<pre><code>
+[grid@cloud ~]$ mkfs.acfs -f /dev/asm/myadvm-19
+
+mkfs.acfs: version                   = 18.0.0.0.0
+mkfs.acfs: on-disk version           = 46.0
+mkfs.acfs: volume                    = /dev/asm/myadvm-19
+mkfs.acfs: volume size               = 107374182400  ( 100.00 GB )
+mkfs.acfs: Format complete.
+</code></pre>
+<p>I used &#8220;-f&#8221; because my volume was already formatted from a previous test. I have now a 100GB filesystem on this volume.</p>
+<pre><code>
+[grid@cloud ~]$ asmcmd volinfo -G DATAC1 MYADVM
+
+Diskgroup Name: DATAC1
+
+         Volume Name: MYADVM
+         Volume Device: /dev/asm/myadvm-19
+         State: ENABLED
+         Size (MB): 102400
+         Resize Unit (MB): 512
+         Redundancy: HIGH
+         Stripe Columns: 8
+         Stripe Width (K): 1024
+         Usage: ACFS
+         Mountpath:
+</code></pre>
+<p>The &#8220;Usage&#8221; shows that ASM knows that the ADVM volume holds an ACFS filesystem.</p>
+<pre><code>
+[opc@cloud ~]$ sudo mkdir -p /myacfs
+</code></pre>
+<p>I&#8217;ll mount this filesystem to /myacfs</p>
+<pre><code>
+[opc@cloud ~]$ sudo mount -t acfs /dev/asm/myadvm-19 /myacfs
+
+[opc@cloud ~]$ mount | grep /myacfs
+
+/dev/asm/myadvm-19 on /myacfs type acfs (rw)
+
+[opc@cloud ~]$ df -Th /myacfs
+
+Filesystem         Type  Size  Used Avail Use% Mounted on
+/dev/asm/myadvm-19 acfs  100G  448M  100G   1% /myacfs
+
+[opc@cloud ~]$ ls -alrt /myacfs
+
+total 100
+drwxr-xr-x 30 root root  4096 Jun 23 10:40 ..
+drwxr-xr-x  4 root root 32768 Jun 23 15:48 .
+drwx------  2 root root 65536 Jun 23 15:48 lost+found
+
+[opc@cloud ~]$ sudo umount /myacfs
+</code></pre>
+<p>I wanted to show that you can mount it from the OS but, as we have Grid Infrastructure, we usually want to manage it as a cluster resource.</p>
+<pre><code>
+[opc@cloud ~]$ sudo acfsutil registry -a /dev/asm/myadvm-19 /myacfs -u grid
+
+acfsutil registry: mount point /myacfs successfully added to Oracle Registry
+
+[opc@cloud ~]$ ls -alrt /myacfs
+
+total 100
+drwxr-xr-x 30 root root      4096 Jun 23 10:40 ..
+drwxr-xr-x  4 grid oinstall 32768 Jun 23 15:48 .
+drwx------  2 root root     65536 Jun 23 15:48 lost+found
+</code></pre>
+<p>The difference here is that I&#8217;ve set the owner of the filesystem to &#8220;grid&#8221; as that&#8217;s the user I&#8217;ll use for the demo.</p>
+<h3>Used and free space</h3>
+<pre><code>
+[grid@cloud ~]$ asmcmd volinfo -G DATAC1 MYADVM
+
+Diskgroup Name: DATAC1
+
+         Volume Name: MYADVM
+         Volume Device: /dev/asm/myadvm-19
+         State: ENABLED
+         Size (MB): 102400
+         Resize Unit (MB): 512
+         Redundancy: HIGH
+         Stripe Columns: 8
+         Stripe Width (K): 1024
+         Usage: ACFS
+         Mountpath: /myacfs
+</code></pre>
+<p>ADVM has the information about the mount path but now to interact with it I&#8217;ll use &#8220;acfsutil&#8221; for ACFS features or the standard Linux commands on filesystems.</p>
+<pre><code>
+[grid@cloud ~]$ du -ah /myacfs
+
+64K     /myacfs/lost+found
+96K     /myacfs
+</code></pre>
+<p>I have no files there: only 96 KB used.</p>
+<pre><code>
+[grid@cloud ~]$ df -Th /myacfs
+
+Filesystem         Type  Size  Used Avail Use% Mounted on
+/dev/asm/myadvm-19 acfs  100G  688M  100G   1% /myacfs
+</code></pre>
+<p>the whole size of 100GB is available.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info storage -u GB -l DATAC1
+
+Diskgroup: DATAC1 (83% free)
+  total disk space:         209952.25
+  ASM file space:           22864.75
+  total free space:         187083.87
+  net free with mirroring:  62361.29
+  usable after reservation: 58473.23
+  redundancy type:          HIGH
+
+    Total space used by ASM non-volume files:
+      used:                    19488.04
+      mirror used:             6496.01
+
+    volume: /dev/asm/myadvm-19
+      total:                   100.00
+      free:                     99.33
+      redundancy type:         high
+      file system:             /myacfs
+...
+----
+unit of measurement: GB
+</code></pre>
+<p>&#8220;acfs info storage&#8221; shows all volumes in the diskgroup (I removed the output for the &#8216;DUMP&#8217; one here)</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info fs /myacfs
+/myacfs
+    ACFS Version: 18.0.0.0.0
+    on-disk version:       47.0
+    compatible.advm:       18.0.0.0.0
+    ACFS compatibility:    18.0.0.0.0
+    flags:        MountPoint,Available
+    mount time:   Tue Jun 23 15:52:35 2020
+    mount sequence number: 8
+    allocation unit:       4096
+    metadata block size:   4096
+    volumes:      1
+    total size:   107374182400  ( 100.00 GB )
+    total free:   106652823552  (  99.33 GB )
+    file entry table allocation: 393216
+    primary volume: /dev/asm/myadvm-19
+        label:
+        state:                 Available
+        major, minor:          248, 9731
+        logical sector size:   512
+        size:                  107374182400  ( 100.00 GB )
+        free:                  106652823552  (  99.33 GB )
+        metadata read I/O count:         1203
+        metadata write I/O count:        10
+        total metadata bytes read:       4927488  (   4.70 MB )
+        total metadata bytes written:    40960  (  40.00 KB )
+        ADVM diskgroup:        DATAC1
+        ADVM resize increment: 536870912
+        ADVM redundancy:       high
+        ADVM stripe columns:   8
+        ADVM stripe width:     1048576
+    number of snapshots:  0
+    snapshot space usage: 0  ( 0.00 )
+    replication status: DISABLED
+    compression status: DISABLED
+</code></pre>
+<p>&#8220;acfsutil info fs&#8221; is the best way to have all information and here it shows the same as what we see from the OS: size=100GB and free=99.33GB</p>
+<h3>Add a file</h3>
+<pre><code>
+[grid@cloud ~]$ dd of=/myacfs/file.tmp if=/dev/zero bs=1G count=42
+
+42+0 records in
+42+0 records out
+45097156608 bytes (45 GB) copied, 157.281 s, 287 MB/s
+</code></pre>
+<p>I have created a 42 GB file in my filesystem. And now will compare the size info.</p>
+<pre><code>
+[grid@cloud ~]$ du -ah /myacfs
+
+64K     /myacfs/lost+found
+43G     /myacfs/file.tmp
+43G     /myacfs
+</code></pre>
+<p>I see one additional file with 43GB</p>
+<pre><code>
+[grid@cloud ~]$ df -Th /myacfs
+
+Filesystem         Type  Size  Used Avail Use% Mounted on
+/dev/asm/myadvm-19 acfs  100G   43G   58G  43% /myacfs
+</code></pre>
+<p>The used space that was 688 MB is now 43GB, the free space which was 100 GB is now 58 GB and the 1% usage is now 43% &#8211; this is the exact math (rounded to next GB) as my file had to allocate extents for all its data.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info storage -u GB -l DATAC1
+
+Diskgroup: DATAC1 (83% free)
+  total disk space:         209952.25
+  ASM file space:           22864.75
+  total free space:         187083.87
+  net free with mirroring:  62361.29
+  usable after reservation: 58473.23
+  redundancy type:          HIGH
+
+    Total space used by ASM non-volume files:
+      used:                    19488.04
+      mirror used:             6496.01
+
+    volume: /dev/asm/myadvm-19
+      total:                   100.00
+      free:                     57.29
+      redundancy type:         high
+      file system:             /myacfs
+</code></pre>
+<p>Here the &#8220;free:&#8221; that was 99.33 GB before is now 57.29 GB which matches what we see from df.<br />
+total free: 106652823552 ( 99.33 GB )</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info fs /myacfs
+
+/myacfs
+    ACFS Version: 18.0.0.0.0
+    on-disk version:       47.0
+    compatible.advm:       18.0.0.0.0
+    ACFS compatibility:    18.0.0.0.0
+    flags:        MountPoint,Available
+    mount time:   Tue Jun 23 15:52:35 2020
+    mount sequence number: 8
+    allocation unit:       4096
+    metadata block size:   4096
+    volumes:      1
+    total size:   107374182400  ( 100.00 GB )
+    total free:   61513723904  (  57.29 GB )
+    file entry table allocation: 393216
+    primary volume: /dev/asm/myadvm-19
+        label:
+        state:                 Available
+        major, minor:          248, 9731
+        logical sector size:   512
+        size:                  107374182400  ( 100.00 GB )
+        free:                  61513723904  (  57.29 GB )
+        metadata read I/O count:         1686
+        metadata write I/O count:        130
+        total metadata bytes read:       8687616  (   8.29 MB )
+        total metadata bytes written:    3555328  (   3.39 MB )
+        ADVM diskgroup:        DATAC1
+        ADVM resize increment: 536870912
+        ADVM redundancy:       high
+        ADVM stripe columns:   8
+        ADVM stripe width:     1048576
+    number of snapshots:  0
+    snapshot space usage: 0  ( 0.00 )
+    replication status: DISABLED
+    compression status: DISABLED
+</code></pre>
+<p>What has changed here is only the &#8220;total free:&#8221; from 99.33 GB to 57.29 GB</p>
+<h3>Create a snapshot</h3>
+<p>For the moment, with no snapshot and no compression, the size allocated in the filesystem (as the &#8220;df&#8221; used) is the same as the size of the files (as the &#8220;du&#8221; file size).</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil snap info /myacfs
+
+    number of snapshots:  0
+    snapshot space usage: 0  ( 0.00 )
+</code></pre>
+<p>The &#8220;acfsutil info fs&#8221; shows no snapshots, and &#8220;acfsutil snap info&#8221; shows the same but will give more details where I&#8217;ll have created snapshots.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil snap create -w S1 /myacfs
+
+acfsutil snap create: Snapshot operation is complete.
+</code></pre>
+<p>This has created a read-write snapshot of the filesystem.</p>
+<pre><code>
+[grid@cloud ~]$ du -ah /myacfs
+
+64K     /myacfs/lost+found
+43G     /myacfs/file.tmp
+43G     /myacfs
+</code></pre>
+<p>Nothing different here as this shows only the base. The snapshots are in a hidden .ACFS that is not listed but can be accessed when mentioning the path.</p>
+<pre><code>
+[grid@cloud ~]$ du -ah /myacfs/.ACFS
+
+32K     /myacfs/.ACFS/.fileid
+32K     /myacfs/.ACFS/repl
+43G     /myacfs/.ACFS/snaps/S1/file.tmp
+43G     /myacfs/.ACFS/snaps/S1
+43G     /myacfs/.ACFS/snaps
+43G     /myacfs/.ACFS
+</code></pre>
+<p>Here I see my 42 GB file in the snapshot. But, as I did no modifications there, it shares the same extents on disk. This means that even if I see two files of 42 GB there is only 42 GB allocated for those two virtual copies.</p>
+<pre><code>
+[grid@cloud ~]$ df -Th /myacfs
+
+Filesystem         Type  Size  Used Avail Use% Mounted on
+
+/dev/asm/myadvm-19 acfs  100G   43G   58G  43% /myacfs
+</code></pre>
+<p>As there are no additional extents allocated for this snapshot, &#8220;df&#8221; shows the same as before. Here we start to see a difference between the physical &#8220;df&#8221; size and the virtual &#8220;du&#8221; size.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info storage -u GB -l DATAC1
+
+Diskgroup: DATAC1 (83% free)
+  total disk space:         209952.25
+  ASM file space:           22864.75
+  total free space:         187083.87
+  net free with mirroring:  62361.29
+  usable after reservation: 58473.23
+  redundancy type:          HIGH
+
+    Total space used by ASM non-volume files:
+      used:                    19488.04
+      mirror used:             6496.01
+
+    volume: /dev/asm/myadvm-19
+      total:                   100.00
+      free:                     57.29
+      redundancy type:         high
+      file system:             /myacfs
+        snapshot: S1 (/myacfs/.ACFS/snaps/S1)
+          used:          0.00
+          quota limit:   none
+...
+----
+unit of measurement: GB
+</code></pre>
+<p>Here I have additional information for my snapshot: &#8220;snapshot: S1 (/myacfs/.ACFS/snaps/S1)&#8221; with 0 GB used because I did not modify anything in the snapshot yet. The volume still has the same free space.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil snap info /myacfs
+    number of snapshots:  1
+    snapshot space usage: 393216  ( 384.00 KB )
+</code></pre>
+<p>The new thing here is &#8220;number of snapshots: 1&#8221; with nearly no space usage (384 KB)</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info fs /myacfs
+/myacfs
+    ACFS Version: 18.0.0.0.0
+    on-disk version:       47.0
+    compatible.advm:       18.0.0.0.0
+    ACFS compatibility:    18.0.0.0.0
+    flags:        MountPoint,Available
+    mount time:   Tue Jun 23 15:52:35 2020
+    mount sequence number: 8
+    allocation unit:       4096
+    metadata block size:   4096
+    volumes:      1
+    total size:   107374182400  ( 100.00 GB )
+    total free:   61513723904  (  57.29 GB )
+    file entry table allocation: 393216
+    primary volume: /dev/asm/myadvm-19
+        label:
+        state:                 Available
+        major, minor:          248, 9731
+        logical sector size:   512
+        size:                  107374182400  ( 100.00 GB )
+        free:                  61513723904  (  57.29 GB )
+        metadata read I/O count:         4492
+        metadata write I/O count:        236
+        total metadata bytes read:       24363008  (  23.23 MB )
+        total metadata bytes written:    12165120  (  11.60 MB )
+        ADVM diskgroup:        DATAC1
+        ADVM resize increment: 536870912
+        ADVM redundancy:       high
+        ADVM stripe columns:   8
+        ADVM stripe width:     1048576
+    number of snapshots:  1
+    snapshot space usage: 393216  ( 384.00 KB )
+    replication status: DISABLED
+    compression status: DISABLED
+
+</code></pre>
+<p>Here I have more detail: those 384 KB are for the file allocation table only.</p>
+<h3>Write on snapshot</h3>
+<p>My snapshot shows no additional space but that will not stay as the goal is to do some modifications, within the same file, like a database would do on its datafiles as soon as it is opened read-write.</p>
+<pre><code>
+[grid@cloud ~]$ dd of=/myacfs/.ACFS/snaps/S1/file.tmp if=/dev/zero bs=1G count=10 conv=notrunc
+
+10+0 records in
+10+0 records out
+10737418240 bytes (11 GB) copied, 58.2101 s, 184 MB/s
+
+</code></pre>
+<p>I&#8217;ve overwritten 10GB within the 42 GB file but the remaining 32 are still the same (that&#8217;s what the conv=notrunc is doing &#8211; not truncating the end of file).</p>
+<pre><code>
+[grid@cloud ~]$ du -ah /myacfs
+
+64K     /myacfs/lost+found
+43G     /myacfs/file.tmp
+43G     /myacfs
+</code></pre>
+<p>Nothing has changed at the base level because I modified only the file in the snapshot.</p>
+<pre><code>
+
+[grid@cloud ~]$ du -ah /myacfs/.ACFS
+
+32K     /myacfs/.ACFS/.fileid
+32K     /myacfs/.ACFS/repl
+43G     /myacfs/.ACFS/snaps/S1/file.tmp
+43G     /myacfs/.ACFS/snaps/S1
+43G     /myacfs/.ACFS/snaps
+43G     /myacfs/.ACFS
+</code></pre>
+<p>Nothing has changed either in the snapshot because the file is still the same size.</p>
+<pre><code>
+[grid@cloud ~]$ df -Th /myacfs
+
+Filesystem         Type  Size  Used Avail Use% Mounted on
+/dev/asm/myadvm-19 acfs  100G   53G   48G  53% /myacfs
+</code></pre>
+<p>The filesystem, has increased by the amount I modified in the snapshot: I had 58GB available and now only 48GB. Because the 10GB of extents that were shared between the shanpshot child and the base (the snapshot parent) are not the same anymore and new extents had to be allocated for the snapshot. This is similar to copy-on-write.</p>
+<p>That&#8217;s the main point of this blog post: you don&#8217;t see this new allocation with &#8220;ls&#8221; or &#8220;du&#8221; but only with &#8220;df&#8221; or the filesystem specific tools.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info storage -u GB -l DATAC1
+
+Diskgroup: DATAC1 (83% free)
+  total disk space:         209952.25
+  ASM file space:           22864.75
+  total free space:         187083.87
+  net free with mirroring:  62361.29
+  usable after reservation: 58473.23
+  redundancy type:          HIGH
+
+    Total space used by ASM non-volume files:
+      used:                    19488.04
+      mirror used:             6496.01
+
+    volume: /dev/asm/myadvm-19
+      total:                   100.00
+      free:                     47.09
+      redundancy type:         high
+      file system:             /myacfs
+        snapshot: S1 (/myacfs/.ACFS/snaps/S1)
+          used:         10.10
+          quota limit:   none
+
+----
+unit of measurement: GB
+</code></pre>
+<p>the volume free space has decreased fro 57.29 to 47.09 GB</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil snap info /myacfs
+snapshot name:               S1
+snapshot location:           /myacfs/.ACFS/snaps/S1
+RO snapshot or RW snapshot:  RW
+parent name:                 /myacfs
+snapshot creation time:      Fri Jul  3 08:01:52 2020
+file entry table allocation: 393216   ( 384.00 KB )
+storage added to snapshot:   10846875648   (  10.10 GB )
+
+    number of snapshots:  1
+    snapshot space usage: 10846875648  (  10.10 GB )
+</code></pre>
+<p>10 GB has been added to the snapshot for the extents that are different than the parent.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info fs /myacfs
+
+/myacfs
+    ACFS Version: 18.0.0.0.0
+    on-disk version:       47.0
+    compatible.advm:       18.0.0.0.0
+    ACFS compatibility:    18.0.0.0.0
+    flags:        MountPoint,Available
+    mount time:   Fri Jul  3 07:33:19 2020
+    mount sequence number: 6
+    allocation unit:       4096
+    metadata block size:   4096
+    volumes:      1
+    total size:   107374182400  ( 100.00 GB )
+    total free:   50566590464  (  47.09 GB )
+    file entry table allocation: 393216
+    primary volume: /dev/asm/myadvm-19
+        label:
+        state:                 Available
+        major, minor:          248, 9731
+        logical sector size:   512
+        size:                  107374182400  ( 100.00 GB )
+        free:                  50566590464  (  47.09 GB )
+        metadata read I/O count:         9447
+        metadata write I/O count:        1030
+        total metadata bytes read:       82587648  (  78.76 MB )
+        total metadata bytes written:    89440256  (  85.30 MB )
+        ADVM diskgroup:        DATAC1
+        ADVM resize increment: 536870912
+        ADVM redundancy:       high
+        ADVM stripe columns:   8
+        ADVM stripe width:     1048576
+    number of snapshots:  1
+    snapshot space usage: 10846875648  (  10.10 GB )
+    replication status: DISABLED
+</code></pre>
+<p>The file entry table allocation has not changed. It was pointing to the parent for all extents before. Now, 10GB of extents are pointing to the snapshot child ones.</p>
+<h3>Write on parent</h3>
+<p>If I overwrite a different part on the parent, it will need to allocate new extents as those extents are share with the snapshot.</p>
+<pre><code>
+[grid@cloud ~]$ dd of=/myacfs/file.tmp if=/dev/zero bs=1G count=10 conv=notrunc seek=20
+
+10+0 records in
+10+0 records out
+10737418240 bytes (11 GB) copied, 35.938 s, 299 MB/s
+</code></pre>
+<p>this has written 10GB again, but at the 20GB offset, not overlapping the range of extents modified in the snapshot.</p>
+<pre><code>
+[grid@cloud ~]$ df -Th /myacfs
+Filesystem         Type  Size  Used Avail Use% Mounted on
+/dev/asm/myadvm-19 acfs  100G   63G   38G  63% /myacfs
+</code></pre>
+<p>Obviously 10GB had to be allocated for those new extents.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil snap info /myacfs
+snapshot name:               S1
+snapshot location:           /myacfs/.ACFS/snaps/S1
+RO snapshot or RW snapshot:  RW
+parent name:                 /myacfs
+snapshot creation time:      Fri Jul  3 09:17:10 2020
+file entry table allocation: 393216   ( 384.00 KB )
+storage added to snapshot:   10846875648   (  10.10 GB )
+
+
+    number of snapshots:  1
+    snapshot space usage: 21718523904  (  20.23 GB )
+</code></pre>
+<p>Those 10GB modified on the base are allocated for the snapshot, because what was a pointer to the parent is now a copy of extents in the state they were before the write.</p>
+<p>I&#8217;m not going into details of copy-on-write or redirect-on-write. You can see that at file level with &#8220;acfsutil info file&#8221; and Ludovico Caldara made a great demo of it a few years ago:<br />
+<iframe loading="lazy" title="ACFS Copy/Redirect on Write (No audio)" width="500" height="281" src="https://www.youtube.com/embed/jyHgpw2ZI5E?start=44&#038;feature=oembed" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe></p>
+<p>Now what happens if I modify, in the parent, the same extents that have been modified in the snapshot? I don&#8217;t need a copy of the previous version of them, right?</p>
+<pre><code>
+[grid@cloud ~]$ dd of=/myacfs/file.tmp if=/dev/zero bs=1G count=10 conv=notrunc
+
+10+0 records in
+10+0 records out
+10737418240 bytes (11 GB) copied, 34.9208 s, 307 MB/s
+</code></pre>
+<p>The first 10GB of this file, since the snapshot was taken, have now been modified in the base and in all snapshots (only one here).</p>
+<pre><code>
+[grid@cloud ~]$ df -Th /myacfs
+Filesystem         Type  Size  Used Avail Use% Mounted on
+/dev/asm/myadvm-19 acfs  100G   74G   27G  74% /myacfs
+</code></pre>
+<p>I had 10GB allocated again for this.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil snap info /myacfs
+snapshot name:               S1
+snapshot location:           /myacfs/.ACFS/snaps/S1
+RO snapshot or RW snapshot:  RW
+parent name:                 /myacfs
+snapshot creation time:      Fri Jul  3 09:17:10 2020
+file entry table allocation: 393216   ( 384.00 KB )
+storage added to snapshot:   10846875648   (  10.10 GB )
+
+    number of snapshots:  1
+    snapshot space usage: 32564994048  (  30.33 GB )
+</code></pre>
+<pre><code>
+[grid@cloud ~]$ acfsutil info file /myacfs/.ACFS/snaps/S1/file.tmp -u |
+                awk '/(Yes|No)$/{ if ( $7!=l ) o=$1 ; s[o]=s[o]+$2 ; i[o]=$7 ; l=$7} END{ for (o in s) printf "offset: %4dGB size: %4dGB Inherited: %3sn",o/1024/1024/1024,s[o]/1024/1024/1024,i[o]}' | sort
+offset:    0GB size:   10GB Inherited:  No
+offset:   10GB size:   31GB Inherited: Yes
+</code></pre>
+<p>I have aggregated, with awk, the range of snapshot extents that are inherited from the parent. The first 10GB are those that I modified in the snapshot. The others, above 10GB are from the S1 snapshot.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info file /myacfs/file.tmp -u |
+                awk '/(Yes|No)$/{ if ( $7!=l ) o=$1 ; s[o]=s[o]+$2 ; i[o]=$7 ; l=$7} END{ for (o in s) printf "offset: %4dGB size: %4dGB Inherited: %3s %sn",o/1024/1024/1024,s[o]/1024/1024/1024,i[o],x[o]}' | sort
+offset:    0GB size:   10GB Inherited:  No
+offset:   10GB size:    9GB Inherited: Yes
+offset:   19GB size:   10GB Inherited:  No
+offset:   30GB size:   11GB Inherited: Yes
+</code></pre>
+<p>Here in the base snapshot I see as inherited, between parent and child, the two ranges that I modified: 10GB from offset 0GB and 10 GB from offset 20GB</p>
+<p>That&#8217;s the important point: when you take a snapshot, the modifications on the parent, as well as the modifications in the snapshot, will allocate new extents to add to the snapshot.</p>
+<h3>Why is this important?</h3>
+<p>This explains why, on ODA, all non-CDB databases are created on a snapshot that has been taken when the filesystem was empty.</p>
+<p>Read-write snapshots are really cool, especially with multitenant as they are automated with the CRATE PLUGGABLE DATABASE &#8230; SNAPSHOT COPY. But you must keep in mind that the snapshot is made at filesystem level (this may change in 20c with <a href="https://docs.oracle.com/en/database/oracle/oracle-database/20/acfsg/acfs-commands-utilities.html#GUID-D8A5327F-E90D-43DC-978B-AB32C610A8ED" target="_blank" rel="noopener noreferrer">File-Based Snapshots</a>). Any change to the master will allocate space, whether used or not in the snapshot copy.</p>
+<p>I blogged about that in the past: <a href="https://www.dbi-services.com/blog/multitenant-thin-provisioning-pdb-snapshots-on-acfs/" target="_blank" rel="noopener noreferrer">https://www.dbi-services.com/blog/multitenant-thin-provisioning-pdb-snapshots-on-acfs/</a></p>
+<p>Here I just wanted to clarify what you see with &#8220;ls&#8221; and &#8220;du&#8221; vs. &#8220;df&#8221; or &#8220;acfsutil info&#8221;. &#8220;ls&#8221; and &#8220;du&#8221; show the virtual size of the files. &#8220;df&#8221; shows the extents allocated in the filesystem as base extents or snapshot copies. &#8220;acfsutil info&#8221; shows those extents allocated as &#8220;storage added to snapshot&#8221; whether they were allocated for modifications on the parent or child.</p>
+<pre><code>
+[grid@cloud ~]$ acfsutil info file /myacfs/.ACFS/snaps/S1/file.tmp -u
+/myacfs/.ACFS/snaps/S1/file.tmp
+
+    flags:        File
+    inode:        18014398509482026
+    owner:        grid
+    group:        oinstall
+    size:         45097156608  (  42.00 GB )
+    allocated:    45105545216  (  42.01 GB )
+    hardlinks:    1
+    device index: 1
+    major, minor: 248,9731
+    create time:  Fri Jul  3 07:36:45 2020
+    access time:  Fri Jul  3 07:36:45 2020
+    modify time:  Fri Jul  3 09:18:25 2020
+    change time:  Fri Jul  3 09:18:25 2020
+    extents:
+        -----offset ----length | -dev --------offset | inherited
+                  0  109051904 |    1    67511517184 | No
+          109051904  134217728 |    1    67620569088 | No
+          243269632  134217728 |    1    67754786816 | No
+          377487360  134217728 |    1    67889004544 | No
+          511705088  134217728 |    1    68023222272 | No
+          645922816  134217728 |    1    68157440000 | No
+          780140544  134217728 |    1    68291657728 | No
+          914358272  134217728 |    1    68425875456 | No
+         1048576000  134217728 |    1    68560093184 | No
+         1182793728  134217728 |    1    68694310912 | No
+...
+</code></pre>
+<p>The difference between &#8220;du&#8221; and &#8220;df&#8221;, which is also the &#8220;storage added to snapshot&#8221; displayed by &#8220;acfsutil snap info&#8221;, is what you see as &#8220;inherited&#8221;=No in &#8220;acfsutil info file -u&#8221; on all files, parent and child. Note that I didn&#8217;t use compression here, which is another reason for the difference between &#8220;du&#8221; and &#8220;df&#8221;.</p>
+
+</div>
+</body>
+</html>

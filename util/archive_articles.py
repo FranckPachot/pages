@@ -668,9 +668,14 @@ def inventory_linkedin(root: Path) -> list[dict[str, Any]]:
     return articles
 
 
-def inventory_slideshare(root: Path) -> list[dict[str, Any]]:
+def inventory_slideshare(
+    root: Path, excluded_source_ids: set[str] | None = None
+) -> list[dict[str, Any]]:
     articles = []
+    excluded_source_ids = excluded_source_ids or set()
     for path in sorted((root / "slideshare" / "articles").glob("*/index.html")):
+        if path.parent.name in excluded_source_ids:
+            continue
         document = read_text(path)
         title = first_match(r"<title>(.*?)</title>", document)
         published = first_match(
@@ -692,6 +697,35 @@ def inventory_slideshare(root: Path) -> list[dict[str, Any]]:
             }
         )
     return articles
+
+
+def inventory_publication_pdfs(root: Path) -> tuple[list[dict[str, Any]], set[str]]:
+    articles = []
+    superseded_slideshare: set[str] = set()
+    required = {"source", "source_id", "title", "published_at", "canonical_url", "archive_path"}
+    for metadata_path in sorted(root.glob("*/publications.json")):
+        payload = json.loads(read_text(metadata_path))
+        publications = payload.get("publications", [])
+        if not isinstance(publications, list):
+            raise ValueError(f"Invalid publications list in {metadata_path}")
+        for publication in publications:
+            missing = required - publication.keys()
+            if missing:
+                raise ValueError(f"Missing {sorted(missing)} in {metadata_path}")
+            archive_path = root / publication["archive_path"]
+            if publication["source"] not in {"soug", "oracle-scene"}:
+                raise ValueError(f"Invalid PDF publication source: {publication['source']}")
+            if archive_path.suffix.casefold() != ".pdf" or not archive_path.is_file():
+                raise ValueError(f"Missing PDF publication: {archive_path}")
+            article = {
+                key: value
+                for key, value in publication.items()
+                if key != "supersedes_slideshare"
+            }
+            articles.append(article)
+            if publication.get("supersedes_slideshare"):
+                superseded_slideshare.add(publication["supersedes_slideshare"])
+    return articles, superseded_slideshare
 
 
 def list_developpez_articles() -> list[str]:
@@ -829,7 +863,9 @@ def main() -> None:
     else:
         articles += inventory_developpez(root)
     articles += inventory_linkedin(root)
-    articles += inventory_slideshare(root)
+    publication_pdfs, superseded_slideshare = inventory_publication_pdfs(root)
+    articles += publication_pdfs
+    articles += inventory_slideshare(root, superseded_slideshare)
     articles.sort(key=lambda article: (article["published_at"], article["source"]), reverse=True)
 
     manifest = {

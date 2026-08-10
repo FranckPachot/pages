@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/should-cpu-intensive-logic-be-done-in-the-db-or-in-application-server/">
+<title>Should CPU-intensive logic be done in the DB or in application server?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/should-cpu-intensive-logic-be-done-in-the-db-or-in-application-server/">https://www.dbi-services.com/blog/should-cpu-intensive-logic-be-done-in-the-db-or-in-application-server/</a> (2021-03-25)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Should CPU-intensive logic be done in the DB or in application server?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Should CPU-intensive logic be done in the DB or in application server? Here was a answer found in Reddit:</p>
+<blockquote class="reddit-embed-bq" ><p><a href="https://www.reddit.com/r/PostgreSQL/comments/mbuca2/comment/gs03gs7/">Comment</a><br /> by<a href="https://www.reddit.com/user/CacheMeUp/">u/CacheMeUp</a> from discussion<a href="https://www.reddit.com/r/PostgreSQL/comments/mbuca2/should_cpuintensive_logic_be_done_in_the_db_or_in/"><no value></a><br /> in<a href="https://www.reddit.com/r/PostgreSQL/">PostgreSQL</a></p></blockquote>
+<p><script async src="https://embed.reddit.com/widgets.js" charset="UTF-8"></script></p>
+<p>Reducing the CPU usage on the database server is a major cost saver with commercial databases, like Oracle Enterprise Edition where you pay license per core. But even in Open Source, on-premises or Cloud, the database servers are usually not the cheapest ones. People often think they can reduce the CPU usage on the DB server by doing more processing on the application server. However, most of the time, this processing operates on data coming from the database, and the result must be saved and shared in the database. Those round-trips take time, but you may not care if the goal is only to reduce the CPU usage on the database server. Still, those roundtrips also use a lot of CPU. Except when you have intense processing to do, it is probably less expensive to run the computation on the database, in the same process that retrieved the data, without any context switch, system call, and with all data already there in RAM or, even better, in CPU caches.</p>
+<p>I&#8217;ll run a quick test with PostgreSQL:</p>
+<pre><code>
+drop table if exists DEMO;
+create unlogged table DEMO as select 'Hello World' txt1, '' txt2 from generate_series(1,100000);
+</code></pre>
+<p>This table is there just to set some rows and my goal is to fill the TXT2 column from TXT1 with some processing.</p>
+<pre><code>
+def cpuintensivework(s,n):
+ r=s
+ import codecs
+ for i in range(n):
+  r=codecs.encode(r,'rot13');
+ return r;
+</code></pre>
+<p>Here is a Python function to do this processing. Very silly here: it applies Rot-13 multiple times. Calling it 1 million times takes 1.340s on my lab (an Oracle Cloud compute VM with Intel(R) Xeon(R) Platinum 8167M CPU @ 2.00GHz). I&#8217;m just simulating some processing, which may implement some business logic that has to run on some data.</p>
+<p>I have installed psycopg2 (`pip install psycopg2-binary`) to run the following, which reads rows from my DEMO table and updates TXT2 with the function applied on TXT1:</p>
+<pre><code>
+import psycopg2
+conn = psycopg2.connect("dbname='postgres' user='postgres' host='localhost' password='postgres'")
+cur = conn.cursor()
+cur.execute('select * from DEMO')
+for row in cur.fetchall():
+    cur.execute("update demo set txt2=%(txt2)s where txt1=%(txt1)s",{"txt1":row[0],"txt2":cpuintensivework(row[0],999999)})
+conn.commit();
+</code></pre>
+<p>This is what happens when you deploy all logic in the application server. You have the library there, with your function, get data, process it and put the result back to the database. And you think that you save some database server CPU by doing that in the application server. How CPU intensive is this function? For each value, I apply Rot13 encoding one million times here. Completely silly for sure, but what I want to test is multiple levels of &#8220;CPU intensive&#8221; workload. So I&#8217;ll run that with one million Rot13, then ten thousands, then one thousand&#8230; To see when doing that on the application server really saves some CPU usage on the database server.</p>
+<p>First I&#8217;ve run this with 10 instead of 999999, so very little compute, and check the CPU usage from my database backend process and my python client:</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+23195 postgres  20   0  401884  11020   8820 R 100.0  0.0   5:06.79 postgres: postgres postgres 127.0.0.1(42558) UPDATE
+23194 franck    20   0  240968  36824  11284 S   0.0  0.0   0:00.19 python3 /tmp/data2code.py 10
+</code></pre>
+<p>With 10 times encoding on the application tier, the database server process is still 100% busy. This is because, even if there&#8217;s a little processing on the client, this is negligible when compared to retrieving the text value sending it to the network stack (even if I&#8217;m running both on the same server, those are system calls) waiting for the response&#8230;</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+23659 postgres  20   0  401884  11020   8820 R 100.0  0.0   0:45.26 postgres: postgres postgres 127.0.0.1(42730) UPDATE
+23658 franck    20   0  240968  36936  11392 S   0.0  0.0   0:00.15 python3 /tmp/data2code.py 100
+</code></pre>
+<p>I&#8217;ve run the same with 100 times encoding and still see 100% on the database backend.</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+23788 postgres  20   0  401884  11020   8820 R  99.7  0.0   0:20.00 postgres: postgres postgres 127.0.0.1(42784) UPDATE
+23787 franck    20   0  240968  36828  11284 S   0.7  0.0   0:00.23 python3 /tmp/data2code.py 1000
+</code></pre>
+<p>When I have 1000 loops on those Rot13 encoding, I start to see the effect of offloading. Very small: the backend is idle 0.3% of times. For sure, this is not enough to reduce significantly the CPU usage on the database server.</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+23852 postgres  20   0  401884  11020   8820 R  97.0  0.0   0:21.39 postgres: postgres postgres 127.0.0.1(42808) UPDATE
+23851 franck    20   0  240968  37064  11520 S   3.0  0.0   0:01.16 python3 /tmp/data2code.py 10000
+</code></pre>
+<p>With 10000 encodings for each value, I start to offload 3% of the CPU time by processing it on the application.</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+24427 postgres  20   0  401884  11020   8820 R  84.7  0.0   0:18.45 postgres: postgres postgres 127.0.0.1(42992) UPDATE
+24426 franck    20   0  240968  37028  11484 S  14.3  0.0   0:04.73 python3 /tmp/data2code.py
+</code></pre>
+<p>Now with 50000 loops, this starts to be significant. The database backend is saving 15% of CPU time which can be used to increase the throughput without adding more CPU. This is where processing on the application server starts to make sense if the vCPU there are cheaper than on the database server. So, let&#8217;s look at those 50000 encoding loops deeper.</p>
+<p>When I run 1000 times my function (with 50000 loops in it) I get:</p>
+<pre><code>
+real    1m19.076s
+user    1m2.109s
+sys     0m0.111s</code></pre>
+<p>79 seconds elapsed time. This means that one call to the function is about 79 millisecond. Or 62 millisecond of CPU if you consider the userspace CPU reported here. This starts to give a rough idea of the &#8220;CPU intensive&#8221; processing that may significantly reduce the database CPU usage when done on the client side. 60 milliseconds of CPU on a 11 characters string is not usual business logic. Checking a password hash value, comparing account amounts, incrementing a gaming score&#8230; all that is much lower. Double-digit millisecond can be CPU intensive encoding, image pattern matching, or compression for example and those are technical and not business logic.</p>
+<p>You see the paradox. You prefer to deploy business logic code on the application server, to maintain code easily, in the language of your choice, easy to unit-test&#8230; And accept some technical processing withing the database server. But when looking at the performance, it should be the opposite. The business logic applied on data should run within the database backend because it is too fast to justify taking the data to another thread, process or even node. Remember, I&#8217;m on the same server here, to count only for CPU usage. But in a real stack, those run on different nodes with network latency.</p>
+<p>If CPU time in millisecond doesn&#8217;t ring a bell, I&#8217;ve run `perf stat`on both application process (python) and database backend (postgres) for this run (50000 Rot13 loops on 1000 items).</p>
+<pre><code>
+ Performance counter stats for 'sh benchsmartdb.sh 1000 50000 data2code':
+
+      61748.646557      task-clock:u (msec)       #    0.786 CPUs utilized
+                 0      context-switches:u        #    0.000 K/sec
+                 0      cpu-migrations:u          #    0.000 K/sec
+             4,483      page-faults:u             #    0.073 K/sec
+   144,979,165,329      cycles:u                  #    2.348 GHz
+   379,558,933,532      instructions:u            #    2.62  insn per cycle
+    86,933,135,095      branches:u                # 1407.855 M/sec
+       114,435,352      branch-misses:u           #    0.13% of all branches
+</code></pre>
+<p>this is my python program: 379 billion CPU instructions to process those 1000 items with this CPU intensive function.</p>
+<pre><code>
+ Performance counter stats for process id '27354,28903,28904,28906,28907,28908,28909,28910,28911':
+
+      19589.804909      task-clock (msec)         #    0.233 CPUs utilized
+             2,096      context-switches          #    0.107 K/sec
+                12      cpu-migrations            #    0.001 K/sec
+             1,001      page-faults               #    0.051 K/sec
+       150,895,753      cycles                    #    0.008 GHz                      (37.49%)
+   101,235,370,509      instructions              #  670.90  insn per cycle           (37.56%)
+    21,987,481,044      branches                  # 1122.394 M/sec                    (37.73%)
+        12,775,395      branch-misses             #    0.06% of all branches          (37.44%)
+</code></pre>
+<p>this is the whole set of PostgreSQL processes: 100 billion CPU instructions to parse the SQL query, read the data from the database, send it to the application, get the result, update the database. There&#8217;s no WAL generation here because I&#8217;ve created an UNLOGGED table to account only for CPU and not disk latency.</p>
+<p>And actually, most of this CPU usage on the database backend is just an overhead because of the process-on-the-application design. You may have seen that my Python program was called &#8216;data2code&#8217; because it bring data to the code. But here is the equivalent where the code is deployed to the database:</p>
+<pre><code>
+create extension plpython3u;
+select * from pg_language;
+create or replace function cpuintensivework(s text,n int) returns text as $$
+ r=s
+ import codecs
+ for i in range(n):
+  r=codecs.encode(r,'rot13');
+ return r;
+$$ language plpython3u;
+</code></pre>
+<p>I have installed the Python language extension (`sudo yum install -y postgresql12-plpython3`) on my PostgreSQL database. There are plenty of possibilities: PL/pgSQL, Tcl, Perl, and Python are in the base distribution, and there are of course many extensions like Java, Lua, R, bash, JavaScript&#8230; This is really the same function. No change to the code to deploy it within the database instead of (or in addition to) the application servers.</p>
+<pre><code>
+import psycopg2
+conn = psycopg2.connect("dbname='postgres' user='postgres' host='localhost' password='postgres'")
+conn.cursor().execute('update demo set txt2=cpuintensivework(txt1,${loops})')
+conn.commit();
+</code></pre>
+<p>My data2code.py is even simpler than code2data.py I&#8217;ve run in above tests. Instead of fetching rows, calling the client-side function, and update in a loop, I just call the UPDATE statement which calls the server-side function in the same SQL code. Of course, this can be optimized with prepared statements, and even doing it fully in SQL. But the goal is to keep code simple and calling a server-side function, in your preferred language to code the business logic, is good enough.</p>
+<pre><code>
+$ sh benchsmartdb.sh 1000 50000 code2data
+
+ Performance counter stats for process id '27587,28903,28904,28906,28907,28908,28909,28910,28911':
+
+      71844.295221      task-clock (msec)         #    0.966 CPUs utilized
+               225      context-switches          #    0.003 K/sec
+                12      cpu-migrations            #    0.000 K/sec
+             2,386      page-faults               #    0.033 K/sec
+    47,515,695,290      cycles                    #    0.661 GHz                      (37.47%)
+   379,912,591,942      instructions              #    8.00  insn per cycle           (37.49%)
+    87,239,899,133      branches                  # 1214.291 M/sec                    (37.48%)
+        80,074,139      branch-misses             #    0.09% of all branches          (37.49%)
+
+      74.365079178 seconds time elapsed
+</code></pre>
+<p>This is faster, and requires less CPU cycles in total. But of course, if your goal was to reduce the CPU usage on the database server, we have 380 billion instructions there where it was only 100 billion on the backend when doing the intensive processing on the application. So for this CPU intensive function, it might be the right choice. But remember that this function is far from usual business logic (50000 loops, 60 milliseconds of CPU, per call).</p>
+<p>But what is interesting is to compare the total. With data2code I had 100 billion instructions on the data server and 379 billion on the application server. With code2data I have 380 billion instructions on the data server and nearly nothing on the application (I didn&#8217;t show it here but that&#8217;s only one UPDATE call without any processing). All that to do the same thing (same function, on same data, with same code, in same language). There&#8217;s a 100 billion overhead here with the data2code design. Because of the communication between multiple processes, though multiple layers. System calls, context switches and not leveraging data locality though CPU cache and RAM.</p>
+<p>I focused on the 50000 loops threshold here, about 60 millisecond of CPU usage, hundreds of million CPU instructions per call, where we start to see some offloading to save some DB server CPU usage. I&#8217;ll continue with the data2code design with more intensive functions, by incrementing the number of loops.</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+23935 postgres  20   0  401884  11020   8820 R  76.1  0.0   0:20.80 postgres: postgres postgres 127.0.0.1(42826) UPDATE
+23934 franck    20   0  240968  36828  11284 S  23.3  0.0   0:10.29 python3 /tmp/data2code.py 100000
+</code></pre>
+<p>With 100000 Rot13 loops in each function call, there&#8217;s a clear 1/4th of processing that is done by the application server instead of the database</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+24018 franck    20   0  240968  36872  11328 R  82.0  0.0   0:56.90 python3 /tmp/data2code.py 1000000
+24019 postgres  20   0  401884  11020   8820 S  18.3  0.0   0:08.25 postgres: postgres postgres 127.0.0.1(42860) idle in transaction
+</code></pre>
+<p>10x more work done in the function and here the application process is now on Top CPU usage. Here the overhead of roundtrips between multiple nodes is negligeable. And the advantage of offloading is clear. This CPU work can be done by a serverless function, like a lambda, that can scale out quickly when needed or be completely stopped when not used.</p>
+<pre><code>
+  PID USER      PR  NI    VIRT    RES    SHR S  %CPU %MEM     TIME+ COMMAND
+24202 franck    20   0  240968  36972  11424 R  99.7  0.0   0:23.04 python3 /tmp/data2code.py 10000000
+24203 postgres  20   0  401884  10808   8692 S   0.0  0.0   0:00.19 postgres: postgres postgres 127.0.0.1(42916) idle in transaction
+</code></pre>
+<p>This is 100% processing on the application side. For sure, you don&#8217;t want to provision some database server capacity for that and calls to the database are minimal. But keep in mind that this is 10 million loops on a 11 characters text. This is not the usual business logic applied to database data. Very specific use cases only.</p>
+<p>I know that bringing code to data may seem more difficult than deploying the code into application servers, which are stateless and use an ORM framework that interacts with the database. But this costs a lot in CPU usage (and even if your money is unlimited, the planet resources are not, and data centers consume them). There are very good articles and talks about Data Gravity. Pulling data to the code is expensive. Pushing the code to the database needs some design considerations, but is generally cheaper. If you have the occasion to listen to Piet de Visser <a href="http://www.rooug.ro/2021/02/rooug-techsession-44-online" target="_blank" rel="noopener">on Microservices and Databases</a>, he has a nice illustration with a famous cartoon character who is able to do it at scale. But remember this hero relies on magic potion. If you don&#8217;t, and your business logic is not too CPU intensive, it can be rewarding to look at procedural languages available in your RDBMS. And the good thing is that you have the choice. PostgreSQL can run many languages. Oracle can run PL/SQL or even JavaScript in 21c. And if scale-out is your main reason, distributed databases can also run code on database pods (see Bryn Llewellyn <a href="https://blog.yugabyte.com/using-stored-procedures-in-distributed-sql-databases/" target="_blank" rel="noopener">Using Stored Procedures in Distributed SQL Databases</a>).</p>
+
+</div>
+</body>
+</html>

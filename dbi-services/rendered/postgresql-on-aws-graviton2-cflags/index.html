@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/postgresql-on-aws-graviton2-cflags/">
+<title>PostgreSQL on AWS Graviton2: CFLAGS</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/postgresql-on-aws-graviton2-cflags/">https://www.dbi-services.com/blog/postgresql-on-aws-graviton2-cflags/</a> (2021-05-17)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">PostgreSQL on AWS Graviton2: CFLAGS</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.</p>
+<p>In a <a href="https://dev.to/aws-heroes/aws-postgresql-on-graviton2-with-newer-gcc-3aha" target="_blank" rel="noopener">previous post</a> I&#8217;ve compiled PostgreSQL with GCC 7 and GCC 11 with the default options and checked that the ARM v8.2 features were used. However it may not be so simple:</p>
+<ul>
+<li>PostgreSQL ./configure defines gcc flags to produce a binary that is compatible with older versions of ARM. This means that it may not use the LSE feature introduced in ARM v8.1</li>
+<li>With this, the default compilation (-march=armv8-a) doesn&#8217;t use LSE (Large System Extensions) for atomic instructions, because they were introduced in v8.1</li>
+<li>This means that we need to call ./configure with CFLAGS=&#8221;-march=armv8-a+lse&#8221; or CFLAGS=&#8221;-march=armv8.1-a&#8221; or CFLAGS=&#8221;-march=armv8.2-a&#8221; to get a binary using LSE atomics</li>
+<li>When I compiled with GCC 11, without adding this CFLAGS, I had the LSE instructions in my binary because GCC 10 introduced the possibility to detect at run-time the support of LSE, and it is enabled by default</li>
+<li>When I compiled with GCC 7 I had the LSE instructions, despites using the default configure, because I was running on Amazon Linux 2 where this run-time detection has been backported, and enabled by default</li>
+<li>However, this run-time detection has been backported, but is not enabled by default on all versions, or distributions, and then may require the -moutline-atomics to use LSE</li>
+</ul>
+<p>So, the most important is to understand if your binary will use LSE (which shows great performance improvement on spinlock and lightweight locks). And it is also good to know if LSE is inlined, or outlined by this run-time detection (which has a limited overhead but allows the binary to be compatible with all ARM versions).</p>
+<p>I have started a t4g.micro EC2 instance which runs on ARM v8.2 Neoverse N1, the Amazon Graviton2. I&#8217;m using it because we have 750 hours per month free until June 30th, 2021 and I try to get my demos easy and free to reproduce. But of course this instance size is too small for running a database and compiling gcc.</p>
+<pre><code>[ec2-user@ip-172-31-83-114 postgresql-14devel]$ PS1="$(curl -s http://169.254.169.254/latest/meta-data/instance-type)# "
+t4g.micro#</code></pre>
+<p>I&#8217;ve set my prompt to the instance type because I&#8217;ve a lot of tty opened and I like to see which one is still running (for the non-free ones especially).</p>
+<p>I am running on Amazon Linux 7 with GCC 7</p>
+<pre><code>
+t4g.micro# cat /etc/system-release
+Amazon Linux release 2 (Karoo)
+
+t4g.micro# gcc --version
+gcc (GCC) 7.3.1 20180712 (Red Hat 7.3.1-12)
+Copyright (C) 2017 Free Software Foundation, Inc.
+This is free software; see the source for copying conditions.  There is NO
+warranty; not even for MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+</code></pre>
+<p>But here the runtime detection and outlining atomics has been backported and enabled by default.</p>
+<p>I&#8217;ll will verify that by building the PostgreSQL binaries.</p>
+<pre><code>
+sudo yum install -y git gcc readline-devel bison-devel zlib-devel
+curl -s https://ftp.postgresql.org/pub/snapshot/dev/postgresql-snapshot.tar.gz | tar -zxvf -
+cd postgresql-14devel
+./configure  --enable-debug
+make clean
+make
+sudo make install
+</code></pre>
+<p>This downloads PostgreSQL source (version 14 from latest development snapshot here) and compiles with all default options.</p>
+<pre><code>
+t4g.micro# file /usr/local/pgsql/bin/postgres
+
+/usr/local/pgsql/bin/postgres: ELF 64-bit LSB executable, ARM aarch64, version 1 (SYSV), dynamically linked (uses shared libs), for GNU/Linux 3.7.0, BuildID[sha1]=37c48090a793b8ee8b62e46e361ac4c24646732f, not stripped
+</code></pre>
+<p>I&#8217;m checking the load and store exclusives, the only ones available before ARM v8.1, and LSE which can replace them with atomic instructions starting from ARM v8.1</p>
+<pre><code>
+t4g.micro# objdump -d /usr/local/pgsql/bin/postgres | awk '/t(ldxr|ldaxr|stxr|stlxr)/{print $3"t(load and store exclusives)"}/t(cas|casp|swp|ldadd|stadd|ldclr|stclr|ldeor|steor|ldset|stset|ldsmax|stsmax|ldsmin|stsmin|ldumax|stumax|ldumin|stumin)/{print $3"t(large-system extensions)"}' | sort -k2 | uniq -c
+
+      2 casal   (large-system extensions)
+      2 ldaddal (large-system extensions)
+      1 ldclral (large-system extensions)
+      1 ldsetal (large-system extensions)
+      1 swpa    (large-system extensions)
+      7 ldaxr   (load and store exclusives)
+      6 stlxr   (load and store exclusives)
+      1 stxr    (load and store exclusives)
+</code></pre>
+<p>I see both here. Instructions like CASAL (compare and swap) and SWPA (swap words) are LSE atomics. LDAXR and STXR are the instructions used before LSE.</p>
+<p>Both are there because I compiled with the GCC versions that builds a binary with run-time detection to use one or the other. I&#8217;ll take one function that makes use of atomics. If you have a high rate of writes in your PostgreSQL databases, from multiple sessions, you may have seen contention on WAL generation. Especially in case of CPU starvation because <a href="https://github.com/postgres/postgres/blob/master/src/backend/access/transam/xlog.c#L1294">XLogInsert-&gt;XLogInsertRecord-&gt;ReserveXLogInsertLocation</a> uses GCC built-in atomics to protect exclusive access the shared memory structure.<br />
+Let&#8217;s see what the compiler has generated for this:</p>
+<pre><code>
+t4g.micro# gdb --batch /usr/local/pgsql/bin/postgres -ex 'disas ReserveXLogInsertLocation'
+
+Dump of assembler code for function ReserveXLogInsertLocation:
+   0x000000000055ff18 &lt;+0&gt;:     stp     x29, x30, [sp, #-80]!
+   0x000000000055ff1c &lt;+4&gt;:     mov     x29, sp
+   0x000000000055ff20 &lt;+8&gt;:     str     w0, [sp, #44]
+   0x000000000055ff24 &lt;+12&gt;:    str     x1, [sp, #32]
+   0x000000000055ff28 &lt;+16&gt;:    str     x2, [sp, #24]
+   0x000000000055ff2c &lt;+20&gt;:    str     x3, [sp, #16]
+   0x000000000055ff30 &lt;+24&gt;:    adrp    x0, 0xde0000 &lt;MultiXactMemberCtlData+56&gt;
+   0x000000000055ff34 &lt;+28&gt;:    add     x0, x0, #0x550
+   0x000000000055ff38 &lt;+32&gt;:    ldr     x0, [x0]
+   0x000000000055ff3c &lt;+36&gt;:    str     x0, [sp, #72]
+   0x000000000055ff40 &lt;+40&gt;:    ldr     w0, [sp, #44]
+   0x000000000055ff44 &lt;+44&gt;:    add     w0, w0, #0x7
+   0x000000000055ff48 &lt;+48&gt;:    and     w0, w0, #0xfffffff8
+   0x000000000055ff4c &lt;+52&gt;:    str     w0, [sp, #44]
+   0x000000000055ff50 &lt;+56&gt;:    ldr     x0, [sp, #72]
+   0x000000000055ff54 &lt;+60&gt;:    bl      0x55f9b0 &lt;tas&gt;
+   0x000000000055ff58 &lt;+64&gt;:    cmp     w0, #0x0
+   0x000000000055ff5c &lt;+68&gt;:    b.eq    0x55ff80 &lt;ReserveXLogInsertLocation+104&gt;  // b.none
+...
+</code></pre>
+<p>This TAS is an atomic Test And Set function. There is a PostgreSQL wiki page about atomics implementation (<a href="https://wiki.postgresql.org/wiki/Atomics" target="_blank" rel="noopener">https://wiki.postgresql.org/wiki/Atomics</a>) but not really up to date. It says that the ARM for TAS is LDREX/STREX load and store instructions. Let&#8217;s look at this in my binary:</p>
+<pre><code>
+t4g.micro# gdb --batch /usr/local/pgsql/bin/postgres -ex 'disas tas'
+
+Dump of assembler code for function tas:
+   0x0000000000514784 &lt;+0&gt;:     stp     x29, x30, [sp, #-32]!
+   0x0000000000514788 &lt;+4&gt;:     mov     x29, sp
+   0x000000000051478c &lt;+8&gt;:     str     x0, [sp, #24]
+   0x0000000000514790 &lt;+12&gt;:    ldr     x1, [sp, #24]
+   0x0000000000514794 &lt;+16&gt;:    mov     w0, #0x1                        // #1
+   0x0000000000514798 &lt;+20&gt;:    bl      0xb4f080 &lt;__aarch64_swp4_acq&gt;
+   0x000000000051479c &lt;+24&gt;:    ldp     x29, x30, [sp], #32
+   0x00000000005147a0 &lt;+28&gt;:    ret
+End of assembler dump.
+
+</code></pre>
+<p>What is interesting here is the call to __aarch64_swp4_acq which is the outlined atomics.</p>
+<pre><code>
+t4g.micro# gdb --batch /usr/local/pgsql/bin/postgres -ex 'disas __aarch64_swp4_acq'
+
+Dump of assembler code for function __aarch64_swp4_acq:
+   0x0000000000b4f080 &lt;+0&gt;:     hint    #0x22
+   0x0000000000b4f084 &lt;+4&gt;:     adrp    x16, 0xe11000 &lt;hist_entries+129832&gt;
+   0x0000000000b4f088 &lt;+8&gt;:     ldrb    w16, [x16, #1848]
+   0x0000000000b4f08c &lt;+12&gt;:    cbz     w16, 0xb4f098 &lt;__aarch64_swp4_acq+24&gt;
+   0x0000000000b4f090 &lt;+16&gt;:    swpa    w0, w0, [x1]
+   0x0000000000b4f094 &lt;+20&gt;:    ret
+   0x0000000000b4f098 &lt;+24&gt;:    mov     w16, w0
+   0x0000000000b4f09c &lt;+28&gt;:    ldaxr   w0, [x1]
+   0x0000000000b4f0a0 &lt;+32&gt;:    stxr    w17, w16, [x1]
+   0x0000000000b4f0a4 &lt;+36&gt;:    cbnz    w17, 0xb4f09c &lt;__aarch64_swp4_acq+28&gt;
+   0x0000000000b4f0a8 &lt;+40&gt;:    ret
+End of assembler dump.
+</code></pre>
+<p>This is where we can see both LSE (SWPA) for ARM v8.1 or later and load store exclusives (LDAXR STRX) for previous versions. The latter is in a loop (CBNZ branches to LDAXR) but the former is one atomic instruction. The decision is done by CBZ to branch to one or the other.</p>
+<p>I have installed GCC 11 where outlined atomics is the default, in all Linux distributions (and doing that on a larger size instance).</p>
+<pre><code>
+CFLAGS="" ./configure ./configure &amp;&amp; make clean &amp;&amp; make &amp;&amp; sudo make install
+</code></pre>
+<p>This shows the same as above: a __aarch64_swp4_acq function with run-time detection and two branches, LSE or loop on load/store.</p>
+<p>However if I explicitely compile for a version of ARM which has LSE atomics, there&#8217;s no need for this runtime detection:</p>
+<pre><code>
+CFLAGS="-march=armv8.2-a" ./configure &amp;&amp; make clean &amp;&amp; make &amp;&amp; sudo make install
+
+c6gn.xlarge# gdb --batch /usr/local/pgsql/bin/postgres -ex 'disas tas'
+
+Dump of assembler code for function tas:
+Dump of assembler code for function tas:
+   0x00000000005146b4 &lt;+0&gt;:     sub     sp, sp, #0x10
+   0x00000000005146b8 &lt;+4&gt;:     str     x0, [sp, #8]
+   0x00000000005146bc &lt;+8&gt;:     ldr     x0, [sp, #8]
+   0x00000000005146c0 &lt;+12&gt;:    mov     w1, #0x1                        // #1
+   0x00000000005146c4 &lt;+16&gt;:    swpa    w1, w1, [x0]
+   0x00000000005146c8 &lt;+20&gt;:    mov     w0, w1
+   0x00000000005146cc &lt;+24&gt;:    add     sp, sp, #0x10
+   0x00000000005146d0 &lt;+28&gt;:    ret
+End of assembler dump.
+</code></pre>
+<p>The TAS doesn&#8217;t call a __aarch64_swp4_acq function and the SWPA is in the function (not outlined).</p>
+<p>I have the same result with:</p>
+<pre><code>
+CFLAGS="-mcpu=neoverse-n1" ./configure &amp;&amp; make clean &amp;&amp; make &amp;&amp; sudo make install
+</code></pre>
+<p>as GCC 11 knows that Neoverse N1 is ARM v8.2 and -mcpu defines -march and -mtune if not specified otherwise</p>
+<p>Note, however, that:</p>
+<pre><code>
+CFLAGS="-mtune=neoverse-n1" ./configure &amp;&amp; make clean &amp;&amp; make &amp;&amp; sudo make install
+</code></pre>
+<p>still generates __aarch64_swp4_acq to be compatible with pre v8.1 ARM (use -mcpu and not -mtune if you don&#8217;t want them, or add -mno-outline-atomics to -mtune)</p>
+<p>Note also that:</p>
+<pre><code>
+c6gn.xlarge# CFLAGS="-march=armv8-a+lse" ./configure &amp;&amp; make clean &amp;&amp; make &amp;&amp; sudo make install
+</code></pre>
+<p>generates the LSE only (without runtime detection)</p>
+<p>But:</p>
+<pre><code>
+c6gn.xlarge# CFLAGS="-march=armv8-a -mno-outline-atomics" ./configure &amp;&amp; make clean &amp;&amp; make &amp;&amp; sudo make install
+
+c6gn.xlarge# gdb --batch /usr/local/pgsql/bin/postgres -ex 'disas tas'
+Dump of assembler code for function tas:
+   0x0000000000514730 :     sub     sp, sp, #0x10
+   0x0000000000514734 :     str     x0, [sp, #8]
+   0x0000000000514738 :     ldr     x0, [sp, #8]
+   0x000000000051473c :    mov     w1, #0x1                        // #1
+   0x0000000000514740 :    ldxr    w2, [x0]
+   0x0000000000514744 :    stxr    w3, w1, [x0]
+   0x0000000000514748 :    cbnz    w3, 0x514740
+   0x000000000051474c :    dmb     ish
+   0x0000000000514750 :    mov     w0, w2
+   0x0000000000514754 :    add     sp, sp, #0x10
+   0x0000000000514758 :    ret
+End of assembler dump.
+</code></pre>
+<p>generates only load store exclusives.</p>
+<p>You can find many blog posts with benchmarks. But, from what we have seen, the optimizations of Graviton2 depend on many parameters: gcc version, compilation flags, host cpu usage, and of course how spinlock and other atomic instructions are a bottleneck for your workload. The most important to understand is where the optimization shows up. In order to avoid severe performance degradation when processes are in spinlock contention and scheduled out of the CPU, we need to provision the instance size, or the autoscaling threshold, to avoid those peaks of CPU starvation. With those ARM optimizations, a smaller size may be acceptable for short peaks. This concurs to lower the cost when running on ARM.</p>
+<p>So, if you are not sure about outline atomics being the default, like before version 10 of GCC, better add CFLAGS=&#8221;-moutline-atomics&#8221; to benefit from LSE when available. A patch to add it by default for that was rejected by the PostgreSQL community: <a href="https://www.postgresql.org/message-id/flat/099F69EE-51D3-4214-934A-1F28C0A1A7A7%40amazon.com" target="_blank" rel="noopener">[PATCH] audo-detect and use -moutline-atomics compilation flag for aarch64</a>.<br />
+With recent GCC, the best is probably CFLAGS=&#8221;-mcpu=neoverse-n1&#8243; for Graviton2. Or CFLAGS=&#8221;-mcpu=neoverse-n1 -moutline-atomics&#8221; if you want the binary to be compatible with non-LSE processors. And above all, in case of doubt, don&#8217;t guess and check the binaries.<br />
+All this is quite new, any feedback welcome:</p>
+<blockquote class="twitter-tweet" data-width="500" data-dnt="true">
+<p lang="en" dir="ltr">Looking at what GCC generates on AWS Graviton2 for PostgreSQL atomics. 🚉 run-time detection of LSE atomics to branch to &#39;old&#39; load store for ARM &lt; v8.1 where LSE is not available 😎 <a href="https://t.co/jEVT6LLmBD">pic.twitter.com/jEVT6LLmBD</a></p>
+<p>&mdash; Franck Pachot (@FranckPachot) <a href="https://twitter.com/FranckPachot/status/1394402352896135175?ref_src=twsrc%5Etfw">May 17, 2021</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+
+</div>
+</body>
+</html>

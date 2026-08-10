@@ -1,0 +1,168 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/_suppress_identifiers_on_dupkey-the-sap-workaround-for-bad-design/">
+<title>&#8220;_suppress_identifiers_on_dupkey&#8221; &#8211; the SAP workaround for bad design</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/_suppress_identifiers_on_dupkey-the-sap-workaround-for-bad-design/">https://www.dbi-services.com/blog/_suppress_identifiers_on_dupkey-the-sap-workaround-for-bad-design/</a> (2017-09-29)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">&#8220;_suppress_identifiers_on_dupkey&#8221; &#8211; the SAP workaround for bad design</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In SQL, &#8216;upsert&#8217; is a conditional insert or update: if the row is there, you update it, but if it is not there, you insert it. In Oracle, you should use a MERGE statement for that. You are clearly doing it wrong if you code something like:</p>
+<pre><code>
+begin
+ insert...
+exception
+ when dup_val_on_index then update...
+end;
+</code></pre>
+<p><!--more--><br />
+But it seems that there are many applications with this bad design, and Oracle has introduced an underscore parameter for them: &#8220;_suppress_identifiers_on_dupkey&#8221;. You won&#8217;t be surprised that this one is part of the long list of parameters required for SAP.</p>
+<p>Let&#8217;s investigate this.</p>
+<h3>Insert &#8211; Exception &#8211; Update</h3>
+<p>So the idea is to try first an insert, rely on the unique constraint (primary key) to get an exception if the row exists, and in this case update the existing row. There are several flows with that.</p>
+<p>The first problem, is that it is not as easy as it looks like. If a concurrent session deletes the row between you insert and update, then the update will fail. You have to manage this. The failed insert cannot leave a lock on the rows that was not inserted.</p>
+<p>The second problem is that the SQL engine is optimized for transactions which commit. When the &#8216;dup_val_on_index&#8217; on index occurs, you have already inserted the table row, updated some indexes, etc. And all that has to be rolled back when the exception occurs. This generates unnecessary contention on the index leaf block, and unnecessary redo.</p>
+<p>Then the third problem, and probably the worst one, is that an exception is an error. And error management has lot of work to do, such as looking into the dictionary for the violated constraint name in order to give you a nice error message.</p>
+<p>I&#8217;ve created the following table:</p>
+<pre><code>
+create table demo as select * from dual;
+create unique index demo on demo(dummy);
+</code></pre>
+<p>And I&#8217;ve run 10 million inserts on it, all with duplicates:</p>
+<pre><code>
+exec for i in 1..1e7 loop begin insert into demo values('x'); exception when others then null; end; end loop;
+</code></pre>
+<p>Here is some extracts from the AWR on manual snapshots taked before and after.</p>
+<pre><code>
+   Elapsed:               20.69 (mins)
+   DB Time:               20.69 (mins)
+</code></pre>
+<p>This has run for 20 minutes.</p>
+<pre><code>
+Instance Efficiency Percentages (Target 100%)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            Buffer Nowait %:  100.00       Redo NoWait %:  100.00
+            Buffer  Hit   %:  100.00    In-memory Sort %:  100.00
+            Library Hit   %:  100.00        Soft Parse %:  100.00
+         Execute to Parse %:   33.34         Latch Hit %:  100.00
+Parse CPU to Parse Elapsd %:   92.31     % Non-Parse CPU:   94.90
+          Flash Cache Hit %:    0.00
+</code></pre>
+<p>The &#8216;Execute to Parse %&#8217; show that 2/3 of statements are parsed each time.</p>
+<pre><code>
+SQL ordered by Gets                           DB/Inst: CDB1/CDB1  Snaps: 19-20
+-&gt; Resources reported for PL/SQL code includes the resources used by all SQL
+   statements called by the code.
+-&gt; %Total - Buffer Gets   as a percentage of Total Buffer Gets
+-&gt; %CPU   - CPU Time      as a percentage of Elapsed Time
+-&gt; %IO    - User I/O Time as a percentage of Elapsed Time
+-&gt; Total Buffer Gets:     180,125,740
+-&gt; Captured SQL account for  127.7% of Total
+&nbsp;
+     Buffer                 Gets              Elapsed
+      Gets   Executions   per Exec   %Total   Time (s)  %CPU   %IO    SQL Id
+----------- ----------- ------------ ------ ---------- ----- ----- -------------
+1.80094E+08           1 1.800942E+08  100.0    1,239.8  99.5    .3 frvpzg5yubp29
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+BEGIN for i in 1..1e7 loop begin insert into demo values('x'); exception when ot
+hers then null; end; end loop; END;
+&nbsp;
+1.60094E+08  10,000,000         16.0   88.9      983.1 100.3    .4 319ypa1z41aba
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+INSERT INTO DEMO VALUES('x')
+&nbsp;
+ 49,999,995   9,999,999          5.0   27.8      201.1 103.2     0 2skwhauh2cwky
+   PDB: PDB1
+select o.name, u.name from obj$ o, user$ u where o.obj# = :1 and o.owner# = u.u
+ser#
+&nbsp;
+ 19,999,998   9,999,999          2.0   11.1      148.5  98.9     0 2jfqzrxhrm93b
+   PDB: PDB1
+select /*+ rule */ c.name, u.name from con$ c, cdef$ cd, user$ u where c.con# =
+ cd.con# and cd.enabled = :1 and c.owner# = u.user#
+</code></pre>
+<p>My failed inserts have read on average 16 blocks for each attempt. that&#8217;s too much for doing nothing. And in addition to that, I see two expensive statements parsed and executed each time: one to get the object name and one to get the constraint name.<br />
+This is how we can retreive the error message which is:</p>
+<pre><code>
+&nbsp;
+ORA-00001: unique constraint (SCOTT.DEMO) violated
+&nbsp;
+</code></pre>
+<p>This is a big waste of resource. I did this test in PL/SQL but if you cumulate all worst practices and run those inserts row by row, then you will see those colors:<br />
+<a href="../../assets/CaptureBreakReset.png"><img loading="lazy" decoding="async" src="../../assets/CaptureBreakReset.png" alt="CaptureBreakReset" width="808" height="463" class="aligncenter size-full wp-image-18783" /></a></p>
+<p>The Orange is &#8216;Log File Sync&#8217; because you generate more redo than necessary.<br />
+The Green is &#8216;CPU&#8217; because you read more blocks than necessary.<br />
+The read is &#8216;SQL*Net break/reset to client&#8217; when the server process sends the error.</p>
+<h3>_suppress_identifiers_on_dupkey</h3>
+<p>When you set &#8220;_suppress_identifiers_on_dupkey&#8221; to true, Oracle will not return the name of the constraint which is violated, but only the information which is already there in the session context.</p>
+<p>Here is the message that you get:</p>
+<pre><code>
+&nbsp;
+ORA-00001: unique constraint (UNKNOWN.obj#=73375) violated
+&nbsp;
+</code></pre>
+<p>Where 73375 is the OBJECT_ID of the index where the unique constraint exception has been violated.</p>
+<p>You have less information, but it is faster:</p>
+<pre><code>
+   Elapsed:               15.45 (mins)
+   DB Time:               15.48 (mins)
+</code></pre>
+<p>There is no Soft Parse overhead:</p>
+<pre><code>
+Instance Efficiency Percentages (Target 100%)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+            Buffer Nowait %:  100.00       Redo NoWait %:  100.00
+            Buffer  Hit   %:  100.00    In-memory Sort %:  100.00
+            Library Hit   %:  100.00        Soft Parse %:   96.43
+         Execute to Parse %:   99.98         Latch Hit %:  100.00
+Parse CPU to Parse Elapsd %:   90.38     % Non-Parse CPU:   99.95
+          Flash Cache Hit %:    0.00
+</code></pre>
+<p>Our statement is the only one using the CPU and reads less blocks:</p>
+<pre><code>
+SQL ordered by Gets                           DB/Inst: CDB1/CDB1  Snaps: 21-22
+-&gt; Resources reported for PL/SQL code includes the resources used by all SQL
+   statements called by the code.
+-&gt; %Total - Buffer Gets   as a percentage of Total Buffer Gets
+-&gt; %CPU   - CPU Time      as a percentage of Elapsed Time
+-&gt; %IO    - User I/O Time as a percentage of Elapsed Time
+-&gt; Total Buffer Gets:     110,132,467
+-&gt; Captured SQL account for   81.8% of Total
+&nbsp;
+     Buffer                 Gets              Elapsed
+      Gets   Executions   per Exec   %Total   Time (s)  %CPU   %IO    SQL Id
+----------- ----------- ------------ ------ ---------- ----- ----- -------------
+1.10091E+08           1 1.100906E+08  100.0      926.2  98.8     1 frvpzg5yubp29
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+BEGIN for i in 1..1e7 loop begin insert into demo values('x'); exception when ot
+hers then null; end; end loop; END;
+&nbsp;
+ 90,090,580  10,000,000          9.0   81.8      515.7  99.1   1.9 319ypa1z41aba
+Module: java@VM104 (TNS V1-V3)
+   PDB: PDB1
+INSERT INTO DEMO VALUES('x')
+</code></pre>
+<p>This parameter is a workaround for bad design, but not a solution.</p>
+<h3>Update &#8211; no rows &#8211; Insert</h3>
+<p>In order to avoid all this rollback and exception management overhead, there is another idea. Start with the update and, when no row was found, insert it. This is easy with the ROWCOUNT.</p>
+<pre><code>
+begin
+ update ...
+ if SQL%ROWCOUNT = 0 then insert ...
+</code></pre>
+<p>This is more efficient but still subject to a concurrent session inserting the row between your update and you insert. But at least, you manage the different scenario with a condition on ROWCOUNT rather than with an exception, which is more scalable.</p>
+<h3>So what?</h3>
+<p>Always use the database in the expected way. Exceptions and Errors are not for the normal scenario of the use-case. Exceptions should be unusual. The solution is to use the MERGE statement which has been implemented exactly for this reason: do an upsert without the error management overhead and with the statement isolation level which prevents errors in a multi-user environment.</p>
+
+</div>
+</body>
+</html>

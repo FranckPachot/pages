@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/password-rolling-change-before-oracle-21c/">
+<title>Password rolling change before Oracle 21c</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/password-rolling-change-before-oracle-21c/">https://www.dbi-services.com/blog/password-rolling-change-before-oracle-21c/</a> (2020-12-27)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Password rolling change before Oracle 21c</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+You may have read about Gradual Password Rollover usage from <a href="https://www.dbi-services.com/blog/oracle-21c-security-gradual-database-password-rollover/" target="_blank" rel="noopener noreferrer">Mouhamadou Diaw</a> and about some internals from <a href="https://www.dbarj.com.br/en/2020/12/21c-gradual-database-password-rollover-brings-new-backdoor-opportunities/" target="_blank" rel="noopener noreferrer">Rodrigo Jorge</a>. But it works only on 21c which is only in the cloud, for the moment, in Autonomous Database and DBaaS (but here I&#8217;ve encountered <a href="https://twitter.com/FranckPachot/status/1336979151933366279?s=20" target="_blank" rel="noopener noreferrer">some problems</a> apparently because of a bug when using SQL*Net native encryption). But your production is not yet in 21c anyway. However, here is how you can achieve a similar goal in 12c,18c or 19c: be able to connect with two passwords for the time window where you are changing the password in a rolling fashion in the application server configuration.</p>
+<h3>Proxy User</h3>
+<p>If your application still connects with the application owner, you do it wrong. Even when it needs to be connected in the application schema by default, and even when you can&#8217;t to an &#8220;alter session set current_schema&#8221; you don&#8217;t have to use this user for authentication. And this is really easy with proxy users. Consider the application owner as a schema, not as a user to connect with.</p>
+<p>My application is in schema DEMO and I&#8217;ll not use DEMO credentials. You can set an impossible password or, better, in 18c, set no password at all. I&#8217;ll use a proxy user authentication to connect to this DEMO user:</p>
+<pre><code>
+19:28:49 DEMO@atp1_tp&gt; grant create session to APP2020 identified by "2020 was a really Bad Year!";
+Grant succeeded.
+
+19:28:50 DEMO@atp1_tp&gt; alter user DEMO grant connect through APP2020;
+User DEMO altered.
+</code></pre>
+<p>The APP2020 user is the one I&#8217;ll use. I named it 2020 because I want to change the credentials every year and, as I don&#8217;t have the gradual rollover password feature, this means changing the user to connect with.</p>
+<pre><code>
+19:28:50 DEMO@atp1_tp&gt; connect APP2020/"2020 was a really Bad Year!"@atp1_tp
+Connected.
+19:28:52 APP2020@atp1_tp&gt; show user
+USER is "APP2020"
+</code></pre>
+<p>This user can connect as usual, as it has the CREATE SESSION privilege. There is a way to prevent this and allow PROXY ONLY CONNECT, but this is unfortunately not documented (<a href="https://anjo.pt/keyword-oracle/2014/11/03/oracle-12-1-proxy-only-connect-user-property/" target="_blank" rel="noopener noreferrer">Miguel Anjo has written about this</a>) so better not using it.</p>
+<p>However, the most important is:</p>
+<pre><code>
+19:28:52 APP2020@atp1_tp&gt; connect APP2020[DEMO]/"2020 was a really Bad Year!"@atp1_tp
+Connected.
+
+19:28:53 DEMO@atp1_tp&gt; show user
+USER is "DEMO"
+</code></pre>
+<p>With proxy connection, in addition to the proxy user credentials I mention the final user I want to connect to, though this proxy user. Now I&#8217;m in the exact same state as if I connected with the DEMO user.</p>
+<h3>No authentication</h3>
+<pre><code>
+19:28:54 ADMIN@atp1_tp&gt; alter user DEMO no authentication;
+User DEMO altered.
+</code></pre>
+<p>As we don&#8217;t connect through this user anymore (and once I&#8217;m sure no application uses it) the best is to set it with NO AUTHENTICATION.</p>
+<h3>New proxy user</h3>
+<p>Now that the application uses this APP2020 for months, I want to change the password. I&#8217;ll add a new proxy user for that:</p>
+<pre><code>
+19:28:54 ADMIN@atp1_tp&gt; show user
+USER is "ADMIN"
+
+19:28:53 ADMIN@atp1_tp&gt; grant create session to APP2021 identified by "Best Hopes for 2021 :)";
+Grant succeeded.
+
+19:28:54 ADMIN@atp1_tp&gt; alter user DEMO grant connect through APP2021;
+User DEMO altered.
+</code></pre>
+<p>Here I have another proxy user that can be used to connect to DEMO, in addition to the existing one</p>
+<pre><code>
+19:28:54 ADMIN@atp1_tp&gt; connect APP2020[DEMO]/"2020 was a really Bad Year!"@atp1_tp
+Connected.
+
+19:28:55 DEMO@atp1_tp&gt; show user
+USER is "DEMO"
+
+19:28:55 DEMO@atp1_tp&gt; connect APP2021[DEMO]/"Best Hopes for 2021 :)"@atp1_tp
+Connected.
+
+19:28:56 DEMO@atp1_tp&gt; show user
+USER is "DEMO"
+</code></pre>
+<p>During this time, I can use both credentials. This gives me enough time to change all application server configuration one by one, without any downtime for the application.</p>
+<p><a href="../../assets/Screenshot-2020-12-27-201256.jpg"><img loading="lazy" decoding="async" class="aligncenter size-full wp-image-46336" src="../../assets/Screenshot-2020-12-27-201256.jpg" alt="" width="1994" height="608" /></a></p>
+<h3>Lock previous account</h3>
+<pre><code>
+19:30:00 ADMIN@atp1_tp&gt;
+ select username,account_status,last_login,password_change_date,proxy_only_connect
+ from dba_users where username like 'APP____';
+
+   USERNAME    ACCOUNT_STATUS                                       LAST_LOGIN    PASSWORD_CHANGE_DATE    PROXY_ONLY_CONNECT
+___________ _________________ ________________________________________________ _______________________ _____________________
+APP2020     OPEN              27-DEC-20 07.28.55.000000000 PM EUROPE/ZURICH    27-DEC-20               N
+APP2021     OPEN              27-DEC-20 07.28.56.000000000 PM EUROPE/ZURICH    27-DEC-20               N
+</code></pre>
+<p>After a while, I can validate that the old user is not used anymore. If you have a connection recycling duration in the connection pool (you should) you can rely on last login.</p>
+<pre><code>
+19:30:00 ADMIN@atp1_tp&gt; alter user APP2020 account lock;
+User APP2020 altered.
+</code></pre>
+<p>Before dropping it, just lock the account, easier to keep track of it and unlock it quickly if anyone encounters a problem</p>
+<pre><code>
+19:30:00 ADMIN@atp1_tp&gt; connect APP2020[DEMO]/"2020 was a really Bad Year!"@atp1_tp
+Error starting at line : 30 File @ /home/opc/demo/tmp/proxy_to_rollover.sql
+In command -
+  connect ...
+Error report -
+Connection Failed
+  USER          = APP2020[DEMO]
+  URL           = jdbc:oracle:thin:@atp1_tp
+  Error Message = ORA-28000: The account is locked.
+Commit
+</code></pre>
+<p>If someone tries to connect with the old password, he will know that the user is locked.</p>
+<pre><code>
+19:30:01 @&gt; connect APP2021[DEMO]/"Best Hopes for 2021 :)"@atp1_tp
+Connected.
+19:30:02 DEMO@atp1_tp&gt; show user
+USER is "DEMO"
+</code></pre>
+<p>Once the old user locked, only the new one is able to connect, with the new user credentials. As this operation can be done with no application downtime, you can do it frequently. From a security point of view, you must change passwords frequently. For end-user passwords, you can set a lifetime, and grace period. But not for system users as the warning may not be cached. Better change them proactively.</p>
+
+</div>
+</body>
+</html>

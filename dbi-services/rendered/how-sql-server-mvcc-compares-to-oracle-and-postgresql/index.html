@@ -1,0 +1,567 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/how-sql-server-mvcc-compares-to-oracle-and-postgresql/">
+<title>How SQL Server MVCC compares to Oracle and PostgreSQL</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/how-sql-server-mvcc-compares-to-oracle-and-postgresql/">https://www.dbi-services.com/blog/how-sql-server-mvcc-compares-to-oracle-and-postgresql/</a> (2020-02-09)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">How SQL Server MVCC compares to Oracle and PostgreSQL</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Microsoft SQL Server has implemented MVCC in 2005, which has been proven to be the best approach for transaction isolation (the I in ACID) in OLTP. But are you sure that writers do not block readers with READ_COMMITTED_SNAPSHOT? I&#8217;ll show here that some reads are still blocked by locked rows, contrary to the precursors of MVCC like PostgreSQL and Oracle.<br />
+<!--more--><br />
+For this demo, I run SQL Server 2019 RHEL image on docker in an Oracle Cloud compute running OEL7.7 as explained in the <a href="https://www.dbi-services.com/blog/running-sql-server-on-the-oracle-free-tier/" rel="noopener noreferrer" target="_blank">previous post</a>. If you don&#8217;t have the memory limit mentioned, you can simply run:</p>
+<pre><code>
+docker run -d -e "ACCEPT_EULA=Y" -e 'MSSQL_PID=Express' -p 1433:1433 -e 'SA_PASSWORD=**P455w0rd**' --name mssql mcr.microsoft.com/mssql/rhel/server:2019-latest
+time until docker logs mssql  | grep -C10 "Recovery is complete." ; do sleep 1 ; done
+</code></pre>
+<h3>Test scenario description</h3>
+<p>Here is what I&#8217;ll run in a first session:</p>
+<ol>
+<li>create a DEMO database</li>
+<li>(optional) set MVCC with Read Commited Snapshot isolation level</li>
+<li>create a DEMO table with two rows. One with &#8220;a&#8221;=1 and one with &#8220;a&#8221;=2</li>
+<li>(optional) build an index on column &#8220;a&#8221;</li>
+<li>update the first line where &#8220;a&#8221;=1</li>
+</ol>
+<pre><code>
+cat &gt; session1.sql &lt;&lt;&#039;SQL&#039;
+ drop database if exists DEMO;
+ create database DEMO;
+ go
+ use DEMO;
+ go
+ -- set MVCC to read snapshot rather than locked current --
+ -- alter database DEMO set READ_COMMITTED_SNAPSHOT on;
+ go
+ drop table if exists DEMO;
+ create table DEMO(id int primary key, a int not null, b int);
+ begin transaction;
+ insert into DEMO values(1,1,1);
+ insert into DEMO values(2,2,2);
+ commit;
+ go
+ select * from DEMO;
+ go
+ -- index to read only rows that we want to modify --
+ -- create index DEMO_A on DEMO(a);
+ go
+ begin transaction;
+ update DEMO set b=b+1 where a=1;
+ go
+SQL
+</code></pre>
+<p>I&#8217;ll run it in the background (you can also run it in another terminal) where it waits 60 seconds before quitting:</p>
+<pre><code>
+( cat session1.sql ; sleep 60 ) | docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e | ts &amp;
+</code></pre>
+<pre><code>
+[root@instance-20200208-1719 ~]# ( cat session1.sql ; sleep 60 ) | docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e | ts &amp;
+[1] 27759
+[root@instance-20200208-1719 ~]# Feb 09 17:05:43 drop database if exists DEMO;
+Feb 09 17:05:43 create database DEMO;
+Feb 09 17:05:43
+Feb 09 17:05:43 use DEMO;
+Feb 09 17:05:43
+Feb 09 17:05:43 Changed database context to 'DEMO'.
+Feb 09 17:05:43 -- set MVCC to read snapshot rather than locked current --
+Feb 09 17:05:43 -- alter database DEMO set READ_COMMITTED_SNAPSHOT on;
+Feb 09 17:05:43
+Feb 09 17:05:43 drop table if exists DEMO;
+Feb 09 17:05:43 create table DEMO(id int primary key, a int not null, b int);
+Feb 09 17:05:43 begin transaction;
+Feb 09 17:05:43 insert into DEMO values(1,1,1);
+Feb 09 17:05:43 insert into DEMO values(2,2,2);
+Feb 09 17:05:43 commit;
+Feb 09 17:05:43
+Feb 09 17:05:43
+Feb 09 17:05:43 (1 rows affected)
+Feb 09 17:05:43
+Feb 09 17:05:43 (1 rows affected)
+Feb 09 17:05:43 select * from DEMO;
+Feb 09 17:05:43
+Feb 09 17:05:43 id          a           b
+Feb 09 17:05:43 ----------- ----------- -----------
+Feb 09 17:05:43           1           1           1
+Feb 09 17:05:43           2           2           2
+Feb 09 17:05:43
+Feb 09 17:05:43 (2 rows affected)
+Feb 09 17:05:43 -- index to read only rows that we want to modify --
+Feb 09 17:05:43 -- create index DEMO_A on DEMO(a);
+Feb 09 17:05:43
+Feb 09 17:05:43 begin transaction;
+Feb 09 17:05:43 update DEMO set b=b+1 where a=1;
+Feb 09 17:05:43
+Feb 09 17:05:43
+Feb 09 17:05:43 (1 rows affected)
+</code></pre>
+<h3>SQL Server default</h3>
+<p>While this session has locked the first row I&#8217;ll run the following, reading the same row that is currently locked by the other transaction:</p>
+<pre><code>
+docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO | ts
+-- read access the row that is not locked
+ select * from DEMO where a=2;
+ go
+</code></pre>
+<p>This hangs until the first transaction is canceled:</p>
+<pre><code>
+[root@instance-20200208-1719 ~]# docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO | ts
+-- read access the row that is not locked
+ select * from DEMO where a=2;
+go
+Feb 09 17:06:42
+Feb 09 17:06:42
+Feb 09 17:06:42
+Feb 09 17:06:42 Sqlcmd: Warning: The last operation was terminated because the user pressed CTRL+C.
+Feb 09 17:06:42
+Feb 09 17:06:42 -- read access the row that is not locked
+Feb 09 17:06:42  select * from DEMO where a=2;
+Feb 09 17:06:42
+Feb 09 17:06:42 id          a           b
+Feb 09 17:06:42 ----------- ----------- -----------
+Feb 09 17:06:42           2           2           2
+Feb 09 17:06:42
+Feb 09 17:06:42 (1 rows affected)
+</code></pre>
+<p>The &#8220;Sqlcmd: Warning: The last operation was terminated because the user pressed CTRL+C&#8221; message is fron the first session and only then my foreground session was able to continue. This is the worst you can encounter with the default isolation level in SQL Server where writes and reads are blocking each other even when not touching the same row (I read the a=2 row and only the a=1 one was locked). The reason for this is that I have no index for this predicate and I have to read all rows in order to find mine:</p>
+<pre><code>
+set showplan_text on ;
+go
+select * from DEMO where a=2;
+go
+</code></pre>
+<pre><code>
+go
+Feb 09 17:07:24 set showplan_text on ;
+Feb 09 17:07:24
+select * from DEMO where a=2;
+go
+Feb 09 17:07:30 select * from DEMO where a=2;
+Feb 09 17:07:30
+Feb 09 17:07:30 StmtText
+Feb 09 17:07:30 -------------------------------
+Feb 09 17:07:30 select * from DEMO where a=2;
+Feb 09 17:07:30
+Feb 09 17:07:30 (1 rows affected)
+Feb 09 17:07:30 StmtText
+Feb 09 17:07:30 ---------------------------------------------------------------------------------------------------------------------------------------------------
+Feb 09 17:07:30   |--Clustered Index Scan(OBJECT:([DEMO].[dbo].[DEMO].[PK__DEMO__3213E83F2AD8547F]), WHERE:([DEMO].[dbo].[DEMO].[a]=CONVERT_IMPLICIT(int,[@1],0)))
+Feb 09 17:07:30
+Feb 09 17:07:30 (1 rows affected)
+</code></pre>
+<p>Now, in order to avoid this situation, I&#8217;ll run the same but with an index on column &#8220;a&#8221;.<br />
+It was commented out in the session1.sql script and then I just re-ren everything without those comments:</p>
+<pre><code>
+( sed -e '/create index/s/--//' session1.sql ; sleep 60 ) | docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e | ts &amp;
+</code></pre>
+<p>I&#8217;m running the same, now with a 3 seconds timeout so that I don&#8217;t have to wait for my background session to terminate:</p>
+<pre><code>
+docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO -t 3 | ts
+ -- read access the row that is not locked
+ select * from DEMO where a=2;
+ go
+</code></pre>
+<pre><code>
+[root@instance-20200208-1719 ~]# docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO -t 3 | ts
+-- read access the row that is not locked
+ select * from DEMO where a=2;
+ go
+Feb 09 17:29:25 -- read access the row that is not locked
+Feb 09 17:29:25  select * from DEMO where a=2;
+Feb 09 17:29:25
+Feb 09 17:29:25 Timeout expired
+</code></pre>
+<p>Here I&#8217;m blocked again like in the previous scenario because the index was not used.<br />
+I can force the index access with an hint:</p>
+<pre><code>
+ -- read access the row that is not locked forcing index access
+ select * from DEMO WITH (INDEX(DEMO_A)) where a=2;
+ go
+</code></pre>
+<pre><code>
+-- read access the row that is not locked forcing index access
+ select * from DEMO WITH (INDEX(DEMO_A)) where a=2;
+ go
+Feb 09 17:29:30 -- read access the row that is not locked forcing index access
+Feb 09 17:29:30  select * from DEMO WITH (INDEX(DEMO_A)) where a=2;
+Feb 09 17:29:30
+Feb 09 17:29:30 id          a           b
+Feb 09 17:29:30 ----------- ----------- -----------
+Feb 09 17:29:30           2           2           2
+Feb 09 17:29:30
+Feb 09 17:29:30 (1 rows affected)
+</code></pre>
+<p>This didn&#8217;t wait because the index access didn&#8217;t have to to to the locked row.</p>
+<p>However, when I read the same row that is concurently locked I have to wait:</p>
+<pre><code>
+-- read access the row that is locked
+ select * from DEMO where a=1;
+ go
+</code></pre>
+<pre><code>
+ -- read access the row that is locked
+ select * from DEMO where a=1;
+ go
+Feb 09 17:29:34  -- read access the row that is locked
+Feb 09 17:29:34  select * from DEMO where a=1;
+Feb 09 17:29:34
+Feb 09 17:29:34 Timeout expired
+</code></pre>
+<p>Here is the confirmation that the index was used only with the hint:</p>
+<pre><code>
+set showplan_text on ;
+ go
+ select * from DEMO where a=2;
+ go
+ select * from DEMO WITH (INDEX(DEMO_A)) where a=2;
+ go
+</code></pre>
+<pre><code>
+Feb 09 17:29:50 set showplan_text on ;
+Feb 09 17:29:50
+ select * from DEMO where a=2;
+ go
+Feb 09 17:29:50  select * from DEMO where a=2;
+Feb 09 17:29:50
+Feb 09 17:29:50 StmtText
+Feb 09 17:29:50 --------------------------------
+Feb 09 17:29:50  select * from DEMO where a=2;
+Feb 09 17:29:50
+Feb 09 17:29:50 (1 rows affected)
+Feb 09 17:29:50 StmtText
+Feb 09 17:29:50 --------------------------------------------------------------------------------------------------------------------------
+Feb 09 17:29:50   |--Clustered Index Scan(OBJECT:([DEMO].[dbo].[DEMO].[PK__DEMO__3213E83F102B4054]), WHERE:([DEMO].[dbo].[DEMO].[a]=(2)))
+Feb 09 17:29:50
+Feb 09 17:29:50 (1 rows affected)
+ select * from DEMO WITH (INDEX(DEMO_A)) where a=2;
+ go
+Feb 09 17:29:52  select * from DEMO WITH (INDEX(DEMO_A)) where a=2;
+Feb 09 17:29:52
+Feb 09 17:29:52 StmtText
+Feb 09 17:29:52 -----------------------------------------------------
+Feb 09 17:29:52  select * from DEMO WITH (INDEX(DEMO_A)) where a=2;
+Feb 09 17:29:52
+Feb 09 17:29:52 (1 rows affected)
+Feb 09 17:29:52 StmtText
+Feb 09 17:29:52 ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Feb 09 17:29:52   |--Nested Loops(Inner Join, OUTER REFERENCES:([DEMO].[dbo].[DEMO].[id]))
+Feb 09 17:29:52        |--Index Seek(OBJECT:([DEMO].[dbo].[DEMO].[DEMO_A]), SEEK:([DEMO].[dbo].[DEMO].[a]=(2)) ORDERED FORWARD)
+Feb 09 17:29:52        |--Clustered Index Seek(OBJECT:([DEMO].[dbo].[DEMO].[PK__DEMO__3213E83F102B4054]), SEEK:([DEMO].[dbo].[DEMO].[id]=[DEMO].[dbo].[DEMO].[id]) LOOKUP ORDERED FORWARD)
+Feb 09 17:29:52
+Feb 09 17:29:52 (3 rows affected)
+</code></pre>
+<p>So, with de the default isolation level and index access, we can read a row that is not locked. The last query was blocked for the SELECT * FROM DEMO WHERE A=1 because we are in the legacy, and default, mode where readers are blocked by writers.</p>
+<h3>SQL Server MVCC</h3>
+<p>In order to improve this situation, Microsoft has implemented MVCC. With it, we do not need to read the current version of the rows (which requires waiting when it is concurrently modified) because the past version of the rows are stored in TEMPDB and we can read a past snapshot of it. Typically, with READ COMMITED SNAPSHOT isolation level, we read a snapshot as-of the point-in-time our query began. <br />
+In general, we need to read all rows from a consistent point in time. This can be the one where our query started, and then while the query is running, a past version may be reconstructed to remove concurrent changes. Or, when there is no MVCC to rebuild this snapshot, this consistent point can only be the one when our query is completed. This means that while we read rows, we must lock them to be sure that they stay the same until the end of our query. Of course, even with MVCC there are cases where we want to read the latest value and then we will lock with something like a SELECT FOR UPDATE. But that&#8217;s not the topic here.</p>
+<p>I&#8217;ll run the same test as the first one, but now have the database with READ_COMMITTED_SNAPSHOT on:</p>
+<pre><code>
+( sed -e '/READ_COMMITTED/s/--//' session1.sql ; sleep 120 ) | docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e | ts &amp;
+</code></pre>
+<pre><code>
+[root@instance-20200208-1719 ~]# ( sed -e '/READ_COMMITTED/s/--//' session1.sql ; sleep 120 ) | docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e | ts &amp;
+[1] 38943
+[root@instance-20200208-1719 ~]# Feb 09 18:21:19 drop database if exists DEMO;
+Feb 09 18:21:19 create database DEMO;
+Feb 09 18:21:19
+Feb 09 18:21:19 use DEMO;
+Feb 09 18:21:19
+Feb 09 18:21:19 Changed database context to 'DEMO'.
+Feb 09 18:21:19 -- set MVCC to read snapshot rather than locked current --
+Feb 09 18:21:19  alter database DEMO set READ_COMMITTED_SNAPSHOT on;
+Feb 09 18:21:19
+Feb 09 18:21:19 drop table if exists DEMO;
+Feb 09 18:21:19 create table DEMO(id int primary key, a int not null, b int);
+Feb 09 18:21:19 begin transaction;
+Feb 09 18:21:19 insert into DEMO values(1,1,1);
+Feb 09 18:21:19 insert into DEMO values(2,2,2);
+Feb 09 18:21:19 commit;
+Feb 09 18:21:19
+Feb 09 18:21:19
+Feb 09 18:21:19 (1 rows affected)
+Feb 09 18:21:19
+Feb 09 18:21:19 (1 rows affected)
+Feb 09 18:21:19 select * from DEMO;
+Feb 09 18:21:19
+Feb 09 18:21:19 id          a           b
+Feb 09 18:21:19 ----------- ----------- -----------
+Feb 09 18:21:19           1           1           1
+Feb 09 18:21:19           2           2           2
+Feb 09 18:21:19
+Feb 09 18:21:19 (2 rows affected)
+Feb 09 18:21:19 -- index to read only rows that we want to modify --
+Feb 09 18:21:19 -- create index DEMO_A on DEMO(a);
+Feb 09 18:21:19
+Feb 09 18:21:19 begin transaction;
+Feb 09 18:21:19 update DEMO set b=b+1 where a=1;
+Feb 09 18:21:19
+Feb 09 18:21:19
+Feb 09 18:21:19 (1 rows affected)
+</code></pre>
+<p>And then running the same scenario:</p>
+<pre><code>
+docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO -t 3 | ts
+ -- read access the row that is not locked
+ select * from DEMO where a=2;
+ go
+ -- read access the row that is locked
+ select * from DEMO where a=1;
+ go
+ -- write access on the row that is not locked
+ delete from DEMO where a=2;
+ go
+</code></pre>
+<pre><code>
+[root@instance-20200208-1719 ~]# docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO -t 3 | ts
+
+-- read access the row that is not locked
+select * from DEMO where a=2;
+go
+Feb 09 18:21:36 -- read access the row that is not locked
+Feb 09 18:21:36 select * from DEMO where a=2;
+Feb 09 18:21:36
+Feb 09 18:21:36 id          a           b
+Feb 09 18:21:36 ----------- ----------- -----------
+Feb 09 18:21:36           2           2           2
+Feb 09 18:21:36
+Feb 09 18:21:36 (1 rows affected)
+
+-- read access the row that is locked
+select * from DEMO where a=1;
+go
+Feb 09 18:21:47 -- read access the row that is locked
+Feb 09 18:21:47 select * from DEMO where a=1;
+Feb 09 18:21:47
+Feb 09 18:21:47 id          a           b
+Feb 09 18:21:47 ----------- ----------- -----------
+Feb 09 18:21:47           1           1           1
+Feb 09 18:21:47
+Feb 09 18:21:47 (1 rows affected)
+
+-- write access on the row that is not locked
+delete from DEMO where a=2;
+go
+Feb 09 18:22:01 -- write access on the row that is not locked
+Feb 09 18:22:01 delete from DEMO where a=2;
+Feb 09 18:22:01
+Feb 09 18:22:01 Timeout expired
+</code></pre>
+<p>Ok, that&#8217;s better. I confirm that readers are not blocked by writers. But the modification on &#8220;A&#8221;=2 was blocked. This is not a writer-writer situation because we are not modifying the row that is locked by the other session. Here, I have no index on &#8220;A&#8221; and then the delete statement must first read the table and had to read this locked row. And obviously, this read is blocked. It seems that DML must read the current version of the row even when MVCC is available. That means that reads can be blocked by writes when those reads are in a writing transaction.</p>
+<p>Last test on SQL Server: the same, with MVCC, and the index on &#8220;A&#8221;</p>
+<pre><code>
+( sed -e '/READ_COMMITTED/s/--//' -e '/create index/s/--//' session1.sql ; sleep 120 ) | docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e | ts &amp;
+</code></pre>
+<pre><code>
+[root@instance-20200208-1719 ~]# ( sed -e '/READ_COMMITTED/s/--//' -e '/create index/s/--//' session1.sql ; sleep 120 ) | docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e | ts &amp;
+[1] 40320
+[root@instance-20200208-1719 ~]#
+[root@instance-20200208-1719 ~]# Feb 09 18:30:15 drop database if exists DEMO;
+Feb 09 18:30:15 create database DEMO;
+Feb 09 18:30:15
+Feb 09 18:30:15 use DEMO;
+Feb 09 18:30:15
+Feb 09 18:30:15 Changed database context to 'DEMO'.
+Feb 09 18:30:15 -- set MVCC to read snapshot rather than locked current --
+Feb 09 18:30:15  alter database DEMO set READ_COMMITTED_SNAPSHOT on;
+Feb 09 18:30:15
+Feb 09 18:30:15 drop table if exists DEMO;
+Feb 09 18:30:15 create table DEMO(id int primary key, a int not null, b int);
+Feb 09 18:30:15 begin transaction;
+Feb 09 18:30:15 insert into DEMO values(1,1,1);
+Feb 09 18:30:15 insert into DEMO values(2,2,2);
+Feb 09 18:30:15 commit;
+Feb 09 18:30:15
+Feb 09 18:30:15
+Feb 09 18:30:15 (1 rows affected)
+Feb 09 18:30:15
+Feb 09 18:30:15 (1 rows affected)
+Feb 09 18:30:15 select * from DEMO;
+Feb 09 18:30:15
+Feb 09 18:30:15 id          a           b
+Feb 09 18:30:15 ----------- ----------- -----------
+Feb 09 18:30:15           1           1           1
+Feb 09 18:30:15           2           2           2
+Feb 09 18:30:15
+Feb 09 18:30:15 (2 rows affected)
+Feb 09 18:30:15 -- index to read only rows that we want to modify --
+Feb 09 18:30:15  create index DEMO_A on DEMO(a);
+Feb 09 18:30:15
+Feb 09 18:30:15 begin transaction;
+Feb 09 18:30:15 update DEMO set b=b+1 where a=1;
+Feb 09 18:30:15
+Feb 09 18:30:15
+Feb 09 18:30:15 (1 rows affected)
+</code></pre>
+<p>Here is my full scenario to see where it blocks:</p>
+<pre><code>
+docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO -t 3
+ -- read access the row that is not locked
+ select * from DEMO where a=2;
+ go
+ -- read access the row that is locked
+ select * from DEMO where a=1;
+ go
+ -- write access on the row that is not locked
+ delete from DEMO where a=2;
+ go
+ -- write access on the row that is locked
+ delete from DEMO where a=1;
+ go
+</code></pre>
+<pre><code>
+docker exec -i mssql /opt/mssql-tools/bin/sqlcmd -S localhost -U SA -P "**P455w0rd**" -e -d DEMO -t 3
+-- read access the row that is not locked
+select * from DEMO where a=2;
+go
+-- read access the row that is not locked
+select * from DEMO where a=2;
+
+id          a           b
+----------- ----------- -----------
+          2           2           2
+
+(1 rows affected)
+
+-- read access the row that is locked
+select * from DEMO where a=1;
+go
+-- read access the row that is locked
+select * from DEMO where a=1;
+
+id          a           b
+----------- ----------- -----------
+          1           1           1
+
+(1 rows affected)
+
+-- write access on the row that is not locked
+delete from DEMO where a=2;
+go
+-- write access on the row that is not locked
+delete from DEMO where a=2;
+
+
+(1 rows affected)
+
+-- write access on the row that is locked
+delete from DEMO where a=1;
+go
+-- write access on the row that is locked
+delete from DEMO where a=1;
+
+Timeout expired
+
+</code></pre>
+<p>Finally, the only blocking situation here is when I want to write on the same row. The index access reduces the risk of being blocked. </p>
+<p>In summary, we can achieve the best concurrency with READ_COMMITTED_SNAPSHOT isolation level, and ensuring that we read only the rows we will update, with proper indexing and maybe hinting. This is, in my opinion, very important to know because we rarely cover those situations during integration tests. But they can happen quickly in production with high load.</p>
+<h3>PostgreSQL</h3>
+<p>Let&#8217;s do the same with PostgreSQL which is natively MVCC:</p>
+<pre><code>
+cat &gt; session1.sql &lt;&lt;&#039;SQL&#039;
+ drop database if exists DEMO;
+ create database DEMO;
+ \c demo
+ drop table if exists DEMO;
+ create table DEMO(id int primary key, a int not null, b int);
+ begin transaction;
+ insert into DEMO values(1,1,1);
+ insert into DEMO values(2,2,2);
+ commit;
+ select * from DEMO;
+ begin transaction;
+ update DEMO set b=b+1 where a=1;
+SQL
+</code></pre>
+<p>No specific settings, and no index created here.</p>
+<pre><code>
+( cat session1.sql ; sleep 120 ; echo "commit;") | psql -e | ts &amp;
+</code></pre>
+<pre><code>
+-bash-4.2$ ( cat session1.sql ; sleep 120 ; echo "commit;") | psql -e | ts &amp;
+[1] 31125
+-bash-4.2$
+-bash-4.2$ Feb 09 18:42:48 drop database if exists DEMO;
+Feb 09 18:42:48 DROP DATABASE
+Feb 09 18:42:48 create database DEMO;
+Feb 09 18:42:49 CREATE DATABASE
+Feb 09 18:42:49 You are now connected to database "demo" as user "postgres".
+Feb 09 18:42:49 drop table if exists DEMO;
+NOTICE:  table "demo" does not exist, skipping
+Feb 09 18:42:49 DROP TABLE
+Feb 09 18:42:49 create table DEMO(id int primary key, a int not null, b int);
+Feb 09 18:42:49 CREATE TABLE
+Feb 09 18:42:49 begin transaction;
+Feb 09 18:42:49 BEGIN
+Feb 09 18:42:49 insert into DEMO values(1,1,1);
+Feb 09 18:42:49 INSERT 0 1
+Feb 09 18:42:49 insert into DEMO values(2,2,2);
+Feb 09 18:42:49 INSERT 0 1
+Feb 09 18:42:49 commit;
+Feb 09 18:42:49 COMMIT
+Feb 09 18:42:49 select * from DEMO;
+Feb 09 18:42:49  id | a | b
+Feb 09 18:42:49 ----+---+---
+Feb 09 18:42:49   1 | 1 | 1
+Feb 09 18:42:49   2 | 2 | 2
+Feb 09 18:42:49 (2 rows)
+Feb 09 18:42:49
+Feb 09 18:42:49 begin transaction;
+Feb 09 18:42:49 BEGIN
+Feb 09 18:42:49 update DEMO set b=b+1 where a=1;
+Feb 09 18:42:49 UPDATE 1
+</code></pre>
+<p>While the transaction updating the first row is in the background, I run the following readers and writers:</p>
+<pre><code>
+psql demo | ts
+ set statement_timeout=3000;
+ -- read access the row that is not locked
+ select * from DEMO where a=2;
+ -- read access the row that is locked
+ select * from DEMO where a=1;
+ -- write access on the row that is not locked
+ delete from DEMO where a=2;
+ -- write access on the row that is locked
+ delete from DEMO where a=1;
+</code></pre>
+<pre><code>
+-bash-4.2$ psql demo | ts
+set statement_timeout=3000;
+Feb 09 18:43:00 SET
+-- read access the row that is not locked
+select * from DEMO where a=2;
+Feb 09 18:43:08  id | a | b
+Feb 09 18:43:08 ----+---+---
+Feb 09 18:43:08   2 | 2 | 2
+Feb 09 18:43:08 (1 row)
+Feb 09 18:43:08
+-- read access the row that is locked
+select * from DEMO where a=1;
+Feb 09 18:43:16  id | a | b
+Feb 09 18:43:16 ----+---+---
+Feb 09 18:43:16   1 | 1 | 1
+Feb 09 18:43:16 (1 row)
+Feb 09 18:43:16
+-- write access on the row that is not locked
+delete from DEMO where a=2;
+Feb 09 18:43:24 DELETE 1
+-- write access on the row that is locked
+delete from DEMO where a=1;
+
+ERROR:  canceling statement due to statement timeout
+CONTEXT:  while deleting tuple (0,1) in relation "demo"
+</code></pre>
+<p>Nothing is blocked except, of course, when modifying the row that is locked.</p>
+<h3>Oracle Database</h3>
+<p>One of the many things I&#8217;ve learned from Tom Kyte when I was reading <a href="https://asktom.oracle.com/pls/apex/f?p=100:5:::NO:::" rel="noopener noreferrer" target="_blank">AskTom</a> regularly is how to build the simplest test cases. And with Oracle there is no need to run multiple sessions to observe multiple transactions concurrency. I can do it with an autonomous transaction in one session and one advantage is that I can share a <a href="https://dbfiddle.uk/?rdbms=oracle_18&amp;fiddle=1bbc42aec0733a33973cbed25294bec1" rel="noopener noreferrer" target="_blank">dbfiddle example</a>:</p>
+<p><a href="../../assets/Annotation-2020-02-09-105259.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-02-09-105259.jpg" alt="" width="1024" height="485" class="alignnone size-large wp-image-37097" /></a></p>
+<p>Here, deadlock at line 14 means that only the &#8220;delete where a=1&#8221; encountered a blocking situation with &#8220;update where a=1&#8221;. All previous statements, select on any row and update of other rows, were executed without conflict.</p>
+<p>A DML statement has two phases: one to find the rows and the second one to modify them. A DELETE or UPDATE in Oracle and Postgres runs the first in snapshot mode: non-blocking MVCC. The second must, of course, modify the current version. This is a very complex mechanism because it may require a retry (restart) when the current version does not match the consistent snapshot that was used for filtering. Both PostgreSQL and Oracle can ensure this write consistency without the need to block the reads. SQL Server has implemented MVCC more recently and provides non-blocking reads only for the SELECT reads. But a read can still be in blocking situation for the query phase of an update statement.</p>
+
+</div>
+</body>
+</html>

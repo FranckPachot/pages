@@ -1,0 +1,321 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-db-on-azure-with-multitenant-option/">
+<title>Oracle DB on Azure with Multitenant Option</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-db-on-azure-with-multitenant-option/">https://www.dbi-services.com/blog/oracle-db-on-azure-with-multitenant-option/</a> (2021-02-22)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle DB on Azure with Multitenant Option</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+If you want to run an Oracle Database in the Microsoft Azure cloud, you will install it yourself on a VM. And then, you can expect the same as when you install it in your premises, in a virtual environment. Except that Oracle makes it two times more expensive by accepting to license the processor metric on vCPUs at the condition that the Intel core factor is not applied. And in addition to that there is a weird limitation on multitenant. I create a VM with the 19c image provided by Azure. I&#8217;m not sure there&#8217;s a big advantage to have this image. You have an Oracle Linux OS, with all prerequisites (which is like having installed the preinstall rpm), and a 19.3 Oracle Home (which is like downloading it, unzip and runInstaller). But you will still have to apply the latest Release Update and create a database.</p>
+<p><a href="../../assets/Screenshot-2021-02-22-193607.jpg"><img loading="lazy" decoding="async" class="aligncenter size-full wp-image-47748" src="../../assets/Screenshot-2021-02-22-193607.jpg" alt="" width="2046" height="1232" /></a></p>
+<p>Here is what I&#8217;ve run after the creation of the VM (can be done through CustomData)</p>
+<pre><code>
+# download latest OPatch and RU (requires the URLs in OPatch and ReleaseUpdate tags)
+(
+mkdir -p /var/tmp/OPatch &amp;&amp; cd /var/tmp/OPatch
+wget -qc $( curl 'http://169.254.169.254/metadata/instance/compute/tags?api-version=2018-02-01&amp;format=text' -H Metadata:true -s | awk -F";" '/OPatch:/{sub(/(^|;).*OPatch:/,"");print $1}')
+mkdir -p /var/tmp/RU &amp;&amp; cd /var/tmp/RU
+wget -qc $(curl 'http://169.254.169.254/metadata/instance/compute/tags?api-version=2018-02-01&amp;format=text' -H Metadata:true -s | awk -F";" '/ReleaseUpdate:/{sub(/(^|;).*ReleaseUpdate:/,"");print $1}')
+unzip -qo p*_*_Linux-x86-64.zip
+rm -f p*_*_Linux-x86-64.zip
+chown -R oracle:oinstall /var/tmp/OPatch /var/tmp/RU
+)
+# fix the missing sar directory
+mkdir -p /var/log/sa
+</code></pre>
+<p>I set the OPatch and ReleaseUpdate tags for the VM with the URL of the binaries in the Object Store. I download it there. And also fix the missing /var/log/sa.</p>
+<pre><code>
+# get Oracle Home from inventory
+ORACLE_HOME=$(sudo xmllint --xpath 'string(/INVENTORY/HOME_LIST[1]/HOME/@LOC)' $(awk -F= '/^inventory_loc/{print $2}' /etc/oraInst.loc)/ContentsXML/inventory.xml)
+# create autostart service
+sudo tee /etc/systemd/system/oracledb.service &lt;&lt;CAT
+[Unit]
+Description=Oracle Database start/stop
+Before=shutdown.target
+After=network-online.target
+[Service]
+Type=idle
+#LimitMEMLOCK=infinity
+#LimitNOFILE=65535
+#EnvironmentFile=/etc/oracle.env
+User=oracle
+Group=oinstall
+ExecStart=$ORACLE_HOME/bin/dbstart $ORACLE_HOME
+ExecStop=$ORACLE_HOME/bin/dbshut $ORACLE_HOME
+RemainAfterExit=yes
+Restart=no
+[Install]
+WantedBy=multi-user.target
+CAT
+sudo systemctl enable oracledb
+</code></pre>
+<p>This will automatically stop and start the database flagged with &#8216;Y&#8217; in /etc/oratab</p>
+<pre><code>
+# Now connecting as Oracle user
+sudo su - oracle &lt;&lt;'SU'
+# set read only Oracle Home
+roohctl -enable
+# update to latest RU
+unzip -qo -d $ORACLE_HOME /var/tmp/OPatch/p*_*_Linux-x86-64.zip
+$ORACLE_HOME/OPatch/opatch lspatches
+cd /var/tmp/RU/*
+$ORACLE_HOME/OPatch/opatch apply --silent
+cd ; rm -rf /var/tmp/RU/*
+SU
+</code></pre>
+<p>I set the Oracle Home in &#8220;ROOH&#8221; mode where the configuration files are separate from the binaries. And apply the downloaded Release Update.</p>
+<pre><code>
+sudo su - oracle &lt;&lt;'SU'
+# put the passwords in the wallet
+mkdir -p       /u01/app/oracle/dbc_wallet
+ yes "W4Lle7p422w0RD" | mkstore -wrl  /u01/app/oracle/dbc_wallet -create
+for user in sys system pdbAdmin ; do
+ yes "W4Lle7p422w0RD" | mkstore -wrl /u01/app/oracle/dbc_wallet -createEntry oracle.dbsecurity.${user}Password "Oracle19c$RANDOM"
+done
+# delete existing databases (just in case because we will re-create)
+for i in $(awk -F: '/^.*:/{print $1}' /etc/oratab | sort -r) ; do $ORACLE_HOME/bin/dbca -silent -deleteDatabase -sourceDB $i -forceArchiveLogDeletion -useWalletForDBCredentials true -dbCredentialsWalletLocation /u01/app/oracle/dbc_wallet ; done ; rm -rf /u01/ora*
+# create the DB
+cdb_name=CDB
+pdb_name=PDB
+unique_name=${cdb_name}_$( curl 'http://169.254.169.254/metadata/instance/compute/name?api-version=2018-02-01&amp;format=text' -H Metadata:true -s )
+grep ^CDB1: /etc/oratab || $ORACLE_HOME/bin/dbca -silent \
+ -createDatabase -gdbName CDB1 -sid CDB1 -createAsContainerDatabase true -numberOfPdbs 1 -pdbName PDB1 \
+ -useWalletForDBCredentials true -dbCredentialsWalletLocation /u01/app/oracle/dbc_wallet \
+ -datafileDestination /u01/oradata -useOMF true -storageType FS \
+ -recoveryAreaDestination /u01/orareco -recoveryAreaSize 4096 -enableArchive true \
+ -memoryMgmtType AUTO_SGA -totalMemory 4096 \
+ -createListener LISTENER:1521 -emConfiguration EMEXPRESS -emExpressPort 443 \
+ -templateName General_Purpose.dbc -databaseType OLTP -sampleSchema true -redoLogFileSize 100 \
+ -initParams db_unique_name=CDB1,user_large_page=AUTO,shared_pool_size=600M
+# old habit to run datapatch
+$ORACLE_HOME/OPatch/datapatch
+# enable database flashback and block change tracking.
+rman target / &lt;&lt;&lt;'set echo on; alter database flashback on; alter database enable block change tracking;'
+# create a service for the application
+sqlplus / as sysdba &lt;'ORCL',network_name=&gt;'ORCL');
+exec dbms_service.start_service(service_name=&gt;'ORCL');
+alter pluggable database save state;
+SQL
+SU
+</code></pre>
+<p>This is the creation of the database, CDB1 here with a PDB1 pluggable database.</p>
+<pre><code>
+sudo su - oracle &lt;&lt;'SU'
+# define the crontab to backup locally (recovery area)
+t=0 ;for i in $(awk -F: '/^.*:/{print $1}' /etc/oratab | sort -r) ; do t=$(($t+1))
+cat &lt;&lt;CRONTAB
+30 $t * * 6   ( PATH="/usr/local/bin:$PATH" ; . oraenv -s &lt;&lt; /tmp/crontab_backup.log 2&gt;&amp;1 &lt;&lt;&lt;'set echo on; backup as compressed backupset incremental level 0 database tag "ORACLE_CRONTAB_WEEKLY";'
+05 $t * * 1-5 ( PATH="/usr/local/bin:$PATH" ; . oraenv -s &lt;&lt; /tmp/crontab_backup.log 2&gt;&amp;1 &lt;&lt;&lt;'set echo on; backup incremental as compressed backupset level 1 database tag "ORACLE_CRONTAB_DAILY";'
+${t}0 * * * * ( PATH="/usr/local/bin:$PATH" ; . oraenv -s &lt;&lt; /tmp/crontab_backup.log 2&gt;&amp;1 &lt;&lt;&lt;'set echo on; backup as compressed backupset archivelog all tag "ORACLE_CRONTAB_HOURLY";'
+CRONTAB
+done | crontab
+SU
+</code></pre>
+<p>This sets a very basic backup strategy into the recovery area: full on week-end, incremental on nights, archivelog every hour. To be customized (maybe backup the recovery area to NFS &#8211; see <a href="https://asktom.oracle.com/pls/apex/asktom.search?tag=rman-backup-on-azure-blob-storage#9543838700346778017" target="_blank" rel="noopener">Tim Gorman answer</a> on AskTOM) and monitored (I like to run a &#8220;report need backup&#8221; independantly, and, of course, monitor the non-reclaimable v$recovery_area_usage).</p>
+<h3>Multitenant</h3>
+<p>I <a href="https://www.dbi-services.com/blog/oracle-disables-your-multitenant-option-when-you-run-on-ec2/" target="_blank" rel="noopener">blogged </a>about a strange limitation of multitenant when running on AWS and here I&#8217;m showing that the same exists on Azure and even with the latest Release Update. Let&#8217;s be clear, I&#8217;ve no idea if this limitation is intentional or not (bug or feature ;)) and why it has not been removed yet if considered as a bug. But if you Bring You Own License and have paid for the multitenant option, you probably want to create several pluggable databases rather than several instances in a VM.</p>
+<pre><code>
+[oracle@o19c ~]$ sql / as sysdba
+
+SQLcl: Release 19.1 Production on Mon Feb 22 07:51:23 2021
+
+Copyright (c) 1982, 2021, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 19c Enterprise Edition Release 19.0.0.0.0 - Production
+Version 19.10.0.0.0
+
+
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         3 PDB1                           READ WRITE NO
+SQL&gt;
+
+SQL&gt; show parameter max_pdbs
+
+NAME     TYPE    VALUE
+-------- ------- -----
+max_pdbs integer 5
+
+</code></pre>
+<p>I have one PDB that I have created at CDB creation time. And MAX_PDBS is set to five. That reminds me what I have seen on AWS. Let&#8217;s see how many PDBs I can create.</p>
+<pre><code>
+SQL&gt; create pluggable database PDB2 from PDB1;
+
+Pluggable database created.
+
+SQL&gt; c/2/3
+  1* create pluggable database PDB3 from PDB1;
+SQL&gt; /
+
+Pluggable database created.
+
+SQL&gt; c/3/4
+  1* create pluggable database PDB4 from PDB1;
+SQL&gt; /
+
+create pluggable database PDB4 from PDB1
+                          *
+ERROR at line 1:
+ORA-65010: maximum number of pluggable databases created
+
+SQL&gt; show pdbs
+
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         3 PDB1                           READ WRITE NO
+         4 PDB2                           MOUNTED
+         5 PDB3                           MOUNTED
+SQL&gt;
+
+</code></pre>
+<p>I cannot reach this MAX_PDBS (it is supposed to be the number of user created PDBS, not the number of containers). This is definitely not the correct behaviour. It looks like a MAX_PDBS=3 as when you don&#8217;t have the multitenant option.</p>
+<pre><code>
+SQL&gt; oradebug setmypid
+Statement processed.
+SQL&gt; oradebug call kscs_cloudprov_ut
+kscs_cloudprov_ut: Detecting cloud provider...
+This is a non oracle cloud database instance
+This is a Azure instance
+CloudDB(10), CloudDetect(10), CloudQuery(ff)
+Function returned BF5A07ED
+SQL&gt;
+</code></pre>
+<p>The Oracle binaries have a function that detects on which cloud provider they run (&#8220;This is a Azure instance&#8221;) because some features are limited when you are not on the Oracle Cloud (&#8220;This is a non oracle cloud database instance&#8221;). But the binaries are the same. The detection is done through each cloud provider metadata API.</p>
+<pre><code>
+[oracle@cloud ~]$ strings $ORACLE_HOME/bin/oracle | grep "http://169.254.169.254"
+http://169.254.169.254/computeMetadata/v1/instance/id
+http://169.254.169.254/latest/meta-data/services/domain
+http://169.254.169.254/opc/v1/instance/id
+http://169.254.169.254/metadata/instance/compute/vmId?api-version=2017-04-02&format=text
+</code></pre>
+<p>The first one is valid in GCP, the second one AWS, third one OCI, and last one looks like Azure. Oracle binaries have a directory of the main cloud providers metadata endpoint to detect where it runs.</p>
+<pre><code>
+[azureuser@o19c ~]$ sudo iptables -A OUTPUT -d 169.254.169.254  -j REJECT
+[azureuser@o19c ~]$ curl 'http://169.254.169.254/metadata/instance/compute/vmId?api-version=2018-02-01&amp;format=text' -H Metadata:true -s
+[azureuser@o19c ~]$
+</code></pre>
+<p>I&#8217;ve blocked this endpoint.</p>
+<pre><code>
+SQL&gt; create pluggable database PDB4 from PDB1;
+
+Pluggable database created.
+</code></pre>
+<p>and that works, I can create my additional PDB (note that I had to restart the instance as the detection is done at startup time)</p>
+<pre><code>
+SQL&gt; oradebug setmypid
+Statement processed.
+SQL&gt; oradebug call kscs_cloudprov_ut
+kscs_cloudprov_ut: Detecting cloud provider...
+This is an on-premise database instance
+CloudDB(0), CloudDetect(0), CloudQuery(ff)
+Function returned E31011D7
+</code></pre>
+<p>You see, I&#8217;m not on-premises as no cloud metadata is available&#8230;</p>
+<pre><code>
+[azureuser@o19c ~]$ sudo iptables -D OUTPUT -d 169.254.169.254  -j REJECT
+[azureuser@o19c ~]$ curl 'http://169.254.169.254/metadata/instance/compute/vmId?api-version=2018-02-01&amp;format=text' -H Metadata:true -s
+4967bff7-591f-4583-bd57-5eb0969b9ff0[azureuser@o19c ~]$
+</code></pre>
+<p>I re-open the metadata by deleting my iptables rule. Because a Cloud VM has some cloud provider software running there which require this.</p>
+<h3>Workaround</h3>
+<pre><code>
+SQL&gt; alter system set "_cdb_disable_pdb_limit"=true scope=spfile;
+System altered.
+
+SQL&gt; startup force
+ORACLE instance started.
+
+Total System Global Area 3439327576 bytes
+Fixed Size                  9140568 bytes
+Variable Size             704643072 bytes
+Database Buffers         2717908992 bytes
+Redo Buffers                7634944 bytes
+Database mounted.
+Database opened.
+
+SQL&gt; oradebug call kscs_cloudprov_ut
+kscs_cloudprov_ut: Detecting cloud provider...
+This is a non oracle cloud database instance
+This is a Azure instance
+CloudDB(10), CloudDetect(10), CloudQuery(ff)
+Function returned BF5A07ED
+SQL&gt;
+</code></pre>
+<p>I&#8217;ve disabled this PDB limit by setting &#8220;_cdb_disable_pdb_limit&#8221;=true and check again that the instance detects that I&#8217;m running on Azure.</p>
+<pre><code>
+SQL&gt; create pluggable database PDB5 from PDB1;
+Pluggable database created.
+
+SQL&gt; c/5/6
+  1* create pluggable database PDB6 from PDB1
+SQL&gt; /
+Pluggable database created.
+</code></pre>
+<p>Ok, now I was able to create an additional PDB. But do you remember that MAX_PDBS was 5? How was I able to create a 6th one?</p>
+<pre><code>
+SQL&gt; show parameter max_pdbs
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_pdbs                             integer     4098
+SQL&gt;
+</code></pre>
+<p>When disabling the limit, the MAX_PDBS was raised. So be careful because you are not allowed to create more than 252 PDBs (4096 on Oracle platforms and never 4098 &#8211; <a href="https://www.dbi-services.com/blog/oracle-12cr2-max_pdbs/" target="_blank" rel="noopener">I tried it</a>)</p>
+<pre><code>
+SQL&gt; alter system set max_pdbs=6;
+System altered.
+
+SQL&gt; show parameter max_pdbs
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+max_pdbs                             integer     6
+SQL&gt; create pluggable database PDB7 from PDB1;
+create pluggable database PDB7 from PDB1
+*
+ERROR at line 1:
+ORA-65010: maximum number of pluggable databases created
+</code></pre>
+<p>Fortunately, I can set the MAX_PDBS limit now that &#8220;_cdb_disable_pdb_limit&#8221;=true.</p>
+<h3>Why does it make sense?</h3>
+<p>Because when you bring your own license you are already penalized for not choosing the Oracle Cloud and one processor license that covered two cores on-premises now cover only one. Then, you want at least to optimize by consolidation: PDBs in a CDB rather than instances in a VM, and rather than multiple VMs. Note that this arithmetic on the number of cores behind the Oracle definition of a processor is subject to discussions. The documents mentioning it are &#8220;for educational purpose&#8221; and &#8220;does not constitute a contract or a commitment to any specific term&#8221;.</p>
+<p>Anyway, you Bring Your Own License, where you can run 3 PDBs per CDB when you don&#8217;t have the multitenant option (and then you want to set MAX_PDBS=3 to be safe) or up to 252 when you have the option (and then you don&#8217;t want to be limited to 3). So in all cases, you have something to change. And Pluggable Database options can be useful to clone or relocate PDBs so that you can change the size of your VM (requires a restart) and balance the services on them.</p>
+<p>Maybe all images are not in all region, so here is how to check:</p>
+<pre><code>
+[opc@a demo]$ az vm image list-publishers --location $(az account list-locations | jq -r '.[] | select ( .metadata.physicalLocation == "Geneva") .name ')
+Command group 'vm' is experimental and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+(NoRegisteredProviderFound) No registered resource provider found for location 'switzerlandwest' and API version '2020-06-01' for type 'locations/publishers'. The supported api-versions are '2015-05-01-preview, 2015-06-15, 2016-03-30, 2016-04-30-preview, 2016-08-30, 2017-03-30, 2017-12-01, 2018-04-01, 2018-06-01, 2018-10-01, 2019-03-01, 2019-07-01, 2019-12-01, 2020-06-01, 2020-09-30, 2020-12-01'. The supported locations are 'eastus, eastus2, westus, centralus, northcentralus, southcentralus, northeurope, westeurope, eastasia, southeastasia, japaneast, japanwest, australiaeast, australiasoutheast, australiacentral, brazilsouth, southindia, centralindia, westindia, canadacentral, canadaeast, westus2, westcentralus, uksouth, ukwest, koreacentral, koreasouth, francecentral, southafricanorth, uaenorth, switzerlandnorth, germanywestcentral, norwayeast'.
+
+[opc@a demo]$ az vm image list-publishers --location $(az account list-locations | jq -r '.[] | select ( .metadata.physicalLocation == "Zurich") .name ') | jq '.[] | select( .name == "Oracle" ) '
+WARNING: Command group 'vm' is experimental and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+{
+  "id": "/Subscriptions/bfaaad07-4a06-45e1-9e93-4eb58fa52f87/Providers/Microsoft.Compute/Locations/SwitzerlandNorth/Publishers/Oracle",
+  "location": "SwitzerlandNorth",
+  "name": "Oracle",
+  "tags": null
+}
+
+[opc@a demo]$ az vm image list --all --location "SwitzerlandNorth" --publisher Oracle --output table --offer database
+Command group 'vm' is experimental and under development. Reference and support levels: https://aka.ms/CLI_refstatus
+Offer                 Publisher    Sku                      Urn                                                         Version
+--------------------  -----------  -----------------------  ----------------------------------------------------------  ---------
+oracle-database-19-3  Oracle       oracle-database-19-0904  Oracle:oracle-database-19-3:oracle-database-19-0904:19.3.1  19.3.1
+</code></pre>
+<p>So for me, nothing in Geneva, but I have the list of regions, and available in Zurich.</p>
+<p>A final note. This VM for &#8220;oracle-database-19-3&#8221; image runs on Oracle Linux. Until Jan 6th, 2021 Oracle did not allow for “Basic Limited” and “Premier Limited” on VMs larger than 8 vCPUs. This has changed to a limit of 64vCPU (and one system license can even cover two VMs within this limit). So there are good news in licensing documents sometimes&#8230;</p>
+
+</div>
+</body>
+</html>

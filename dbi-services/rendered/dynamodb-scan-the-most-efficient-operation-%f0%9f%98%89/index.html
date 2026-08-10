@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/dynamodb-scan-the-most-efficient-operation-%f0%9f%98%89/">
+<title>DynamoDB Scan: the most efficient operation &#x1f609;</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/dynamodb-scan-the-most-efficient-operation-%f0%9f%98%89/">https://www.dbi-services.com/blog/dynamodb-scan-the-most-efficient-operation-%f0%9f%98%89/</a> (2020-12-20)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">DynamoDB Scan: the most efficient operation &#x1f609;</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+The title is provocative on purpose because you can read in many places that you should avoid scans, and that <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-query-scan.html" target="_blank" rel="noopener noreferrer"><em>Scan operations are less efficient than other operations in DynamoDB</em></a>. I think that there is a risk, reading those message without understanding what is behind, that people will actually avoid Scans and replace them by something that is even worse. If you want to compare the efficiency of an operation, you must compare it when doing the same thing, or it is an Apple vs. Orange comparison. Here I&#8217;ll compare with two extreme use cases: the need to get all items, and the need to get one item only. And then I&#8217;ll explain further what is behind the &#8220;avoid scans&#8221; idea.</p>
+<p>I have created a table with 5000 items:</p>
+<pre><code>
+aws dynamodb create-table --table-name Demo
+ --attribute-definitions AttributeName=K,AttributeType=N
+ --key-schema            AttributeName=K,KeyType=HASH
+ --billing-mode PROVISIONED --provisioned-throughput ReadCapacityUnits=25,WriteCapacityUnits=25
+
+for i in {1..5000} ; do
+aws dynamodb put-item     --table-name Demo --item '{"K":{"N":"'${i}'"},"V":{"S":"'"$RANDOM"'"}}'
+done
+</code></pre>
+<p>Because each time I demo on a small table I have people commenting with &#8220;this proves nothing, the table is too small&#8221; I have to precise that you don&#8217;t need petabytes to understand how it scales. Especially with DynamoDB which is designed to scale linearly: there is no magic that will happen after reaching a threshold, like you can have in RDBMS (small scans optimized with cache, large scans optimized with storage index / zone maps). If you have doubts, you can run the same and change 5000 by 5000000000 and you will observe the same, but you do that on your own cloud bill, not mine 😉</p>
+<p>Let&#8217;s count the items:</p>
+<pre><code>
+[opc@a DynamoDBLocal]$ aws dynamodb scan --table-name Demo --select=COUNT --return-consumed-capacity TOTAL --output text
+
+5000    None    5000
+CONSUMEDCAPACITY        6.0     Demo
+</code></pre>
+<p>This is a Scan operation. The consumed capacity is 6 RCU. Is this good or bad? Efficient or not?<br />
+First, let&#8217;s understand those 6 RCU. I have 5000 items, their size is a bit less than 10 bytes (2 attributes with name in one character, number up to 5 digits). This is about 48 KiloBytes, read with eventual consistency (we don&#8217;t read all mirrors) where reading 4 KiloBytes costs 0.5 RCU. The maths is easy: 48 / 4 / 2 = 6. If you test it on 5000 millions of items as I suggested for those who don&#8217;t believe in small test cases, you will see 6 million RCU. It is just elementary arithmetic, cross-multiply and you get it, there&#8217;s no magic. So, if you provisioned the maximum on-demand RCU, which I think is 40000 RCU/Second by default, you can count those 5000 million items in two minutes and a half. Is that inefficient? Try parallel scans&#8230;</p>
+<h3>Scan</h3>
+<p>You see where I&#8217;m coming. There&#8217;s no operation to &#8220;avoid&#8221; or ban. It just depends on what you want to do. Counting all items is done with a scan and you cannot do faster in DynamoDB. Except if you maintain a global counter, but then you will double the cost of each putItem. You don&#8217;t make it faster, you just transfer the cost to another part of the application.</p>
+<p>You may want to do something more complex than a count. This is a scan that sums the values of the attribute &#8220;V&#8221;:</p>
+<pre><code>
+[opc@a DynamoDBLocal]$ aws dynamodb scan --table-name Demo --select=SPECIFIC_ATTRIBUTES --projection-expression=V --return-consumed-capacity TOTAL --output text
+| awk '/^CONSUMEDCAPACITY/{rcu=rcu+$2}/^V/{sum=sum+$2;cnt=cnt+1}END{printf "%10.2f rcu   %10d items %10d sum(V)n",rcu,cnt,sum}'
+
+      6.00 rcu         5000 items   81599797 sum(V)
+</code></pre>
+<p>The code handles pagination (not needed here as my table is less than 1MB, but for people trying on 5000 million items, they can copy/paste this). I&#8217;ve described scan pagination in a <a href="https://www.dbi-services.com/blog/dynamodb-scan-pagination/" target="_blank" rel="noopener noreferrer">previous post</a> so you understand why I use the &#8220;text&#8221; output here. No surprise, a Scan is a Scan and there&#8217;s no cache in DynamoDB to make it faster when you read the same data frequently: 6 RCU again.</p>
+<h3>GetItem</h3>
+<p>Then, what will happen if you tell your developers that they must avoid scans? The table design is already there, and they need to get the count and the sum. This is not a critical use-case, maybe just to display it in a daily dashboard, so there&#8217;s no point to add the overhead of maintaining counters, with a lambda or AWS Glue Elastic Views. A Scan is perfectly valid here. But they try to avoid this &#8220;<em>inefficient scan</em>&#8221; and then come with this idea: they know the last item number inserted (5000 in my demo) and then use the &#8220;efficient&#8221; getItem call:</p>
+<pre><code>
+[opc@a DynamoDBLocal]$ for i in {1..5000} ; do  aws dynamodb get-item --table-name Demo --key '{"K":{"N":"'$i'"}}' --return-consumed-capacity TOTAL ; done
+| awk '/^CONSUMEDCAPACITY/{rcu=rcu+$2}/^V/{sum=sum+$2;cnt=cnt+1}END{printf "%10.2f rcu   %10d items %10d sum(V)n",rcu,cnt,sum}'
+
+   2500.00 rcu         5000 items   81599797 sum(V)
+
+</code></pre>
+<p>No surprises if you know how it works: each getItem costs 0.5 RU and then the total is 2500 RCU. Most of the time, you get to read the same block of data from the storage, but this still counts as RCU. This is 416 times more expensive than the scan. So, let&#8217;s refine the &#8220;<em>scan is the least efficient operation</em>&#8221; claim by:</p>
+<ul>
+<li>Scan is the worst efficient operation to get one item</li>
+<li>Scan is the most efficient operation to get many items</li>
+</ul>
+<h3>Size</h3>
+<p>What means &#8220;many&#8221; here? As I did here, getting all items is where scan is the most efficient. But given what we know in my example, as getItem costs 0.5 RCU per item and a Scan costs 6 RCU, we can say that Scan is the most efficient operation when getting more than 12 items. However, this depends on two things. First, depending on which predicate filters those 12 items, a Query may be faster than Scan. This depends on the data model and it is not the case with my table here. Second, this factor of 12 depends on the size of the items. Because:</p>
+<ul>
+<li>The Scan operation depends on the size of the table (all items with all attributes) and not on the number of items read</li>
+<li>The GetItem operation depends on the number of items reads (and their size when larger than 4KB)</li>
+</ul>
+<p>In my example, I have small items (10 bytes) and then a Scan cat get more than 400 items per 0.5 RCU. Where GetItem can get at most 1 item per RCU. With this, the Scan is quickly more efficient than GetItem. And this does not depend on the size of the table, but the size of each items. This is important because the <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-query-scan.html" target="_blank" rel="noopener noreferrer">best practice documentation</a> also says <em>&#8220;you should avoid using a Scan operation on a large table or index with a filter that removes many results&#8221; </em>. If we take the &#8220;avoid&#8221; as absolute, this is true, but it can also apply to any operation: avoid to read your data and everything will be faster and cheaper 😉 If we take &#8220;<em>avoid</em>&#8221; as using another access type, like GetItem, then this is wrong: the table size does not count in the efficiency. This claim is right only when this &#8220;<em>filter that removes many results</em>&#8221; is an equality predicate on the partition key. But at the time the developer reads this, the table design is done and it is too late. In NoSQL, you don&#8217;t have the agility to change the partitioning key without huge refactoring of the code, because you don&#8217;t have the RDBMS logical data independence. The best you can do for this use-case is a Scan and, maybe, cache it with your application code, or a DAX service, if it occurs too frequently.</p>
+<p>All this is not new for SQL people. This myth of &#8220;full table scans are evil&#8221; is very old. Then, people realized that a full table scan may be the most efficient, especially with all optimization that happened in the last decades (hash joins, re-fetching, direct-path reads, storage indexes, adaptive plans,&#8230;). Please never say that something is inefficient without the context, of you will miss the best of it. When a &#8220;best practice&#8221; is spread without the context, it becomes a myth. DynamoDB has the advantage to be simple (limited access paths, no cost-based optimizer,&#8230;), and then it is easy to understand the cost of an access path rather than apply some best practices blindly.</p>
+<p>How do you measure efficiency? When you look at the number of items you can get with one RCU, a Scan is actually the most efficient. And, please, don&#8217;t think that we should &#8220;avoid&#8221; scans as if another operation can be more efficient. What we should avoid with DynamoDB is a data model that requires scans for critical operations. Remember that it is a key-value datastore: optimized to get one item with GetItem (or one collection with Query) for one hash key value. When you need to read many items, it is still efficient with an appropriate composite key defined for that, like in the Single Table Design where one Query can retrieve with one RCU all items to be joined, or with Global Secondary Index as it is a replica with a different partitioning schema. But as soon as you read from all partitions, a Scan is the most efficient operation.</p>
+
+</div>
+</body>
+</html>

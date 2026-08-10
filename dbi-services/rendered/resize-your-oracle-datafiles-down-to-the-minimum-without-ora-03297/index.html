@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/resize-your-oracle-datafiles-down-to-the-minimum-without-ora-03297/">
+<title>Resize your Oracle datafiles down to the minimum without ORA-03297</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/resize-your-oracle-datafiles-down-to-the-minimum-without-ora-03297/">https://www.dbi-services.com/blog/resize-your-oracle-datafiles-down-to-the-minimum-without-ora-03297/</a> (2014-09-08)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Resize your Oracle datafiles down to the minimum without ORA-03297</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Your datafiles have grown in the past but now you want to reclaim as much space as possible, because you are short on filesystem space, or you want to move some files without moving empty blocks, or your backup size is too large. ALTER DATABASE DATAFILE &#8230; RESIZE can reclaim the space at the end of the datafile, down to the latest allocated extent.</p>
+<p>But if you try to get lower, you will get:</p>
+<pre><code>ORA-03297: file contains used data beyond requested RESIZE value
+</code></pre>
+<p>So, how do you find this minimum value, which is the datafile&#8217;s high water mark?<br />
+You have the brute solution: try a value. If it passes, then try a lower value. If it failed, then try a higher one.<br />
+Or there is the smart solution: find the datafile high water mark.</p>
+<p>You can query DBA_EXTENTS to know that. But did you try on a database with a lot of datafiles? It runs forever. Because DBA_EXTENTS is doing a lot of joins that you don&#8217;t need here. So my query directly reads SYS.X$KTFBUE which is the underlying fixed table that gives extent allocation in Locally Managed Tablespaces.</p>
+<p>Note that the query may take a few minutes when you have a lot of tables, because the information is on disk, in each segment header, in the bitmaps used by LMT tablepaces. And you have to read all of them.</p>
+<p>Here is my query:</p>
+<pre><code>set linesize 1000 pagesize 0 feedback off trimspool on
+with
+ hwm as (
+  -- get highest block id from each datafiles ( from x$ktfbue as we don't need all joins from dba_extents )
+  select /*+ materialize */ ktfbuesegtsn ts#,ktfbuefno relative_fno,max(ktfbuebno+ktfbueblks-1) hwm_blocks
+  from sys.x$ktfbue group by ktfbuefno,ktfbuesegtsn
+ ),
+ hwmts as (
+  -- join ts# with tablespace_name
+  select name tablespace_name,relative_fno,hwm_blocks
+  from hwm join v$tablespace using(ts#)
+ ),
+ hwmdf as (
+  -- join with datafiles, put 5M minimum for datafiles with no extents
+  select file_name,nvl(hwm_blocks*(bytes/blocks),5*1024*1024) hwm_bytes,bytes,autoextensible,maxbytes
+  from hwmts right join dba_data_files using(tablespace_name,relative_fno)
+ )
+select
+ case when autoextensible='YES' and maxbytes&gt;=bytes
+ then -- we generate resize statements only if autoextensible can grow back to current size
+  '/* reclaim '||to_char(ceil((bytes-hwm_bytes)/1024/1024),999999)
+   ||'M from '||to_char(ceil(bytes/1024/1024),999999)||'M */ '
+   ||'alter database datafile '''||file_name||''' resize '||ceil(hwm_bytes/1024/1024)||'M;'
+ else -- generate only a comment when autoextensible is off
+  '/* reclaim '||to_char(ceil((bytes-hwm_bytes)/1024/1024),999999)
+   ||'M from '||to_char(ceil(bytes/1024/1024),999999)
+   ||'M after setting autoextensible maxsize higher than current size for file '
+   || file_name||' */'
+ end SQL
+from hwmdf
+where
+ bytes-hwm_bytes&gt;1024*1024 -- resize only if at least 1MB can be reclaimed
+order by bytes-hwm_bytes desc
+/
+</code></pre>
+<p>and here is a sample output:</p>
+<pre><code>/* reclaim    3986M from    5169M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_undotbs1_o9pfojva_.dbf' resize 1183M;
+/* reclaim    3275M from   15864M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_apcpy_o5pfojni_.dbf' resize 12589M;
+/* reclaim    2998M from    3655M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_cpy_qt_oepfok3n_.dbf' resize 657M;
+/* reclaim    2066M from    2250M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_undotbs2_olpfokc9_.dbf' resize 185M;
+/* reclaim     896M from    4000M */ alter database datafile '/u01/oradata/DB1USV/datafile/o1_mf_cpy_ocpfok3n_.dbf' resize 3105M;
+</code></pre>
+<p>You get directly the resize statements, with the reclaimable space in comments.</p>
+<p>A few remarks about my query:</p>
+<ul>
+<li>I generate the resize statements only for datafiles which are autoextensible. This is because I want to be sure that the datafiles can grow back to their original size if needed.</li>
+<li>When datafile is not autoextensible, or maxsize is not higher than the current size, I only generate a comment.</li>
+<li>When a datafile has no extents at all I generate a resize to 5MB. I would like to find the minimum possible size (without getting ORA-3214) but my test do not validate yet what is documented in MOS. If anyone has an idea, please share.</li>
+<li>There is probably a way to get that high water mark in a cheaper way. Because the alter statement gives the ORA-03297 much quicker. Information is probably available in the datafile headers, without going to segment headers, but I don&#8217;t know if it is exposed in a safe way. If you have an idea, once again, please share.</li>
+</ul>
+<p>Note that I&#8217;m using that query for quite a long time. I even think that it was my first contribution to Oracle community on the web, about 9 years ago, in the <a href="http://www.dba-village.com/village/dvp_scripts.ScriptDetails?ScriptIdA=2142">dba-village</a> website. Since then my contribution has grown to forums, blogs, articles, presentations, &#8230; and tweets. Sharing is probably addictive 😉</p>
+<h3>Update May 18th, 2016</h3>
+<p>Thanks to <a href="https://sqldep.com/">#QueryScope @SQLdep</a> here is the query visualisation:<br />
+<a href="../../assets/current_graph_column_lineage_HWM_Datafile.png"><img loading="lazy" decoding="async" src="../../assets/current_graph_column_lineage_HWM_Datafile.png" alt="current_graph_column_lineage_HWM_Datafile" width="958" height="284" class="alignnone size-full wp-image-8723" /></a><br />
+Nothing difficult here, isn&#8217;t it?</p>
+<h3>Update 11-AUG-2018</h3>
+<p>In multitenant the query above will display only the root datafiles, multiple times. Here is the query I use in multitenant to show all CDB datafiles that can be resized:<br />
+<a href="https://github.com/FranckPachot/scripts/blob/master/administration/resize-datafiles.sql">https://github.com/FranckPachot/scripts/blob/master/administration/resize-datafiles.sql<br />
+</a></p>
+
+</div>
+</body>
+</html>

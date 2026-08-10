@@ -1,0 +1,232 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-12cr2-awr-views-in-multitenant/">
+<title>Oracle 12cR2: AWR views in multitenant</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-12cr2-awr-views-in-multitenant/">https://www.dbi-services.com/blog/oracle-12cr2-awr-views-in-multitenant/</a> (2016-12-19)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle 12cR2: AWR views in multitenant</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In a <a href="http://dbi-services.com/blog/12c-multitenant-internals-awr-tables-and-views/" target="_blank" rel="noopener noreferrer">previous post</a> I explained how the AWR views have changed between 12.1.0.1 and 12.1.0.2 and now in 12.2.0.1 they have changed again. This is a good illustration of multitenant object link usage.<br />
+<!--more--><br />
+What&#8217;s new in 12<em>c</em>R2 is the ability to run AWR snapshots at CDB or PDB level. I really think that it makes more sense to read an AWR report at CDB level because it&#8217;s about analysing the system (=instance) activity. But with PDBaaS I can understand the need to give a report to analyse PDB sessions, resource and statements.</p>
+<p>I&#8217;ll start with the conclusion &#8211; a map of AWR view to show which ones read from CDB level snapshots, or PDB snapshots, or both:</p>
+<p><a href="../../assets/C0DLx2GXEAALIG4.jpg"><img loading="lazy" decoding="async" src="../../assets/C0DLx2GXEAALIG4.jpg" alt="C0DLx2GXEAALIG4" width="1024" height="493" class="alignnone size-large wp-image-13769" /></a><br />
+I&#8217;ll explain AWR reports in a future post. Basically when you run awrrpt.sql from CDB$ROOT you get CDB snapshots and when you run it from PDB you have the choice.</p>
+<p>In the diagram above, just follow the arrows to know which view reads from PDB or CDB or both. You see two switches between the root and the PDB: data link for one way and common view for the other way. Note that all are metadata links so switches occurs also at parse time.</p>
+<h3>WRM$_</h3>
+<p>Let&#8217;s start from the table where AWR snapshots are stored:</p>
+<pre><code>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where object_name='WRM$_SNAPSHOT';
+&nbsp;
+OWNER OBJECT_NAME                    OBJECT_TYPE             SHARING
+----- ------------------------------ ----------------------- ------------------
+SYS   WRM$_SNAPSHOT                  TABLE                   METADATA LINK
+</code></pre>
+<p>This is a table. METADATA LINK means that the structure is the same in all containers, but data is different.</p>
+<p>I have the following containers:</p>
+<pre><code>
+SQL&gt; select con_id,dbid,name from v$containers;
+&nbsp;
+    CON_ID       DBID NAME
+---------- ---------- ------------------------------
+         1  904475458 CDB$ROOT
+         2 2066620152 PDB$SEED
+         3 2623271973 PDB1
+</code></pre>
+<p>From CDB$ROOT I see data for the CDB:</p>
+<pre><code>
+SQL&gt; select dbid,count(*) from WRM$_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+ 904475458         91
+</code></pre>
+<p>and from PDB I see snapshots taken from PDB:</p>
+<pre><code>
+SQL&gt; alter session set container=PDB1;
+Session altered.
+&nbsp;
+SQL&gt; select dbid,count(*) from WRM$_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+2623271973         79
+</code></pre>
+<p>So remember, CDB$ROOT has 91 snapshots with DBID= 904475458 and PDB1 has 79 snapshots with DBID=2623271973</p>
+<h3>AWR_ROOT_ and AWR_PDB_</h3>
+<p>Views on WRM$_SNAPSHOT are referenced in DBA_DEPENDENCIES:</p>
+<pre><code>
+SQL&gt; select owner,name,type from dba_dependencies where referenced_name='WRM$_SNAPSHOT' and type like 'VIEW';
+&nbsp;
+OWNER NAME                           TYPE
+----- ------------------------------ -------------------
+SYS   AWR_ROOT_SNAPSHOT              VIEW
+SYS   AWR_ROOT_SYSSTAT               VIEW
+SYS   AWR_ROOT_ACTIVE_SESS_HISTORY   VIEW
+SYS   AWR_ROOT_ASH_SNAPSHOT          VIEW
+SYS   AWR_PDB_SNAPSHOT               VIEW
+SYS   AWR_PDB_ACTIVE_SESS_HISTORY    VIEW
+SYS   AWR_PDB_ASH_SNAPSHOT           VIEW
+</code></pre>
+<p>I&#8217;m interested in views that show snapshot information: AWR_ROOT_SNAPSHOT and AWR_PDB_SNAPSHOT</p>
+<pre><code>
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where object_name in ('AWR_ROOT_SNAPSHOT','AWR_PDB_SNAPSHOT') order by 3;
+&nbsp;
+OWNER  OBJECT_NAME                    OBJECT_TYPE             SHARING
+------ ------------------------------ ----------------------- ------------------
+PUBLIC AWR_ROOT_SNAPSHOT              SYNONYM                 METADATA LINK
+PUBLIC AWR_PDB_SNAPSHOT               SYNONYM                 METADATA LINK
+SYS    AWR_ROOT_SNAPSHOT              VIEW                    DATA LINK
+SYS    AWR_PDB_SNAPSHOT               VIEW                    METADATA LINK
+</code></pre>
+<p>Besides the synonyms, we have a metadata link view AWR_PDB_SNAPSHOT and a data link view AWR_ROOT_SNAPSHOT. The data link one means that it switches to CDB$ROOT when queried from a PDB. Here is the definition:</p>
+<pre><code>
+SQL&gt; select owner,view_name,container_data,text from dba_views where view_name in ('AWR_ROOT_SNAPSHOT','AWR_PDB_SNAPSHOT');
+&nbsp;
+OWNER  VIEW_NAME                      C TEXT
+------ ------------------------------ - --------------------------------------------------------------------------------
+SYS    AWR_ROOT_SNAPSHOT              Y select snap_id, dbid, instance_number, startup_time,
+                                               begin_interval_time, end_interval_time,
+                                               flush_elapsed, snap_level, error_count, snap_flag, snap_timezone,
+                                               decode(con_dbid_to_id(dbid), 1, 0, con_dbid_to_id(dbid)) con_id
+                                        from WRM$_SNAPSHOT
+                                        where status = 0
+&nbsp;
+SYS    AWR_PDB_SNAPSHOT               N select snap_id, dbid, instance_number, startup_time,
+                                               begin_interval_time, end_interval_time,
+                                               flush_elapsed, snap_level, error_count, snap_flag, snap_timezone,
+                                               decode(con_dbid_to_id(dbid), 1, 0, con_dbid_to_id(dbid)) con_id
+                                        from WRM$_SNAPSHOT
+                                        where status = 0
+</code></pre>
+<p>Same definition. The difference is that AWR_PDB_SNAPSHOT reads from the current container but AWR_ROOT_SNAPSHOT being a DATA LINK always read from CDB$ROOT.</p>
+<p>This is what we can see:</p>
+<pre><code>
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+&nbsp;
+SQL&gt; select dbid,count(*) from AWR_ROOT_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+ 904475458         91
+&nbsp;
+SQL&gt; select dbid,count(*) from AWR_PDB_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+ 904475458         91
+&nbsp;
+SQL&gt; alter session set container=PDB1;
+Session altered.
+&nbsp;
+SQL&gt; select dbid,count(*) from AWR_ROOT_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+ 904475458         91
+</code></pre>
+<p>This query when run in PDB1 displays the 91 snapshots from the CDB.</p>
+<pre><code>
+SQL&gt; select dbid,count(*) from AWR_PDB_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+2623271973         79
+</code></pre>
+<p>This one shows what is in the current container.</p>
+<p>Those are the views used by the AWR report, depending on the AWR location choice. But what about the DBA_HIST_ views that we know and use from previous versions?</p>
+<h3>DBA_HIST_ and CDB_HIST_</h3>
+<p>I continue to follow the dependencies:</p>
+<pre><code>
+SQL&gt; select owner,name,type from dba_dependencies where referenced_name in ('AWR_ROOT_SNAPSHOT','AWR_PDB_SNAPSHOT') and name like '%SNAPSHOT' order by 3;
+&nbsp;
+OWNER  NAME                           TYPE
+------ ------------------------------ -------------------
+PUBLIC AWR_ROOT_SNAPSHOT              SYNONYM
+PUBLIC AWR_PDB_SNAPSHOT               SYNONYM
+SYS    DBA_HIST_SNAPSHOT              VIEW
+SYS    CDB_HIST_SNAPSHOT              VIEW
+&nbsp;
+SQL&gt; select owner,object_name,object_type,sharing from dba_objects where object_name in ('CDB_HIST_SNAPSHOT','DBA_HIST_SNAPSHOT');
+&nbsp;
+OWNER  OBJECT_NAME                    OBJECT_TYPE             SHARING
+------ ------------------------------ ----------------------- ------------------
+SYS    DBA_HIST_SNAPSHOT              VIEW                    METADATA LINK
+SYS    CDB_HIST_SNAPSHOT              VIEW                    METADATA LINK
+PUBLIC DBA_HIST_SNAPSHOT              SYNONYM                 METADATA LINK
+PUBLIC CDB_HIST_SNAPSHOT              SYNONYM                 METADATA LINK
+</code></pre>
+<p>Here are the views I&#8217;m looking for. They are metadata link only. Not data link. This means that they do not switch to CDB$ROOT.</p>
+<p>But there&#8217;s more in the view definition:</p>
+<pre><code>
+SQL&gt; select owner,view_name,container_data,text from dba_views where view_name in ('CDB_HIST_SNAPSHOT','DBA_HIST_SNAPSHOT');
+&nbsp;
+OWNER  VIEW_NAME                      C TEXT
+------ ------------------------------ - --------------------------------------------------------------------------------
+SYS    DBA_HIST_SNAPSHOT              N select "SNAP_ID","DBID","INSTANCE_NUMBER","STARTUP_TIME","BEGIN_INTERVAL_TIME","
+                                        END_INTERVAL_TIME","FLUSH_ELAPSED","SNAP_LEVEL","ERROR_COUNT","SNAP_FLAG","SNAP_
+                                        TIMEZONE","CON_ID" from AWR_ROOT_SNAPSHOT
+&nbsp;
+SYS    CDB_HIST_SNAPSHOT              Y SELECT k."SNAP_ID",k."DBID",k."INSTANCE_NUMBER",k."STARTUP_TIME",k."BEGIN_INTERV
+                                        AL_TIME",k."END_INTERVAL_TIME",k."FLUSH_ELAPSED",k."SNAP_LEVEL",k."ERROR_COUNT",
+                                        k."SNAP_FLAG",k."SNAP_TIMEZONE",k."CON_ID", k.CON$NAME, k.CDB$NAME FROM CONTAINE
+                                        RS("SYS"."AWR_PDB_SNAPSHOT") k
+</code></pre>
+<p>The DBA_HIST_SNAPSHOT is a simple one view on AWR_ROOT_SNAPSHOT which, as we have seen above, always show snapshots from CDB:</p>
+<pre><code>
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+&nbsp;
+SQL&gt; select dbid,count(*) from DBA_HIST_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+ 904475458         91
+&amp;nbsp
+SQL&gt; alter session set container=PDB1;
+Session altered.
+&nbsp;
+SQL&gt; select dbid,count(*) from DBA_HIST_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+ 904475458         91
+</code></pre>
+<p>Then CDB_HIST_SNAPSHOT reads AWR_PDB_SNAPSHOT which show current container snapshots. But this view is a COMMON DATA one, with the CONTAINER() function. This means that from CDB$ROOT when executed with a common user data from all open containers will be retrieved:</p>
+<pre><code>
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+&nbsp;
+SQL&gt; select dbid,count(*) from CDB_HIST_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+2623271973         79
+ 904475458         91
+</code></pre>
+<p>However, from a PDB you cannot see anything else:</p>
+<pre><code>
+SQL&gt; alter session set container=PDB1;
+Session altered.
+&nbsp;
+SQL&gt; select dbid,count(*) from CDB_HIST_SNAPSHOT group by dbid;
+&nbsp;
+      DBID   COUNT(*)
+---------- ----------
+2623271973         79
+</code></pre>
+<h3>So what?</h3>
+<p>Multitenant adds a new dimension in the dictionary views and we must be aware of that. However, compatibility is still there. The scripts that we used to run to query DBA_HIST views should still work. Don&#8217;t forget to always join on DBID and INSTANCE_NUMBER in addition to SNAP_ID so that your scripts are still working in RAC, and cross containers.<br />
+In 12.2 you can do the same for your application: used metadata links, data links, and common views for your tables. But remember to keep it simple&#8230;</p>
+
+</div>
+</body>
+</html>

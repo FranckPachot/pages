@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/sqlnet-expire_time-and-enablebroken/">
+<title>SQLNET.EXPIRE_TIME and ENABLE=BROKEN</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/sqlnet-expire_time-and-enablebroken/">https://www.dbi-services.com/blog/sqlnet-expire_time-and-enablebroken/</a> (2020-02-15)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">SQLNET.EXPIRE_TIME and ENABLE=BROKEN</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Those parameters, SQLNET.EXPIRE_TIME in sqlnet.ora and ENABLE=BROKEN in a connection description exist for a long time but may have changed in behavior. They are both related to detecting dead TCP connections with keep-alive probes. The former from the server, and the latter from the client.<br />
+<!--more--><br />
+The change in 12c is described in the following MOS note: <a href="https://support.oracle.com/knowledge/Oracle%20Database%20Products/1591874_1.html" rel="noopener noreferrer" target="_blank">Oracle Net 12c: Changes to the Functionality of Dead Connection Detection (DCD) (Doc ID 1591874.1)</a>. Basically instead sending a TNS packet for the keep-alive, the server Dead Connection Detection now relies on the TCP keep-alive feature when available. The note mentions that it may be required to set (ENABLE=BROKEN) in the connection string &#8220;in some circumstances&#8221; - which is not very precise. This &#8220;ENABLE=BROKEN&#8221; was used in the past for transparent failover when we had no VIP (virtual IP) in order to detect a lost connection to the server.</p>
+<p>I don&#8217;t like those statements like &#8220;on some platform&#8221;, &#8220;in some circumstances&#8221;, &#8220;with some drivers&#8221;, &#8220;it may be necessary&#8221;&#8230; so there&#8217;s only one solution: test it in your context.</p>
+<p>My listener is on (DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=localhost)(PORT=1521))) and I will connect to it and keep my connection idle (no user call to the server).I trace the server (through the forks of the listener, found by pgrep with the name of listener associated with this TCP address) and color it in green (GREP_COLORS=&#8217;ms=01;32&#8242;):</p>
+<pre><code>
+pkill strace ; strace -fyye trace=socket,setsockopt -p $(pgrep -f "tnslsnr $(lsnrctl status "(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=localhost)(PORT=1521)))" | awk '/^Alias/{print $2}') ") 2&gt;&amp;1 | GREP_COLORS='ms=01;32' grep --color=auto -E '^|.*sock.*|^=*' &amp;
+</code></pre>
+<p>I trace the client and color it in yellow (GREP_COLORS=&#8217;ms=01;32&#8242;):</p>
+<pre><code>
+strace -fyye trace=socket,setsockopt sqlplus demo/demo@"(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=PDB1))(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=1521)))" &lt;&lt;&lt;quit 2&gt;&amp;1 | GREP_COLORS='ms=01;33' grep --color=auto -E '^|.*sock.*|^=*'
+</code></pre>
+<p>I&#8217;m mainly interested by the setsockopt() here because this is how to enable TCP Keep Alive.</p>
+<h3>(ENABLE=BROKEN) on the client</h3>
+<p>My first test is without enabling DCD on the server: I have nothing defined in sqlnet.ora on the server side. I connect from the client without mentioning &#8220;ENABLE=BROKEN&#8221;:</p>
+<p><a href="../../assets/001_sOtfbplR2S997QV2kR21rw.png"><img loading="lazy" decoding="async" src="../../assets/001_sOtfbplR2S997QV2kR21rw.png" alt="" width="1024" height="608" class="alignnone size-large wp-image-37380" /></a><br />
+The server (green) has set SO_KEEPALIVE but not the client.</p>
+<p>Now I run the same scenario but adding (ENABLE=BROKEN) in the description:</p>
+<pre><code>
+strace -fyye trace=socket,setsockopt sqlplus demo/demo@"(DESCRIPTION=(ENABLE=BROKEN)(CONNECT_DATA=(SERVICE_NAME=PDB1))(ADDRESS=(PROTOCOL=tcp)(HOST=127.0.0.1)(PORT=1521)))" &lt;&lt;&lt;quit 2&gt;&amp;1 | GREP_COLORS='ms=01;33' grep --color=auto -E '^|.*sock.*|^=*'
+</code></pre>
+<p><a href="../../assets/002_4UaZ5tc3FPt7ax2aG4lyCw.png"><img loading="lazy" decoding="async" src="../../assets/002_4UaZ5tc3FPt7ax2aG4lyCw.png" alt="" width="1024" height="560" class="alignnone size-large wp-image-37381" /></a></p>
+<p>The client (yellow) has now a call to set keep-alive:</p>
+<pre><code>
+setsockopt(9&lt;TCP:[1810151]&gt;, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+</code></pre>
+<p>However, as I&#8217;ll show later, this uses the TCP defaults:</p>
+<pre><code>
+[oracle@db195 tmp]$ tail /proc/sys/net/ipv4/tcp_keepalive*
+==&gt; /proc/sys/net/ipv4/tcp_keepalive_intvl &lt;==
+75
+==&gt; /proc/sys/net/ipv4/tcp_keepalive_probes &lt;==
+9
+==&gt; /proc/sys/net/ipv4/tcp_keepalive_time &lt;==
+7200
+</code></pre>
+<p>After 2 hours (7200 seconds) of idle connection, the client will send a probe 9 times, every 75 seconds. If you want to reduce it you must change it on the client system settings. If you don&#8217;t add &#8220;(ENABLE=BROKEN)&#8221; the dead broken connection will not be detected before then next user call, after the default TCP timeout (15 minutes).</p>
+<p>That&#8217;s only from the client when its connection to the server is lost.</p>
+<h3>SQLNET.EXPIRE_TIME on the server</h3>
+<p>On the server side, we have seen that SO_KEEPALIVE is set - using the TCP defaults. But, there, it may be important to detect dead connections faster because a session may hold some locks. You can (and should) set a lower value in sqlnet.ora with SQLNET.EXPIRE_TIME. Before 12c this parameter was used to send TNS packets as keep-alive probes but now that SO_KEEPALIVE is set, this parameter will control the keep-alive idle time (using TCP_KEEPIDL instead of the default /proc/sys/net/ipv4/tcp_keepalive_time).<br />
+Here is the same as my first test (without the client ENABLE=BROKER) but after having set SQLNET.EXPIRE_TIME=42 in $ORACLE_HOME/network/admin/sqlnet.ora</p>
+<p><strong>Side note: </strong>I&#8217;ve got the &#8220;do we need to restart the listener?&#8221; question very often about changes in sqlnet.ora but the answer is clearly &#8220;no&#8221;. This file is read for each new connection to the database. The listener forks the server (aka shadow) process and this one reads the sqlnet.ora, as we can see here when I &#8220;strace -f&#8221; the listener but the forked process is setting-up the socket.</p>
+<p><a href="../../assets/003_v0niUPYu1eCVPMbIyUwNTA.png"><img loading="lazy" decoding="async" src="../../assets/003_v0niUPYu1eCVPMbIyUwNTA.png" alt="" width="1024" height="589" class="alignnone size-large wp-image-37382" /></a></p>
+<p>Here is the new setsockopt() from the server process:</p>
+<pre><code>
+[pid  5507] setsockopt(16&lt;TCP:[127.0.0.1:1521-&gt;127.0.0.1:31374]&gt;, SOL_TCP, TCP_KEEPIDLE, [2520], 4) = 0
+[pid  5507] setsockopt(16&lt;TCP:[127.0.0.1:1521-&gt;127.0.0.1:31374]&gt;, SOL_TCP, TCP_KEEPINTVL, [6], 4) = 0
+[pid  5507] setsockopt(16&lt;TCP:[127.0.0.1:1521-&gt;127.0.0.1:31374]&gt;, SOL_TCP, TCP_KEEPCNT, [10], 4) = 0
+</code></pre>
+<p>This means that the server waits for 42 minutes of inactivity (the EXPIRE_TIME that I&#8217;ve set, here TCP_KEEPIDLE=2520 seconds) and then sends a probe. Without answer (ack) it re-probes every 6 seconds during one minute (the 6 seconds interval is defined by TCP_KEEPINTVL and TCP_KEEPCNT sets the retries to 10 times). We control the idle time with SQLNET.EXPIRE_TIME and then can expect that a dead connection is closed after one additional minute of retry.</p>
+<p>Here is a combination of SQLNET.EXPIRE_TIME (server detecting dead connection in 42+1 minute) and ENABLE=BROKEN (client detecting dead connection after the default of 2 hours):</p>
+<p><a href="../../assets/004_-qYHyeQdnx6SDBxvjJ0tGw.png"><img loading="lazy" decoding="async" src="../../assets/004_-qYHyeQdnx6SDBxvjJ0tGw.png" alt="" width="1024" height="611" class="alignnone size-large wp-image-37383" /></a></p>
+<h3>tcpdump and iptable drop</h3>
+<p>The above, with strace, shows the translation of Oracle settings to Linux settings. Now I&#8217;ll translate to the actual behavior by tracing the TCP packets exchanged, with tcpdump:</p>
+<pre><code>
+sqlplus demo/demo@"(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=PDB1))(ADDRESS=(PROTOCOL=tcp)(HOST=localhost)(PORT=1521)))"
+host cat $ORACLE_HOME/network/admin/sqlnet.ora
+host sudo netstat -np  | grep sqlplus
+host sudo netstat -np  | grep 36316
+set time on escape on
+host sudo tcpdump -vvnni lo port 36316 \&amp;
+</code></pre>
+<p>&#8220;netstat -np | grep sqlplus&#8221; finds the client connection in order to get the port and &#8220;netstat -np | grep $port&#8221; shows both connections (&#8220;sqlplus&#8221; for the client and &#8220;oracleSID&#8221; for the server).</p>
+<p>I have set SQLNET.EXPIRE_TIME=3 here and I can see that the server sends a 0-length packets every 3 minutes (connection at 14:43:39, then idle, 1st probe: 14:46:42, 2nd probe: 14:49:42…). And each time the client replied with an ACK and then the server knows that the connection is still alive:</p>
+<p><a href="../../assets/005_fODTEXfxWi2XoeJA73ANVQ.jpg"><img loading="lazy" decoding="async" src="../../assets/005_fODTEXfxWi2XoeJA73ANVQ.jpg" alt="" width="2048" height="919" class="alignnone size-full wp-image-37384" /></a></p>
+<p>Now I simulate a client that doesn&#8217;t answer, by blocking the input packets:</p>
+<pre><code>
+host sudo iptables -I INPUT 1 -p tcp --dport 36316 -j DROP
+host sudo netstat -np  | grep 36316
+</code></pre>
+<p>Here I see the next probe 3 minutes after the last one (14:55:42) and then, as there is no reply, the 10 probes every 6 seconds:</p>
+<p><a href="../../assets/006_cg2olnhVFszZwbhz7MeiDw.jpg"><img loading="lazy" decoding="async" src="../../assets/006_cg2olnhVFszZwbhz7MeiDw.jpg" alt="" width="2048" height="600" class="alignnone size-full wp-image-37385" /></a></p>
+<p>At the end, I checked the TCP connections and the server one has disappeared. But the client side remains. That is exactly what DCD does: when a session is idle for a while it tests if the connection is dead and closes it to release all resources.<br />
+If I continue from there and try to run a query, the server cannot be reached and I&#8217;ll hang for the default TCP timeout of 15 minutes. If I try to cancel, I get &#8220;ORA-12152: TNS:unable to send break message&#8221; as it tries to send an out-of-bound break. SQLNET.EXPIRE_TIME is only for the server-side. The client detects nothing until it tries to send something.</p>
+<p>For the next test, I remove my iptables rule to stop blocking the packets:</p>
+<pre><code>
+host sudo iptables -D INPUT 1
+</code></pre>
+<p>And I&#8217;m now running the same but with (ENABLE=BROKEN)</p>
+<pre><code>
+connect demo/demo@(DESCRIPTION=(ENABLE=BROKEN)(CONNECT_DATA=(SERVICE_NAME=PDB1))(ADDRESS=(PROTOCOL=tcp)(HOST=localhost)(PORT=1521)))
+host sudo netstat -np  | grep sqlplus
+host sudo netstat -np  | grep 37064
+host sudo tcpdump -vvnni lo port 37064 \&amp;
+host sudo iptables -I INPUT 1 -p tcp --dport 37064 -j DROP
+host sudo netstat -np  | grep 37064
+host sudo iptables -D INPUT 1
+host sudo netstat -np  | grep 37064
+</code></pre>
+<p>Here is the same as before: DCD after 3 minutes idle, and 10 probes that fail because I&#8217;ve blocked again with iptables:</p>
+<p><a href="../../assets/007_ab76dLbXchBQm3e7JAN8-g.jpg"><img loading="lazy" decoding="async" src="../../assets/007_ab76dLbXchBQm3e7JAN8-g.jpg" alt="" width="2048" height="878" class="alignnone size-full wp-image-37386" /></a></p>
+<p>As with the previous test, the server connection (the oracleSID) has been closed and only the client one remains. As I know that SO_KEEPALIVE has been enabled thanks to (ENABLE=BROKEN) the client will detect the closed connection:</p>
+<p><a href="../../assets/008_496ZL4OcGEBsIp82En_xHA.jpg"><img loading="lazy" decoding="async" src="../../assets/008_496ZL4OcGEBsIp82En_xHA.jpg" alt="" width="2048" height="970" class="alignnone size-full wp-image-37387" /></a></p>
+<p>17:52:48 is 2 hours after the last activity and probes 9 times every 1&#8217;15 according to the system defaults:</p>
+<pre><code>
+[oracle@db195 tmp]$ tail /proc/sys/net/ipv4/tcp_keepalive*
+==&gt; /proc/sys/net/ipv4/tcp_keepalive_intvl &lt;==    TCP_KEEPINTVL
+75
+==&gt; /proc/sys/net/ipv4/tcp_keepalive_probes &lt;==     TCP_KEEPCNT
+9
+==&gt; /proc/sys/net/ipv4/tcp_keepalive_time &lt;==      TCP_KEEPIDLE
+</code></pre>
+<p>It was long (but you can change those defaults on the client) but finally, the client connection is cleared up (sqlplus not there in the last netstat).<br />
+Now, an attempt to run a user call fails immediately with the famous ORA-03113 because the client knows that the connection is closed:</p>
+<p><a href="../../assets/009_82V0NiGP69mmDD3PN85q-g-1.png"><img loading="lazy" decoding="async" src="../../assets/009_82V0NiGP69mmDD3PN85q-g-1.png" alt="" width="968" height="333" class="alignnone size-full wp-image-37388" /></a></p>
+<p>Just a little additional test to show ORA-03135. If the server detects and closes the dead connection, but before the dead connection is detected on the client, we have seen that we wait for a 15 minutes timeout. But that&#8217;s because the iptable rule was still there to drop the packet. If I remove the rule before attempting a user-call, the server can be reached (then no wait and timeout) and detects immediately that there&#8217;s no endpoint anymore. This raises &#8220;connection lost contact&#8221;.</p>
+<p><a href="../../assets/010_VvCn1wO4wnjCLT89BTRPkA.jpg"><img loading="lazy" decoding="async" src="../../assets/010_VvCn1wO4wnjCLT89BTRPkA.jpg" alt="" width="2048" height="1296" class="alignnone size-full wp-image-37375" /></a></p>
+<p>In summary:</p>
+<ul>
+<li>On the server, the keep-alive is always enabled and SQLNET.EXPIRE_TIME is used to reduce the tcp_keepalive_time defined by the system, because it is probably too long.</li>
+<li>On the client, the keep-alive is enabled only when (ENABLE=BROKEN) is in the connection description, and uses the tcp_keepalive_time from the system. Without it, the broken connection will be detected only when attempting a user call.</li>
+</ul>
+<p>Setting SQLNET.EXPIRE_TIME to a few minutes (like 10) is a good idea because you don&#8217;t want to keep resources and locks on the server when a simple ping can ensure that the connection is lost and we have to rollback. If we don&#8217;t, then the dead connections may disappear only after 2 hours and 12 minutes (the idle time + the probes). On the client-side, it is also a good idea to add (ENABLE=BROKEN) so that idle sessions that have lost contact have a chance to know it before trying to use them. This is a performance gain if it helps to avoid sending a &#8220;select 1 from dual&#8221; each time you grab a connection from the pool</p>
+<p>And, most important: the documentation is imprecise, which means that the behavior can change without notification. This is a test on specific OS, specific driver, specific version,… Do not take the results from this post, but now you know how to check in your environment.</p>
+
+</div>
+</body>
+</html>

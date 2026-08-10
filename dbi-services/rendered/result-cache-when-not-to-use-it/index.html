@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/result-cache-when-not-to-use-it/">
+<title>Result Cache: when *not* to use it</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/result-cache-when-not-to-use-it/">https://www.dbi-services.com/blog/result-cache-when-not-to-use-it/</a> (2018-01-29)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Result Cache: when *not* to use it</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+I encountered recently a case where result cache was incorrectly used, leading to high contention when the application encountered a peak of load. It was not a surprise when I&#8217;ve seen that the function was called with an &#8216;ID&#8217; as argument, which may have thousands of values in this system. I mentioned to the software vendor that the result cache must be used only for frequently calling the function with same arguments, not for random values, even if each value have 2 or 3 identical calls. And, to detail this, I looked at the Oracle Documentation to link the part which explains when the result cache can be used and when it should be avoided.</p>
+<p>But I&#8217;ve found nothing relevant. This is another(*) case where the Oracle Documentation is completely useless. Without explaining how a feature works, you completely fail to get this feature used. Most people will not take the risk to use it, and a few will use it in the wrong place, before definitely blacklisting this feature.</p>
+<p>   (*) By another case, I&#8217;m thinking about <a href="https://twitter.com/FranckPachot/status/937340469662633984" target="_blank" rel="noopener noreferrer">Kamil Stawiarski presentation about Pragma UDF</a> and the lack of useful documentation about it.</p>
+<p><!--more--></p>
+<h3>Oracle documentation</h3>
+<p>So this is what I&#8217;ve find in the <a href="https://docs.oracle.com/en/database/oracle/oracle-database/12.2/tgdba/tuning-result-cache.html#GUID-FA30CC32-17AB-477A-9E4C-B47BFE0968A1" target="_blank" rel="noopener noreferrer">Database Performance Tuning Guide</a> about the <i>Benefits of Using the Server Result Cache</i></p>
+<ol>
+<li><i>The benefits of using the server result cache depend on the application</i></li>
+<li><i>OLAP applications can benefit significantly from its use.</i></li>
+<li><i>Good candidates for caching are queries that access a high number of rows but return a small number, such as those in a data warehouse.</i></li>
+</ol>
+<p>So, this is vague (&#8216;depends&#8217;, &#8216;can benefit&#8217;, &#8216;good candidates&#8217;). And doesn&#8217;t help to decide when it can be used.<br />
+The &#8216;access a high number of rows but return a small number&#8217; is an indication why cache hits can benefit. However, there is no mention of the most important things, which are :</p>
+<ul>
+<li>The cache result is invalidated for any DML on the tables the result relies on.</li>
+<li>The cache miss, when the result is invalidated is expensive</li>
+<li>The cache miss, when the result is not in the result cache is expensive</li>
+<li>The &#8216;expensive&#8217; here is a scalability issue: not detected in unit tests, but big contention when load increases</li>
+</ul>
+<h3>Real things to know</h3>
+<p>The first thing to know is that the Result Cache memory is protected by a latch:</p>
+<pre><code>
+SQL&gt; select addr,name,gets,misses,sleeps,spin_gets,wait_time from v$latch where name like 'Result Cache%';
+&nbsp;
+ADDR             NAME                            GETS     MISSES     SLEEPS  SPIN_GETS  WAIT_TIME
+---------------- ------------------------- ---------- ---------- ---------- ---------- ----------
+00000000600477D0 Result Cache: RC Latch             2          0          0          0          0
+0000000060047870 Result Cache: SO Latch             0          0          0          0          0
+0000000060047910 Result Cache: MB Latch             0          0          0          0          0
+</code></pre>
+<p>This latch has no children:</p>
+<pre><code>
+SQL&gt; select * from v$latch_children where name like '%Result Cache%';
+&nbsp;
+no rows selected
+</code></pre>
+<p>Only one latch to protect the whole result cache: concurrent sessions &#8211; even for different functions &#8211; have to serialize their access on the same latch.</p>
+<p>This latch is acquired in exclusive mode when the session has to write to the result cache (cache miss, invalidation,&#8230;) or in shared mode &#8211; since 11<i>g</i>R2 when reading only. This has been explained by Alex Fatkulin <a href="http://afatkulin.blogspot.ch/2012/05/result-cache-latch-in-11gr2-shared-mode.html" target="_blank" rel="noopener noreferrer">http://afatkulin.blogspot.ch/2012/05/result-cache-latch-in-11gr2-shared-mode.html</a>.</p>
+<p>This means that, whatever the Oracle Documentation says, the benefit of result cache comes only at cache hit: when the result of the function is already there, and has not been invalidated. If you call the same function with always the same parameter, frequently, and with no changes in the related tables, then we are in the good case.</p>
+<p>But if there was a modification of one of the tables, even some rows that have nothing to do with the result, then you will have an overhead: exclusive latch get. And if you call the function with new values for the arguments, that&#8217;s also a cache miss which has to get this exclusive latch. And if you have multiple sessions experiencing a cache miss, then they will spin on CPU to get the exclusive latch. This can be disastrous with a large number of sessions. I have seen this kind of contention for hours with connection pools set to 100 sessions when the call to the function is frequent with different values.</p>
+<p>To show it, I create a demo table (just to have a dependency) and a result_cache function:</p>
+<pre><code>
+SQL&gt; create table DEMO as select rownum n from xmltable('1 to 1000');
+Table created.
+&nbsp;
+SQL&gt; create or replace function F(n number) return number result_cache as begin for i in (select * from DEMO where DEMO.n=F.n) loop return i.n; end loop; end;
+  2  /
+Function created.
+</code></pre>
+<p>I have just restarted the instance and my latch statistics are reset:</p>
+<pre><code>
+SQL&gt; select addr,name,gets,misses,sleeps,spin_gets,wait_time from v$latch where name like 'Result Cache%';
+&nbsp;
+ADDR             NAME                            GETS     MISSES     SLEEPS  SPIN_GETS  WAIT_TIME
+---------------- ------------------------- ---------- ---------- ---------- ---------- ----------
+00000000600477D0 Result Cache: RC Latch             2          0          0          0          0
+0000000060047870 Result Cache: SO Latch             0          0          0          0          0
+0000000060047910 Result Cache: MB Latch             0          0          0          0          0
+</code></pre>
+<h3>Result Cache Hit</h3>
+<p>This will call the function always with the same argument, and no change in the table it relies on:</p>
+<pre><code>SQL&gt; declare n number; begin for i in 1..1e3 loop n:=n+f(1); end loop; end;
+  2  /
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>So, the first call is a cache miss and the 999 next calls are cache hits. This is the perfect case for Result Cache.</p>
+<pre><code>
+SQL&gt; select addr,name,gets,misses,sleeps,spin_gets,wait_time from v$latch where name like 'Result Cache%';
+&nbsp;
+ADDR             NAME                            GETS     MISSES     SLEEPS  SPIN_GETS  WAIT_TIME
+---------------- ------------------------- ---------- ---------- ---------- ---------- ----------
+00000000600477D0 Result Cache: RC Latch          1009          0          0          0          0
+0000000060047870 Result Cache: SO Latch             1          0          0          0          0
+0000000060047910 Result Cache: MB Latch             0          0          0          0          0
+</code></pre>
+<p>So, that&#8217;s about 1000 latch gets. With cache hits you get the latch once per execution, and this is a shared latch, so no contention here.<br />
+You want to see check that it is a shared latch? Just set a breakpoint with gdb on the ksl_get_shared_latch function (up to 12.1 because 12.2 uses ksl_get_shared_latch_int) and print the arguments (as explained by <a href="https://blogs.sap.com/2014/11/25/oracle-researching-internal-latch-implementation-kslgetsharedlatch-kslfre-kslgetslw-and-crashing-pmon/" target="_blank" rel="noopener noreferrer">Stefan Koehler</a> and <a href="https://fritshoogland.wordpress.com/2015/07/17/oracle-12-and-latches-part-2/" target="_blank" rel="noopener noreferrer">Frits Hoogland</a>):</p>
+<p>As my RC latch is at address 00000000600477D0 I set a beakpoint on ksl_get_shared_latch where the first argument is 0x600477d0 and display the other arguments:</p>
+<pre><code>
+break ksl_get_shared_latch
+condition 1 $rdi == 0x600477d0
+ commands
+ silent
+ printf "ksl_get_shared_latch laddr:%x, willing:%d, where:%d, why:%d, mode:%dn", $rdi, $rsi, $rdx, $rcx, $r8
+ c
+ end
+</code></pre>
+<p>Then one call with cache hit displays:</p>
+<pre><code>
+ksl_get_shared_latch laddr:600477d0, willing:1, where:1, why:5358, mode:8
+</code></pre>
+<p>Mode 8 is shared: many concurrent sessions can do the same without waiting. Shared is scalable: cache hits are scalable.</p>
+<h3>Cache miss &#8211; result not in cache</h3>
+<p>Here each call will have a  different value for the argument, so that they are all cache misses (except the first one):</p>
+<pre><code>
+SQL&gt; declare n number; begin for i in 1..1e3 loop n:=n+f(i); end loop; end;
+  2  /
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>Now the &#8216;RC latch&#8217; statistics have increased further:</p>
+<pre><code>
+SQL&gt; select addr,name,gets,misses,sleeps,spin_gets,wait_time from v$latch where name like 'Result Cache%';
+&nbsp;
+ADDR             NAME                            GETS     MISSES     SLEEPS  SPIN_GETS  WAIT_TIME
+---------------- ------------------------- ---------- ---------- ---------- ---------- ----------
+00000000600477D0 Result Cache: RC Latch          6005          0          0          0          0
+0000000060047870 Result Cache: SO Latch             1          0          0          0          0
+0000000060047910 Result Cache: MB Latch             0          0          0          0          0
+</code></pre>
+<p>This is about 5000 additional latch gets, which means 5 per execution. And, because it writes, you can expect them to be exclusive.</p>
+<p>Here is my gdb script output when I call the function with a value that is not already in cache:</p>
+<pre><code>
+ksl_get_shared_latch laddr:600477d0, willing:1, where:1, why:5358, mode:8
+ksl_get_shared_latch laddr:600477d0, willing:1, where:1, why:5347, mode:16
+ksl_get_shared_latch laddr:600477d0, willing:1, where:1, why:5358, mode:16
+ksl_get_shared_latch laddr:600477d0, willing:1, where:1, why:5374, mode:16
+</code></pre>
+<p>Mode 16 is exclusive. And we have 3 of them in addition to the shared one. You can imagine what happens when several sessions are running this: spin and wait, all sessions on the same resource.</p>
+<h3>Cache miss &#8211; result in cache but invalid</h3>
+<p>I run the same again, where all values are in cache now:</p>
+<pre><code>
+SQL&gt; declare n number; begin for i in 1..1e3 loop n:=n+f(i); end loop; end;
+  2  /
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>So this is only 1000 additional gets:</p>
+<pre><code>
+SQL&gt; select addr,name,gets,misses,sleeps,spin_gets,wait_time from v$latch where name like 'Result Cache%';
+&nbsp;
+ADDR             NAME                            GETS     MISSES     SLEEPS  SPIN_GETS  WAIT_TIME
+---------------- ------------------------- ---------- ---------- ---------- ---------- ----------
+00000000600477D0 Result Cache: RC Latch          7005          0          0          0          0
+0000000060047870 Result Cache: SO Latch             1          0          0          0          0
+0000000060047910 Result Cache: MB Latch             0          0          0          0          0
+</code></pre>
+<p>The function depends on DEMO table, and I do some modifications on it:</p>
+<pre><code>
+SQL&gt; insert into DEMO values (0)
+1 row created.
+SQL&gt; commit;
+Commit complete.
+</code></pre>
+<p>This has invalidated all previous results. A new run will have all cache miss:</p>
+<pre><code>
+SQL&gt; declare n number; begin for i in 1..1e3 loop n:=n+f(i); end loop; end;
+  2  /
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>And this is 5000 additional gets:</p>
+<pre><code>
+SQL&gt; select addr,name,gets,misses,sleeps,spin_gets,wait_time from v$latch where name like 'Result Cache%';
+&nbsp;
+ADDR             NAME                            GETS     MISSES     SLEEPS  SPIN_GETS  WAIT_TIME
+---------------- ------------------------- ---------- ---------- ---------- ---------- ----------
+00000000600477D0 Result Cache: RC Latch         12007          0          0          0          0
+0000000060047870 Result Cache: SO Latch             1          0          0          0          0
+0000000060047910 Result Cache: MB Latch             0          0          0          0          0
+</code></pre>
+<h3>So what?</h3>
+<p>The important thing to know is that each cache miss requires an exclusive access to the Result Cache, multiple times. Those must be avoided. The Result Cache is good for a static set of result. It is not a short-term cache to workaround an application design where the function is called two or three times with the same values. This is, unfortunately, not explained in the Oracle Documentation. But it becomes obvious when we look at the implementation, or when we load test it with multiple sessions. The consequence can be this kind of high contention during minutes or hours:</p>
+<pre><code>
+Top 5 Timed Events                                                    Avg %Total
+~~~~~~~~~~~~~~~~~~                                                   wait   Call
+Event                                            Waits    Time (s)   (ms)   Time
+----------------------------------------- ------------ ----------- ------ ------
+latch free                                     858,094   1,598,387   1863   78.8
+enq: RC - Result Cache: Contention             192,855     259,563   1346   12.8
+</code></pre>
+<p>Without either the knowledge of the implementation, or relevant load tests, the risk is that a developer stays on his good results in unit testing, and implement Result Cache in each function. The consequence will be seen too late, in production, at a time of load peak. If this happens to you, you can disable the result cache (DBMS_RESULT_CACHE.BYPASS(TRUE);) but the risk is to have performance degradation in the &#8216;good cases&#8217;. Or recompile the procedures with removed RESULT_CACHE, but you may bring a new contention on library cache then.</p>
+
+</div>
+</body>
+</html>

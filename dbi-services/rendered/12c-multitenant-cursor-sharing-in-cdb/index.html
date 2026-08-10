@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-multitenant-cursor-sharing-in-cdb/">
+<title>12c multitenant: Cursor sharing in CDB</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-multitenant-cursor-sharing-in-cdb/">https://www.dbi-services.com/blog/12c-multitenant-cursor-sharing-in-cdb/</a> (2016-03-12)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12c multitenant: Cursor sharing in CDB</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In multitenant, there are two goals: consolidation within the same container database and isolation of pluggable databases. I see multitenant consolidation as an extension of schema consolidation. What is not possible in schema consolidation, such as public objects name collision, is now possible with pluggable databases. 10 years ago I administrated on a database with high level of consolidation: 3000 schemas with same structure and different data. The big scalability issue there was library cache waits (it was 10g) because same SQL statements running on thousands of schemas means parent cursors with lot of child. When 12c came out, and I&#8217;ve seen that Multitenant shares the parent cursor, then I wanted to compare library cache contention between schema consolidation an pluggable database consolidation.<br />
+<!--more--><br />
+I&#8217;ve created 50 pluggable databases PDB001 to PDB050 with 50 users in each USER001 to USER050.<br />
+I prepared the following script:</p>
+<pre><code>
+begin
+ for i in 1..1000 loop
+  execute immediate 'select * from dual';
+  execute immediate 'select '||i||' from dual';
+ end loop;
+end;
+/
+</code></pre>
+<p>The idea is to run the same statement in a loop, with other different statements to avoid cursor caching. Actually my goal is to simulate what we find sometimes with connection pools that run a &#8216;select from dual&#8217; before grabbing a session, just to check it is still there.<br />
+I&#8217;ve run 50 concurrent sessions with that script in the following connections:</p>
+<ol>
+<li>Same schema name on multiple pluggable databases</li>
+<li>Different schema names on the same pluggable database</li>
+<li>Same schema name on same pluggable database</li>
+<li>Different user names on different pluggable databases</li>
+</ol>
+<p>And here are the 4 runs displayed by Orachrome Lighty, my favorite tool to display database performance statistics.<br />
+<a href="../../assets/CaptureCDBCURSORS0011.png"><img loading="lazy" decoding="async" src="../../assets/CaptureCDBCURSORS0011.png" alt="CaptureCDBCURSORS001" width="1279" height="718" class="alignnone size-full wp-image-7446" /></a></p>
+<p>Good reference for mutexes are Tanel Poder and Andrey Nikolaev. <a href="http://blog.tanelpoder.com/files/Oracle_Latch_And_Mutex_Contention_Troubleshooting.pdf">http://blog.tanelpoder.com/files/Oracle_Latch_And_Mutex_Contention_Troubleshooting.pdf</a></p>
+<p>Basically here, &#8220;library cache: mutex X&#8221; is the most important wait event and it&#8217;s contention on library cache because of the hard parses.</p>
+<p>Then, I changed the script to add more contention. I artificially multiply the number of child cursors. In addition to the 50 ones (not shared because of different user and/or container) I change an optimizer parameter to get 50 different versions:</p>
+<pre><code>
+begin
+ for i in 1..50
+ loop
+ execute immediate 'alter session set optimizer_index_cost_adj='||i;
+ for j in 1..20
+ loop
+  execute immediate 'select * from dual';
+  execute immediate 'select '||i||'+'||j||' from dual';
+ end loop;
+ end loop;
+end;
+/
+</code></pre>
+<p>The time it takes is longer than when we had only one version, but it&#8217;s still the same time in container consolidation vs. schema consolidation:</p>
+<p><a href="../../assets/CaptureCDBCURSORS002.png"><img loading="lazy" decoding="async" src="../../assets/CaptureCDBCURSORS002.png" alt="CaptureCDBCURSORS002" width="1643" height="744" class="alignnone size-full wp-image-7449" /></a></p>
+<p>&#8220;cursor: mutex X&#8221; appears here. It&#8217;s the contention on the parent cursor because of the multiple versions to search.</p>
+<p>So, in current version (I tested on 12.1.0.2) multitenant consolidation is the same as schema consolidation: not worse and not better. This was designed on purpose: sharing the parent cursor saves memory by avoiding to store same information multiple times. It&#8217;s the goal of consolidation. The non-sharing is done at child cursor level.</p>
+<p>This means that bad application design that lead to library cache contention in schema consolidation will not be better when separating into multiple pluggable databases.<br />
+When you want explicitly to avoid sharing, then you have either to set different optimizer parameter (I dream of a dummy one, just to avoid sharing without changing anything else) or to issue different statements. In following example, I add the connection info as comment in the statement:</p>
+<pre><code>
+begin
+ for i in 1..1000 loop
+  execute immediate 'select /*+ &amp;_USER.@&amp;_CONNECT_IDENTIFIER */ * from dual';
+  execute immediate 'select '||i||' from dual';
+ end loop;
+end;
+/
+</code></pre>
+<p>And here is the result. No contention except when I connect with same user and same service:</p>
+<p><a href="../../assets/CaptureCDBCURSORS003.png"><img loading="lazy" decoding="async" src="../../assets/CaptureCDBCURSORS003.png" alt="CaptureCDBCURSORS003" width="1671" height="705" class="alignnone size-full wp-image-7456" /></a></p>
+<p>Please, don&#8217;t hesitate to comment. Even if contention on library cache has improved at each release, high number of versions are always a problem. Especially with bad application design that parse too often. Reading a long chain of child cursors can take a long time and requires exclusive latch on parent cursor. PSU 11.2.0.2.2 introduced cursor obsolescence to limit the number of child cursor, but some bugs came with that. In 12.1 it&#8217;s limited to 1024 child cursors. With hundreds of pluggable databases we can reach that very quickly because of the many reasons for non-sharing (bind length, NLS settings, adaptive cursor sharing, etc).</p>
+<p>On additional note, if you look at V$SQL_SHARED_CURSOR you don&#8217;t see any reason for the non-sharing when it&#8217;s because of different container. A enhancement request (bug 22663468) has been opened for that.</p>
+
+</div>
+</body>
+</html>

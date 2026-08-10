@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/how-to-disable-a-sql-plan-directive-permanently/">
+<title>How to disable a SQL Plan Directive permanently</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/how-to-disable-a-sql-plan-directive-permanently/">https://www.dbi-services.com/blog/how-to-disable-a-sql-plan-directive-permanently/</a> (2015-06-12)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">How to disable a SQL Plan Directive permanently</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In 12c you will see a lot of SQL Plan Directives. Some are useful to get better execution plans, but some will trigger too much Adaptive Dynamic Sampling and that can become a big overhead, especially in Standard Edition. Then you don&#8217;t want to drop them &#8211; or they will reappear. You can disable them, but what will happen after the retention weeks? Let&#8217;s test it.</p>
+<h3>Disabled directive</h3>
+<p>A directive has been created which triggers too expensive dynamic sampling. You don&#8217;t want that and you have disabled it one year ago with:</p>
+<pre><code>SQL&gt; dbms_spd.alter_sql_plan_directive(14130932452940503769,'ENABLED','NO');
+</code></pre>
+<p>and everything is good. You&#8217;re happy with that. Here is the directive:</p>
+<pre><code>SQL&gt; select directive_id,state,last_used,auto_drop,enabled,extract(notes,'/spd_note/spd_text/text()') spd_text,extract(notes,'/spd_note/internal_state/text()') internal_state from dba_sql_plan_directives where directive_id in(select directive_id from dba_sql_plan_dir_objects where owner='DEMO' );
+
+        DIRECTIVE_ID STATE      LAST_USED AUTO_DROP ENABLED SPD_TEXT                         INTERNAL_S
+-------------------- ---------- --------- --------- ------- -------------------------------- ----------
+14130932452940503769 SUPERSEDED 28-APR-14 YES       NO      {E(DEMO.DEMO_TABLE)[A, B, C, D]} HAS_STATS
+</code></pre>
+<p>The directive has not been used since April 2014 thanks to the &#8216;enabled&#8217; set to NO.</p>
+<p>If I run a query with a filter on those columns:</p>
+<pre><code>SQL&gt; select count(*) Q1 from DEMO_TABLE where a+b=c+d;
+
+                  Q1
+--------------------
+               10000
+
+23:10:32 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'basic +note'));
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------
+EXPLAINED SQL STATEMENT:
+------------------------
+select count(*) Q1 from DEMO_TABLE where a+b=c+d
+
+Plan hash value: 1839825454
+
+-----------------------------------------
+| Id  | Operation          | Name       |
+-----------------------------------------
+|   0 | SELECT STATEMENT   |            |
+|   1 |  SORT AGGREGATE    |            |
+|   2 |   TABLE ACCESS FULL| DEMO_TABLE |
+-----------------------------------------
+
+</code></pre>
+<p>there is no dynamic sampling that this is exactly what I want.</p>
+<h3>Retention weeks</h3>
+<p>My retention is the default: 53 weeks. Let&#8217;s see what happens after 53 weeks. I can call the &#8216;auto drop&#8217; job with dbms_spd.drop_sql_plan_directive passing a null instead of a directive_id:</p>
+<pre><code>SQL&gt; exec dbms_spd.drop_sql_plan_directive(null);
+
+PL/SQL procedure successfully completed.
+</code></pre>
+<h3>Run a few queries</h3>
+<p>Then let&#8217;s have a few queries on those table columns:</p>
+<pre><code>SQL&gt; select count(*) Q2 from DEMO_TABLE where a+b=c+d;
+
+                  Q2
+--------------------
+               10000
+
+SQL&gt; select count(*) Q3 from DEMO_TABLE where a+b=c+d;
+
+                  Q3
+--------------------
+               10000
+
+</code></pre>
+<p>and check the execution plan:</p>
+<pre><code>SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'basic +note'));
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------
+EXPLAINED SQL STATEMENT:
+------------------------
+select count(*) Q3 from DEMO_TABLE where a+b=c+d
+
+Plan hash value: 1839825454
+
+-----------------------------------------
+| Id  | Operation          | Name       |
+-----------------------------------------
+|   0 | SELECT STATEMENT   |            |
+|   1 |  SORT AGGREGATE    |            |
+|   2 |   TABLE ACCESS FULL| DEMO_TABLE |
+-----------------------------------------
+
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=2)
+   - 1 Sql Plan Directive used for this statement
+
+</code></pre>
+<p>A directive has been used:</p>
+<pre><code> SQL&gt; select directive_id,state,last_used,auto_drop,enabled,extract(notes,'/spd_note/spd_text/text()') spd_text,extract(notes,'/spd_note/internal_state/text()') internal_state from dba_sql_plan_directives where directive_id in(select directive_id from dba_sql_plan_dir_objects where owner='DEMO' );
+
+        DIRECTIVE_ID STATE      LAST_USED AUTO_DROP ENABLED SPD_TEXT                         INTERNAL_S
+-------------------- ---------- --------- --------- ------- -------------------------------- ----------
+14130932452940503769 SUPERSEDED 15-MAY-15 YES       YES     {E(DEMO.DEMO_TABLE)[A, B, C, D]} HAS_STATS
+</code></pre>
+<p>Oh! The directive is back and enabled !</p>
+<h3>Auto Drop</h3>
+<p>Here are the criteria for auto-drop. SPD are considered to be dropped when AUTO_DROP is YES and either:</p>
+<ul>
+<li>SPD is flagged as redundant</li>
+<li>One of the tables has been dropped (in recycle_bin means dropped)</li>
+<li>LAST_USAGE is from before the retention window</li>
+<li>State is NEW (LAST_USED is null) and CREATED is before retention window</li>
+</ul>
+<p>Do you see? Nothing about the ENABLE YES/NO there&#8230;</p>
+<h3>Conclusion</h3>
+<p>If you want to disable a SPD and be sure that it will never reappear then you have to do both of following:</p>
+<pre><code>SQL&gt; exec dbms_spd.alter_sql_plan_directive(14130932452940503769,'ENABLED','NO');
+SQL&gt; exec dbms_spd.alter_sql_plan_directive(14130932452940503769,'AUTO_DROP','NO');
+</code></pre>
+<p>then because the AUTO DROP is disabled, the directive will never be deleted automatically.</p>
+
+</div>
+</body>
+</html>

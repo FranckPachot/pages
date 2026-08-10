@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/unplug-an-encrypted-pdb-ora-46680-master-keys-of-the-container-database-must-be-exported/">
+<title>Unplug an Encrypted PDB (ORA-46680: master keys of the container database must be exported)</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/unplug-an-encrypted-pdb-ora-46680-master-keys-of-the-container-database-must-be-exported/">https://www.dbi-services.com/blog/unplug-an-encrypted-pdb-ora-46680-master-keys-of-the-container-database-must-be-exported/</a> (2018-01-20)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Unplug an Encrypted PDB (ORA-46680: master keys of the container database must be exported)</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In the Oracle Database Cloud DBaaS you provision a multitenant database where tablespaces are encrypted. This means that when you unplug/plug the pluggable databases, you also need to export /import the encryption keys. You cannot just copy the wallet because the wallet contains all CDB keys. Usually, you can be guided by the error messages, but this one needs a little explanation and an example.<br />
+<!--more--><br />
+Here I&#8217;ll unplug PDB6 from CDB1 and plug it into CDB2</p>
+<pre><code>[oracle@VM122 blogs]$ connect /@CDB1 as sysdba
+SQLcl: Release 17.4.0 Production on Fri Jan 19 22:22:44 2018
+Copyright (c) 1982, 2018, Oracle.  All rights reserved.
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.2.0.1.0 - 64bit Production
+&nbsp;
+22:22:46 SQL&gt; show pdbs
+&nbsp;
+  CON_ID CON_NAME   OPEN MODE    RESTRICTED
+  ------ ---------- ------------ ----------
+       2 PDB$SEED   READ ONLY    NO
+       3 PDB1       READ WRITE   NO
+       5 PDB6       READ WRITE   NO</code></pre>
+<p>Here are the master keys:</p>
+<pre><code>
+SQL&gt; select con_id,tag,substr(key_id,1,6)||'...' "KEY_ID...",creator,key_use,keystore_type,origin,creator_pdbname,activating_pdbname from v$encryption_keys;
+&nbsp;
+  CON_ID TAG    KEY_ID...   CREATOR   KEY_USE      KEYSTORE_TYPE       ORIGIN   CREATOR_PDBNAME   ACTIVATING_PDBNAME
+  ------ ---    ---------   -------   -------      -------------       ------   ---------------   ------------------
+       1 cdb1   AcyH+Z...   SYS       TDE IN PDB   SOFTWARE KEYSTORE   LOCAL    CDB$ROOT          CDB$ROOT
+       3 pdb6   Adnhnu...   SYS       TDE IN PDB   SOFTWARE KEYSTORE   LOCAL    PDB6              PDB6
+</code></pre>
+<h3>Export keys and Unplug PDB</h3>
+<p>Let&#8217;s try to unplug PDB6:</p>
+<pre><code>22:22:51 SQL&gt; alter pluggable database PDB6 close immediate;
+Pluggable database PDB6 altered.
+&nbsp;
+22:23:06 SQL&gt; alter pluggable database PDB6 unplug into '/var/tmp/PDB6.xml';
+&nbsp;
+Error starting at line : 1 in command -
+alter pluggable database PDB6 unplug into '/var/tmp/PDB6.xml'
+Error report -
+ORA-46680: master keys of the container database must be exported
+</code></pre>
+<p>This message is not clear. You don&#8217;t export the container database (CDB) key. You have to export the PDB ones.</p>
+<p>Then, I have to open the PDB, switch to it, and export the key:</p>
+<pre><code>
+SQL&gt; alter session set container=PDB6;
+Session altered.
+&nbsp;
+SQL&gt; administer key management set keystore open identified by "k3yCDB1";
+Key MANAGEMENT succeeded.
+&nbsp;
+SQL&gt; administer key management
+  2   export encryption keys with secret "this is my secret password for the export"
+  3   to '/var/tmp/PDB6.p12'
+  4   identified by "k3yCDB1"
+  5  /
+&nbsp;
+Key MANAGEMENT succeeded.
+</code></pre>
+<p>Note that I opened the keystore with a password. If you use an autologin wallet, you have to close it, in the CDB$ROOT, and open it with password.</p>
+<p>Now I can unplug the database:</p>
+<pre><code>
+SQL&gt; alter pluggable database PDB6 close immediate;
+Pluggable database PDB6 altered.
+&nbsp;
+SQL&gt; alter pluggable database PDB6 unplug into '/var/tmp/PDB6.xml';
+Pluggable database PDB6 altered.
+</code></pre>
+<h3>Plug PDB and Import keys</h3>
+<p>I&#8217;ll plug it in CDB2:</p>
+<pre><code>
+SQL&gt; connect /@CDB2 as sysdba
+Connected.
+SQL&gt; create pluggable database PDB6 using '/var/tmp/PDB6.xml' file_name_convert=('/CDB1/PDB6/','/CDB2/PDB6/');
+Pluggable database PDB6 created.
+</code></pre>
+<p>When I open it, I get a warning:</p>
+<pre><code>
+18:05:45 SQL&gt; alter pluggable database PDB6 open;
+ORA-24344: success with compilation error
+24344. 00000 -  "success with compilation error"
+*Cause:    A sql/plsql compilation error occurred.
+*Action:   Return OCI_SUCCESS_WITH_INFO along with the error code
+&nbsp;
+Pluggable database PDB6 altered.
+</code></pre>
+<p>The PDB is opened in restricted mode and then I have to import the wallet:</p>
+<pre><code>
+SQL&gt; show pdbs
+&nbsp;
+  CON_ID CON_NAME   OPEN MODE    RESTRICTED
+  ------ --------   ---- ----    ----------
+       2 PDB$SEED   READ ONLY    NO
+       6 PDB6       READ WRITE   YES
+&nbsp;
+SQL&gt; select name,cause,type,status,message,action from pdb_plug_in_violations;
+&nbsp;
+NAME   CAUSE                   TYPE      STATUS     MESSAGE                                 ACTION
+----   -----                   ----      ------     -------                                 ------
+PDB6   Wallet Key Needed       ERROR     PENDING    PDB needs to import keys from source.   Import keys from source.
+</code></pre>
+<p>Then I open the destination CDB wallet and import the PDB keys into it:</p>
+<pre><code>
+SQL&gt; alter session set container=PDB6;
+Session altered.
+&nbsp;
+SQL&gt; administer key management set keystore open identified by "k3yCDB2";
+Key MANAGEMENT succeeded.
+&nbsp;
+SQL&gt; administer key management
+  2   import encryption keys with secret "this is my secret password for the export"
+  3   from '/var/tmp/PDB6.p12'
+  4   identified by "k3yCDB2"
+  5   with backup
+  6  /
+&nbsp;
+Key MANAGEMENT succeeded.
+</code></pre>
+<p>Now the PDB can be opened for all sessions</p>
+<pre><code>
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+&nbsp;
+SQL&gt; alter pluggable database PDB6 close;
+Pluggable database PDB6 altered.
+&nbsp;
+SQL&gt; alter pluggable database PDB6 open;
+Pluggable database PDB6 altered.
+</code></pre>
+<p>Here is a confirmation that the PDB has the same key as the in the origin CDB:</p>
+<pre><code>
+SQL&gt; select con_id,tag,substr(key_id,1,6)||'...' "KEY_ID...",creator,key_use,keystore_type,origin,creator_pdbname,activating_pdbname from v$encryption_keys;
+&nbsp;
+  CON_ID TAG    KEY_ID...   CREATOR   KEY_USE      KEYSTORE_TYPE       ORIGIN   CREATOR_PDBNAME   ACTIVATING_PDBNAME
+  ------ ---    ---------   -------   -------      -------------       ------   ---------------   ------------------
+       1 cdb2   AdTdo9...   SYS       TDE IN PDB   SOFTWARE KEYSTORE   LOCAL    CDB$ROOT          CDB$ROOT
+       4 pdb1   Adnhnu...   SYS       TDE IN PDB   SOFTWARE KEYSTORE   LOCAL    PDB6              PDB6
+</code></pre>
+
+</div>
+</body>
+</html>

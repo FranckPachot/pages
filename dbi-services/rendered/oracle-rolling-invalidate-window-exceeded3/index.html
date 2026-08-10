@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-rolling-invalidate-window-exceeded3/">
+<title>Oracle Rolling Invalidate Window Exceeded(3)</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-rolling-invalidate-window-exceeded3/">https://www.dbi-services.com/blog/oracle-rolling-invalidate-window-exceeded3/</a> (2021-02-24)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle Rolling Invalidate Window Exceeded(3)</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+This extends a previous post (<a href="https://www.dbi-services.com/blog/rolling-invalidate-window-exceeded/" target="_blank" rel="noopener">Rolling Invalidate Window Exceeded</a>) where, in summary, the ideas were:</p>
+<ul>
+<li>When you gather statistics, you want the new executions to take into account the new statistics, which means that the old execution plans (child cursors) should be invalidated</li>
+<li>You don&#8217;t want all child cursors to be immediately invalidated, to avoid an hard parse storm, and this is why this invalidation is rolling: a 5 hour window is defined, starting at the next execution (after the statistics gathering) and a random timestamp is set there where a newer execution will hard parse rather than sharing an existing cursor</li>
+<li>The &#8220;invalidation&#8221; term is misleading as it has nothing to do with the V$SQL.INVALIDATIONS wich is at parent cursor level. Here the existing plans are still valid. The &#8220;rolling invalidation&#8221; just make them non-shareable</li>
+</ul>
+<p>In this blog post I&#8217;ll share my query to show the timestamps involved:</p>
+<ul>
+<li>INVALIDATION_WINDOW which is the start of the invalidation (or rather the end of sharing of this cursor) for a future parse call</li>
+<li>KSUGCTM (Kernel Service User Get Current TiMe) which is the time when non-sharing occured and a new child cursor has been created (hard parse instead of soft parse)</li>
+</ul>
+<p>As usual, here is a simple example</p>
+<pre><code>
+alter system flush shared_pool;
+create table DEMO as select * from dual;
+insert into DEMO select * from dual;
+commit;
+alter system set "_optimizer_invalidation_period"=15 scope=memory;
+</code></pre>
+<p>I have created a demo table and set the invalidation to 15 seconds instead of the 5 hours default.</p>
+<pre><code>
+20:14:19 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+
+PL/SQL procedure successfully completed.
+
+20:14:19 SQL&gt; select * from dba_tab_stats_history where table_name='DEMO' order by stats_update_time;
+
+OWNER   TABLE_NAME   PARTITION_NAME   SUBPARTITION_NAME   STATS_UPDATE_TIME
+-----   ----------   --------------   -----------------   -----------------------------------
+DEMO    DEMO                                              23-FEB-21 08.14.19.698111000 PM GMT
+
+1 row selected.
+</code></pre>
+<p>I&#8217;ve gathered the statistics at 20:14:19 but there are no cursor yet to invalidate.</p>
+<pre><code>
+20:14:20 SQL&gt; host sleep 30
+
+20:14:50 SQL&gt; select * from DEMO;
+
+DUMMY
+-----
+X
+
+1 row selected.
+
+20:14:50 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='0m8kbvzchkytt';
+
+  CHILD_NUMBER REASON
+-------------- --------------------------------------------------------------------------------
+             0
+
+1 row selected.
+</code></pre>
+<p>I have executed my statement which created the child parent and, of course, no invalidation yet.</p>
+<pre><code>
+20:14:50 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+
+PL/SQL procedure successfully completed.
+
+20:14:50 SQL&gt; select * from dba_tab_stats_history where table_name='DEMO' order by stats_update_time;
+
+OWNER   TABLE_NAME   PARTITION_NAME   SUBPARTITION_NAME   STATS_UPDATE_TIME
+-----   ----------   --------------   -----------------   -----------------------------------
+DEMO    DEMO                                              23-FEB-21 08.14.19.698111000 PM GMT
+DEMO    DEMO                                              23-FEB-21 08.14.50.270984000 PM GMT
+
+2 rows selected.
+
+20:14:50 SQL&gt; host sleep 30
+
+20:15:20 SQL&gt; select * from DEMO;
+
+DUMMY
+-----
+X
+
+
+1 row selected.
+
+20:15:20 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='0m8kbvzchkytt';
+
+  CHILD_NUMBER REASON
+-------------- --------------------------------------------------------------------------------
+             0
+
+1 row selected.
+</code></pre>
+<p>I have gathered statistics and ran my statement again. There&#8217;s no invalidation yet because the invalidation window starts only at next parse or execution that occurs after statistics gathering. This next execution occured after 20:15:20 and sets the start of the invalidation window. But for the moment, the same child is still shared.</p>
+<pre><code>
+20:15:20 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+
+PL/SQL procedure successfully completed.
+
+20:15:20 SQL&gt; select * from dba_tab_stats_history where table_name='DEMO' order by stats_update_time;
+
+OWNER   TABLE_NAME   PARTITION_NAME   SUBPARTITION_NAME   STATS_UPDATE_TIME
+-----   ----------   --------------   -----------------   -----------------------------------
+DEMO    DEMO                                              23-FEB-21 08.14.19.698111000 PM GMT
+DEMO    DEMO                                              23-FEB-21 08.14.50.270984000 PM GMT
+DEMO    DEMO                                              23-FEB-21 08.15.20.476025000 PM GMT
+
+
+3 rows selected.
+
+20:15:20 SQL&gt; host sleep 30
+
+20:15:50 SQL&gt; select * from DEMO;
+
+DUMMY
+-----
+X
+
+1 row selected.
+
+20:15:50 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='0m8kbvzchkytt';
+
+  CHILD_NUMBER REASON
+-------------- --------------------------------------------------------------------------------
+             0 &lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Window Exceeded(2)&lt;/reason&gt;&lt;size&gt;0x0&lt;/size&gt;&lt;details&gt;already_processed&lt;/details&gt;&lt;/ChildNode&gt;&lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Window Exceeded(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;invalidation_window&gt;1614111334&lt;/invalidation_window&gt;&lt;ksugctm&gt;1614111350&lt;/ksugctm&gt;&lt;/ChildNode&gt;
+             1
+
+2 rows selected.
+
+</code></pre>
+<p>I&#8217;ve gathered the statistics again, but what matters here is that I&#8217;ve run my statement now that the invalidation window has been set (by the previous execution from 20:15:20), and has been reached (I waited 30 seconds which is more than the 15 second window I&#8217;ve defined), and then this new execution set the cursor as non-shareable , for &#8220;Rolling Invalidate Window Exceeded(3)&#8221; reason, and has created a new child cursor.</p>
+<pre><code>20:15:50 SQL&gt; select child_number,invalidations,parse_calls,executions,cast(last_active_time as timestamp) last_active_time
+    ,timestamp '1970-01-01 00:00:00'+numtodsinterval(to_number(regexp_replace(reason,'.*.invalidation_window&gt;([0-9]*)./invalidation_window&gt;.ksugctm&gt;([0-9]*).*','1')),'second') invalidation_window
+    ,timestamp '1970-01-01 00:00:00'+numtodsinterval(to_number(regexp_replace(reason,'.*([0-9]*)./invalidation_window&gt;.ksugctm&gt;([0-9]*)./ksugctm&gt;.*','2')),'second') ksugctm
+    from v$sql_shared_cursor left outer join v$sql using(sql_id,child_number,address,child_address)
+    where reason like '%Rolling Invalidate Window Exceeded(3)%' and sql_id='0m8kbvzchkytt'
+    order by sql_id,child_number,invalidation_window desc
+    ;
+
+  CHILD_NUMBER   INVALIDATIONS   PARSE_CALLS   EXECUTIONS LAST_ACTIVE_TIME                  INVALIDATION_WINDOW               KSUGCTM
+--------------   -------------   -----------   ---------- -------------------------------   -------------------------------   ----------------------------
+
+             0               0             3            2 23-FEB-21 08.15.50.000000000 PM   23-FEB-21 08.15.34.000000000 PM   23-FEB-21 08.15.50.000000000 PM
+
+1 row selected.</code></pre>
+<p>So at 20:15:20 the invalidation has been set (but not exposed yet) at random within the next 15 seconds (because I changed the 5 hours default) and it is now visible as INVALIDATION_WINDOW: 20:15:34 and then the next execution after this timestamp has created a new child at 21:15:50 which is visible by KSUGCTM but also in LAST_ACTIVE_TIME (even if this child cursor has not been executed, just updated).</p>
+<p>The important thing is that those child cursors will not be used again but are still there, increasing the length of the list of child cursors that is read when parsing a new statement with the same SQL text. And this can go up to 8192 if you&#8217;ve left the default &#8220;_cursor_obsolete_threshold&#8221; (which is recommended to lower &#8211; see Mike Dietrich <a href="https://mikedietrichde.com/2018/09/11/oracle-12-2-and-higher-set-_cursor_obsolete_threshold-to-old-default/" target="_blank" rel="noopener">blog post</a>)</p>
+<p>And this also means that you should not gather statistics too often and this is why GATHER AUTO is the default option. You may lower the STALE_PERCENT for some tables (if very large with few changes, it may not be gathered othen enough) but gathering stats from a table everyday, even if small, has bad effect on cursor versions.</p>
+<pre><code>
+SQL&gt; alter session set nls_timestamp_format='dd-mon hh24:mi:ss';
+SQL&gt;
+
+select sql_id,child_number,ksugctm,invalidation_window
+    ,(select cast(max(stats_update_time) as timestamp) from v$object_dependency
+      join dba_tab_stats_history on to_owner=owner and to_name=table_name and to_type=2
+      where from_address=address and from_hash=hash_value and stats_update_time ([0-9]*)./invalidation_window&gt;.ksugctm&gt;([0-9]*).*','1')),'second') invalidation_window
+    ,timestamp '1970-01-01 00:00:00'+numtodsinterval(to_number(regexp_replace(reason,'.*([0-9]*)./invalidation_window&gt;.ksugctm&gt;([0-9]*)./ksugctm&gt;.*','2')),'second') ksugctm
+    from v$sql_shared_cursor left outer join v$sql using(sql_id,child_number,address,child_address)
+    where reason like '%Rolling Invalidate Window Exceeded(3)%' --and sql_id='0m8kbvzchkytt'
+    ) order by sql_id,child_number,invalidation_window desc;
+
+SQL_ID            CHILD_NUMBER KSUGCTM           INVALIDATION_WINDOW   LAST_ANALYZE
+-------------     ------------ ---------------   -------------------   ----------------------------------
+04kug40zbu4dm                2 23-feb 06:01:23   23-feb 06:01:04
+0m8kbvzchkytt                0 23-feb 21:34:47   23-feb 21:34:25       23-FEB-21 09.34.18.582833000 PM GMT
+0m8kbvzchkytt                1 23-feb 21:35:48   23-feb 21:35:23       23-FEB-21 09.35.18.995779000 PM GMT
+0m8kbvzchkytt                2 23-feb 21:36:48   23-feb 21:36:22       23-FEB-21 09.36.19.305025000 PM GMT
+0m8kbvzchkytt                3 23-feb 21:37:49   23-feb 21:37:32       23-FEB-21 09.37.19.681986000 PM GMT
+0m8kbvzchkytt                4 23-feb 21:38:50   23-feb 21:38:26       23-FEB-21 09.38.20.035265000 PM GMT
+0m8kbvzchkytt                5 23-feb 21:39:50   23-feb 21:39:32       23-FEB-21 09.39.20.319662000 PM GMT
+0m8kbvzchkytt                6 23-feb 21:40:50   23-feb 21:40:29       23-FEB-21 09.40.20.617857000 PM GMT
+0m8kbvzchkytt                7 23-feb 21:41:50   23-feb 21:41:28       23-FEB-21 09.41.20.924223000 PM GMT
+0m8kbvzchkytt                8 23-feb 21:42:51   23-feb 21:42:22       23-FEB-21 09.42.21.356828000 PM GMT
+0m8kbvzchkytt                9 23-feb 21:43:51   23-feb 21:43:25       23-FEB-21 09.43.21.690408000 PM GMT
+0sbbcuruzd66f                2 23-feb 06:00:46   23-feb 06:00:45
+0yn07bvqs30qj                0 23-feb 01:01:09   23-feb 00:18:02
+121ffmrc95v7g                3 23-feb 06:00:35   23-feb 06:00:34</code></pre>
+<p>This query joins with the statistics history in order to get an idea of the root cause of the invalidation. I look at the cursor dependencies, and the table statistics. This may be customized with partitions, index names,&#8230;</p>
+<p>The core message here is that gathering statistics on a table will make the cursors unshareable. If you have, say 10 versions because of multiple NLS settings et bind variable length,&#8230; and gather the statistics every day, the list of child cursor will increase until reaching the obsolete threshold. And when the list is long, you will have more pressure on library cache during attempts to soft parse. If you gather statistics without the automatic job, and do it without &#8216;GATHER AUTO&#8217;, even on small tables where gathering is fast, you increase the number of cursor versions without a reason. The best practice for statistics gathering is keeping the AUTO settings. The query above may help to see the correlation between statistics gathering and rolling invalidation.</p>
+
+</div>
+</body>
+</html>

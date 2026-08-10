@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/investigating-oracle-lock-issues-with-event-10704/">
+<title>Investigating Oracle lock issues with event 10704</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/investigating-oracle-lock-issues-with-event-10704/">https://www.dbi-services.com/blog/investigating-oracle-lock-issues-with-event-10704/</a> (2014-03-14)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Investigating Oracle lock issues with event 10704</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Did you ever encounter unexplained Oracle lock issues? They may be coming from unindexed foreign keys (which is worse in 11g). It&#8217;s not easy to monitor. Of course you can check Oracle locks from V$LOCKED_OBJECT, but that is a solution only for locks that remain. Some Oracle locks are there only for a short duration. How do you check which lock is acquired by a statement?</p>
+<p>Event 10704 is the solution. I&#8217;ll show some examples in order to explain which lines from the trace are interresting, and how to interpret them.</p>
+<p>In this posting, I&#8217;ll illustrate how to use event 10704 to understand locking on referential integrity (the well know index on foreign key issue) in 12c.</p>
+<p>I set the trace (10704 level 3 for the locks, 10046 to see the statements):</p>
+<pre><code>SQL&gt; alter session set events='10046 trace name context forever, level 1 : 10704 trace name context forever, level 3' tracefile_identifier='ForeignKey';
+Session altered.</code></pre>
+<p>I delete from the DEPT table:</p>
+<pre><code>SQL&gt; DELETE FROM SCOTT.DEPT WHERE DEPTNO=0;
+0 rows deleted.</code></pre>
+<p>and then terminate the transaction:</p>
+<pre><code>SQL&gt; ROLLBACK;
+Rollback complete.</code></pre>
+<p>and stop the trace:</p>
+<pre><code>SQL&gt; alter session set events='10046 trace name context off : 10704 trace name context off ';
+Session altered.</code></pre>
+<p>Now let&#8217;s get the trace file name:</p>
+<pre><code>SQL&gt; column tracefile new_value tracefile
+SQL&gt; select tracefile from v$process where addr=(select paddr from v$session where sid=sys_context('USERENV','SID'));
+
+TRACEFILE
+--------------------------------------------------------------------------------
+/u01/app/oracle/diag/rdbms/demo/DEMO/trace/DEMO_ora_28042_ForeignKey.trc</code></pre>
+<p>and grep the interresting lines from the trace file:</p>
+<pre><code>SQL&gt; host grep -A 1 -E 'ksqgtl [*]{3}|ksqrcl: [A-Z]|ksqcnv: [A-Z]|XCTEND|PARSE ERROR|PARSING' &amp;tracefile</code></pre>
+<p>The output is:</p>
+<pre><code>--
+PARSING IN CURSOR #140064855052048 len=37 dep=0 uid=0 oct=7 lid=0 tim=294484898588 hv=3450586461 ad='822782c8' sqlid='c1fnpd76urjax'
+DELETE FROM SCOTT.DEPT WHERE DEPTNO=0
+--
+ksqgtl *** TM-00017EA8-00000000-00000000-00000000 mode=3 flags=0x401 timeout=21474836 ***
+ksqgtl: xcb=0x8eb5bcf8, ktcdix=2147483647, topxcb=0x8eb5bcf8
+--
+ksqgtl *** TM-00017EAA-00000000-00000000-00000000 mode=4 flags=0x401 timeout=21474836 ***
+ksqgtl: xcb=0x8eb5bcf8, ktcdix=2147483647, topxcb=0x8eb5bcf8
+--
+ksqrcl: TM-00017EAA-00000000-00000000-00000000
+ksqcmi: TM-00017EAA-00000000-00000000-00000000 mode=0 timeout=0
+--
+PARSING IN CURSOR #140064855052048 len=8 dep=0 uid=0 oct=45 lid=0 tim=294484900906 hv=2761672982 ad='0' sqlid='8sst43uk9rk8q'
+ROLLBACK
+--
+XCTEND rlbk=1, rd_only=1, tim=294484900964
+ksqrcl: TM-00017EA8-00000000-00000000-00000000
+ksqcmi: TM-00017EA8-00000000-00000000-00000000 mode=0 timeout=0
+--</code></pre>
+<p>In order to interpret it, we need one more information &#8211; the OBJECT_ID in hexadecimal:</p>
+<pre><code>SQL&gt; column object_name format a20
+SQL&gt; column object_type format a20
+SQL&gt; select object_id , to_char(object_id,'0XXXXXXX') , object_name,object_type from all_objects where owner='SCOTT' order by 2;
+
+ OBJECT_ID  TO_CHAR(O OBJECT_NAME          OBJECT_TYPE
+---------- --------- -------------------- --------------------
+ 97960      00017EA8  DEPT                 TABLE
+ 97961      00017EA9  PK_DEPT              INDEX
+ 97962      00017EAA  EMP                  TABLE
+ 97963      00017EAB  PK_EMP               INDEX
+ 97964      00017EAC  BONUS                TABLE
+ 97965      00017EAD  SALGRADE             TABLE
+
+7 rows selected.</code></pre>
+<p>Great. Now let&#8217;s interpret that.<br />
+You see the DELETE statement in the trace file (written by event 10046 which is the sql_trace). Then we have:</p>
+<div style="text-align: left"><samp>  ksqgtl *** TM-00017EA8-00000000-00000000-00000000 mode=3</samp></div>
+<p>&#8230;which means we get lock (ksqgtl) on table (lock_type=TM) SCOTT.DEPT (object_id=17EA8) in mode Row-X (mode=3).<br />
+This is expected as we have the intention to delete rows, thus we request Row-X lock on the table.<br />
+And next to it you see:</p>
+<div style="text-align: left"><samp>  TM-00017EAA-00000000-00000000-00000000 mode=4</samp></div>
+<p>which is a table lock on SCOTT.EMP (object_id=17EAA) in Share mode (mode=4) &#8211; the child lock that we see since 8.1.7 when the foreign key is not indexed.<br />
+That lock is released immediately (which is the behaviour since 9.2) after the delete:</p>
+<div style="text-align: left"><samp style="color: #000000;font-style: normal;font-variant: normal;font-weight: normal;letter-spacing: normal;line-height: normal;text-indent: 0px">ksqrcl: TM-00017EAA-00000000-00000000-00000000</samp></div>
+<p>ksqrcl is the function that releases lock. That is done before the end of the transaction (XCTEND from sql_trace).<br />
+And the Row-X on DEPT is released once the transaction is ended:</p>
+<div style="text-align: left"><samp style="color: #000000;font-style: normal;font-variant: normal;font-weight: normal;letter-spacing: normal;line-height: normal;text-indent: 0px">ksqrcl: TM-00017EA8-00000000-00000000-00000000</samp></div>
+<p>If we create a index in order to avoid the Share mode lock:</p>
+<pre><code>SQL&gt; CREATE INDEX SCOTT.FK_DEPTNO on SCOTT.EMP(DEPTNO);
+Index created.SQL&gt; DELETE FROM SCOTT.DEPT WHERE DEPTNO=0;
+0 rows deleted.
+SQL&gt; ROLLBACK;
+Rollback complete.</code></pre>
+<p>&#8230;then here is what we get from the 10704 trace:</p>
+<p><samp>ksqgtl *** TM-00017EAA-00000000-00000000-00000000 mode=4 flags=0x401 timeout=0 ***</samp></p>
+<p>This is the Share mode lock on the table when creating the index.<br />
+This is what a delete on the parent generates:</p>
+<pre><code>ksqgtl *** TM-00017EA8-00000000-00000000-00000000 mode=3 flags=0x401 timeout=21474836 ***
+ksqgtl *** TM-00017EAA-00000000-00000000-00000000 mode=3 flags=0x401 timeout=21474836 ***
+XCTEND rlbk=1, rd_only=1, tim=294485532138
+ksqrcl: TM-00017EAA-00000000-00000000-00000000
+ksqrcl: TM-00017EA8-00000000-00000000-00000000</code></pre>
+<p>&#8230;which are only Row-X (mode=3) locks, but are released only at the end of the transaction.</p>
+<p>And besides requesting a lock (ksqgtl) and releasing a lock (ksqrcl), the third interresting function is when a lock is converted (ksqcnv) from one mode to another mode.</p>
+<p>Let&#8217;s see an exemple when we first delete rows from the child  (without the index on the foreign key):</p>
+<pre><code>SQL&gt; DELETE FROM SCOTT.EMP WHERE DEPTNO=0
+ksqgtl *** TM-00017EA8-00000000-00000000-00000000 mode=2 flags=0x401 timeout=21474836 ***
+ksqgtl *** TM-00017EAA-00000000-00000000-00000000 mode=3 flags=0x401 timeout=21474836 ***</code></pre>
+<p>DML on EMP (object_id=17EAA) requests a Row-X and because of the referential integrity it request also a Row-S on the opposite side DEPT (object_id=17EA8)</p>
+<p>Note that I did this example on 12c. That behaviour has changed in each Oracle version (and you can use event 10704 on your version in order to check on yours). Basically it was Row-S before 11g. Then 11g changed it to Row-X which introduced a lot of issues (see <a href="http://hoopercharles.wordpress.com/2010/01/07/deadlock-on-oracle-11g-but-not-on-10g/" target="_blank" rel="noopener noreferrer">here</a> and <a href="http://jonathanlewis.wordpress.com/2010/02/15/lock-horror/" target="_blank" rel="noopener noreferrer">here</a> for example). Fortunately 12c get it back to Row-S for two situations: insert into parent and delete from child.</p>
+<pre><code>SQL&gt; DELETE FROM SCOTT.DEPT WHERE DEPTNO=0
+ksqcnv: TM-00017EA8-00000000-00000000-00000000 mode=3 timeout=21474836
+ksqcnv: TM-00017EAA-00000000-00000000-00000000 mode=5 timeout=21474836
+ksqcnv: TM-00017EAA-00000000-00000000-00000000 mode=3 timeout=21474836</code></pre>
+<p>Here we see the lock conversions. On DEPT (object_id=17EA8) we had a Row-S (mode=2) and now requesting a Row-X (mode=3) because of the DML on it.<br />
+And because of the unindexed foreign key we temporarily need a Share lock in addition to the Row-X we had. This is Share Row-X (mode=5). And it is converted back to Row-X as soon as the delete is done.</p>
+<p>So remember the following in order to interpret the 10704 trace dump:</p>
+<ul>
+<li>ksqgtl: lock request</li>
+<li>ksqcnv: lock conversion</li>
+<li>ksqrrcl: lock release</li>
+</ul>
+<p>For more reference, you can get the lock type description, such as TM , from V$LOCK_TYPE:</p>
+<pre><code>SQL&gt; select * from v$lock_type where type='TM';</code></pre>
+<table style="width: 90%" border="0" summary="Script output" align="center">
+<tbody>
+<tr>
+<th scope="col"><samp>TYPE </samp></th>
+<th scope="col"><samp>NAME</samp></th>
+<th scope="col"><samp>ID1_TAG</samp></th>
+<th scope="col"><samp>ID2_TAG</samp></th>
+<th scope="col"><samp>IS_</samp></th>
+<th scope="col"><samp>IS_</samp></th>
+<th scope="col"><samp>DESCRIPTION</samp></th>
+<th scope="col"><samp>CON_ID</samp></th>
+</tr>
+<tr>
+<td><samp>TM</samp></td>
+<td><samp>DML</samp></td>
+<td><samp>object #</samp></td>
+<td><samp>table/partition</samp></td>
+<td><samp>YES</samp></td>
+<td><samp>NO</samp></td>
+<td><samp>Synchronizes accesses to an object</samp></td>
+<td align="right"><samp>0</samp></td>
+</tr>
+</tbody>
+</table>
+<p>And when ID1 is an object# then the first hexadecimal is the OBJECT_ID from DBA_OBJECTS.<br />
+About the lock modes, you have the intended row locks which have the goal to block concurrent DDL:</p>
+<p>mode=2 is Row-S, mode=3 is Row-X<br />
+and the table locks which have the goal to prevent concurrent row locks :<br />
+mode=4 is Share, mode=5 is Row-X + Share, mode=6 is eXclusive.</p>
+<p>You can also check the blocking matrix:</p>
+<p><a class="easyblog-thumb-preview" title="CaptureLockMatrix.PNG" href="http://prezi.com/cdckwsgqxeyi/oracle-table-lock-modes/"><img decoding="async" style="margin-left: auto;margin-right: auto" title="CaptureLockMatrix.PNG" src="../../assets/CaptureLockMatrix.png" alt="CaptureLockMatrix.PNG" width="50%" height="50%" /></a></p>
+<p style="text-align: center"><a href="http://prezi.com/cdckwsgqxeyi/oracle-table-lock-modes/">http://prezi.com/cdckwsgqxeyi/oracle-table-lock-modes/</a></p>
+
+</div>
+</body>
+</html>

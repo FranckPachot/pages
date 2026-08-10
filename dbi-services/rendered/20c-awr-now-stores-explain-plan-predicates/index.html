@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/20c-awr-now-stores-explain-plan-predicates/">
+<title>20c: AWR now stores explain plan predicates</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/20c-awr-now-stores-explain-plan-predicates/">https://www.dbi-services.com/blog/20c-awr-now-stores-explain-plan-predicates/</a> (2020-05-13)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">20c: AWR now stores explain plan predicates</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In a previous post <a href="https://www.dbi-services.com/blog/awr-dont-store-explain-plan-predicates/" rel="noopener noreferrer" target="_blank">https://www.dbi-services.com/blog/awr-dont-store-explain-plan-predicates/</a> I explained this limitation in gathering filter and access predicates by Statspack and then AWR because of old bugs about reverse parsing of predicates. Oracle listens to its customers through support (enhancement requests), though the community (votes on database ideas), and through the product managers who participate in User Groups and ACE program. And here it is: in 20c the predicates are collected by AWS and visible with DBMS_XPLAN and AWRSQRPT reports.</p>
+<p>I&#8217;ll test with a very simple query on the 20c preview available in the Oracle Cloud DBaaS:</p>
+<pre><code>
+set feedback on sql_id echo on pagesize 1000
+
+SQL&gt; select * from dual where ascii(dummy)=42;
+
+no rows selected
+
+SQL_ID: g4gx2zqbkjwh1
+</code></pre>
+<p>I used the &#8220;FEEDBACK ON SQL&#8221; feature to get the SQL_ID.</p>
+<p>Because this query is fast, it will not be gathered by AWR except if I &#8216;color&#8217; it:</p>
+<pre><code>
+SQL&gt; exec dbms_workload_repository.add_colored_sql('g4gx2zqbkjwh1');
+
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>Coloring a statement is the AWR feature to use when you want to get a statement always gathered, for example when you have optimized it and want compare the statistics.</p>
+<p>Now running the statement between two snapshots:</p>
+<pre><code>
+SQL&gt; exec dbms_workload_repository.create_snapshot;
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from dual where ascii(dummy)=42;
+
+no rows selected
+
+SQL&gt; exec dbms_workload_repository.create_snapshot;
+
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>Here, I&#8217;m sure it has been gathered.</p>
+<p>Now checking the execution plan:</p>
+<pre><code>
+SQL&gt; select * from dbms_xplan.display_awr('g4gx2zqbkjwh1');
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+SQL_ID g4gx2zqbkjwh1
+--------------------
+select * from dual where ascii(dummy)=42
+
+Plan hash value: 272002086
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     2 (100)|          |
+|*  1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter(ASCII("DUMMY")=42)
+
+
+18 rows selected.
+</code></pre>
+<p>Here I have the predicate. This is a silly example but the predicate information is very important when looking at a large execution plan trying to understand the cardinality estimation or the reason why an index is not used.</p>
+<p>Of course, this is also visible from the ?/rdbms/admin/awrsqrpt report:<br />
+<a href="../../assets/Annotation-2020-05-12-205338.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-05-12-205338.jpg" alt="" width="1024" height="720" class="aligncenter size-large wp-image-39666" /></a></p>
+<h3>What if you upgrade?</h3>
+<p>AWR gathers the SQL Plan only when it is not already there. Then, when we will update to 20c only the new plans will get the predicates. Here is an example where I simulate the pre-20c behaviour with &#8220;_cursor_plan_unparse_enabled&#8221;=false:</p>
+<pre><code>
+SQL&gt; alter session set "_cursor_plan_unparse_enabled"=false;
+
+Session altered.
+
+SQL&gt; exec dbms_workload_repository.add_colored_sql('g4gx2zqbkjwh1');
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; exec dbms_workload_repository.create_snapshot;
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from dual where ascii(dummy)=42;
+
+no rows selected
+
+SQL&gt; exec dbms_workload_repository.create_snapshot;
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from dbms_xplan.display_awr('g4gx2zqbkjwh1');
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+SQL_ID g4gx2zqbkjwh1
+--------------------
+select * from dual where ascii(dummy)=42
+
+Plan hash value: 272002086
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+13 rows selected.
+</code></pre>
+<p>No predicate here. Even If I re-connect to reset the &#8220;_cursor_plan_unparse_enabled&#8221;:</p>
+<pre><code>
+SQL&gt; connect / as sysdba
+Connected.
+SQL&gt; exec dbms_workload_repository.create_snapshot;
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from dual where ascii(dummy)=42;
+
+no rows selected
+
+SQL&gt; exec dbms_workload_repository.create_snapshot;
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select * from dbms_xplan.display_awr('g4gx2zqbkjwh1');
+
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------------
+SQL_ID g4gx2zqbkjwh1
+--------------------
+select * from dual where ascii(dummy)=42
+
+Plan hash value: 272002086
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+13 rows selected.
+</code></pre>
+<p>This will be the situation after upgrade.</p>
+<p>If you want to re-gather all sql_plans, you need to purge the AWR repository:</p>
+<pre><code>
+SQL&gt; execute dbms_workload_repository.drop_snapshot_range(1,1e22);
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; execute dbms_workload_repository.purge_sql_details();
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; commit;
+
+</code></pre>
+<p>This clears everything, so I do not recommend to do that at the same time as the upgrade as you may like to compare some performance with the past. Anyway, we have time and maybe this fix will be backported in 19c.</p>
+<p>There are very small chances that fix is ported to Statspack, but you can do it yourself as I mentioned in <a href="http://viewer.zmags.com/publication/dd9ed62b#/dd9ed62b/36" rel="noopener noreferrer" target="_blank">http://viewer.zmags.com/publication/dd9ed62b#/dd9ed62b/36</a> (&#8220;on Improving Statspack Experience&#8221;) with something like:</p>
+<pre><code>
+sed -i -e 's/ 0 -- should be//' -e 's/[(]2254299[)]/--&amp;/' $ORACLE_HOME/rdbms/admin/spcpkg.sql
+</code></pre>
+
+</div>
+</body>
+</html>

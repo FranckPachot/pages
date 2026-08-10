@@ -1,0 +1,722 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12cr2-real-time-materialized-view-on-query-computation/">
+<title>12cR2 real-time materialized view (on query computation)</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12cr2-real-time-materialized-view-on-query-computation/">https://www.dbi-services.com/blog/12cr2-real-time-materialized-view-on-query-computation/</a> (2017-02-17)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12cR2 real-time materialized view (on query computation)</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Materialized views is a very old feature (you may remember that it was called snapshots a long time ago). It has all advantages of a view, as you can define any select statement that joins, filters, aggregates, and see it as one table. It has all advantages of a table, as it is stored in one segment, can be indexed, partitioned, have constraints, be compressed, etc. It looks like indexes as it stores data redundantly, in a different physical way, more focused on the way it will be queried rather than on the way data is entered. Like indexes, they can be used transparently (with query rewrite) but unlike indexes, they are not maintained synchronously but have to be refreshed. It has some advantages of replication because it can capture the changes done on source tables, into materialized view logs, so that refresh can be incremental (fast refresh).<br />
+Oracle Database 12.2 goes a step further being able to deliver fresh result even when the materialized is stale. This is an amazing feature called real-time materialized view, that does on-query computation of fresh result from the stale one, joined with the materialized view log.<br />
+<!--more--><br />
+I create my DEMO table on Oracle Exdata Express Cloud Service</p>
+<pre><code>
+SQL&gt; create table DEMO (id primary key,a,b) as select rownum,round(log(10,rownum)) a, rownum b from xmltable('1 to 100000');
+Table created.
+</code></pre>
+<p>I plan to create a materialized view to aggregate the count and sum of B grouped by A. And DBMS_MVIEW can tell me what I need to be able to fast refresh it.</p>
+<h3>Explain Materialized View</h3>
+<p>The goal is to have real-time materialized view with frequent refreshes, which means that we need fast refresh to be possible after any kind of modification.</p>
+<pre><code>
+SQL&gt; exec dbms_mview.explain_mview('select a,count(b),sum(b),count(*) from DEMO group by a');
+PL/SQL procedure successfully completed.
+&nbsp;
+SQL&gt; select distinct capability_name||' '||msgtxt||' '||related_text from mv_capabilities_table where capability_name like 'REFRESH_FAST%' and possible='N';
+&nbsp;
+CAPABILITY_NAME||''||MSGTXT||''||RELATED_TEXT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+REFRESH_FAST_AFTER_ONETAB_DML COUNT(*) is not present in the select list
+REFRESH_FAST
+REFRESH_FAST_AFTER_INSERT the detail table does not have a materialized view log PDB_ADMIN.DEMO
+REFRESH_FAST_AFTER_ANY_DML see the reason why REFRESH_FAST_AFTER_ONETAB_DML is disabled
+REFRESH_FAST_PCT PCT is not possible on any of the detail tables in the materialized view
+REFRESH_FAST_AFTER_ONETAB_DML see the reason why REFRESH_FAST_AFTER_INSERT is disabled
+</code></pre>
+<p>Here is what I have to do in order to have a materialized view that can be fast refreshed: COUNT(*) in the select, and create a materialized view log.</p>
+<h3>Materialized view log</h3>
+<pre><code>
+SQL&gt; create materialized view log on DEMO;
+Materialized view log created.
+</code></pre>
+<p>Let&#8217;s check if it is ok now, with he additional count(*):</p>
+<pre><code>
+SQL&gt; delete from mv_capabilities_table;
+15 rows deleted.
+&nbsp;
+SQL&gt; exec dbms_mview.explain_mview('select a,count(b),sum(b),count(*) from DEMO group by a');
+PL/SQL procedure successfully completed.
+&nbsp;
+SQL&gt; select distinct capability_name||' '||msgtxt||' '||related_text from mv_capabilities_table where capability_name like 'REFRESH_FAST%' and possible='N';
+&nbsp;
+CAPABILITY_NAME||''||MSGTXT||''||RELATED_TEXT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+REFRESH_FAST
+REFRESH_FAST_AFTER_ANY_DML see the reason why REFRESH_FAST_AFTER_ONETAB_DML is disabled
+REFRESH_FAST_AFTER_INSERT mv log must have ROWID PDB_ADMIN.DEMO
+REFRESH_FAST_AFTER_INSERT mv log must have new values PDB_ADMIN.DEMO
+REFRESH_FAST_AFTER_INSERT mv log does not have all necessary columns PDB_ADMIN.DEMO
+REFRESH_FAST_PCT PCT is not possible on any of the detail tables in the materialized view
+REFRESH_FAST_AFTER_ONETAB_DML see the reason why REFRESH_FAST_AFTER_INSERT is disabled
+</code></pre>
+<p>I must add ROWID, used columns and NEW VALUES</p>
+<pre><code>
+SQL&gt; drop materialized view log on DEMO;
+Materialized view log dropped.
+&nbsp;
+SQL&gt; create materialized view log on DEMO with sequence, rowid (a,b) including new values;
+Materialized view log created.
+</code></pre>
+<p>You can see that I&#8217;ve added the sequence, that was not mentioned by the explain_mview. I&#8217;ll come back on that later and probably in another post.</p>
+<pre><code>
+SQL&gt; delete from mv_capabilities_table;
+16 rows deleted.
+SQL&gt; exec dbms_mview.explain_mview('select a,count(b),sum(b),count(*) from DEMO group by a');
+PL/SQL procedure successfully completed.
+SQL&gt; select distinct capability_name||' '||msgtxt||' '||related_text from mv_capabilities_table where capability_name like 'REFRESH_FAST%' and possible='N';
+&nbsp;
+CAPABILITY_NAME||''||MSGTXT||''||RELATED_TEXT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+REFRESH_FAST_PCT PCT is not possible on any of the detail tables in the materialized view
+</code></pre>
+<p>Ok, now I&#8217;m ready to create the materialized view. The only remaining message is for partitioned tables.</p>
+<pre><code>
+SQL&gt; create materialized view DEMO_MV refresh fast on demand as select a,count(b),sum(b),count(*) from DEMO group by a;
+Materialized view created.
+</code></pre>
+<h3>Aggregate query on the source table</h3>
+<p>I&#8217;m running a simple query that can get its result from the source table or from the materialized view</p>
+<pre><code>
+SQL&gt; select sum(b) from DEMO where a=3;
+&nbsp;
+    SUM(B)
+----------
+   4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  brdc1qcbc2npk, child number 0
+-------------------------------------
+select sum(b) from DEMO where a=3
+&nbsp;
+Plan hash value: 2180342005
+&nbsp;
+---------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |      |      1 |        |      1 |00:00:00.01 |     262 |
+|   1 |  SORT AGGREGATE            |      |      1 |      1 |      1 |00:00:00.01 |     262 |
+|*  2 |   TABLE ACCESS STORAGE FULL| DEMO |      1 |  16667 |   2846 |00:00:00.01 |     262 |
+---------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("A"=3)
+       filter("A"=3)
+</code></pre>
+<p>The query has read the source table. I need to enable query rewrite to get the CBO transparently transforming to a query on the materialized view.</p>
+<h3>Query Rewrite</h3>
+<pre><code>
+SQL&gt; alter materialized view DEMO_MV enable query rewrite;
+Materialized view altered.
+</code></pre>
+<p>I also need the query_rewrite_integrity to be set. It is by default:</p>
+<pre><code>
+SQL&gt; show parameter query_rewrite
+&nbsp;
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+query_rewrite_enabled                string      TRUE
+query_rewrite_integrity              string      enforced
+</code></pre>
+<p>Now, the rewrite can occur:</p>
+<pre><code>
+SQL&gt; select sum(b) from DEMO where a=3;
+&nbsp;
+    SUM(B)
+----------
+   4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  brdc1qcbc2npk, child number 0
+-------------------------------------
+select sum(b) from DEMO where a=3
+&nbsp;
+Plan hash value: 2792196921
+&nbsp;
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name    | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |         |      1 |        |      1 |00:00:00.01 |       9 |
+|   1 |  SORT AGGREGATE                       |         |      1 |      1 |      1 |00:00:00.01 |       9 |
+|*  2 |   MAT_VIEW REWRITE ACCESS STORAGE FULL| DEMO_MV |      1 |      1 |      1 |00:00:00.01 |       9 |
+-----------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("DEMO_MV"."A"=3)
+       filter("DEMO_MV"."A"=3)
+</code></pre>
+<p>This query is optimized: 9 blocks read from the materialized view instead of 262 ones from the source table.</p>
+<p>You can note that it&#8217;s not a new child cursor: the previous cursor has been invalidated when I altered the materialized view.</p>
+<p>This rewrite can occur only because the materialized view has been refreshed and the source table had no modifications on it.</p>
+<h3>Stale MVIEW</h3>
+<p>Let&#8217;s do some DML on the source table.</p>
+<pre><code>
+SQL&gt; insert into DEMO values(0,0,0);
+1 row created.
+</code></pre>
+<p>and query again</p>
+<pre><code>
+SQL&gt; select sum(b) from DEMO where a=3;
+&nbsp;
+    SUM(B)
+----------
+   4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  brdc1qcbc2npk, child number 1
+-------------------------------------
+select sum(b) from DEMO where a=3
+&nbsp;
+Plan hash value: 2180342005
+&nbsp;
+---------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |      |      1 |        |      1 |00:00:00.01 |     270 |
+|   1 |  SORT AGGREGATE            |      |      1 |      1 |      1 |00:00:00.01 |     270 |
+|*  2 |   TABLE ACCESS STORAGE FULL| DEMO |      1 |  16667 |   2846 |00:00:00.01 |     270 |
+---------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("A"=3)
+       filter("A"=3)
+</code></pre>
+<p>Now, the materialized view is stale. We cannot get the same result from it, so the rewrite didn&#8217;t happen.</p>
+<p>You can see that I have a new child cursor. The previous one cannot be shared because the previous one was only for non-stale materialized view.</p>
+<h3>Stale tolerated</h3>
+<p>If I want to keep using the materialized view, I have the option to accept stale results:</p>
+<pre><code>
+SQL&gt; alter session set query_rewrite_integrity=stale_tolerated;
+Session altered.
+</code></pre>
+<p>Now, the rewrite can occur even when the source table has changed since the last refresh.</p>
+<pre><code>
+SQL&gt; select sum(b) from DEMO where a=3;
+&nbsp;
+    SUM(B)
+----------
+   4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  brdc1qcbc2npk, child number 2
+-------------------------------------
+select sum(b) from DEMO where a=3
+&nbsp;
+Plan hash value: 2792196921
+&nbsp;
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name    | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |         |      1 |        |      1 |00:00:00.01 |       9 |
+|   1 |  SORT AGGREGATE                       |         |      1 |      1 |      1 |00:00:00.01 |       9 |
+|*  2 |   MAT_VIEW REWRITE ACCESS STORAGE FULL| DEMO_MV |      1 |      1 |      1 |00:00:00.01 |       9 |
+-----------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("DEMO_MV"."A"=3)
+       filter("DEMO_MV"."A"=3)
+</code></pre>
+<p>Of course, here you can&#8217;t see that the result is stale, because I inserted a row with value 0 which do not change the sum. Let&#8217;s do a count the rows, which is something that is also aggregated in my materialized view. I have the option to disable the rewrite and query the source table:</p>
+<pre><code>
+SQL&gt; select /*+ no_rewrite */ count(b) from DEMO;
+&nbsp;
+  COUNT(B)
+----------
+    100001
+</code></pre>
+<p>This is the accurate result, but with access to full table.</p>
+<p>The rewrite can also be forced by hint (because it is a cost decision)</p>
+<pre><code>
+SQL&gt; select /*+ rewrite */ count(b) from DEMO;
+&nbsp;
+  COUNT(B)
+----------
+    100000
+</code></pre>
+<p>Stale result here: I don&#8217;t see the latest modifications.</p>
+<h3>Frequent refresh</h3>
+<p>In order to limit the gap between fresh data and stale result, you can refresh the materialized view frequently. It&#8217;s not too expensive thanks to the materialized view log: fast refresh is incremental.</p>
+<p>Here I don&#8217;t want stale result:</p>
+<pre><code>
+SQL&gt; alter session set query_rewrite_integrity=enforced;
+Session altered.
+</code></pre>
+<p>and I refresh the materialized view</p>
+<pre><code>
+SQL&gt; exec dbms_mview.refresh('DEMO_MV','f');
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>Then I can expect, for the time until the next updates, to get results from he materialized view.</p>
+<pre><code>
+SQL&gt; select sum(b) from DEMO where a=3;
+&nbsp;
+    SUM(B)
+----------
+   4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  brdc1qcbc2npk, child number 1
+-------------------------------------
+select sum(b) from DEMO where a=3
+&nbsp;
+Plan hash value: 2180342005
+&nbsp;
+---------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |      |      1 |        |      1 |00:00:00.01 |     270 |
+|   1 |  SORT AGGREGATE            |      |      1 |      1 |      1 |00:00:00.01 |     270 |
+|*  2 |   TABLE ACCESS STORAGE FULL| DEMO |      1 |  16667 |   2846 |00:00:00.01 |     270 |
+---------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("A"=3)
+       filter("A"=3)
+</code></pre>
+<p>Unfortunately I re-used the same cursor here. When you refresh, the cursors are not invalidated.</p>
+<p>I&#8217;m running another statement now to get it parsed again:</p>
+<pre><code>
+SQL&gt; select sum(b) this_is_another_cursor from DEMO where a=3;
+&nbsp;
+THIS_IS_ANOTHER_CURSOR
+----------------------
+               4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  27xfg0qjcf7ff, child number 0
+-------------------------------------
+select sum(b) this_is_another_cursor from DEMO where a=3
+&nbsp;
+Plan hash value: 2792196921
+&nbsp;
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name    | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |         |      1 |        |      1 |00:00:00.01 |       9 |
+|   1 |  SORT AGGREGATE                       |         |      1 |      1 |      1 |00:00:00.01 |       9 |
+|*  2 |   MAT_VIEW REWRITE ACCESS STORAGE FULL| DEMO_MV |      1 |      1 |      1 |00:00:00.01 |       9 |
+-----------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("DEMO_MV"."A"=3)
+       filter("DEMO_MV"."A"=3)
+</code></pre>
+<p>So, we now read the materialized view but this will last only while there is no updates on the table. So the idea is to trigger a refresh as soon as there are modifications. Ideally it should be like indexes, which are maintained automatically. But indexes are much simple: it&#8217;s a simple value to rowid mapping entry to maintain. And rowids do not change. Materialized views have joins, aggregates and contains all columns.</p>
+<h3>Refresh on commit</h3>
+<p>So the idea is to defer the maintenance of the materialized view to commit time. This is the latest point where we are required to do it as we want other sessions to never see stale results. And materialized view logs are there to store the incremental changes even if the transaction is very long. Of course, we need to be aware of it because in general the commit is an immediate and simple operation.</p>
+<p>Let&#8217;s define the materialized view to refresh on commit instead of on-demand</p>
+<pre><code>
+SQL&gt; alter materialized view DEMO_MV refresh on commit;
+Materialized view altered.
+</code></pre>
+<p>I do some modifications</p>
+<pre><code>
+SQL&gt; delete from DEMO where id=0;
+1 row deleted.
+</code></pre>
+<p>And I run my query</p>
+<pre><code>
+SQL&gt; select sum(b) this_is_a_third_cursor from DEMO where a=3;
+&nbsp;
+THIS_IS_A_THIRD_CURSOR
+----------------------
+               4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  5dfs068dgbwvd, child number 0
+-------------------------------------
+select sum(b) this_is_a_third_cursor from DEMO where a=3
+&nbsp;
+Plan hash value: 2180342005
+&nbsp;
+---------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |      |      1 |        |      1 |00:00:00.01 |     270 |
+|   1 |  SORT AGGREGATE            |      |      1 |      1 |      1 |00:00:00.01 |     270 |
+|*  2 |   TABLE ACCESS STORAGE FULL| DEMO |      1 |  16667 |   2846 |00:00:00.01 |     270 |
+---------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("A"=3)
+       filter("A"=3)
+</code></pre>
+<p>Rewrite cannot happen here because the materialized view is stale. I didn&#8217;t commit yet. Of course, other sessions can query from the view because they must not see my modification.</p>
+<pre><code>
+SQL&gt; commit;
+Commit complete.
+</code></pre>
+<p>The commit has triggered the fast refresh of the materialized view</p>
+<pre><code>
+SQL&gt; select sum(b) this_is_a_fourth_cursor from DEMO where a=3;
+&nbsp;
+THIS_IS_A_FOURTH_CURSOR
+-----------------------
+                4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0075r0yzqt90a, child number 0
+-------------------------------------
+select sum(b) this_is_a_fourth_cursor from DEMO where a=3
+&nbsp;
+Plan hash value: 2792196921
+&nbsp;
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name    | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |         |      1 |        |      1 |00:00:00.01 |       9 |
+|   1 |  SORT AGGREGATE                       |         |      1 |      1 |      1 |00:00:00.01 |       9 |
+|*  2 |   MAT_VIEW REWRITE ACCESS STORAGE FULL| DEMO_MV |      1 |      1 |      1 |00:00:00.01 |       9 |
+-----------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("DEMO_MV"."A"=3)
+       filter("DEMO_MV"."A"=3)
+</code></pre>
+<p>With on commit refresh, the materialized view is never stale. The problem is that it can slow down the transactions: in addition to fill the materialized view logs, the commit has the overhead to apply them. In 12.1 this is the only way to have a query on the materialized view that is always fresh. But there&#8217;s something new in 12.2.</p>
+<h3>Real-time materialized views</h3>
+<p>Even when the materialized view is stale, we can get fresh result without querying the source tables. We have the stale values in the materialized view and we have all changes logged into the materialized view log. Easy or not, merging that can be computed to get fresh result. We still need fast refresh but we don&#8217;t need refresh on commit anymore:</p>
+<pre><code>
+SQL&gt; alter materialized view DEMO_MV refresh on demand;
+Materialized view altered.
+</code></pre>
+<p>And in order to use this new feature we have to enable it a materialized view level:</p>
+<pre><code>
+SQL&gt; alter materialized view DEMO_MV enable on query computation;
+Materialized view altered.
+</code></pre>
+<p>Then let the magic happen:</p>
+<pre><code>
+SQL&gt; select sum(b) from DEMO where a=3;
+&nbsp;
+    SUM(B)
+----------
+   4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  brdc1qcbc2npk, child number 0
+-------------------------------------
+select sum(b) from DEMO where a=3
+&nbsp;
+Plan hash value: 2792196921
+&nbsp;
+-----------------------------------------------------------------------------------------------------------
+| Id  | Operation                             | Name    | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                      |         |      1 |        |      1 |00:00:00.01 |       9 |
+|   1 |  SORT AGGREGATE                       |         |      1 |      1 |      1 |00:00:00.01 |       9 |
+|*  2 |   MAT_VIEW REWRITE ACCESS STORAGE FULL| DEMO_MV |      1 |      1 |      1 |00:00:00.01 |       9 |
+-----------------------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - storage("DEMO_MV"."A"=3)
+       filter("DEMO_MV"."A"=3)
+</code></pre>
+<p>Here my materialized view is not stale, so nothing special happened. Here is a some modification:</p>
+<pre><code>
+SQL&gt; insert into DEMO values(0,0,0);
+1 row created.
+</code></pre>
+<p>and&#8230;</p>
+<pre><code>
+SQL&gt; select sum(b) try_again from DEMO where a=3;
+&amp;npsp;
+ TRY_AGAIN
+----------
+   4950617
+&amp;npsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&amp;npsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dtmhccwr0v7r5, child number 0
+-------------------------------------
+select sum(b) try_again from DEMO where a=3
+&amp;npsp;
+Plan hash value: 2180342005
+&amp;npsp;
+---------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |      |      1 |        |      1 |00:00:00.01 |     270 |
+|   1 |  SORT AGGREGATE            |      |      1 |      1 |      1 |00:00:00.01 |     270 |
+|*  2 |   TABLE ACCESS STORAGE FULL| DEMO |      1 |  16667 |   2846 |00:00:00.01 |     270 |
+---------------------------------------------------------------------------------------------
+&amp;npsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&amp;npsp;
+   2 - storage("A"=3)
+       filter("A"=3)
+</code></pre>
+<p>Still no magic here. For the session that did the modifications, it seems that query rewrite cannot happen. All changes are in the materialized view log, but applying the uncommited ones for my session seems to be impossible here. Well, let&#8217;s commit my changes.</p>
+<pre><code>
+SQL&gt; commit;
+Commit complete.
+</code></pre>
+<p>and see the magic:</p>
+<pre><code>
+SQL&gt; select sum(b) try_again from DEMO where a=3;
+&amp;nbps;
+    SUM(B)
+----------
+   4950617
+&amp;nbps;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&amp;nbps;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dtmhccwr0v7r5, child number 0
+-------------------------------------
+select sum(b) try_again from DEMO where a=3
+&amp;nbps;
+Plan hash value: 2180342005
+&amp;nbps;
+---------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |      |      1 |        |      1 |00:00:00.01 |     270 |
+|   1 |  SORT AGGREGATE            |      |      1 |      1 |      1 |00:00:00.01 |     270 |
+|*  2 |   TABLE ACCESS STORAGE FULL| DEMO |      1 |  16667 |   2846 |00:00:00.01 |     270 |
+---------------------------------------------------------------------------------------------
+&amp;nbps;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&amp;nbps;
+   2 - storage("A"=3)
+       filter("A"=3)
+</code></pre>
+<p>Oh&#8230; that&#8217;s my previous cursor. No invalidation occurs. I have to parse a different statement.</p>
+<pre><code>
+SQL&gt; select sum(b) here_I_am from DEMO where a=3;
+&nbsp;
+ HERE_I_AM
+----------
+   4950617
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  34fqrktpthuk7, child number 1
+-------------------------------------
+select sum(b) here_I_am from DEMO where a=3
+&nbsp;
+Plan hash value: 1240257898
+&nbsp;
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                               | Name                       | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                        |                            |      1 |        |      1 |00:00:00.01 |      25 |       |       |          |
+|   1 |  SORT AGGREGATE                         |                            |      1 |      1 |      1 |00:00:00.01 |      25 |       |       |          |
+|   2 |   VIEW                                  |                            |      1 |    705 |      1 |00:00:00.01 |      25 |       |       |          |
+|   3 |    UNION-ALL                            |                            |      1 |        |      1 |00:00:00.01 |      25 |       |       |          |
+|*  4 |     FILTER                              |                            |      1 |        |      1 |00:00:00.01 |      16 |       |       |          |
+|*  5 |      HASH JOIN OUTER                    |                            |      1 |    100 |      1 |00:00:00.01 |      16 |  3843K|  3843K| 1699K (0)|
+|*  6 |       MAT_VIEW ACCESS STORAGE FULL      | DEMO_MV                    |      1 |      1 |      1 |00:00:00.01 |       9 |  1025K|  1025K|          |
+|   7 |       VIEW                              |                            |      1 |    100 |      1 |00:00:00.01 |       7 |       |       |          |
+|   8 |        HASH GROUP BY                    |                            |      1 |        |      1 |00:00:00.01 |       7 |  1956K|  1956K| 2324K (0)|
+|   9 |         VIEW                            |                            |      1 |      1 |      1 |00:00:00.01 |       7 |       |       |          |
+|  10 |          RESULT CACHE                   | 6jf9k1y2wt8xc5b00gv9px6ww0 |      1 |        |      1 |00:00:00.01 |       7 |       |       |          |
+|* 11 |           VIEW                          |                            |      1 |      1 |      1 |00:00:00.01 |       7 |       |       |          |
+|  12 |            WINDOW SORT                  |                            |      1 |      1 |      1 |00:00:00.01 |       7 |  2048 |  2048 | 2048  (0)|
+|* 13 |             TABLE ACCESS STORAGE FULL   | MLOG$_DEMO                 |      1 |      1 |      1 |00:00:00.01 |       7 |  1025K|  1025K|          |
+|  14 |     VIEW                                |                            |      1 |    605 |      0 |00:00:00.01 |       9 |       |       |          |
+|  15 |      UNION-ALL                          |                            |      1 |        |      0 |00:00:00.01 |       9 |       |       |          |
+|* 16 |       FILTER                            |                            |      1 |        |      0 |00:00:00.01 |       0 |       |       |          |
+|  17 |        NESTED LOOPS OUTER               |                            |      1 |    600 |      0 |00:00:00.01 |       0 |       |       |          |
+|  18 |         VIEW                            |                            |      1 |    100 |      0 |00:00:00.01 |       0 |       |       |          |
+|* 19 |          FILTER                         |                            |      1 |        |      0 |00:00:00.01 |       0 |       |       |          |
+|  20 |           HASH GROUP BY                 |                            |      1 |        |      0 |00:00:00.01 |       0 |  2982K|  2982K|          |
+|* 21 |            VIEW                         |                            |      1 |      1 |      0 |00:00:00.01 |       0 |       |       |          |
+|  22 |             RESULT CACHE                | 6jf9k1y2wt8xc5b00gv9px6ww0 |      1 |        |      1 |00:00:00.01 |       0 |       |       |          |
+|* 23 |              VIEW                       |                            |      0 |      1 |      0 |00:00:00.01 |       0 |       |       |          |
+|  24 |               WINDOW SORT               |                            |      0 |      1 |      0 |00:00:00.01 |       0 | 73728 | 73728 |          |
+|* 25 |                TABLE ACCESS STORAGE FULL| MLOG$_DEMO                 |      0 |      1 |      0 |00:00:00.01 |       0 |  1025K|  1025K|          |
+|* 26 |         INDEX UNIQUE SCAN               | I_SNAP$_DEMO_MV            |      0 |      6 |      0 |00:00:00.01 |       0 |  1025K|  1025K|          |
+|* 27 |       HASH JOIN                         |                            |      1 |      5 |      0 |00:00:00.01 |       9 |  3043K|  3043K| 1702K (0)|
+|* 28 |        MAT_VIEW ACCESS STORAGE FULL     | DEMO_MV                    |      1 |      1 |      1 |00:00:00.01 |       9 |  1025K|  1025K|          |
+|  29 |        VIEW                             |                            |      1 |    100 |      1 |00:00:00.01 |       0 |       |       |          |
+|  30 |         HASH GROUP BY                   |                            |      1 |        |      1 |00:00:00.01 |       0 |  1956K|  1956K| 2319K (0)|
+|  31 |          VIEW                           |                            |      1 |      1 |      1 |00:00:00.01 |       0 |       |       |          |
+|  32 |           RESULT CACHE                  | 6jf9k1y2wt8xc5b00gv9px6ww0 |      1 |        |      1 |00:00:00.01 |       0 |       |       |          |
+|* 33 |            VIEW                         |                            |      0 |      1 |      0 |00:00:00.01 |       0 |       |       |          |
+|  34 |             WINDOW SORT                 |                            |      0 |      1 |      0 |00:00:00.01 |       0 | 73728 | 73728 |          |
+|* 35 |              TABLE ACCESS STORAGE FULL  | MLOG$_DEMO                 |      0 |      1 |      0 |00:00:00.01 |       0 |  1025K|  1025K|          |
+-----------------------------------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+<p>We got it. All the magic. The materialized view is read. The materialized view log is read. But we don&#8217;t need the source tables. All this is merged by outer join and union all. The plan is harder to read but it requires only 25 logical reads to get fresh results instead of 270 from the source table. The bigger the tables are, the more complex the query is, the more benefit you get as long as you don&#8217;t have too many changes since the last refresh. And this without any overhead on other transactions commits. That&#8217;s the beauty of 12<em>c</em>R2 Enterprise Edition. Can you imagine you have to code this yourself? For any query? For any modifications on source tables?</p>
+<h3>FRESH_MV</h3>
+<p>This was query rewrite: query the source table and have the CBO transform the query to query the materialized (given that the CBO costing estimates that it is cheaper). But you can also query the materialized view and ask to get fresh result by joining materialized view log to the stale result. And this can be used also in Standard Edition (only query rewrite is limited to Enterprise Edition). On-query computation when querying the materialized vue is enabled by the FRESH_MV hint:</p>
+<pre><code>
+SQL&gt; select /*+ fresh_mv */ * from DEMO_MV;
+&nbsp;
+         A   COUNT(B)     SUM(B)   COUNT(*)
+---------- ---------- ---------- ----------
+         5      68378 4500058747      68378
+         2        285      49590        285
+         3       2846    4950617       2846
+         1         28        490         28
+         4      28460  494990550      28460
+         0          4          6          4
+&nbsp;
+6 rows selected.
+&nbsp;
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last +alias'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  gyar0v20qcksu, child number 0
+-------------------------------------
+select /*+ fresh_mv */ * from DEMO_MV
+&nbsp;
+Plan hash value: 2169890143
+&nbsp;
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                              | Name                       | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                       |                            |      1 |        |      6 |00:00:00.01 |      12 |       |       |          |
+|   1 |  VIEW                                  |                            |      1 |    730 |      6 |00:00:00.01 |      12 |       |       |          |
+|   2 |   UNION-ALL                            |                            |      1 |        |      6 |00:00:00.01 |      12 |       |       |          |
+|*  3 |    VIEW                                | VW_FOJ_0                   |      1 |    100 |      5 |00:00:00.01 |       9 |       |       |          |
+|*  4 |     HASH JOIN FULL OUTER               |                            |      1 |    100 |      6 |00:00:00.01 |       9 |  2897K|  2897K| 3217K (0)|
+|   5 |      VIEW                              |                            |      1 |      6 |      6 |00:00:00.01 |       9 |       |       |          |
+|   6 |       MAT_VIEW ACCESS STORAGE FULL     | DEMO_MV                    |      1 |      6 |      6 |00:00:00.01 |       9 |  1025K|  1025K|          |
+|   7 |      VIEW                              |                            |      1 |    100 |      1 |00:00:00.01 |       0 |       |       |          |
+|   8 |       HASH GROUP BY                    |                            |      1 |        |      1 |00:00:00.01 |       0 |  1956K|  1956K| 2268K (0)|
+|   9 |        VIEW                            |                            |      1 |      1 |      1 |00:00:00.01 |       0 |       |       |          |
+|  10 |         RESULT CACHE                   | 6jf9k1y2wt8xc5b00gv9px6ww0 |      1 |        |      1 |00:00:00.01 |       0 |       |       |          |
+|* 11 |          VIEW                          |                            |      0 |      1 |      0 |00:00:00.01 |       0 |       |       |          |
+|  12 |           WINDOW SORT                  |                            |      0 |      1 |      0 |00:00:00.01 |       0 | 73728 | 73728 |          |
+|* 13 |            TABLE ACCESS STORAGE FULL   | MLOG$_DEMO                 |      0 |      1 |      0 |00:00:00.01 |       0 |  1025K|  1025K|          |
+|  14 |    VIEW                                |                            |      1 |    630 |      1 |00:00:00.01 |       3 |       |       |          |
+|  15 |     UNION-ALL                          |                            |      1 |        |      1 |00:00:00.01 |       3 |       |       |          |
+|* 16 |      FILTER                            |                            |      1 |        |      0 |00:00:00.01 |       1 |       |       |          |
+|  17 |       NESTED LOOPS OUTER               |                            |      1 |    600 |      1 |00:00:00.01 |       1 |       |       |          |
+|  18 |        VIEW                            |                            |      1 |    100 |      1 |00:00:00.01 |       0 |       |       |          |
+|* 19 |         FILTER                         |                            |      1 |        |      1 |00:00:00.01 |       0 |       |       |          |
+|  20 |          HASH GROUP BY                 |                            |      1 |        |      1 |00:00:00.01 |       0 |  1956K|  1956K| 2304K (0)|
+|  21 |           VIEW                         |                            |      1 |      1 |      1 |00:00:00.01 |       0 |       |       |          |
+|  22 |            RESULT CACHE                | 6jf9k1y2wt8xc5b00gv9px6ww0 |      1 |        |      1 |00:00:00.01 |       0 |       |       |          |
+|* 23 |             VIEW                       |                            |      0 |      1 |      0 |00:00:00.01 |       0 |       |       |          |
+|  24 |              WINDOW SORT               |                            |      0 |      1 |      0 |00:00:00.01 |       0 | 73728 | 73728 |          |
+|* 25 |               TABLE ACCESS STORAGE FULL| MLOG$_DEMO                 |      0 |      1 |      0 |00:00:00.01 |       0 |  1025K|  1025K|          |
+|* 26 |        INDEX UNIQUE SCAN               | I_SNAP$_DEMO_MV            |      1 |      6 |      1 |00:00:00.01 |       1 |  1025K|  1025K|          |
+|  27 |      MERGE JOIN                        |                            |      1 |     30 |      1 |00:00:00.01 |       2 |       |       |          |
+|  28 |       MAT_VIEW ACCESS BY INDEX ROWID   | DEMO_MV                    |      1 |      6 |      6 |00:00:00.01 |       2 |       |       |          |
+|  29 |        INDEX FULL SCAN                 | I_SNAP$_DEMO_MV            |      1 |      6 |      6 |00:00:00.01 |       1 |  1025K|  1025K|          |
+|* 30 |       FILTER                           |                            |      6 |        |      1 |00:00:00.01 |       0 |       |       |          |
+|* 31 |        SORT JOIN                       |                            |      6 |    100 |      1 |00:00:00.01 |       0 |  2048 |  2048 | 2048  (0)|
+|  32 |         VIEW                           |                            |      1 |    100 |      1 |00:00:00.01 |       0 |       |       |          |
+|  33 |          SORT GROUP BY                 |                            |      1 |        |      1 |00:00:00.01 |       0 |  2048 |  2048 | 2048  (0)|
+|  34 |           VIEW                         |                            |      1 |      1 |      1 |00:00:00.01 |       0 |       |       |          |
+|  35 |            RESULT CACHE                | 6jf9k1y2wt8xc5b00gv9px6ww0 |      1 |        |      1 |00:00:00.01 |       0 |       |       |          |
+|* 36 |             VIEW                       |                            |      0 |      1 |      0 |00:00:00.01 |       0 |       |       |          |
+|  37 |              WINDOW SORT               |                            |      0 |      1 |      0 |00:00:00.01 |       0 | 73728 | 73728 |          |
+|* 38 |               TABLE ACCESS STORAGE FULL| MLOG$_DEMO                 |      0 |      1 |      0 |00:00:00.01 |       0 |  1025K|  1025K|          |
+----------------------------------------------------------------------------------------------------------------------------------------------------------
+</code></pre>
+<p>Have you seen that we need even less logical reads (12) than before (25). There is an optimization here with RESULT CACHE. You get this when you have the sequence in the materialized view log, and you can see that the sequence is used in the predicates:</p>
+<pre><code>
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   3 - filter("AV$0"."OJ_MARK" IS NULL)
+   4 - access(SYS_OP_MAP_NONNULL("SNA$0"."A")=SYS_OP_MAP_NONNULL("AV$0"."GB0"))
+  11 - filter((("MAS$"."OLD_NEW$$"='N' AND "MAS$"."SEQ$$"="MAS$"."MAXSEQ$$") OR (INTERNAL_FUNCTION("MAS$"."OLD_NEW$$") AND
+              "MAS$"."SEQ$$"="MAS$"."MINSEQ$$")))
+  13 - storage("MAS$"."SNAPTIME$$"&gt;TO_DATE(' 2017-02-16 20:31:08', 'syyyy-mm-dd hh24:mi:ss'))
+       filter("MAS$"."SNAPTIME$$"&gt;TO_DATE(' 2017-02-16 20:31:08', 'syyyy-mm-dd hh24:mi:ss'))
+  16 - filter(CASE  WHEN ROWID IS NOT NULL THEN 1 ELSE NULL END  IS NULL)
+  19 - filter(SUM(1)&gt;0)
+  23 - filter((("MAS$"."OLD_NEW$$"='N' AND "MAS$"."SEQ$$"="MAS$"."MAXSEQ$$") OR (INTERNAL_FUNCTION("MAS$"."OLD_NEW$$") AND
+              "MAS$"."SEQ$$"="MAS$"."MINSEQ$$")))
+  25 - storage("MAS$"."SNAPTIME$$"&gt;TO_DATE(' 2017-02-16 20:31:08', 'syyyy-mm-dd hh24:mi:ss'))
+       filter("MAS$"."SNAPTIME$$"&gt;TO_DATE(' 2017-02-16 20:31:08', 'syyyy-mm-dd hh24:mi:ss'))
+  26 - access("DEMO_MV"."SYS_NC00005$"=SYS_OP_MAP_NONNULL("AV$0"."GB0"))
+  30 - filter("DEMO_MV"."COUNT(*)"+"AV$0"."D0"&gt;0)
+  31 - access("DEMO_MV"."SYS_NC00005$"=SYS_OP_MAP_NONNULL("AV$0"."GB0"))
+       filter("DEMO_MV"."SYS_NC00005$"=SYS_OP_MAP_NONNULL("AV$0"."GB0"))
+  36 - filter((("MAS$"."OLD_NEW$$"='N' AND "MAS$"."SEQ$$"="MAS$"."MAXSEQ$$") OR (INTERNAL_FUNCTION("MAS$"."OLD_NEW$$") AND
+              "MAS$"."SEQ$$"="MAS$"."MINSEQ$$")))
+  38 - storage("MAS$"."SNAPTIME$$"&gt;TO_DATE(' 2017-02-16 20:31:08', 'syyyy-mm-dd hh24:mi:ss'))
+       filter("MAS$"."SNAPTIME$$"&gt;TO_DATE(' 2017-02-16 20:31:08', 'syyyy-mm-dd hh24:mi:ss'))
+</code></pre>
+<p>Of course, you also see a predicate with the staleness timestamp (here  2017-02-16 20:31:08) of the materialized view.</p>
+<p>This result cache is interesting because the materialized view log is read several times in the execution plan and this is a way to actually read it only once.</p>
+<pre><code>
+SQL&gt; select type,column_count,row_count,cache_id,name from v$result_cache_objects;
+&nbsp;
+TYPE       COLUMN_COUNT  ROW_COUNT CACHE_ID                       NAME
+---------- ------------ ---------- ------------------------------ ------------------------------
+Dependency            0          0 PDB_ADMIN.MLOG$_DEMO           PDB_ADMIN.MLOG$_DEMO
+Result                7          1 6jf9k1y2wt8xc5b00gv9px6ww0     DMLTYPES:MLOG$_DEMO
+</code></pre>
+<p>The result cache has a dependency on the materialized view log, to be aware of additional changes, and when tracing the transformed query, we can see a lifetime of session for this result cache. /*+ RESULT_CACHE(LIFETIME=SESSION, NAME=&#8221;DMLTYPES:MLOG$_DEMO&#8221;) */. Note that I included the sequence in the materialized view log, but this is not required. I&#8217;ll show in a future post that the execution plan is different then, and not using result cache.</p>
+<h3>So what?</h3>
+<p>This is an amazing feature. You can optimize your queries transparently by creating materialized views, get fresh result, and minimize the refresh overhead. And depending on the size of the tables and the rate of modifications. You can choose the right refresh frequency with the goal to limit the materialized view logs to apply on each query. You have real-time result and bulk refresh at the same time. Oracle Database has always been a database for mixed workloads, where readers don&#8217;t block writers. And once again we have a feature to optimize queries by pre-calculating them, with minimal impact on source.</p>
+<p>It is transparent, but after this first test, I have a few questions that raise and that I&#8217;ll try to answer in future posts: Is it always better to have the sequence in the materialized view log? Is the default result cache size still sufficient? How can it use a 1 seconds only precision timestamp and not a SCN? What happens with this at winter Daylight Saving Time clock change? Can we get query rewrite when our own transaction has made the modifications? Do we need to invalidate cursors that read the source table? How accurate are the cardinality estimations on the very volatile materialized view? When full materialized view log is read, can it trigger a complete refresh?</p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/18c-order-by-in-with-clause-is-not-preserved/">
+<title>18c: Order by in WITH clause is not preserved</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/18c-order-by-in-with-clause-is-not-preserved/">https://www.dbi-services.com/blog/18c-order-by-in-with-clause-is-not-preserved/</a> (2018-07-05)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">18c: Order by in WITH clause is not preserved</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+For a <a href="https://www.dbi-services.com/blog/18c-some-optimization-about-redo-size/" target="_blank" rel="noopener noreferrer">previous post</a> I&#8217;ve run on 18c a script of mine to get the V$MYSTAT delta values between two queries. This script (new version available on <a href="https://github.com/FranckPachot/scripts/blob/master/administration/generate_mystat_diff.sql" target="_blank" rel="noopener noreferrer">GitHub</a>) generates the queries to store some values and subtract them on the next execution. But I had to fix it for 18c because I relied on some order by in a CTE which is lost in 18c.<br />
+The idea was to get the statistic names in a Common Table Expression (CTE):</p>
+<pre><code>
+with stats as (
+  select rownum n,stat_id,name from (select stat_id,name from v$statname where name in (&amp;names) order by stat_id)
+)
+</code></pre>
+<p>and query it from different parts of the UNION ALL which generates the script:</p>
+<pre><code>
+select 'select ' from dual
+union all
+select '   '||decode(n,1,' ',',')||'"CUR'||stat_id||'" - '||'&amp;'||'LAG'||stat_id||' "DIF'||stat_id||'"' from stats
+union all
+select '   '||',nvl("CUR'||stat_id||'",0) "CUR'||stat_id||'"' from stats
+union all
+</code></pre>
+<p>The rowum in the WITH clause is used later to add the comma for all rows except the first one &#8211; using decode(n,1,&#8217; &#8216;,&#8217;,&#8217;)</p>
+<p>But this relied on two assumptions:</p>
+<ol>
+<li>the WITH keeps the rows ordered</li>
+<li>the UNION ALL keeps the rows ordered</li>
+</ol>
+<p>Of course, it would be better to add a number on each part and an ORDER BY at the end of the query. But for better readability, I didn&#8217;t.</p>
+<p>However, the first assumption is wrong since 12.2 where the optimizer introduced In-Memory Cursor Duration Temp Tables. In the query above, the CTE is materialized because it is used multiple times. And this optimization keeps it in memory. But it seems that this structure does not keep the rows ordered.</p>
+<p>Here is an example where I have a 4 rows table:</p>
+<pre><code>
+SQL&gt; create table DEMO as select rownum id from xmltable('1 to 4');
+Table DEMO created.
+&nbsp;
+SQL&gt; select  * from DEMO order by id;
+&nbsp;
+        ID
+----------
+         1
+         2
+         3
+         4
+</code></pre>
+<p>When I put the same query in a WITH clause, with its ORDER BY, and query it from 2 union all statements, the rows are not ordered anymore:</p>
+<pre><code>
+SQL&gt; with cte as ( select * from DEMO order by id)
+     select rownum,id from cte
+     union all
+     select rownum,id from cte ;
+&nbsp;
+    ROWNUM         ID
+---------- ----------
+         1          4
+         2          3
+         3          2
+         4          1
+         1          4
+         2          3
+         3          2
+         4          1
+</code></pre>
+<p>The execution plan shows the materialization of the CTE result, and mentions that it is an In-Memory Cursor Duration Temp Table (CURSOR DURATION MEMORY)</p>
+<pre><code>
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'+projection');
+&nbsp;
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  9uwc06ana6trn, child number 0
+-------------------------------------
+with cte as ( select * from DEMO order by id)   select rownum,id from
+cte   union all  select rownum,id from cte
+&nbsp;
+Plan hash value: 4025392480
+&nbsp;
+----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                | Name                      | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                         |                           |       |       |     4 (100)|          |
+|   1 |  TEMP TABLE TRANSFORMATION               |                           |       |       |            |          |
+|   2 |   LOAD AS SELECT (CURSOR DURATION MEMORY)| SYS_TEMP_0FD9D6640_23D74B |       |       |            |          |
+|   3 |    SORT ORDER BY                         |                           |     4 |    12 |     4  (25)| 00:00:01 |
+|   4 |     TABLE ACCESS FULL                    | DEMO                      |     4 |    12 |     3   (0)| 00:00:01 |
+|   5 |   UNION-ALL                              |                           |       |       |            |          |
+|   6 |    COUNT                                 |                           |       |       |            |          |
+|   7 |     VIEW                                 |                           |     4 |    52 |     2   (0)| 00:00:01 |
+|   8 |      TABLE ACCESS FULL                   | SYS_TEMP_0FD9D6640_23D74B |     4 |    12 |     2   (0)| 00:00:01 |
+|   9 |    COUNT                                 |                           |       |       |            |          |
+|  10 |     VIEW                                 |                           |     4 |    52 |     2   (0)| 00:00:01 |
+|  11 |      TABLE ACCESS FULL                   | SYS_TEMP_0FD9D6640_23D74B |     4 |    12 |     2   (0)| 00:00:01 |
+----------------------------------------------------------------------------------------------------------------------
+&nbsp;
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+   1 - STRDEF[22], STRDEF[22]
+   2 - SYSDEF[4], SYSDEF[0], SYSDEF[1], SYSDEF[120], SYSDEF[0]
+   3 - (#keys=1) "DEMO"."ID"[NUMBER,22]
+   4 - (rowset=256) "DEMO"."ID"[NUMBER,22]
+   5 - STRDEF[22], STRDEF[22]
+   6 - "ID"[NUMBER,22], ROWNUM[8]
+   7 - "ID"[NUMBER,22]
+   8 - "C0"[NUMBER,22]
+   9 - "ID"[NUMBER,22], ROWNUM[8]
+  10 - "ID"[NUMBER,22]
+  11 - "C0"[NUMBER,22]
+</code></pre>
+<h3>/*+ inline */</h3>
+<p>If the CTE is not materialized, the rows are ordered, bit the table is read two times:</p>
+<pre><code>
+SQL&gt; with cte as ( select /*+ inline */ * from DEMO order by id)
+  2   select rownum,id from cte
+  3   union all
+  4   select rownum,id from cte ;
+&nbsp;
+    ROWNUM         ID
+---------- ----------
+         1          1
+         2          2
+         3          3
+         4          4
+         1          1
+         2          2
+         3          3
+         4          4
+&nbsp;
+8 rows selected.
+&nbsp;
+SQL&gt;
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'+projection');
+&nbsp;
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  0dad0vwg3k0th, child number 0
+-------------------------------------
+with cte as ( select /*+ inline */ * from DEMO order by id)   select
+rownum,id from cte   union all  select rownum,id from cte
+&nbsp;
+Plan hash value: 2913170750
+&nbsp;
+------------------------------------------------------------------------------
+| Id  | Operation             | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |      |       |       |     8 (100)|          |
+|   1 |  UNION-ALL            |      |       |       |            |          |
+|   2 |   COUNT               |      |       |       |            |          |
+|   3 |    VIEW               |      |     4 |    52 |     4  (25)| 00:00:01 |
+|   4 |     SORT ORDER BY     |      |     4 |    12 |     4  (25)| 00:00:01 |
+|   5 |      TABLE ACCESS FULL| DEMO |     4 |    12 |     3   (0)| 00:00:01 |
+|   6 |   COUNT               |      |       |       |            |          |
+|   7 |    VIEW               |      |     4 |    52 |     4  (25)| 00:00:01 |
+|   8 |     SORT ORDER BY     |      |     4 |    12 |     4  (25)| 00:00:01 |
+|   9 |      TABLE ACCESS FULL| DEMO |     4 |    12 |     3   (0)| 00:00:01 |
+------------------------------------------------------------------------------
+&nbsp;
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+&nbsp;
+   1 - STRDEF[22], STRDEF[22]
+   2 - "ID"[NUMBER,22], ROWNUM[8]
+   3 - "ID"[NUMBER,22]
+   4 - (#keys=1) "DEMO"."ID"[NUMBER,22]
+   5 - (rowset=256) "DEMO"."ID"[NUMBER,22]
+   6 - "ID"[NUMBER,22], ROWNUM[8]
+   7 - "ID"[NUMBER,22]
+   8 - (#keys=1) "DEMO"."ID"[NUMBER,22]
+   9 - (rowset=256) "DEMO"."ID"[NUMBER,22]
+</code></pre>
+<h3>&#8220;_in_memory_cdt&#8221;=off</h3>
+<p>If the CTE is materialized, but the new feature to keep it in memory is disabled, the rows are ordered (but probably by chance &#8211; there si no guarantee):</p>
+<pre><code>
+SQL&gt; alter session set "_in_memory_cdt"=off;
+&nbsp;
+Session altered.
+&nbsp;
+SQL&gt;
+SQL&gt; with cte as ( select /*+ materialize */ * from DEMO order by id)
+  2   select rownum,id from cte
+  3   union all
+  4   select rownum,id from cte ;
+&nbsp;
+    ROWNUM         ID
+---------- ----------
+         1          1
+         2          2
+         3          3
+         4          4
+         1          1
+         2          2
+         3          3
+         4          4
+&nbsp;
+8 rows selected.
+&nbsp;
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'+projection');
+&nbsp;
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  9uwc06ana6trn, child number 1
+-------------------------------------
+with cte as ( select * from DEMO order by id)   select rownum,id from
+cte   union all  select rownum,id from cte
+&nbsp;
+Plan hash value: 4025392480
+&nbsp;
+--------------------------------------------------------------------------------------------------------
+| Id  | Operation                  | Name                      | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT           |                           |       |       |     4 (100)|          |
+|   1 |  TEMP TABLE TRANSFORMATION |                           |       |       |            |          |
+|   2 |   LOAD AS SELECT           | SYS_TEMP_0FD9D664D_23D74B |       |       |            |          |
+|   3 |    SORT ORDER BY           |                           |     4 |    12 |     4  (25)| 00:00:01 |
+|   4 |     TABLE ACCESS FULL      | DEMO                      |     4 |    12 |     3   (0)| 00:00:01 |
+|   5 |   UNION-ALL                |                           |       |       |            |          |
+|   6 |    COUNT                   |                           |       |       |            |          |
+|   7 |     VIEW                   |                           |     4 |    52 |     2   (0)| 00:00:01 |
+|   8 |      TABLE ACCESS FULL     | SYS_TEMP_0FD9D664D_23D74B |     4 |    12 |     2   (0)| 00:00:01 |
+|   9 |    COUNT                   |                           |       |       |            |          |
+|  10 |     VIEW                   |                           |     4 |    52 |     2   (0)| 00:00:01 |
+|  11 |      TABLE ACCESS FULL     | SYS_TEMP_0FD9D664D_23D74B |     4 |    12 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------------------------------------
+&nbsp;
+Column Projection Information (identified by operation id):
+-----------------------------------------------------------
+&nbsp;
+   1 - STRDEF[22], STRDEF[22]
+   2 - SYSDEF[4], SYSDEF[0], SYSDEF[1], SYSDEF[120], SYSDEF[0]
+   3 - (#keys=1) "DEMO"."ID"[NUMBER,22]
+   4 - (rowset=256) "DEMO"."ID"[NUMBER,22]
+   5 - STRDEF[22], STRDEF[22]
+   6 - "ID"[NUMBER,22], ROWNUM[8]
+   7 - "ID"[NUMBER,22]
+   8 - "C0"[NUMBER,22]
+   9 - "ID"[NUMBER,22], ROWNUM[8]
+  10 - "ID"[NUMBER,22]
+  11 - "C0"[NUMBER,22]
+</code></pre>
+<h3>So what?</h3>
+<p>We should never rely on the preservation of the row order except when explicitly documented (like rownum over a subquery with order by). And this In-Memory Cursor Duration Temporary table also works in parallel and RAC, so we can understand that the rows are not read in the same order as they were stored. This is always a problem when we migrate. When something works by chance in a version and not in the newer versions, people usually incriminate the migration, rather than recognizing an old bug in the application, just because it was working before.</p>
+
+</div>
+</body>
+</html>

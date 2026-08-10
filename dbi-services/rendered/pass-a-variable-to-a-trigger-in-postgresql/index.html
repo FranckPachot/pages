@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/pass-a-variable-to-a-trigger-in-postgresql/">
+<title>Pass a variable to a trigger in PostgreSQL</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/pass-a-variable-to-a-trigger-in-postgresql/">https://www.dbi-services.com/blog/pass-a-variable-to-a-trigger-in-postgresql/</a> (2021-04-22)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Pass a variable to a trigger in PostgreSQL</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+With Oracle there are many ways to set a state in the session: context variables, set with DBMS_SESSION.SET_CONTEXT and retrieved with SYS_CONTEXT, or package global variables, or global or private temporary tables with ON COMMIT PRESERVE ROWS,&#8230;</p>
+<p>How would you do it in PostgreSQL? I&#8217;m taking an example from a <a href="https://www.yugabyte.com/slack">Yugabyte slack</a> question, as Yugabyte SQL layer is the PostgreSQL one.</p>
+<pre><code>
+CREATE TABLE employees (
+  employee_no integer PRIMARY KEY,
+  name text,
+  department text
+);
+
+INSERT INTO employees (employee_no, name, department) VALUES
+(1221, 'John Smith', 'Marketing'),
+(1222, 'Bette Davis', 'Sales'),
+(1223, 'Lucille Ball', 'Operations'),
+(1224, 'John Zimmerman', 'Sales');
+
+CREATE TABLE mgr_table (
+  mgr_id integer references employees,
+  employee_no integer references employees,
+  primary key(mgr_id, employee_no)
+);
+
+insert into mgr_table values(1223,1222);
+</code></pre>
+<p>We have an employee/manager table example:</p>
+<pre><code>
+CREATE TABLE employee_dept_changes (
+  employee_no integer NOT NULL references employees,
+  name text,
+  department text,
+  changed_on TIMESTAMP(6) NOT NULL,
+  changed_by integer
+);
+</code></pre>
+<p>This table is there to log the changes when an employee is transferred to another manager. You can see that we log the values, but also the context about who is transferring because this operation is allowed only by a manager.</p>
+<p>Ideally, all database operations are encapsulated in a microservice. The application calls a stored procedure that does all the logic: update the manager and log the change. And this procedure has all context. However, the idea here is to do this logging through a trigger. The trigger has access to the table values, but how can we pass the context of who is doing this change? Without context variables, or package variables, this requires something else.</p>
+<p>If you look at the stackoverflow for <a href="https://stackoverflow.com/questions/66972555/is-there-a-way-to-pass-a-variable-as-an-argument-to-a-trigger-function-in-yugaby" target="_blank" rel="noopener">this question</a>, you will see Frits Hoogland and Bryn Llewellyn answers with workaround and recommendations. I&#8217;m just adding here a possibility (with the same recommendation: don&#8217;t have procedures calling SQL calling triggers, but all logic encapsulated in procedural code calling SQL).</p>
+<pre><code>
+ALTER TABLE employees ADD COLUMN
+  "_trigger_state_mgr_id" integer --&gt; this is added to pass the state variable
+</code></pre>
+<p>I&#8217;m adding a column to my table. This will not take any storage but will be used only to pass some values to the trigger</p>
+<pre><code>
+CREATE OR REPLACE FUNCTION record_dept_changes()
+RETURNS TRIGGER AS
+$$
+BEGIN
+ IF NEW.department  OLD.department
+  THEN INSERT INTO employee_dept_changes(employee_no, name, department, changed_on, changed_by)
+   VALUES(OLD.employee_no, OLD.name, OLD.department, now(), NEW."_trigger_state_mgr_id"  --&gt; passing the state to the added column
+   );
+ END IF;
+ NEW."_trigger_state_mgr_id" := null; --&gt; setting null not to persist anything (or maybe a real "last_update_by" column makes sense?)
+ RETURN NEW;
+END;
+$$
+LANGUAGE 'plpgsql';
+</code></pre>
+<p>The trigger logs the change into the &#8220;changes&#8221; table, reading this added column value. But I set this value to null once used because I don&#8217;t want to waste any storage (disk and memory) for it.</p>
+<pre><code>
+CREATE TRIGGER dept_changes
+BEFORE UPDATE ON employees
+FOR EACH ROW
+EXECUTE PROCEDURE record_dept_changes();
+</code></pre>
+<p>In PostgreSQL the trigger calls the procedure which has access to the NEW. valies</p>
+<pre><code>
+CREATE OR REPLACE PROCEDURE transfer_employee(integer, integer, text)
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  -- IF employee reports to mgr, allow mgr to transfer person
+  IF EXISTS (SELECT employee_no FROM mgr_table where mgr_id = $1 and employee_no = $2)
+  THEN
+   UPDATE employees
+   SET department = $3, "_trigger_state_mgr_id" = $1 --&gt; passing the state through the column
+   WHERE employee_no = $2;
+   COMMIT;
+  END IF;
+END;
+$$;
+</code></pre>
+<p>Here is my procedure that implements the transfer service. In addition to checking if the manager is allowed to do the transfer, and doing the update, I set the additional column with the context value.</p>
+<p>This column is declared in the metadata, is used by the update statement but is discarded by the trigger. If PostgreSQL had a feature like the Oracle invisible column, I would set this column as invisible as I don&#8217;t want to see it in SELECT * or INSERT to it. I can do the same with a view on top of the table.</p>
+<p>In summary:</p>
+<ul>
+<li>you may have less feature in open source software than commercial ones, but this probably means that there&#8217;s something to do differently in the application design. Commercial vendors can implement anything when important customers pay for it. An open source community will not add more complexity to workaround a problem that should be addressed by the application design. Don&#8217;t call SQL DML with trigger magic behind. Call a procedure that has all the logic, including all DML (main change and audit) and verifications</li>
+<li>workarounds are valid as long as you document them (what they do, and why) and verify all side effects (like setting it to null afterwards). There are often many workarounds and choose the one that makes more sense. Here, maybe the &#8220;_trigger_state_mgr_id&#8221; will become a real column to persist one day, if there&#8217;s a need to store the latest manager that assigned the employee to a department</li>
+</ul>
+
+</div>
+</body>
+</html>

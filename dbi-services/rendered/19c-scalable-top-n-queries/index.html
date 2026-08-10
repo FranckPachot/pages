@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/19c-scalable-top-n-queries/">
+<title>19c: scalable Top-N queries without further hints to the query planner</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/19c-scalable-top-n-queries/">https://www.dbi-services.com/blog/19c-scalable-top-n-queries/</a> (2020-07-14)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">19c: scalable Top-N queries without further hints to the query planner</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+The FETCH FIRST &#8230; ROWS ONLY syntax arrived in Oracle 12c and is much more convenient than using a subquery with &#8216;ORDER BY&#8217; wrapped in a &#8220;WHERE ROWNUM &lt; &#8230;&#8221; around it. But as I mentioned in a <a href="https://www.dbi-services.com/blog/oracle-rownum-vs-rownumber-and-12c-fetch-first/" target="_blank" rel="noopener noreferrer">previous post</a> it required the FIRST_ROWS() hint to get correct estimations. In SQL you don&#8217;t want to overload your code for performance, right? The RDBMS optimizer does the job for you. This was a bug with this new FETCH FIRST syntax, that is fixed (See <a href="https://blogs.oracle.com/optimizer/fetch-first-rows-just-got-faster" target="_blank" rel="noopener noreferrer">Nigel Bayliss post</a> about this) in 19c:</p>
+<pre><code>
+SQL&gt; select bugno,value,optimizer_feature_enable,description from  V$SYSTEM_FIX_CONTROL where bugno=22174392;
+
+      BUGNO    VALUE    OPTIMIZER_FEATURE_ENABLE                                                      DESCRIPTION
+___________ ________ ___________________________ ________________________________________________________________
+   22174392        1 19.1.0                      first k row optimization for window function rownum predicate
+
+</code></pre>
+<p>You can use this query on database metadata to check that you have the fix enabled (VALUE=1 means that the bug is ON). Yes, Oracle Database is not open source, but a lot of information is disclosed: you can query, with SQL, all optimizer enhancements and bug fixes, and versions they appear. And you can even enable or disable them at query level:</p>
+<pre><code>
+select /*+ opt_param('_fix_control' '22174392:OFF') */
+continentexp,countriesandterritories,cases from covid where cases&gt;0
+order by daterep desc, cases desc fetch first 5 rows only
+</code></pre>
+<p>This simulates previous versions where the fix were not there.</p>
+<p>Here is an example on the COVID table I&#8217;ve created in a previous post:<a href="https://www.dbi-services.com/blog/oracle-select-from-file/" target="_blank" rel="noopener noreferrer">https://www.dbi-services.com/blog/oracle-select-from-file/</a><br />
+I&#8217;m running this on the Oracle Cloud 20c preview but you can run the same on any recent version.</p>
+<h3>FETCH FIRST n ROWS</h3>
+<p>I&#8217;m looking at the Top-5 countries with the highest covid cases in the latest date I have in my database. This means ORDER BY the date and number of cases (both in descending order) and fetching only the first 5 rows.</p>
+<pre><code>
+SQL&gt; select continentexp,countriesandterritories,cases
+  2  from covid where cases&gt;0
+  3  order by daterep desc, cases desc fetch first 5 rows only
+  4  /
+
+
+   CONTINENTEXP     COUNTRIESANDTERRITORIES    CASES
+_______________ ___________________________ ________
+America         United_States_of_America       57258
+Asia            India                          28701
+America         Brazil                         24831
+Africa          South_Africa                   12058
+Europe          Russia                          6615
+
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'allstats last')
+  2  /
+
+
+                                                                                                         PLAN_TABLE_OUTPUT
+__________________________________________________________________________________________________________________________
+SQL_ID  753q1ymf0sv0w, child number 1
+-------------------------------------
+select continentexp,countriesandterritories,cases from covid where
+cases&gt;0 order by daterep desc, cases desc fetch first 5 rows only
+
+Plan hash value: 1833981741
+
+-----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                | Name  | Starts | E-Rows | A-Rows |   A-Time   | Buffers |  OMem |  1Mem | Used-Mem |
+-----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT         |       |      1 |        |      5 |00:00:00.01 |     239 |       |       |          |
+|*  1 |  VIEW                    |       |      1 |      5 |      5 |00:00:00.01 |     239 |       |       |          |
+|*  2 |   WINDOW SORT PUSHED RANK|       |      1 |  20267 |      5 |00:00:00.01 |     239 |   124K|   124K|  110K (0)|
+|*  3 |    TABLE ACCESS FULL     | COVID |      1 |  20267 |  18150 |00:00:00.01 |     239 |       |       |          |
+-----------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter("from$_subquery$_002"."rowlimit_$$_rownumber"&lt;=5)
+   2 - filter(ROW_NUMBER() OVER ( ORDER BY INTERNAL_FUNCTION("DATEREP") DESC ,INTERNAL_FUNCTION("CASES") DESC )0)
+
+</code></pre>
+<p>I have queried the execution plan because the RDBMS optimization is not a black box: you can ask for an explanation. Here, it reads the whole table (TABLE ACCESS FULL), SORT it, and FILTER the rows up to number 5.</p>
+<p>This is not efficient at all. In a relational database, rather than streaming all changes to another data store, we add purpose-built indexes to scale with a new query use-case:</p>
+<pre><code>
+SQL&gt; create index covid_date_cases on covid(daterep,cases)
+  2  /
+Index COVID_DATE_CASES created.
+
+</code></pre>
+<p>That&#8217;s all. This index will be automatically maintained with strong consistency, and transparently for any modifications to the table.</p>
+<h3>NOSORT STOPKEY</h3>
+<p>I&#8217;m running exactly the same query:</p>
+<pre><code>
+SQL&gt; select continentexp,countriesandterritories,cases
+  2  from covid where cases&gt;0
+  3  order by daterep desc, cases desc fetch first 5 rows only
+  4  /
+
+   CONTINENTEXP     COUNTRIESANDTERRITORIES    CASES
+_______________ ___________________________ ________
+America         United_States_of_America       57258
+Asia            India                          28701
+America         Brazil                         24831
+Africa          South_Africa                   12058
+Europe          Russia                          6615
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'allstats last')
+  2  /
+
+                                                                                              PLAN_TABLE_OUTPUT
+_______________________________________________________________________________________________________________
+SQL_ID  753q1ymf0sv0w, child number 2
+-------------------------------------
+select continentexp,countriesandterritories,cases from covid where
+cases&gt;0 order by daterep desc, cases desc fetch first 5 rows only
+
+Plan hash value: 1929215041
+
+------------------------------------------------------------------------------------------------------------
+| Id  | Operation                     | Name             | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT              |                  |      1 |        |      5 |00:00:00.01 |       7 |
+|*  1 |  VIEW                         |                  |      1 |      5 |      5 |00:00:00.01 |       7 |
+|*  2 |   WINDOW NOSORT STOPKEY       |                  |      1 |      6 |      5 |00:00:00.01 |       7 |
+|   3 |    TABLE ACCESS BY INDEX ROWID| COVID            |      1 |  20267 |      5 |00:00:00.01 |       7 |
+|*  4 |     INDEX FULL SCAN DESCENDING| COVID_DATE_CASES |      1 |      6 |      5 |00:00:00.01 |       3 |
+------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter("from$_subquery$_002"."rowlimit_$$_rownumber"&lt;=5)
+   2 - filter(ROW_NUMBER() OVER ( ORDER BY INTERNAL_FUNCTION("DATEREP") DESC,INTERNAL_FUNCTION("CASES") DESC )0)
+       filter("CASES"&gt;0)
+
+</code></pre>
+<p>There is a big difference here. I don&#8217;t need to read the table anymore. The index provides the entries already sorted and a FULL SCAN DESCENDING will just read the first ones. Look at the &#8216;Buffer&#8217; column here which is the read units. In the previous test, without the index, it was 239 blocks. But what was bad there is that the FULL TABLE SCAN has a O(N) time complexity. Now with the index, I read only 7 blocks (3 to go down the index B*Tree and 4 to get the remaining column values). And this has a constant time complexity: even with billions of rows in the table this query will read less than 10 blocks, and most of them probably from memory. This will take less than a millisecond whatever the size of the table is.</p>
+<p>3 small conclusions here:</p>
+<ul>
+<li>If you think your RDBMS doesn&#8217;t scale, be sure that you run the latest version of it. Mainstream database have constant improvement and bug fixes.</li>
+<li>You don&#8217;t need another database each time you have another use case. Creating indexes can solve many problems and you have full agility when the RDBMS can create them online, and when there&#8217;s zero code to change.</li>
+<li>You don&#8217;t need to test on billions of rows. The execution plan operations tell you what scales or not. You don&#8217;t need to tell the optimizer how to proceed, but he tells you how he plans and how he did.</li>
+</ul>
+
+</div>
+</body>
+</html>

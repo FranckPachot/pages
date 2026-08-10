@@ -1,0 +1,181 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/display-data-guard-configuration-in-sql-developer/">
+<title>Display Data Guard configuration in SQL Developer</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/display-data-guard-configuration-in-sql-developer/">https://www.dbi-services.com/blog/display-data-guard-configuration-in-sql-developer/</a> (2017-08-01)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Display Data Guard configuration in SQL Developer</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+The latest version of SQL Developer, the 17.2 one released after Q2 of 2017, has a new item in the DBA view showing the Data Guard configuration. This is the occasion to show how you can cascade the log shipping in Oracle 12<em>c</em><br />
+<!--more--><br />
+A quick note about this new versioning: this is the release for 2017 Q2 and the version number has more digits to mention the exact build time. Here this version is labeled 17.2.0.188.1159 and we can see when it has been built:</p>
+<pre><code>
+SQL&gt;  select to_date('17.x.0.188.1159','rr."x.0".ddd.hh24mi') build_time from dual;
+ 
+BUILD_TIME
+--------------------
+07-JUL-2017 11:59:00
+</code></pre>
+<h3>Non-Cascading Standby</h3>
+<p>Here is my configuration with two standby databases:</p>
+<pre><code>
+DGMGRL&gt; show configuration
+Configuration - orcl
+ 
+  Protection Mode: MaxPerformance
+  Members:
+  orcla - Primary database
+    orclb - Physical standby database
+    orclc - Physical standby database
+ 
+Fast-Start Failover: DISABLED
+ 
+Configuration Status:
+SUCCESS   (status updated 9 seconds ago)
+</code></pre>
+<p>I have only the LogXptMode defined here, without any RedoRoutes</p>
+<pre><code>
+DGMGRL&gt; show database orcla LogXptMode
+  LogXptMode = 'SYNC'
+</code></pre>
+<p>with this configuration, the broker has set the following log destination on orcla, orclb and orclc:</p>
+<pre><code>
+INSTANCE_NAME    NAME                 VALUE
+---------------- -------------------- -------------------------------------------------------------------------------------------------------------
+ORCLA            log_archive_dest_1   location=USE_DB_RECOVERY_FILE_DEST, valid_for=(ALL_LOGFILES, ALL_ROLES)
+ORCLA            log_archive_dest_2   service="ORCLB", SYNC AFFIRM delay=0 optional compression=disable max_failure=0 max_connections=1 reopen=300
+                                      db_unique_name="orclb" net_timeout=30, valid_for=(online_logfile,all_roles)
+ORCLA            log_archive_dest_3   service="ORCLC", SYNC AFFIRM delay=0 optional compression=disable max_failure=0 max_connections=1 reopen=300
+                                      db_unique_name="orclc" net_timeout=30, valid_for=(online_logfile,all_roles)
+ 
+INSTANCE_NAME    NAME                 VALUE
+---------------- -------------------- -------------------------------------------------------------------------------------------------------------
+ORCLB            log_archive_dest_1   location=/u01/fast_recovery_area
+ 
+INSTANCE_NAME    NAME                 VALUE
+---------------- -------------------- -------------------------------------------------------------------------------------------------------------
+ORCLC            log_archive_dest_1   location=/u01/fast_recovery_area
+</code></pre>
+<p>In the latest SQL Developer you have the graphical representation of it from the DBA view / Dataguard / console:</p>
+<p><a href="../../assets/SDDG001.png"><img loading="lazy" decoding="async" class="alignnone size-large wp-image-17524" src="../../assets/SDDG001.png" alt="SDDG001" width="1024" height="102" /></a></p>
+<h3>Cascading Standby</h3>
+<p>In 12<i>c</i> we can define cascading standby: instead of the primary shipping the redo to all standby databases, you can have the primary shipping to one standby only, and this one can forward the redo to another one. You define that with the RedoRoute property:</p>
+<pre><code>
+DGMGRL&gt; edit database orcla set property redoroutes = '(local:orclb)         (orclb:orclc async)';
+Property "redoroutes" updated
+DGMGRL&gt; edit database orclb set property redoroutes = '(orcla:orclc async)   (local:orcla)';
+Property "redoroutes" updated
+</code></pre>
+<p>The first route defined in each property is applied when orcla is the primary database:</p>
+<ul>
+<li>on orcla (local:orclb) means that orcla sends redo to orclb when primary</li>
+<li>on orclb (orcla:orclc async) means that orclb sends redo to orclc when orcla is primary. LogXptMode is SYNC but overriden here with ASYNC</li>
+</ul>
+<p>The second route defined in each property is applied when orclb is the primary database:</p>
+<ul>
+<li>on orcla (orclb:orclc async) means that orcla sends redo to orclc when orclb is primary. LogXptMode is SYNC but overriden here with ASYNC</li>
+<li>on orclb (local:orcla) means that orclb sends redo to orcla when primary</li>
+</ul>
+<p>With this configuration, and orcla still being the primary, the broker has set the following log destination on orcla, orclb and orclc:</p>
+<pre><code>
+INSTANCE_NAME    NAME                 VALUE
+---------------- -------------------- -------------------------------------------------------------------------------------------------------------
+ORCLA            log_archive_dest_1   location=USE_DB_RECOVERY_FILE_DEST, valid_for=(ALL_LOGFILES, ALL_ROLES)
+ORCLA            log_archive_dest_2   service="ORCLB", SYNC AFFIRM delay=0 optional compression=disable max_failure=0 max_connections=1 reopen=300
+                                      db_unique_name="orclb" net_timeout=30, valid_for=(online_logfile,all_roles)
+ 
+INSTANCE_NAME    NAME                 VALUE
+---------------- -------------------- -------------------------------------------------------------------------------------------------------------
+ORCLB            log_archive_dest_1   location=/u01/fast_recovery_area
+ORCLB            log_archive_dest_2   service="ORCLC", ASYNC NOAFFIRM delay=0 optional compression=disable max_failure=0 max_connections=1 reopen=3
+                                      00 db_unique_name="orclc" net_timeout=30, valid_for=(standby_logfile,all_roles)
+ 
+INSTANCE_NAME    NAME                 VALUE
+---------------- -------------------- -------------------------------------------------------------------------------------------------------------
+ORCLC            log_archive_dest_1   location=/u01/fast_recovery_area
+</code></pre>
+<p>The show configuration from DGMGRL displays them indented to see the cascading redo shipping:</p>
+<pre><code>
+DGMGRL&gt; show configuration
+Configuration - orcl
+ 
+  Protection Mode: MaxPerformance
+  Members:
+  orcla - Primary database
+    orclb - Physical standby database
+      orclc - Physical standby database (receiving current redo)
+ 
+Fast-Start Failover: DISABLED
+ 
+Configuration Status:
+SUCCESS   (status updated 27 seconds ago)
+</code></pre>
+<p>And SQL Developer Data Guard console shows:<br />
+<a href="../../assets/SDDG0021.png"><img loading="lazy" decoding="async" class="alignnone size-large wp-image-17573" src="../../assets/SDDG0021.png" alt="SDDG002" width="1024" height="65" /></a></p>
+<h3>Switchover</h3>
+<p>Now the goal of defining several routes is to have all log destination automatically changed when the database role change.<br />
+I&#8217;m doing a switchover:</p>
+<pre><code>
+Connected to "orclb"
+Connected as SYSDG.
+DGMGRL&gt; switchover to orclb;
+Performing switchover NOW, please wait...
+New primary database "orclb" is opening...
+Operation requires start up of instance "ORCLA" on database "orcla"
+Starting instance "ORCLA"...
+ORACLE instance started.
+Database mounted.
+Database opened.
+Connected to "orcla"
+Switchover succeeded, new primary is "orclb"
+</code></pre>
+<p>Now it is orcla which cascades the orclb redo to orclc:</p>
+<pre><code>
+DGMGRL&gt; show configuration;
+Configuration - orcl
+ 
+  Protection Mode: MaxPerformance
+  Members:
+  orclb - Primary database
+    orcla - Physical standby database
+      orclc - Physical standby database (receiving current redo)
+ 
+Fast-Start Failover: DISABLED
+ 
+Configuration Status:
+SUCCESS   (status updated 74 seconds ago)
+</code></pre>
+<p>Here is how it is displayed from SQL Developer:</p>
+<p><a href="../../assets/SDDG0031.png"><img loading="lazy" decoding="async" class="alignnone size-large wp-image-17574" src="../../assets/SDDG0031.png" alt="SDDG003" width="1024" height="63" /></a></p>
+<p>We have seen how the configuration is displayed from DGMGRL and graphically from SQL Developer. Of course, you can also query the Data Guard configuration:</p>
+<pre><code>
+SQL&gt; select * from V$DATAGUARD_CONFIG;
+ 
+DB_UNIQUE_NAME  PARENT_DBUN  DEST_ROLE         CURRENT_SCN  CON_ID
+--------------  -----------  ---------         -----------  ------
+orcla           orclb        PHYSICAL STANDBY  3407900      0
+orclc           orcla        PHYSICAL STANDBY  3408303      0
+orclb           NONE         PRIMARY DATABASE  0            0
+</code></pre>
+<p>and the broker configuration:</p>
+<pre><code>
+SQL&gt;  select * from V$DG_BROKER_CONFIG;
+ 
+DATABASE  CONNECT_IDENTIFIER  DATAGUARD_ROLE    REDO_SOURCE  ENABLED  STATUS  VERSION  CON_ID
+--------  ------------------  --------------    -----------  -------  ------  -------  ------
+orcla     ORCLA               PHYSICAL STANDBY  -UNKNOWN-    TRUE     0       11.0     0
+orclb     ORCLB               PRIMARY           -N/A-        TRUE     0       11.0     0
+orclc     ORCLC               PHYSICAL STANDBY  orcla        TRUE     0       11.0     0
+</code></pre>
+<p>This another reason to use the broker. Once the configuration is setup and tested, you have nothing else to think about when you do a switchover. The log archive destination is automatically updated depending on the database roles.</p>
+
+</div>
+</body>
+</html>

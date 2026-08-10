@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/drop-pdb-including-datafiles-may-keep-files-open/">
+<title>Drop PDB including datafiles may keep files open</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/drop-pdb-including-datafiles-may-keep-files-open/">https://www.dbi-services.com/blog/drop-pdb-including-datafiles-may-keep-files-open/</a> (2017-12-25)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Drop PDB including datafiles may keep files open</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+I like that Oracle drops the datafiles from the operating system when we remove them from the database (with drop tablespace or drop pluggable database) because I don&#8217;t like to have orphean files remaining in the filesystem. However, to ensure that space is reclaimed, we must be sure that Oracle did not leave a process with this file opened. Linux allows to drop an open file but then drops only the inode. The consequence is that we do not see the file, but space is not reclaimable until the process closes the handle.<br />
+Here is a case where I&#8217;ve had an issue in 12.2 where plugging a PDB is done in parallel and the parallel processes keep the files opened even if we drop the pluggable database.<br />
+<!--more--><br />
+I have 1.2 GB free on my filesystem:</p>
+<pre><code>SQL&gt; host df -h /u02/oradata
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root  3.1G  1.9G  1.2G  61% /
+</code></pre>
+<h3>Plug</h3>
+<p>I plug a PDB from a PDB archvive:</p>
+<pre><code>SQL&gt; create pluggable database PDB0
+  2   using '/u01/app/temp/PDB0.pdb'
+  3   file_name_convert=('/u01/app/temp','/u02/oradata')
+  4  /
+&nbsp;
+Pluggable database PDB0 created.
+</code></pre>
+<h3>Open</h3>
+<p>In my example the PDB was from an older PSU level. I open it:</p>
+<pre><code>SQL&gt; alter pluggable database PDB0 open;
+ORA-24344: success with compilation error
+&nbsp;
+Pluggable database PDB0 altered.
+</code></pre>
+<p>I got a warning and the PDB is in restricted session mode:</p>
+<pre><code>SQL&gt; show pdbs
+  CON_ID CON_NAME   OPEN MODE    RESTRICTED
+  ------ ---------- ------------ ----------
+       2 PDB$SEED   READ ONLY    NO
+       3 PDB0       READ WRITE   YES
+       4 PDB1       READ WRITE   NO
+</code></pre>
+<p>The reason is that a PSU installed in the CDB$ROOT was not there when the PDB was unplugged:</p>
+<pre><code>
+SQL&gt; select status,message from pdb_plug_in_violations;
+STATUS    MESSAGE
+------    ------------------------------------------------------------------------------------------------------------
+PENDING   DBRU bundle patch 171017 (DATABASE RELEASE UPDATE 12.2.0.1.171017): Installed in the CDB but not in the PDB.
+</code></pre>
+<p>I can run datapatch, but let&#8217;s say that I realize it&#8217;s the wrong PDB archive and I want to drop what I&#8217;ve imported. Then I expect to reclaim the space in order to be able to import the right one again.</p>
+<h3>Processes</h3>
+<p>Before closing the PDB here are all the processes having one of the datafiles opened:</p>
+<pre><code>SQL&gt; host for i in $(fuser /u02/oradata/*) ; do ps --no-headers -p $i ; done
+/u02/oradata/sysaux01.dbf:
+/u02/oradata/system01.dbf:
+/u02/oradata/temp01.dbf:
+/u02/oradata/undotbs01.dbf:
+/u02/oradata/users01.dbf:
+ 6053 ?        00:00:00 ora_dbw0_cdb1
+ 6122 ?        00:00:01 ora_p003_cdb1
+ 6594 ?        00:00:01 oracle_6594_cdb
+ 6053 ?        00:00:00 ora_dbw0_cdb1
+ 6120 ?        00:00:01 ora_p002_cdb1
+ 6594 ?        00:00:01 oracle_6594_cdb
+ 6053 ?        00:00:00 ora_dbw0_cdb1
+ 6594 ?        00:00:01 oracle_6594_cdb
+ 6053 ?        00:00:00 ora_dbw0_cdb1
+ 6118 ?        00:00:00 ora_p001_cdb1
+ 6594 ?        00:00:01 oracle_6594_cdb
+ 6053 ?        00:00:00 ora_dbw0_cdb1
+ 6116 ?        00:00:00 ora_p000_cdb1
+ 6594 ?        00:00:01 oracle_6594_cdb
+</code></pre>
+<p>There is my session shadow process, also the DBWR, and the Pnnn parallel processes who did the copy of the datafiles during the plug.</p>
+<h3>Close</h3>
+<p>So, I want to drop it and then I close it:</p>
+<pre><code>SQL&gt; alter pluggable database PDB0 close;
+&nbsp;
+Pluggable database PDB0 altered.
+</code></pre>
+<p>Close means that all files are closed. Is it true? Actually not:</p>
+<pre><code>SQL&gt; host for i in $(fuser /u02/oradata/*) ; do ps --no-headers -p $i ; done
+/u02/oradata/sysaux01.dbf:
+/u02/oradata/system01.dbf:
+/u02/oradata/undotbs01.dbf:
+/u02/oradata/users01.dbf:
+ 6122 ?        00:00:01 ora_p003_cdb1
+ 6120 ?        00:00:01 ora_p002_cdb1
+ 6118 ?        00:00:00 ora_p001_cdb1
+ 6116 ?        00:00:00 ora_p000_cdb1
+</code></pre>
+<p>The parallel processes still have the datafiles opened. This is probably a bug and I&#8217;ll open a SR referencing this blog post.</p>
+<p>So I want to reclaim space:</p>
+<pre><code>SQL&gt; host df -h /u02/oradata
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root  3.1G  2.6G  527M  84% /
+</code></pre>
+<p>I expect to have this 527 MB available go back to 1.2 GB available once I drop the PDB.</p>
+<h3>Drop including datafiles</h3>
+<p>I cannot drop the PDB and keep the datafiles, or I&#8217;ll get ORA-65179: cannot keep datafiles for a pluggable database that is not unplugged<br />
+I don&#8217;t want to unplug it but just to drop it, then I must mention the &#8216;including datafiles&#8217;:</p>
+<pre><code>
+SQL&gt; drop pluggable database PDB0 including datafiles;
+&nbsp;
+Pluggable database PDB0 dropped.
+</code></pre>
+<p>Unfortunately, the space is not reclaimed:</p>
+<pre><code>SQL&gt; host df -h /u02/oradata
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root  3.1G  2.6G  527M  84% /
+</code></pre>
+<p>As you have seen that the Pnnn processes were still there after the close, you know the reason. Linux has removed the inode but the file is still there in the filesystem until the processes close the handles (or the processes are killed). You can see them with lsof or from the /proc filesystem:</p>
+<pre><code>
+SQL&gt; host find /proc/*/fd -ls 2&gt;/dev/null | grep deleted
+ 79174    0 lrwx------   1 oracle   oinstall       64 Dec 25 21:20 /proc/6116/fd/257 -&gt; /u02/oradata/users01.dbf (deleted)
+ 79195    0 lrwx------   1 oracle   oinstall       64 Dec 25 21:20 /proc/6118/fd/257 -&gt; /u02/oradata/undotbs01.dbf (deleted)
+ 79216    0 lrwx------   1 oracle   oinstall       64 Dec 25 21:20 /proc/6120/fd/257 -&gt; /u02/oradata/system01.dbf (deleted)
+ 79237    0 lrwx------   1 oracle   oinstall       64 Dec 25 21:20 /proc/6122/fd/257 -&gt; /u02/oradata/sysaux01.dbf (deleted)
+</code></pre>
+<p>On a running CDB I cannot kill the background processes because they may be doing something useful. Until I can re-start the instance, the only way to reclaim the space is to write an empty file to replace those files. I cannot use the file name which has been deleted but I can use the /proc link:</p>
+<pre><code>
+SQL&gt; host find /proc/*/fd -ls 2&gt;/dev/null | grep -E " [/]u02[/]oradata[/].* [(]deleted[)]" | awk '{print $11}' | while read f ; do : &gt; $f ; done
+</code></pre>
+<p>And finally space is reclaimed:</p>
+<pre><code>SQL&gt; host df -h /u02/oradata
+Filesystem           Size  Used Avail Use% Mounted on
+/dev/mapper/ol-root  3.1G  1.9G  1.2G  61% /
+</code></pre>
+<h3>So what?</h3>
+<p>I encountered this issue with a PDB plug but I&#8217;m quite sure we can encounter it in other situations when the parallel processes had opened the PDB datafiles. You can imagine the consequence on a multitenant CDB for DBaaS where you have hundreds of PDBs and constantly create and drop them, probably in an automated way. Space not reclaimed means that at one time the provisioning will fail. I hope this bug will be filled and fixed. Closing a PDB should take care that all processes close the files. The safe way is to include something like I did, emptying the deleted files, with the proper verifications that the old files belong to a dropped PDB.</p>
+
+</div>
+</body>
+</html>

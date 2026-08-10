@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/running-sql-server-on-the-oracle-free-tier/">
+<title>Running SQL Server on the Oracle Free tier</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/running-sql-server-on-the-oracle-free-tier/">https://www.dbi-services.com/blog/running-sql-server-on-the-oracle-free-tier/</a> (2020-02-08)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Running SQL Server on the Oracle Free tier</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>The Oracle Cloud is not only for Oracle Database. You can create a VM running Oracle Linux with full root access to it, even in the free tier: a free VM that will be always up, never expires, with full ssh connectivity to a sudoer user, where you are able to tunnel any port. Of course, there are some limits that I&#8217;ve detailed in a <a href="https://medium.com/@FranckPachot/the-oracle-cloud-free-tier-37c27f3b1e19?source=friends_link&amp;sk=2233caa140b1f1501ad8874f18fd2197" target="_blank" rel="noopener noreferrer">previous post</a>. But that is sufficient to run a database, given that you configure a low memory usage. For Oracle Database XE, <a href="https://blog.ora-600.pl/2019/09/27/how-to-install-oracle-xe-18c-in-oracle-cloud-free-tier/" target="_blank" rel="noopener noreferrer">Kamil Stawiarski</a> mentions that you can just hack the memory test in the RPM shell script.<br />
+But for Microsoft SQL Server, that&#8217;s a bit more complex because this test is hardcoded in the sqlservr binary and the solution I propose here is to intercept the call to the sysinfo() system call.<br />
+<!--more--><br />
+Creating a VM in the Oracle Cloud is very easy, here are the steps in one picture:<br />
+<img loading="lazy" decoding="async" class="alignnone size-large wp-image-37075" src="../../assets/oraclefreetierforsqlserver001.png" alt="" width="1024" height="683" /></p>
+<p>I&#8217;m connecting to the public IP Address with ssh (the public key is uploaded when creating the VM) and I&#8217;ll will run everything as root:</p>
+<pre><code>ssh opc@129.213.138.34
+sudo su -
+cat /etc/oracle-release</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37066" src="../../assets/Annotation-2020-02-08-172455.jpg" alt="" width="1024" height="135" /></p>
+<p>I install docker engine (version 19.3 there)</p>
+<pre><code>yum install -y docker-engine</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37065" src="../../assets/Annotation-2020-02-08-172733.jpg" alt="" width="1024" height="483" /></p>
+<p>I start docker</p>
+<pre><code>
+systemctl start docker
+docker info</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37064" src="../../assets/Annotation-2020-02-08-172947.jpg" alt="" width="1024" height="697" /><br />
+I&#8217;ll use the latest SQL Server 2019 image built on RHEL</p>
+<pre><code>docker pull mcr.microsoft.com/mssql/rhel/server:2019-latest
+docker images</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37063" src="../../assets/Annotation-2020-02-08-173411.jpg" alt="" width="1024" height="256" /></p>
+<p>5 minutes to download a 1.5GB image. Now trying to start it.<br />
+The nice thing (when I compare to Oracle) is that we don&#8217;t have to manually accept the license terms with a click-through process. I just mention that I have read and accepted them with: ACCEPT_EULA=Y</p>
+<p>I try to run it:</p>
+<pre><code>docker run \
+ -e "ACCEPT_EULA=Y" \
+ -e 'MSSQL_PID=Express' \
+ -p 1433:1433 \
+ -e 'SA_PASSWORD=**P455w0rd**' \
+ --name mssql \
+ mcr.microsoft.com/mssql/rhel/server:2019-latest</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37062" src="../../assets/Annotation-2020-02-08-173451.jpg" alt="" width="1024" height="228" /></p>
+<p>There&#8217;s a hardcoded prerequisite verification to check that the system has at least 2000 MB of RAM. And I have less than one GB here in this free tier:</p>
+<pre><code>
+awk '/^Mem/{print $0,$2/1024" MB"}' /proc/meminfo
+</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37071" src="../../assets/Annotation-2020-02-08-174805.jpg" alt="" width="1024" height="137" /></p>
+<p>Fortunately, there&#8217;s always a nice geek on the internet with an awesome solution: hack the sysinfo() system call with a LD_PRELOAD&#8217;ed wrapper : <a href="https://github.com/justin2004/mssql_server_tiny" target="_blank" rel="noopener noreferrer">A Slightly Liberated Microsoft SQL Server Docker image</a></p>
+<p>Let&#8217;s get it:</p>
+<pre><code>git clone https://github.com/justin2004/mssql_server_tiny.git
+cd mssql_server_tiny</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37061" src="../../assets/Annotation-2020-02-08-173735.jpg" alt="" width="1024" height="769" /></p>
+<p>I changed the FROM to build from the 2019 RHEL image and I preferred to use /etc/ld.so.preload rather than overriding the CMD command with LD_LIBRARY:</p>
+<pre><code>
+FROM oraclelinux:7-slim AS build0
+WORKDIR /root
+RUN yum update -y &amp;&amp; yum install -y binutils gcc
+ADD wrapper.c /root/
+RUN gcc -shared  -ldl -fPIC -o wrapper.so wrapper.c
+FROM mcr.microsoft.com/mssql/rhel/server:2019-latest
+COPY --from=build0 /root/wrapper.so /root/
+ADD wrapper.c /root/
+USER root
+RUN echo "/root/wrapper.so" &gt; /etc/ld.so.preload
+USER mssql
+</code></pre>
+<p>I didn&#8217;t change the wrapper for the sysinfo function:</p>
+<pre><code>#define _GNU_SOURCE
+#include
+#include
+#include
+int sysinfo(struct sysinfo *info){
+    // clear it
+    //dlerror();
+    void *pt=NULL;
+    typedef int (*real_sysinfo)(struct sysinfo *info);
+    // we need the real sysinfo function address
+    pt = dlsym(RTLD_NEXT,"sysinfo");
+    //printf("pt: %x\n", *(char *)pt);
+    // call the real sysinfo system call
+    int real_return_val=((real_sysinfo)pt)(info);
+    // but then modify its returned totalram field if necessary
+    // because sqlserver needs to believe it has "2000 megabytes"
+    // physical memory
+    if( info-&gt;totalram totalram = 1000l * 1000l * 1000l * 2l ;
+    }
+    return real_return_val;
+}
+</code></pre>
+<p>I build the image from there:</p>
+<pre><code>docker build -t mssql .</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37070" src="../../assets/Annotation-2020-02-08-175629.jpg" alt="" width="1024" height="523" /><br />
+I run it:</p>
+<pre><code>docker run -d \
+ -e "ACCEPT_EULA=Y" \
+ -e 'MSSQL_PID=Express' \
+ -p 1433:1433 \
+ -e 'SA_PASSWORD=**P455w0rd**' \
+ --name mssql \
+ mssql</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37069" src="../../assets/Annotation-2020-02-08-180121-scaled.jpg" alt="" width="1024" height="558" /></p>
+<p>I wait until it is ready:</p>
+<pre><code>until docker logs mssql  | grep -C10 "Recovery is complete." ; do sleep 1 ; done</code></pre>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37068" src="../../assets/Annotation-2020-02-08-180219.jpg" alt="" width="1024" height="236" /></p>
+<p>All is ok and I connect and check the version:</p>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37067" src="../../assets/Annotation-2020-02-08-180605-scaled.jpg" alt="" width="1024" height="493" /></p>
+<p>Well&#8230; as you can see my first attempt failed. I am running with very low memory here, and then many memory allocation problems can be expected. If you look at the logs after a while, many automatic system tasks fail. But that&#8217;s sufficient for a minimal lab and you can tweak some Linux and SQL Server parameters if you need it. Comments are welcome here for feedback and ideas&#8230;</p>
+<p>The port 1433 is exposed here locally and it can be tunneled through ssh. This is a free lab environment always accessible from everywhere to do small tests in MS SQL, running on the Oracle free tier. Here is how I connect with <a href="https://dbeaver.io/download/" target="_blank" rel="noopener noreferrer">DBeaver</a> from my laptop, just mentioning the public IP address, private ssh key and connection information:</p>
+<p><img loading="lazy" decoding="async" class="alignnone size-large wp-image-37088" src="../../assets/oraclefreetierforsqlserver002-1.png" alt="" width="1024" height="683" /></p>
+
+</div>
+</body>
+</html>

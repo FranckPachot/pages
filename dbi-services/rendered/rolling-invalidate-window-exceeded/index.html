@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/rolling-invalidate-window-exceeded/">
+<title>Rolling Invalidate Window Exceeded</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/rolling-invalidate-window-exceeded/">https://www.dbi-services.com/blog/rolling-invalidate-window-exceeded/</a> (2016-08-30)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Rolling Invalidate Window Exceeded</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Today I was doing a hard parse storm post-mortem analysis. One hypothesis was rolling invalidation causing invalidation, but figures didn&#8217;t match. I often reproduce the hypothesis to check the numbers to be sure I interpret them correctly. Especially the timestamps in V$SQL_SHARED_CURSOR.REASON. And as it may help others (including myself in the future) I share the test case.<br />
+<!--more--><br />
+I create a table with one row (12c online statistics gathering, so num_rows is 1) and then insert one more row.</p>
+<pre><code>
+21:31:26 SQL&gt; create table DEMO as select * from dual;
+Table created.
+21:31:26 SQL&gt; insert into DEMO select * from dual;
+1 row created.
+21:31:26 SQL&gt; commit;
+Commit complete.
+</code></pre>
+<p>I run a query on the table. I don&#8217;t care about the result, so let&#8217;s put it something that will be useful later: the UTC time as the number of seconds since Jan 1st, 1970 (aka Epoch)</p>
+<pre><code>
+21:32:52 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585572
+                                                               1472585572
+</code></pre>
+<p>The execution plan cardinality estimation is 1 row as this is what is in object statistics.</p>
+<pre><code>
+21:32:52 SQL&gt; select * from table(dbms_xplan.display_cursor(null,null));
+&nbsp;
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  61x2h0y9zv0r6, child number 0
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+&nbsp;
+Plan hash value: 4000794843
+&nbsp;
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     1 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+</code></pre>
+<p>I gather statistics with all default attributes, so rolling invalidation occurs.</p>
+<pre><code>
+21:32:52 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO');
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>At this time, the cursor has been parsed only once:</p>
+<pre><code>
+21:32:52 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time from v$sql where sql_id='61x2h0y9zv0r6';
+&nbsp;
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------
+            0          1           1          1 2016-08-30/21:32:51 2016-08-30/21:32:51 30-AUG-16 21:32:51
+</code></pre>
+<p>By default the invalidation window is 5 hours. I don&#8217;t want to wait so I set it to something shorter- 15 seconds:</p>
+<pre><code>
+21:32:54 SQL&gt; alter system set "_optimizer_invalidation_period"=15;
+System altered.
+</code></pre>
+<p>There will not be any invalidation until the next execution. To prove it I wait 20 seconds, run the query again and check the execution plan:</p>
+<pre><code>
+21:33:12 SQL&gt; select (sysdate-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(SYSDATE-DATE'1970-01-01')*24*3600
+----------------------------------
+                        1472592792
+                        1472592792
+&nbsp;
+21:33:12 SQL&gt; select * from table(dbms_xplan.display_cursor('61x2h0y9zv0r6',null));
+&nbsp;
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  61x2h0y9zv0r6, child number 0
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+&nbsp;
+Plan hash value: 4000794843
+&nbsp;
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     1 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+</code></pre>
+<p>This is still the old cursor (child number 0) with old stats (num_rows=1)</p>
+<p>However, from this point rolling invalidation occurs: a random timestamp is generated within the rolling window (15 seconds here &#8211; 5 hours in default database).</p>
+<p>I don&#8217;t know how to see this timestamp at that point (comments welcome) so I run the query several times within this 15 seconds window to see when it occurs:</p>
+<pre><code>
+21:33:16 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585596
+                                                               1472585596
+&nbsp;
+21:33:19 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585599
+                                                               1472585599
+&nbsp;
+21:33:22 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585602
+                                                               1472585602
+&nbsp;
+21:33:25 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585605
+                                                               1472585605
+&nbsp;
+21:33:28 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585608
+                                                               1472585608
+&nbsp;
+21:33:31 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585611
+                                                               1472585611
+</code></pre>
+<p>After those runs, I check that I have a new execution plan with new estimation from new statistics (num_rows=2):</p>
+<pre><code>
+21:33:31 SQL&gt; select * from table(dbms_xplan.display_cursor('61x2h0y9zv0r6',null));
+&nbsp;
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  61x2h0y9zv0r6, child number 0
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+&nbsp;
+Plan hash value: 4000794843
+&nbsp;
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     1 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+&nbsp;
+SQL_ID  61x2h0y9zv0r6, child number 1
+-------------------------------------
+select (cast(sys_extract_utc(current_timestamp) as
+date)-date'1970-01-01')*24*3600 from DEMO
+&nbsp;
+Plan hash value: 4000794843
+&nbsp;
+------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Cost (%CPU)| Time     |
+------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DEMO |     2 |     2   (0)| 00:00:01 |
+------------------------------------------------------------------
+</code></pre>
+<p>Yes, I have a new child cursor, child number 1. A new cursor means that I have a reason in V$SQL_SHARED_CURSOR:</p>
+<pre><code>
+21:33:31 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='61x2h0y9zv0r6';
+&nbsp;
+CHILD_NUMBER REASON
+------------ --------------------------------------------------------------------------------
+           0 &lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Win
+             dow Exceeded(2)&lt;/reason&gt;&lt;size&gt;0x0&lt;/size&gt;&lt;details&gt;already_processed&lt;/details&gt;&lt;/Ch
+             ildNode&gt;&lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invali
+             date Window Exceeded(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;invalidation_window&gt;1472585604&lt;
+             /invalidation_window&gt;&lt;ksugctm&gt;1472585607&lt;/ksugctm&gt;&lt;/ChildNode&gt;
+&nbsp;
+           1
+</code></pre>
+<p>Child cursor number 0 has not been shared because of rolling invalidation. The invalidation_window number, 1472585604, is the timestamp set by rolling invalidation, set at first parse call (or execution) after stats gathering, and defined within the rolling window that follows. After this one (1472585604 is 21:33:24 in my GMT+2 timezone) the cursor will not be shared and a new hard parse occurs. I think that ksugctm is the timestamp when the new cursor is created. 1472585607 is 21:33:27 here in Switzerland. You see the corresponding timestamps in V$SQL:</p>
+<pre><code>
+21:33:31 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time from v$sql where sql_id='61x2h0y9zv0r6';
+&nbsp;
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------
+            0          1           5          5 2016-08-30/21:32:51 2016-08-30/21:32:51 30-AUG-16 21:33:24
+            0          1           2          2 2016-08-30/21:32:51 2016-08-30/21:33:27 30-AUG-16 21:33:30
+</code></pre>
+<p>Ok. Important thing is that the &#8216;rolling invalidation&#8217; is not an invalidation (as V$SQL.INVALIDATIONS=0) of the cursor, but just non-sharing of the child.</p>
+<p>If we gather statistics with immediate invalidation, it&#8217;s different:</p>
+<pre><code>
+21:33:31 SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO',no_invalidate=&gt;false);
+PL/SQL procedure successfully completed.
+&nbsp;
+21:33:34 SQL&gt; select (cast(sys_extract_utc(current_timestamp) as date)-date'1970-01-01')*24*3600 from DEMO;
+&nbsp;
+(CAST(SYS_EXTRACT_UTC(CURRENT_TIMESTAMP)ASDATE)-DATE'1970-01-01')*24*3600
+-------------------------------------------------------------------------
+                                                               1472585614
+                                                               1472585614
+21:33:34 SQL&gt; select child_number,reason from v$sql_shared_cursor where sql_id='61x2h0y9zv0r6';
+&nbsp;
+CHILD_NUMBER REASON
+------------ --------------------------------------------------------------------------------
+           0 &lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;/ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Win
+             dow Exceeded(3)&lt;/reason&gt;&lt;size&gt;2x4&lt;/size&gt;&lt;invalidation_window&gt;1472585604&lt;/invalid
+             ation_window&gt;&lt;ksugctm&gt;1472585607&lt;/ksugctm&gt;&lt;/ChildNode&gt;&lt;ChildNode&gt;&lt;ChildNumber&gt;0&lt;
+             /ChildNumber&gt;&lt;ID&gt;33&lt;/ID&gt;&lt;reason&gt;Rolling Invalidate Window Exceeded(2)&lt;/reason&gt;&lt;s
+             ize&gt;0x0&lt;/size&gt;&lt;details&gt;already_processed&lt;/details&gt;&lt;/ChildNode&gt;
+</code></pre>
+<p>I&#8217;ve only one child here, a new one, and I&#8217;m not sure the reason has a meaning.</p>
+<pre><code>
+21:33:34 SQL&gt; select invalidations,loads,parse_calls,executions,first_load_time,last_load_time,last_active_time from v$sql where sql_id='61x2h0y9zv0r6';
+&nbsp;
+INVALIDATIONS      LOADS PARSE_CALLS EXECUTIONS FIRST_LOAD_TIME     LAST_LOAD_TIME      LAST_ACTIVE_TIME
+------------- ---------- ----------- ---------- ------------------- ------------------- ------------------
+            1          2           1          1 2016-08-30/21:32:51 2016-08-30/21:33:33 30-AUG-16 21:33:33
+</code></pre>
+<p>This is an invalidation of the cursor. Old children cursors are removed and the proud parent is marked as invalidated 1 time.</p>
+
+</div>
+</body>
+</html>

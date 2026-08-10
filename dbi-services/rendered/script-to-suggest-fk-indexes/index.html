@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/script-to-suggest-fk-indexes/">
+<title>Script to suggest FK indexes</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/script-to-suggest-fk-indexes/">https://www.dbi-services.com/blog/script-to-suggest-fk-indexes/</a> (2016-07-04)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Script to suggest FK indexes</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In Oracle, when the referenced key is deleted (by delete on parent table, or update on the referenced columns) the child tables(s) are locked to prevent any concurrent insert that may reference the old key. This lock is a big issue on OLTP applications because it&#8217;s a TM Share lock, usually reserved for DDL only, and blocking any modification on the child table and blocking some modifications on tables that have a relationship with that child table. This problem can be be overcome when an index structure which allows to find concurrent inserts that may reference the old value. Here is the script I use to find which index is missing.<br />
+<!--more--><br />
+The idea is not to suggest to index all foreign keys for three reasons:</p>
+<ul>
+<li>when there are no delete or update in parent side, you don&#8217;t have that locking issue</li>
+<li>when there is minimal write activity on child side, the lock may not have big consequence</li>
+<li>you probably have indexes build for performance reasons that can be used to avoid locking even when they have more columns or have different column order</li>
+</ul>
+<p>The idea is not to suggest an index for each locking issue but only when blocking locks have been observed. Yes, it is a reactive solution, but proactive ones cannot be automatic. If you know your application well and then you know what you ave to index, then you don&#8217;t need this script. If you don&#8217;t, then proactive suggestion will suggest too many indexes.</p>
+<p>Here is the kind of output that I get with this script:</p>
+<pre><code>--  DELETE on APP1.GCO_GOOD has locked APP1.FAL_TASK in mode 5 for 8 minutes between 14-sep 10:36 and 14-sep 10:44
+--      blocked statement: DELETE FAL LOT LOT WHERE C FAB TYPE       AND EXISTS SELECT
+--      blocked statement: UPDATE DOC POSITION DETAIL SET DOC POSITION DETAIL ID B
+--      blocked statement: delete from C AP GCO GOOD where rowid    doa  rowid
+--      blocked statement: DELETE FROM FAL LOT WHERE FAL LOT ID    B
+--      blocked statement: DELETE FROM FAL TASK LINK PROP WHERE FAL LOT PROP ID B
+--      blocked statement: INSERT INTO FAL LOT PROGRESS  FAL LOT PROGRESS ID FAL LOT
+--      blocked statement: insert into FAL TASK LINK             FAL SCHEDULE STEP ID
+--      FK chain: APP1.GCO_GOOD referenced by(cascade delete) APP1"."GCO_SERVICE referenced by(cascade set null) APP1"."FAL_TASK (APP1.FAL_TASK_S_GCO_SERV) unindexed
+--         FK column GCO_GCO_GOOD_ID
+--      Suggested index:    CREATE INDEX ON "APP1"."FAL_TASK" ("GCO_GCO_GOOD_ID");
+--       Other existing Indexes:    CREATE INDEX "APP1"."FAL_TASK_S_DIC_FR_TASK_COD7_FK" ON "APP1"."FAL_TASK" ("DIC_FREE_TASK_CODE7_ID")
+--       Other existing Indexes:    CREATE INDEX "APP1"."FAL_TASK_S_DIC_FR_TASK_COD9_FK" ON "APP1"."FAL_TASK" ("DIC_FREE_TASK_CODE9_ID")
+--       Other existing Indexes:    CREATE INDEX "APP1"."FAL_TASK_S_PPS_TOOLS13_FK" ON "APP1"."FAL_TASK" ("PPS_TOOLS13_ID")</code></pre>
+<p>I&#8217;ll detail each part.</p>
+<h3>ASH</h3>
+<p>Yes we have to detect blocking issues from the past and I use ASH for that. If you don&#8217;t have Diagnostic Pack, then you have to change the query with another way to sample V$SESSION.</p>
+<pre><code>--  DELETE on APP1.GCO_GOOD has locked APP1.FAL_TASK in mode 5 for 8 minutes between 14-sep 10:36 and 14-sep 10:44
+--      blocked statement: DELETE FAL LOT LOT WHERE C FAB TYPE       AND EXISTS SELECT
+--      blocked statement: UPDATE DOC POSITION DETAIL SET DOC POSITION DETAIL ID B
+--      blocked statement: delete from C AP GCO GOOD where rowid    doa  rowid
+--      blocked statement: DELETE FROM FAL LOT WHERE FAL LOT ID    B
+--      blocked statement: DELETE FROM FAL TASK LINK PROP WHERE FAL LOT PROP ID B
+--      blocked statement: INSERT INTO FAL LOT PROGRESS  FAL LOT PROGRESS ID FAL LOT
+--      blocked statement: insert into FAL TASK LINK             FAL SCHEDULE STEP ID
+</code></pre>
+<p>The first part of the output comes from ASH and detects the blocking situations: which statement, how long, and the statements that were blocked.<br />
+This part of the script will probably need to be customized: I join with DBA_HIST_SQL_PLAN supposing that the queries have been captured by AWR as long running queries. I check last 15 days of ASH. You may change those to fit the blocking situation encountered.</p>
+<h3>Foreign Key</h3>
+<p>Then, we have to find the unindexed foreign key which is responsible for those locks.</p>
+<pre><code>
+--      FK chain: APP1.GCO_GOOD referenced by(cascade delete) APP1"."GCO_SERVICE referenced by(cascade set null) APP1"."FAL_TASK (APP1.FAL_TASK_S_GCO_SERV) unindexed
+--         FK column GCO_GCO_GOOD_ID
+</code></pre>
+<p>Here you see that it&#8217;s not easy. Actually, all scripts I&#8217;ve seen do not detect that situation where the CASCADE SET NULL cascades the issue. Here &#8220;APP1&#8243;.&#8221;GCO_SERVICE&#8221; has its foreign key indexed but the SET NULL, even when not on the referenced column, locks the child (for no reason as far as I know, but it does).<br />
+My script goes up to a level 10 using a connect by query to detect this situation.</p>
+<h3>Suggested Index</h3>
+<p>The suggested index is an index on the foreign key column:</p>
+<pre><code>
+--      Suggested index:    CREATE INDEX ON "APP1"."FAL_TASK" ("GCO_GCO_GOOD_ID");
+</code></pre>
+<p>This is only a suggestion. Any regular index that starts with foreign key column in whatever order can be used to avoid the lock.<br />
+Remember to think about performance first. The index may be used to navigate from parent to child.</p>
+<h3>Existing Index</h3>
+<p>Finally, when adding an index it&#8217;s good to check if there are other indexe that would not be needed anymore, so my script displays all of them.<br />
+If you think that some indexes are not required, remember that in 12c you can make them invisible for a while and you will be able to bring them back to visible quickly in case of regression.</p>
+<h3>Script</h3>
+<p>Here is the script. Sorry, no comments on it yet and a few display things to change. Just try it, it&#8217;s just a query on AWR (need Diag. Pack) and table/index/constraint metadata. You can customize it and don&#8217;t hesitate to comment if you have ideas to improve. I used it in several environments and it has always found the chain of foreign key that is responsible for an &#8216;enq: TM&#8217; blocking situation. And believe me this is not always easy to do just by looking at the data model.</p>
+<pre><code>
+set serveroutput on
+declare
+ procedure print_all(s varchar2) is begin null;
+  dbms_output.put_line(s);
+ end;
+ procedure print_ddl(s varchar2) is begin null;
+  dbms_output.put_line(s);
+ end;
+begin
+ dbms_metadata.set_transform_param(dbms_metadata.session_transform,'SEGMENT_ATTRIBUTES',false);
+ for a in (
+        select count(*) samples,
+        event,p1,p2,o.owner c_owner,o.object_name c_object_name,p.object_owner p_owner,p.object_name p_object_name,id,operation,min(p1-1414332420+4) lock_mode,min(sample_time) min_time,max(sample_time) max_time,ceil(10*count(distinct sample_id)/60) minutes
+        from dba_hist_active_sess_history left outer join dba_hist_sql_plan p using(dbid,sql_id) left outer join dba_objects o on object_id=p2 left outer join dba_objects po on po.object_id=current_obj#
+        where event like 'enq: TM%' and p1&gt;=1414332420 and sample_time&gt;sysdate-15 and p.id=1 and operation in('DELETE','UPDATE','MERGE')
+        group by
+        event,p1,p2,o.owner,o.object_name,p.object_owner,p.object_name,po.owner,po.object_name,id,operation
+        order by count(*) desc
+ ) loop
+  print_ddl('--  '||a.operation||' on '||a.p_owner||'.'||a.p_object_name||' has locked '||a.c_owner||'.'||a.c_object_name||' in mode '||a.lock_mode||' for '||a.minutes||' minutes between '||to_char(a.min_time,'dd-mon hh24:mi')||' and '||to_char(a.max_time,'dd-mon hh24:mi'));
+  for s in (
+   select distinct regexp_replace(cast(substr(sql_text,1,2000) as varchar2(60)),'[^a-zA-Z ]',' ') sql_text
+   from dba_hist_active_sess_history join dba_hist_sqltext t using(dbid,sql_id)
+   where event like 'enq: TM%' and p2=a.p2 and sample_time&gt;sysdate-90
+  ) loop
+   print_all('--      '||'blocked statement: '||s.sql_text);
+  end loop;
+  for c in (
+    with
+      c as (
+      select p.owner p_owner,p.table_name p_table_name,c.owner c_owner,c.table_name c_table_name,c.delete_rule,c.constraint_name
+      from dba_constraints p
+      join dba_constraints c on (c.r_owner=p.owner and c.r_constraint_name=p.constraint_name)
+      where p.constraint_type in ('P','U') and c.constraint_type='R'
+    )
+    select c_owner owner,constraint_name,c_table_name,connect_by_root(p_owner||'.'||p_table_name)||sys_connect_by_path(decode(delete_rule,'CASCADE','(cascade delete)','SET NULL','(cascade set null)',' ')||' '||c_owner||'"."'||c_table_name,' referenced by') foreign_keys
+    from c
+    where level&lt;=10 and c_owner=a.c_owner and c_table_name=a.c_object_name
+    connect by nocycle p_owner=prior c_owner and p_table_name=prior c_table_name and ( level=1 or prior delete_rule in (&#039;CASCADE&#039;,&#039;SET NULL&#039;) )
+    start with p_owner=a.p_owner and p_table_name=a.p_object_name
+  ) loop
+   print_all(&#039;--      &#039;||&#039;FK chain: &#039;||c.foreign_keys||&#039; (&#039;||c.owner||&#039;.&#039;||c.constraint_name||&#039;)&#039;||&#039; unindexed&#039;);
+   for l in (select * from dba_cons_columns where owner=c.owner and constraint_name=c.constraint_name) loop
+    print_all(&#039;--         FK column &#039;||l.column_name);
+   end loop;
+   print_ddl(&#039;--      Suggested index: &#039;||regexp_replace(translate(dbms_metadata.get_ddl(&#039;REF_CONSTRAINT&#039;,c.constraint_name,c.owner),chr(10)||chr(13),&#039;  &#039;),&#039;ALTER TABLE (&quot;[^&quot;]+&quot;[.]&quot;[^&quot;]+&quot;) ADD CONSTRAINT (&quot;[^&quot;]+&quot;) FOREIGN KEY ([(].*[)]).* REFERENCES &quot;.*&#039;,&#039;CREATE INDEX ON 1 3;&#039;));
+   for x in (
+     select rtrim(translate(dbms_metadata.get_ddl(&#039;INDEX&#039;,index_name,index_owner),chr(10)||chr(13),&#039;  &#039;)) ddl
+     from dba_ind_columns where (index_owner,index_name) in (select owner,index_name from dba_indexes where owner=c.owner and table_name=c.c_table_name)
+     and column_name in (select column_name from dba_cons_columns where owner=c.owner and constraint_name=c.constraint_name)
+     )
+   loop
+    print_ddl(&#039;--      Existing candidate indexes &#039;||x.ddl);
+   end loop;
+   for x in (
+     select rtrim(translate(dbms_metadata.get_ddl(&#039;INDEX&#039;,index_name,index_owner),chr(10)||chr(13),&#039;  &#039;)) ddl
+     from dba_ind_columns where (index_owner,index_name) in (select owner,index_name from dba_indexes where owner=c.owner and table_name=c.c_table_name)
+     )
+   loop
+    print_all(&#039;--       Other existing Indexes: &#039;||x.ddl);
+   end loop;
+  end loop;
+ end loop;
+end;
+/
+</code></pre>
+<p>I didn&#8217;t take time to document/comment the script but don&#8217;t hesitate to ask what you don&#8217;t understand there.</p>
+<p>You should not see any &#8216;enq: TM&#8217; from an OLTP application. If you have them, even short, they will become problematic one day. It&#8217;s the kind of thing that can block the whole database.</p>
+
+</div>
+</body>
+</html>

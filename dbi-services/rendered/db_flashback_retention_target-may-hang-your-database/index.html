@@ -1,0 +1,155 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/db_flashback_retention_target-may-hang-your-database/">
+<title>DB_FLASHBACK_RETENTION_TARGET may hang your database</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/db_flashback_retention_target-may-hang-your-database/">https://www.dbi-services.com/blog/db_flashback_retention_target-may-hang-your-database/</a> (2016-05-26)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">DB_FLASHBACK_RETENTION_TARGET may hang your database</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+DB_FLASHBACK_RETENTION_TARGET is set to keep enough flashback logs to be able to flashback database within the specified retention window. But it&#8217;s supposed to be a target only, meaning that on space pressure some files can be deleted. But be careful, there are cases where they are not and then the database hangs until you set a lower retention.<br />
+<!--more--><br />
+The fun part is the message telling you that it cannot reclaim space from a 50GB FRA where 0% is used:</p>
+<blockquote class="twitter-tweet" data-width="500" data-dnt="true">
+<p lang="en" dir="ltr">Humm&#8230;<br />Can&#39;t reclaim space because 0% is used <a href="https://t.co/4snP3OQZUV">pic.twitter.com/4snP3OQZUV</a></p>
+<p>&mdash; Franck Pachot (@FranckPachot) <a href="https://twitter.com/FranckPachot/status/735747180577718272?ref_src=twsrc%5Etfw">May 26, 2016</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<p>Less funny is the primary database hanging because its own FRA is full (deletion policy being APPLIED ON ALL STANDBY)</p>
+<p><a href="../../assets/CaptureCDB02FLASHBACKRET.png"><img loading="lazy" decoding="async" src="../../assets/CaptureCDB02FLASHBACKRET.png" alt="CaptureCDB02FLASHBACKRET" width="1920" height="372" class="alignnone size-full wp-image-8830" /></a></p>
+<h3>What happened</h3>
+<p>So, I&#8217;ve a Data Guard configuration where the deletion policy is &#8216;APPLIED ON ALL STANDBY&#8217; and both sites have FLASHBACK ON.</p>
+<p>I&#8217;ve no guaranteed restore points:</p>
+<pre><code>
+RMAN&gt; list restore point all;
+&nbsp;
+using target database control file instead of recovery catalog
+SCN              RSP Time  Type       Time      Name
+---------------- --------- ---------- --------- ----
+&nbsp;
+</code></pre>
+<p>and flashback retention is 1 day to allow a possible reinstate, or simple to allow to use the standby to flashback to recent point in time:</p>
+<pre><code>
+SQL&gt; show parameter flashback
+&nbsp;
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+db_flashback_retention_target        integer     1440
+</code></pre>
+<p>Here is the space usage of my standby database FRA when I have high activity on the primary:</p>
+<pre><code>
+SQL&gt; select * from v$recovery_area_usage;
+&nbsp;
+FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES     CON_ID
+----------------------- ------------------ ------------------------- --------------- ----------
+CONTROL FILE                             0                         0               0          0
+REDO LOG                                 0                         0               0          0
+ARCHIVED LOG                             0                         0               0          0
+BACKUP PIECE                            .1                         0               3          0
+IMAGE COPY                               0                         0               0          0
+FLASHBACK LOG                         98.5                         0              50          0
+FOREIGN ARCHIVED LOG                     0                         0               0          0
+AUXILIARY DATAFILE COPY                  0                         0               0          0
+</code></pre>
+<p>FLASHBACK LOG are filling the 50GB I have because I generate more than 50GB of changes per day. They are not set as reclaimable but I expected that they can be reclaimaible in case of space pressure on FRA because the retention is a target retention &#8211; not a guaranteed retention.</p>
+<p>ARCHIVED LOG become reclaimable as soon as they are applied thanks to the deletion policy. And they are actually reclaimed because space is needed for flashback logs.</p>
+<p>At that point, I can expect that when new redo is coming the archived logs can always be written because archived logs have priority on non-guaranteed flashback logs.</p>
+<p>I forgot to tell you that the UNDO tablespace has not been created with RETENTION GUARANTEE:</p>
+<pre><code>
+SQL&gt; select contents,retention from dba_tablespaces;
+&nbsp;
+CONTENTS  RETENTION
+--------- -----------
+PERMANENT NOT APPLY
+PERMANENT NOT APPLY
+UNDO      NOGUARANTEE
+TEMPORARY NOT APPLY
+PERMANENT NOT APPLY
+</code></pre>
+<p>But actually, my standby database is in an archiver stuck situation:</p>
+<pre><code>
+Thu May 26 07:42:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19815: WARNING: db_recovery_file_dest_size of 53687091200 bytes is 0.00% used, and has 53687091200 remaining bytes available.
+Thu May 26 07:42:01 2016
+************************************************************************
+You have following choices to free up space from recovery area:
+1. Consider changing RMAN RETENTION POLICY. If you are using Data Guard,
+   then consider changing RMAN ARCHIVELOG DELETION POLICY.
+2. Back up files to tertiary device such as tape using RMAN
+   BACKUP RECOVERY AREA command.
+3. Add disk space and increase db_recovery_file_dest_size parameter to
+   reflect the new space.
+4. Delete unnecessary files using RMAN DELETE command. If an operating
+   system command was used to delete files, then use RMAN CROSSCHECK and
+   DELETE EXPIRED commands.
+************************************************************************
+Thu May 26 07:42:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19809: limit exceeded for recovery files
+ORA-19804: cannot reclaim 1073741824 bytes disk space from 53687091200 limit
+Thu May 26 07:43:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19815: WARNING: db_recovery_file_dest_size of 53687091200 bytes is 0.00% used, and has 53687091200 remaining bytes available.
+Thu May 26 07:43:01 2016
+************************************************************************
+You have following choices to free up space from recovery area:
+1. Consider changing RMAN RETENTION POLICY. If you are using Data Guard,
+   then consider changing RMAN ARCHIVELOG DELETION POLICY.
+2. Back up files to tertiary device such as tape using RMAN
+   BACKUP RECOVERY AREA command.
+3. Add disk space and increase db_recovery_file_dest_size parameter to
+   reflect the new space.
+4. Delete unnecessary files using RMAN DELETE command. If an operating
+   system command was used to delete files, then use RMAN CROSSCHECK and
+   DELETE EXPIRED commands.
+************************************************************************
+Thu May 26 07:43:01 2016
+Errors in file /u01/app/oracle/diag/rdbms/cdb_02/CDB/trace/CDB_arc1_5612.trc:
+ORA-19809: limit exceeded for recovery files
+ORA-19804: cannot reclaim 1073741824 bytes disk space from 53687091200 limit
+Thu May 26 07:43:46 2016
+</code></pre>
+<p>This blocks the standby with a big gap and this may have bad consequence on primary availability and protection.</p>
+<h3>Workaround</h3>
+<p>The workaround is to lower the flashback retention target so that all changes fit in the FRA:</p>
+<pre><code>
+SQL&gt; alter system set db_flashback_retention_target=60;
+</code></pre>
+<p>and as soon as I did it some flashback logs became reclaimable:</p>
+<pre><code>
+SQL&gt; select * from v$recovery_area_usage;
+&nbsp;
+FILE_TYPE               PERCENT_SPACE_USED PERCENT_SPACE_RECLAIMABLE NUMBER_OF_FILES     CON_ID
+----------------------- ------------------ ------------------------- --------------- ----------
+CONTROL FILE                             0                         0               0          0
+REDO LOG                                 0                         0               0          0
+ARCHIVED LOG                             0                         0               0          0
+BACKUP PIECE                            .1                         0               3          0
+IMAGE COPY                               0                         0               0          0
+FLASHBACK LOG                         96.5                        68              49          0
+FOREIGN ARCHIVED LOG                     0                         0               0          0
+AUXILIARY DATAFILE COPY                  0                         0               0          0
+</code></pre>
+<p>Which you can see in the alert.log as they are deleted to reclaim space:</p>
+<pre><code>
+Thu May 26 07:43:46 2016
+ALTER SYSTEM SET db_flashback_retention_target=60 SCOPE=BOTH;
+Thu May 26 07:44:01 2016
+Deleted Oracle managed file /u03/app/oracle/fast_recovery_area/CDB_02/flashback/o1_mf_cncs7qnx_.flb
+Deleted Oracle managed file /u03/app/oracle/fast_recovery_area/CDB_02/archivelog/2016_05_26/o1_mf_0_0_cnfbb1b4_.arc
+</code></pre>
+<h3>Conclusion</h3>
+<p>I&#8217;ll open a SR for it (easier to format in WordPress than in MOS). This is in 12<em>c</em>R1 multitenant with Patch Set Update : 12.1.0.2.160119<br />
+For the moment, the recommandation is: always monitor the FRA for (used-reclaimable) space even in a standby where archvielogs become reclaimable as soon as they are applied.</p>
+<h3>Update 19-JUN-2016</h3>
+<p>The recommandation is to monitor ORA-19815 and ignore the 0%. There is a BUG 16664572 (DIAG: IMPROVE DIAGNOSTIC RELATED TO ORA-19815) about that problem under dev.</p>
+
+</div>
+</body>
+</html>

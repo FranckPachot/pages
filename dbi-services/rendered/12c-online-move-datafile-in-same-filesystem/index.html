@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-online-move-datafile-in-same-filesystem/">
+<title>12c online move datafile in same filesystem.</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-online-move-datafile-in-same-filesystem/">https://www.dbi-services.com/blog/12c-online-move-datafile-in-same-filesystem/</a> (2016-11-02)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12c online move datafile in same filesystem.</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+On Linux, when you move a datafile, with &#8220;mv&#8221; within the filesystem it&#8217;s just a rename. There is no copy. In 12c you can move a datafile online where oracle takes care of the move at OS level. But be careful. Even if you are in the same filesystem, moving a datafile online does a copy of the file.<br />
+<!--more--></p>
+<h3>Linux mv</h3>
+<p>I have a file, /u01/oradata/test1.txt and I move it to /u01/oradata/test2.txt within the same filesystem:</p>
+<pre><code>
+mv /u01/oradata/test1.txt /u01/oradata/test2.txt
+</code></pre>
+<p>Actually, I&#8217;m running it with strace, tracing file operations for these files:</p>
+<pre><code>
+strace -e trace=file mv /u01/oradata/test1.txt /u01/oradata/test2.txt
+</code></pre>
+<p>Then I can see clearly that there is no open() call but just a rename():</p>
+<pre><code>
+execve("/usr/bin/mv", ["mv", "/u01/oradata/test1.txt", "/u01/oradata/test2.txt"], [/* 29 vars */]) = 0
+stat("/u01/oradata/test2.txt", 0x7ffcfa624270) = -1 ENOENT (No such file or directory)
+lstat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0644, st_size=0, ...}) = 0
+lstat("/u01/oradata/test2.txt", 0x7ffcfa623f20) = -1 ENOENT (No such file or directory)
+rename("/u01/oradata/test1.txt", "/u01/oradata/test2.txt") = 0
+</code></pre>
+<p>If I do the same to another filesystem:</p>
+<pre><code>
+strace -e trace=file mv /u01/oradata/test2.txt /u02/oradata/test2.txt
+</code></pre>
+<p>a rename() is attempted:</p>
+<pre><code>
+execve("/usr/bin/mv", ["mv", "/u01/oradata/test2.txt", "/u02/oradata/test2.txt"], [/* 29 vars */]) = 0
+stat("/u02/oradata/test2.txt", 0x7fff1e2b3340) = -1 ENOENT (No such file or directory)
+lstat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0644, st_size=0, ...}) = 0
+lstat("/u02/oradata/test2.txt", 0x7fff1e2b2ff0) = -1 ENOENT (No such file or directory)
+rename("/u01/oradata/test2.txt", "/u02/oradata/test2.txt") = -1 EXDEV (Invalid cross-device link)
+</code></pre>
+<p>but because it&#8217;s another filesystem, the &#8220;mv&#8221; command will do like a &#8220;cp&#8221;, open the source in read and the target in write, creating it if not exist:</p>
+<pre><code>
+unlink("/u02/oradata/test2.txt")        = -1 ENOENT (No such file or directory)
+lgetxattr("/u01/oradata/test2.txt", "security.selinux", "unconfined_u:object_r:unlabeled_t:s0", 255) = 37
+open("/u01/oradata/test2.txt", O_RDONLY|O_NOFOLLOW) = 3
+open("/u02/oradata/test2.txt", O_WRONLY|O_CREAT|O_EXCL, 0600) = 4
+newfstatat(AT_FDCWD, "/u01/oradata/test2.txt", {st_mode=S_IFREG|0644, st_size=0, ...}, AT_SYMLINK_NOFOLLOW) = 0
+unlinkat(AT_FDCWD, "/u01/oradata/test2.txt", 0) = 0
+</code></pre>
+<h3>Move datafile</h3>
+<p>Let&#8217;s do the same from the database where I&#8217;ve created the same datafile:</p>
+<pre><code>
+SQL&gt; create tablespace DEMO datafile '/u01/oradata/test1.txt' size 5M;
+Tablespace created.
+</code></pre>
+<p>I get my shadow process PID:</p>
+<pre><code>
+SQL&gt; set define %
+SQL&gt; column spid new_value spid
+SQL&gt; select spid from v$process join v$session on paddr=addr where sid=sys_context('userenv','sid');
+&nbsp;
+SPID
+------------------------
+7257
+&nbsp;
+SQL&gt; host ps -fp %spid
+UID        PID  PPID  C STIME TTY          TIME CMD
+oracle    7257  7256 93 21:35 ?        00:00:03 oracleCDB1 (DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=beq)))
+</code></pre>
+<p>and run strace on it:</p>
+<pre><code>SQL&gt; host strace -o /tmp/tmp.log -e trace=file -p %spid &amp;</code></pre>
+<p>I move the file online to the same filesystem:</p>
+<pre><code>
+SQL&gt; alter database move datafile '/u01/oradata/test1.txt' to '/u01/oradata/test2.txt';
+Database altered.
+</code></pre>
+<p>and read the trace:</p>
+<pre><code>grep /test /tmp/tmp.log</code></pre>
+<pre><code>
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+statfs("/u01/oradata/test1.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014477, f_bavail=853095, f_files=786432, f_ffree=672545, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+open("/u01/oradata/test1.txt", O_RDWR|O_DSYNC) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+statfs("/u01/oradata/test1.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014477, f_bavail=853095, f_files=786432, f_ffree=672545, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+statfs("/u01/oradata/test1.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014477, f_bavail=853095, f_files=786432, f_ffree=672545, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test1.txt", O_RDONLY) = 11
+</code></pre>
+<p>At this point the source datafile is opened in read. It continues with:</p>
+<pre><code>
+open("/u01/oradata/test2.txt", O_RDONLY) = -1 ENOENT (No such file or directory)
+stat("/u01/oradata/test2.txt", 0x7ffd0201e5d8) = -1 ENOENT (No such file or directory)
+open("/u01/oradata/test2.txt", O_RDWR|O_CREAT|O_EXCL|O_SYNC, 0660) = 11
+</code></pre>
+<p>and now the destination datafile in write, created if not exist (existence had been tested before). Then it starts the copy:</p>
+<pre><code>
+stat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+stat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test2.txt", O_RDONLY) = 11
+stat("/u01/oradata/test2.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+open("/u01/oradata/test2.txt", O_RDONLY) = 11
+statfs("/u01/oradata/test2.txt", {f_type="EXT2_SUPER_MAGIC", f_bsize=4096, f_blocks=3063586, f_bfree=1014475, f_bavail=853093, f_files=786432, f_ffree=672544, f_fsid={1366374386, -1275721753}, f_namelen=255, f_frsize=4096}) = 0
+open("/u01/oradata/test2.txt", O_RDONLY) = 11
+open("/u01/oradata/test2.txt", O_RDWR)  = 11
+open("/u01/oradata/test2.txt", O_RDWR|O_DSYNC) = 11
+</code></pre>
+<p>at the end, because I didn&#8217;t use the &#8216;KEEP&#8217; option, so the source file is deleted:</p>
+<pre><code>
+stat("/u01/oradata/test1.txt", {st_mode=S_IFREG|0640, st_size=5251072, ...}) = 0
+unlink("/u01/oradata/test1.txt")        = 0
+stat("/u01/app/oracle/diag/rdbms/cdb1/CDB1/log/test", {st_mode=S_IFDIR|0750, st_size=4096, ...}) = 0
+</code></pre>
+<h3>So what?</h3>
+<p>As any online move operation, you need two times the space during the copy. Here, the source file is still used for read and write until the move finishes, so this cannot be a rename. A rename would have to put the datafile offline even for a short time. If you can afford a small downtime, then you may prefer to use the offline rename (&#8220;mv&#8221; at OS level, ALTER DATABASE RENAME FILE at database level).</p>
+
+</div>
+</body>
+</html>

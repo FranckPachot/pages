@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/myth-nosql-vs-rdbms-relational-queries-are-unbounded/">
+<title>The myth of NoSQL (vs. RDBMS) &#8220;a simpler API to bound resources&#8221;</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/myth-nosql-vs-rdbms-relational-queries-are-unbounded/">https://www.dbi-services.com/blog/myth-nosql-vs-rdbms-relational-queries-are-unbounded/</a> (2020-07-21)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">The myth of NoSQL (vs. RDBMS) &#8220;a simpler API to bound resources&#8221;</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+NoSQL provides an API that is much simpler than SQL. And one advantage of it is that users cannot exceed a defined amount of resources in one call. You can read this in <a href="http://alexbdebrie" target="_blank" rel="noopener noreferrer">Alex DeBrie</a> article <a href="https://www.alexdebrie.com/posts/dynamodb-no-bad-queries/#relational-queries-are-unbounded" target="_blank" rel="noopener noreferrer">https://www.alexdebrie.com/posts/dynamodb-no-bad-queries/#relational-queries-are-unbounded</a> which I take as a base for some of my &#8220;Myth of NoSQL vs RDBMS&#8221; posts because he explains very well how SQL and NoSQL are perceived by the users. But this idea of simpler API to limit what users can do is is quite common, precedes the NoSQL era, and is still valid with some SQL databases. Here I&#8217;m demonstrating that some RDBMS provide a powerful API and still can bound what users can do. Oracle Database has a resource manager for a long time, like defining resource limits on a per-service base, and those features are very simple to use in the Oracle Autonomous Database &#8211; the managed database in the Oracle Cloud.</p>
+<p>I am using the example schema from the ATP database in the free tier, so that anyone can play with this. As usual, what I show on 1 million rows, and one thread, can scale to multiples vCPU and nodes. Once you get the algorithms (execution plan) you know how it scales.</p>
+<pre><code>
+06:36:08 SQL&gt; set echo on serveroutput on time on timing on
+
+06:36:14 SQL&gt; select count(*) ,sum(s.amount_sold),sum(p.prod_list_price)
+              from sh.sales s join sh.products p using(prod_id);
+
+
+   COUNT(*)    SUM(S.AMOUNT_SOLD)    SUM(P.PROD_LIST_PRICE)
+___________ _____________________ _________________________
+     918843           98205831.21               86564235.57
+
+Elapsed: 00:00:00.092
+
+</code></pre>
+<p>I have scanned nearly one million rows from the SALES table and joined it to the PRODUCTS table, aggregated data to show the sum from both tables columns. That takes 92 milliseconds here (including network roundtrip). You are not surprised to get fast response with a join because you have read <a href="https://www.dbi-services.com/blog/the-myth-of-nosql-vs-rdbms-joins-dont-scale/" target="_blank" rel="noopener noreferrer">The myth of NoSQL (vs. RDBMS) “joins dont scale”</a> 😉</p>
+<p>Ok, now let&#8217;s say that a developer never learned about SQL joins and wants to do the same with a simpler scan/query API:</p>
+<pre><code>
+06:36:14 SQL&gt; declare
+    l_count_sales    number:=0;
+    l_amount_sold    number:=0;
+    l_sum_list_price number:=0;
+   begin
+    -- scan SALES
+    for s in (select * from sh.sales) loop
+     -- query PRODUCTS
+     for p in (select * from sh.products where prod_id=s.prod_id) loop
+      -- aggregate SUM and COUNT
+      l_count_sales:=l_count_sales+1;
+      l_amount_sold:=l_amount_sold+s.amount_sold;
+      l_sum_list_price:=l_sum_list_price+p.prod_list_price;
+     end loop;
+    end loop;
+    dbms_output.put_line('count_sales='||l_count_sales||' amount_sold='||l_amount_sold||' sum_list_price='||l_sum_list_price);
+   end;
+   /
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:02:00.374
+
+</code></pre>
+<p>I have run this within the database with PL/SQL because I don&#8217;t want to add network rountrips and process switches to this bad design. You see that it takes 2 minutes here. Why? Because the risk when providing an API that doesn&#8217;t support joins is that the developer will do the join in his procedural code. Without SQL, the developer has no efficient and agile way to do this GROUP BY and SUM that was a one-liner in SQL: he will either loop on this simple scan/get API, or she will add a lot of code to initialize and maintain an aggregate derived from this table.</p>
+<p>So, what can I do to avoid a user running this kind of query that will take a lot of CPU and IO resources? A simpler API will not solve this problem as the user will workaround this with many small queries. In the Oracle Autonomous Database, the admin can set some limits per service:</p>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-41940" src="../../assets/Annotation-2020-07-21-084607.jpg" alt="" width="1024" height="498" /></p>
+<p>This says: when connected to the &#8216;TP&#8217; service (which is the one for transactional processing with high concurrency) a user query cannot use more than 5 seconds of elapsed time or the query is canceled.</p>
+<p>Now if I run the statement again:</p>
+<pre><code>
+Error starting at line : 54 File @ /home/opc/demo/tmp/atp-resource-mgmt-rules.sql
+In command -
+declare
+ l_count_sales    number:=0;
+ l_amount_sold    number:=0;
+ l_sum_list_price number:=0;
+begin
+ -- scan SALES
+ for s in (select * from sh.sales) loop
+  -- query PRODUCTS
+  for p in (select * from sh.products where prod_id=s.prod_id) loop
+   -- aggregate SUM and COUNT
+   l_count_sales:=l_count_sales+1;
+   l_amount_sold:=l_amount_sold+s.amount_sold;
+   l_sum_list_price:=l_sum_list_price+p.prod_list_price;
+  end loop;
+ end loop;
+ dbms_output.put_line('count_sales='||l_count_sales||' amount_sold='||l_amount_sold||' sum_list_price='||l_sum_list_price);
+end;
+Error report -
+ORA-56735: elapsed time limit exceeded - call aborted
+ORA-06512: at line 9
+ORA-06512: at line 9
+56735. 00000 -  "elapsed time limit exceeded - call aborted"
+*Cause:    The Resource Manager SWITCH_ELAPSED_TIME limit was exceeded.
+*Action:   Reduce the complexity of the update or query, or contact your
+           database administrator for more information.
+
+Elapsed: 00:00:05.930
+</code></pre>
+<p>I get a message that I exceeded the limit. I hope that, from the message &#8220;Action: Reduce the complexity&#8221;, the user will understand something like &#8220;Please use SQL to process data sets&#8221; and will write a query with the join.</p>
+<p>Of course, if the developer is thick-headed he will run his loop from his application code and will run one million short queries that will not exceed the time limit per execution. And it will be worse because of the roundtrips between the application and the database. The &#8220;Set Resource Management Rules&#8221; has another tab than &#8220;Run-away criteria&#8221;, which is &#8220;CPU/IO shares&#8221;, so that one service can be throttled when the overall resources are saturated. With this, we can give higher priority to critical services. But I prefer to address the root cause and show to the developer that when you need to join data, the most efficient is a SQL JOIN. And when you need to aggregate data, the most efficient is SQL GROUP BY. Of course, we can also re-design the tables to pre-join (<a href="https://www.dbi-services.com/blog/oracle-index-on-joins/" target="_blank" rel="noopener noreferrer">materialized views in SQL</a> or <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-modeling-nosql-B.html" target="_blank" rel="noopener noreferrer">single-table design in DynamoDB</a> for example) when data is ingested, but that&#8217;s another topic.</p>
+<p>In the autonomous database, the GUI makes it simple, but you can query V$ views to monitor it. For example:</p>
+<pre><code>
+06:38:20 SQL&gt; select sid,current_consumer_group_id,state,active,yields,sql_canceled,last_action,last_action_reason,last_action_time,current_active_time,active_time,current_consumed_cpu_time,consumed_cpu_time
+              from v$rsrc_session_info where sid=sys_context('userenv','sid');
+
+
+     SID    CURRENT_CONSUMER_GROUP_ID      STATE    ACTIVE    YIELDS    SQL_CANCELED    LAST_ACTION     LAST_ACTION_REASON       LAST_ACTION_TIME    CURRENT_ACTIVE_TIME    ACTIVE_TIME    CURRENT_CONSUMED_CPU_TIME    CONSUMED_CPU_TIME
+________ ____________________________ __________ _________ _________ _______________ ______________ ______________________ ______________________ ______________________ ______________ ____________________________ ____________________
+   41150                        30407 RUNNING    TRUE             21               1 CANCEL_SQL     SWITCH_ELAPSED_TIME    2020-07-21 06:38:21                       168           5731                         5731                 5731
+
+
+06:39:02 SQL&gt; select id,name,cpu_wait_time,cpu_waits,consumed_cpu_time,yields,sql_canceled
+              from v$rsrc_consumer_group;
+
+
+      ID            NAME    CPU_WAIT_TIME    CPU_WAITS    CONSUMED_CPU_TIME    YIELDS    SQL_CANCELED
+________ _______________ ________________ ____________ ____________________ _________ _______________
+   30409 MEDIUM                         0            0                    0         0               0
+   30406 TPURGENT                       0            0                    0         0               0
+   30407 TP                           286           21                 5764        21               1
+   30408 HIGH                           0            0                    0         0               0
+   30410 LOW                            0            0                    0         0               0
+   19515 OTHER_GROUPS                 324           33                18320        33               0
+
+</code></pre>
+<p>You can see one SQL canceled here in the TP consumer group and my session was at 5.7 consumed CPU time.</p>
+<p>I could have set the same programmatically with:</p>
+<pre><code>
+exec cs_resource_manager.update_plan_directive(consumer_group =&gt; 'TP', elapsed_time_limit =&gt; 5);
+</code></pre>
+<p>So, rather than limiting the API, better to give full SQL possibilities and limit the resources used per service: it makes sense to accept only short queries from the Transaction Processing services (TP/TPURGENT) and allow more time, but less shares, for the reporting ones (LOW/MEDIUM/HIGH)</p>
+
+</div>
+</body>
+</html>

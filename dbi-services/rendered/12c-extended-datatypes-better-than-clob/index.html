@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-extended-datatypes-better-than-clob/">
+<title>Oracle 12c extended datatypes better than CLOB?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-extended-datatypes-better-than-clob/">https://www.dbi-services.com/blog/12c-extended-datatypes-better-than-clob/</a> (2014-05-23)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle 12c extended datatypes better than CLOB?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+12c has introduced character strings that can can go above 4000 bytes. In the previous versions, in PL/SQL only we were allowed to have VARCHAR2 up to 32k. In SQL the VARCHAR2 datatype was limited to 4000 and CHAR was limited to 2000. That became a bit small especially when lot of applications needed to store unicode characters.</p>
+<p>From 12c we can have SQL datatypes having up to 32k bytes for VARCHAR2, CHAR and RAW. It&#8217;s not allowed by default. We need to set max_string_size=extended and recompile views with utl32k. Nice improvement. But is it a good idea to use that new feature when we already have CLOB for large character strings ? The New Features documentation is clear about that: extended datatypes have been introduced to be compatible with other databases &#8211; not to replace existing features.</p>
+<p>I will not go into the details how they are stored. Information about that is available elsewhere. See for example <a href="http://twitter.com/ludodba">@ludodba</a> recent blog post <a href="http://www.ludovicocaldara.net/dba/extended-data-types-storage/trackback">Where are Extended Data Types stored?</a>. Extended datatypes are stored as chained rows if you just extend an existing table, or as a LOB if you defined them on a new table. Chained rows is clearly not a good option, so, given that you (re)create the tables, their storage is similar to CLOB.</p>
+<p>But there is something that I don&#8217;t like with LOBS: they are fetched row by row. When you select a row you get only the handle. And you get the CLOB later when you access to it through the handle. Did you ever try to datapump a table with LOBs through network_link? Huge amount of roundtrips and very bad performance. It&#8217;s one rare case where doing expdp/impdp with a dumpfile is better. For very large objects, you will do several roundtrips anyway, so this is not an issue. But with character strings that are just a few kilobytes having them as LOB introduces an ineffective overhead.</p>
+<p>Let&#8217;s compare the fetch behaviour with those new extended datatypes. For my demo, I&#8217;ll use a table with a clob column &#8220;C&#8221; and an extended varchar2 column &#8220;E&#8221;, and insert same data into both columns.</p>
+<pre><code>
+SQL&gt; create table TEST ( C clob , E varchar2(9000) );
+Table created.
+SQL&gt; insert into TEST select lpad(rownum,9000,'x'),lpad(rownum,9000,'x') from dual connect by level &lt;=10;
+10 rows created.</code></pre>
+<p>Here is the autotrace when reading the CLOB from 10 rows:</p>
+<pre><code>SQL&gt; set autotrace trace stat
+ SQL&gt; select C from TEST;
+ &nbsp;
+  10 rows selected.
+  &nbsp;
+  Statistics
+  ----------------------------------------------------------
+            2  recursive calls
+            0  db block gets
+           27  consistent gets
+           20  physical reads
+            0  redo size
+        93936  bytes sent via SQL*Net to client
+         2722  bytes received via SQL*Net from client
+           22  SQL*Net roundtrips to/from client
+            0  sorts (memory)
+            0  sorts (disk)
+           10  rows processed</code></pre>
+<p>For only 10 rows I&#8217;ve made 22 roundtrips. This is the problem with LOBs. Too many roundtrips. Well there is another problem that I&#8217;ll not show here, which is the fact that you can fetch the lob a long time after, even when the cursor is closed. It does consistent read so you have to set your undo_retention accordingly.</p>
+<p>Now here is the same data from the extended varchar2 column:</p>
+<pre><code>SQL&gt; select E from TEST;
+  &nbsp;
+  10 rows selected.
+ &nbsp;
+  Statistics
+  ----------------------------------------------------------
+            1  recursive calls
+            0  db block gets
+           56  consistent gets
+            0  physical reads
+            0  redo size
+        90501  bytes sent via SQL*Net to client
+          492  bytes received via SQL*Net from client
+            2  SQL*Net roundtrips to/from client
+            0  sorts (memory)
+            0  sorts (disk)
+           10  rows processed</code></pre>
+<p>Here I got the same volume (10 times 9000 characters) but this time I did only 2 roundtrips.<br />
+Let&#8217;s go further and trace with sql_trace. LOB calls are instrumented since 11g so we can see them from the trace file:</p>
+<pre><code>PARSING IN CURSOR #139894737850360 len=18 dep=0 uid=103 oct=3 lid=103 tim=8952647276 hv=844696927 ad='77e1a518' sqlid='132sh6wt5k3az'
+ select C from TEST
+ END OF STMT
+ PARSE #139894737850360:c=0,e=82,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=895260
+ EXEC #139894737850360:c=0,e=69,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=897416
+ FETCH #139894737850360:c=0,e=97,p=0,cr=4,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=848200
+ LOBREAD: c=999,e=10893,p=2,cr=1,cu=0,tim=8952659696
+ FETCH #139894737850360:c=0,e=43,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=860372
+ LOBREAD: c=1000,e=1614,p=2,cr=1,cu=0,tim=8952662447
+ FETCH #139894737850360:c=0,e=47,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=863495
+ LOBREAD: c=2000,e=657,p=2,cr=1,cu=0,tim=8952664615
+ FETCH #139894737850360:c=0,e=40,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=865575
+ LOBREAD: c=0,e=706,p=2,cr=1,cu=0,tim=8952666808
+ FETCH #139894737850360:c=0,e=37,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=867552
+ LOBREAD: c=1000,e=949,p=2,cr=1,cu=0,tim=8952669193
+ FETCH #139894737850360:c=0,e=92,p=0,cr=4,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=869825
+ LOBREAD: c=0,e=844,p=2,cr=1,cu=0,tim=8952671276
+ FETCH #139894737850360:c=0,e=68,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=872168
+ LOBREAD: c=1000,e=756,p=2,cr=1,cu=0,tim=8952673521
+ FETCH #139894737850360:c=0,e=44,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=874712
+ LOBREAD: c=999,e=914,p=2,cr=1,cu=0,tim=8952676180
+ FETCH #139894737850360:c=0,e=64,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=877352
+ LOBREAD: c=0,e=931,p=2,cr=1,cu=0,tim=8952678875
+ FETCH #139894737850360:c=0,e=52,p=0,cr=1,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=879774
+ LOBREAD: c=1000,e=795,p=2,cr=1,cu=0,tim=8952681136
+ FETCH #139894737850360:c=1000,e=7,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=891850
+ STAT #139894737850360 id=1 cnt=10 pid=0 pos=1 obj=100085 op='TABLE ACCESS FULL TEST (cr=16 pr=0 pw=0 time=60 us cost=5 size=20980 card=10)'
+ CLOSE #139894737850360:c=0,e=31,dep=0,type=0,tim=8952684289</code></pre>
+<p>And the sql_trace with the same data from the extended datatype.</p>
+<pre><code>PARSING IN CURSOR #139895028091224 len=18 dep=0 uid=103 oct=3 lid=103 tim=8954178349 hv=1829009117 ad='7b48ba08' sqlid='4kq232tqh8xqx'
+ select E from TEST
+ END OF STMT
+ PARSE #139895028091224:c=0,e=64,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=895345
+ EXEC #139895028091224:c=0,e=36,p=0,cr=0,cu=0,mis=0,r=0,dep=0,og=1,plh=1357081020,tim=895435
+ FETCH #139895028091224:c=1000,e=896,p=0,cr=8,cu=0,mis=0,r=1,dep=0,og=1,plh=1357081020,tim=899458
+ FETCH #139895028091224:c=4000,e=3660,p=0,cr=48,cu=0,mis=0,r=9,dep=0,og=1,plh=1357081020,tim=89535
+ STAT #139895028091224 id=1 cnt=10 pid=0 pos=1 obj=100085 op='TABLE ACCESS FULL TEST (cr=56 pr=0 pw=0 time=670 us cost=5 size=20010 card=10)'
+ CLOSE #139895028091224:c=0,e=13,dep=0,type=0,tim=8954214996</code></pre>
+<p>So there is is one big advantage over CLOB: the column values are returned without additional roundtrips.</p>
+<p>That would mean that if you have character strings that may be between 4k and 32k then extended datatypes can be a good option. It&#8217;s a new feature however, and designed for another goal (easy migration from other databases). So it&#8217;s something to test carefully and the tests must integrate all you infrastructure components (backups, exports, replication, etc).</p>
+
+</div>
+</body>
+</html>

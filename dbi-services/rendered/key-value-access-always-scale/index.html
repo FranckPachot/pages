@@ -1,0 +1,200 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/key-value-access-always-scale/">
+<title>NoSQL and SQL: key-value access always scale</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/key-value-access-always-scale/">https://www.dbi-services.com/blog/key-value-access-always-scale/</a> (2020-11-04)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">NoSQL and SQL: key-value access always scale</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+I have written about some NoSQL myths in previous posts (<a href="https://www.dbi-services.com/blog/rdbms-scales-the-algorithm/" target="_blank" rel="noopener noreferrer">here</a> and <a href="https://www.dbi-services.com/blog/the-myth-of-nosql-vs-rdbms-joins-dont-scale/" target="_blank" rel="noopener noreferrer">here</a>) and I got some feedback from people mentioning that the test case was on relatively small data. This is true. In order to understand how it works, we need to explain and trace the execution, and that is easier on a small test case. Once the algorithm is understood it is easy to infer how it scales. Then, if readers want to test it on huge data, they can. This may require lot of cloud credits, and I usually don&#8217;t feel the need to do this test for a blog post, especially when I include all the code to reproduce it on a larger scale.</p>
+<p>But this approach may be biased by the fact that I&#8217;ve been working a lot with RDBMS where we have all tools to understand how it works. When you look at the execution plan, you know the algorithm and can extrapolate the numbers to larger tables. When you look at the wait events, you know on which resource they can scale with higher concurrency. But times change, NoSQL databases, especially the ones managed by the cloud providers, provide only a simple API with limited execution statistics. Because that&#8217;s the goal: simple usage. And this is why people prefer to look at real scale executions when talking about performance. And, as it is not easy to run a real scale Proof of Concept, they look at the well-known big data users like Google, Facebook, Amazon&#8230;</p>
+<p>I was preparing my DOAG presentation <a href="https://programm.doag.org/doag/2020/#/scheduledEvent/603447" target="_blank" rel="noopener noreferrer">&#8220;#KnowSQL: Where are we with SQL, NoSQL, NewSQL in 2020?&#8221;</a> where I&#8217;ll mention at 4TB table I&#8217;ve seen at a customer. The table was far too big (30 million extents!) because it was not managed for years (a purge job failing, not being monitored, and the outsourcing company adding datafiles for years without trying to understand). But the application was still working well, with happy users. Because they use a key-value access, and this has always been scalable. Here is a common misconception: NoSQL databases didn&#8217;t invent new techniques to store data. Hash partitioning and indexes are the way to scale this. It existed in RDBMS for a long time. What NoSQL did was providing easy access to this limited API, and restraining data access to this simple API in order to guarantee predictable performance.</p>
+<p>By coincidence, with my presentation in mind, I had access to an Oracle Exadata that was not yet used, and I got the occasion to create a similar table containing billion of items:</p>
+<pre><code>
+SQL&gt; info+ BIG
+
+TABLE: BIG
+         LAST ANALYZED:2020-10-29 22:32:06.0
+         ROWS         :3049226754
+         SAMPLE SIZE  :3049226754
+         INMEMORY     :
+         COMMENTS     :
+
+Columns
+
+NAME         DATA TYPE      NULL  DEFAULT    LOW_VALUE   HIGH_VALUE   NUM_DISTINCT   HISTOGRAM
+------------ -------------- ----- ---------- ----------- ------------ -------------- ---------
+*K           RAW(16 BYTE)   No                                            3049226754     HYBRID
+ V           BLOB           Yes                                           0              NONE
+
+Indexes
+INDEX_NAME             UNIQUENESS   STATUS   FUNCIDX_STATUS   COLUMNS
+---------------------- ------------ -------- ---------------- ------
+FRANCK.SYS_C00205258   UNIQUE       N/A                       K
+</code></pre>
+<p>Just two columns: one RAW(16) to store the key as a UUID and one BLOB to store any document value. Exactly like a key-value document store today, and similar to the table I&#8217;ve seen at my customer. Well, at this customer, this was desined in the past century, with LONG RAW instead of BLOB, but this would make no sense today. And this table was not partitioned because they didn&#8217;t expect this size. In my test I did what we should do today for this key-value use case: partition by HASH:</p>
+<pre><code>
+create table BIG ( K RAW(16) primary key using index local, V BLOB ) tablespace users
+LOB (V) store as securefile (enable storage in row nocache compress high)
+partition by hash (K) partitions 100000 parallel 20
+</code></pre>
+<p>It is probably not useful to have 100000 partitions for a few terabytes table, but then this table is ready for a lot of more data. And in Oracle 100000 partition is far from the limit which is 1 million partitions. Note that this is a lab. I am not recommending to create 100000 partitions if you don&#8217;t need to. I&#8217;m just saying that it is easy to create a terabytes table with the performance of really small tables when accessed with the partitioning key.</p>
+<p>So, here is the size:</p>
+<pre><code>
+14:58:58 SQL&gt; select segment_type,segment_name,dbms_xplan.format_size(sum(bytes)) "SIZE",count(*)
+from dba_segments where owner='FRANCK'
+group by grouping sets ((),(segment_type),(segment_type,segment_name))
+;
+
+SEGMENT_TYPE                   SEGMENT_NAME                   SIZE         COUNT(*)
+------------------------------ ------------------------------ ---------- ----------
+LOB PARTITION                  SECURFILE                      781G           100000
+LOB PARTITION                                                 781G           100000
+INDEX PARTITION                SYS_C00205258                  270G           100000
+INDEX PARTITION                SYS_IL0000826625C00002$$       6250M          100000
+INDEX PARTITION                                               276G           200000
+TABLE PARTITION                BIG                            7691G          100000
+TABLE PARTITION                                               7691G          100000
+                                                              8749G          400000
+8 rows selected.
+</code></pre>
+<p>There&#8217;s 8.5 TB in total here. The table, named &#8220;BIG&#8221;, has 100000 partitions for a total of 7691 GB. The primary key index, &#8220;SYS_C00205258&#8221; is 270 GB as it contains the key (so 16 bytes, plus the ROWID to address the table, per entry). It is a local index, with same HASH partitioning as the table. For documents that are larger than the table block, the LOB partition can store them. Here I have mostly small documents which are stored in the table.</p>
+<p>I inserted the rows quickly with a bulk load which I didn&#8217;t really tune or monitor. But here is an excerpt from AWR report when the insert was running:</p>
+<pre><code>
+
+Plan Statistics                                          DB/Inst: EXA19C/EXA19C1  Snaps: 16288-16289
+-&gt; % Snap Total shows the % of the statistic for the SQL statement compared to the instance total
+
+Stat Name                                Statement   Per Execution % Snap
+---------------------------------------- ---------- -------------- -------
+Elapsed Time (ms)                        3.2218E+07   16,108,804.2    99.4
+CPU Time (ms)                            2.1931E+07   10,965,611.8    99.4
+Executions                                        2            1.0     0.0
+Buffer Gets                              6.5240E+08  326,201,777.5   115.6
+Disk Reads                               4.0795E+07   20,397,517.5   100.2
+Parse Calls                                      48           24.0     0.0
+Rows                                     5.1202E+08  256,008,970.0     N/A
+User I/O Wait Time (ms)                   2,024,535    1,012,267.6    96.9
+Cluster Wait Time (ms)                    4,293,684    2,146,841.9    99.9
+Application Wait Time (ms)                      517          258.5    20.6
+Concurrency Wait Time (ms)                4,940,260    2,470,130.0    96.0
+          -------------------------------------------------------------
+</code></pre>
+<p>This is about 16 key-value ingested per millisecond (256,008,970.0/16,108,804.2). And it can go further as I have 15% of buffer contention that I can easily get rid of if I take care of the index definition.</p>
+<p>After running this a few days, I have nearly 5 billion rows here:</p>
+<pre><code>SQL&gt; select count(*) from BIG;
+
+  COUNT(*)
+----------
+4967207817
+
+Elapsed: 00:57:05.949</code></pre>
+<p>The full scan to get the exact count lasted one hour here because I&#8217;ve run it without parallel query (an equivalent of map reduce) so the count was done on one CPU only. Anyway, if counting the rows were a use case, I would create a materialized view to aggregate some metrics.</p>
+<p>By curiosity I&#8217;ve run the same with parallel query: 6 minutes to count the 5 billion documents with 20 parallel processes:<br />
+<a href="../../assets/Screenshot-2020-11-02-223247-scaled-1.jpg"><img loading="lazy" decoding="async" class="aligncenter size-full wp-image-44662" src="../../assets/Screenshot-2020-11-02-223247-scaled-1.jpg" alt="" width="2560" height="1355" /></a></p>
+<p>My goal is to test reads. In order to have predictable results, I flush the buffer cache:</p>
+<pre><code>
+5:10:51 SQL&gt; alter system flush buffer_cache;
+
+System FLUSH altered.
+
+Elapsed: 00:00:04.817
+</code></pre>
+<p>Of course, in real life, there&#8217;s a good chance that all the index branches stay in memory.</p>
+<pre><code>
+15:11:11 SQL&gt; select * from BIG where K=hextoraw('B23375823AD741B3E0532900000A7499');
+
+K                                V
+-------------------------------- --------------------------------------------------------------------------------
+B23375823AD741B3E0532900000A7499 4E2447354728705E776178525C7541354640695C577D2F2C3F45686264226640657C3E5D2453216A
+
+Elapsed: 00:00:00.011
+</code></pre>
+<p>&#8220;Elapsed&#8221; is the elapsed time in seconds. Here 11 milliseconds. NoSQL databases advertise their &#8220;single digit millisecond&#8221; and that&#8217;s right, because &#8220;No SQL&#8221; provides a very simple API (key-value access). Any database, NoSQL or RDBMS, can be optimized for this key-value access. An index on the key ensures a O(logN) scalability and, when you can hash partition it, you can maintain this cost constant when data grows, which is then O(1).</p>
+<p>In order to understand not only the time, but also how it scales with more data or high throughput, I look at the execution plan:</p>
+<pre><code>
+
+15:11:27 SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'allstats last');
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  gqcazx39y5jnt, child number 21
+--------------------------------------
+select * from BIG where K=hextoraw('B23375823AD741B3E0532900000A7499')
+
+Plan hash value: 2410449747
+
+----------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                          | Name          | Starts | E-Rows | A-Rows |   A-Time   | Buffers | Reads |
+----------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                   |               |      1 |        |      1 |00:00:00.01 |       3 |     3 |
+|   1 |  PARTITION HASH SINGLE             |               |      1 |      1 |      1 |00:00:00.01 |       3 |     3 |
+|   2 |   TABLE ACCESS BY LOCAL INDEX ROWID| BIG           |      1 |      1 |      1 |00:00:00.01 |       3 |     3 |
+|*  3 |    INDEX UNIQUE SCAN               | SYS_C00205258 |      1 |      1 |      1 |00:00:00.01 |       2 |     2 |
+----------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access("K"=HEXTORAW('B23375823AD741B3E0532900000A7499'))
+
+</code></pre>
+<p>I&#8217;ve read only 3 &#8220;Buffers&#8221; here. Thanks to the partitioning (PARTITION HASH SINGLE), each local index is small, with a root branch and a leaf block: 2 buffers read. This B*Tree index (INDEX UNIQUE SCAN) returns the physical address in the table (TABLE ACCESS BY LOCAL INDEX ROWID) in order to get the additional column.</p>
+<p>Finally, I insert one row:</p>
+<pre><code>
+SQL&gt; set timing on autotrace on
+SQL&gt; insert into BIG values(hextoraw('1D15EA5E8BADF00D8BADF00DFF'),utl_raw.cast_to_raw(dbms_random.string('p',1024)));
+
+1 row created.
+
+Elapsed: 00:00:00.04
+</code></pre>
+<p>This takes 40 milliseconds</p>
+<p>&nbsp;</p>
+<h4>Update 22-APR-2020</h4>
+<p>I got questions about this. Of course this platform was not suited at this workload. It was just what I had access to play with enough capacity. The point was just about the scalability of key-value access, whatever the size of the table. This was an Exadata X6-2 Elastic Rack HC 8TB, which means 7,200 RPM disks with just few flash cards for cache. This is why the response time is in milliseconds. Today, in X8 or X8M, this would be full SSD access, or PMEM.</p>
+<p>The autotrace shows what is behind:</p>
+<pre><code>
+Execution Plan
+----------------------------------------------------------
+
+---------------------------------------------------------------------------------
+| Id  | Operation                | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+---------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT         |      |     1 |  1177 |     1   (0)| 00:00:01 |
+|   1 |  LOAD TABLE CONVENTIONAL | BIG  |       |       |            |          |
+---------------------------------------------------------------------------------
+
+Statistics
+----------------------------------------------------------
+          1  recursive calls
+          8  db block gets
+          1  consistent gets
+          7  physical reads
+       1864  redo size
+        872  bytes sent via SQL*Net to client
+       1048  bytes received via SQL*Net from client
+          3  SQL*Net roundtrips to/from client
+          1  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+</code></pre>
+<p>There are a few blocks to maintain (db block gets) when adding a new entry into a B*Tree index, especially when there are some blocks to split to allocate more space in the tree. In RDBMS you should categorize the data ingestion into:</p>
+<ul>
+<li>high throughput for big data, like metrics and logs from IoT, with the rate of bulk inserts as I did to fill-in the table</li>
+<li>fast response time to put one of few items and this is milliseconds, scaling thanks to local index partitioning</li>
+</ul>
+<p>I&#8217;m talking about the roots of NoSQL here: providing the simplest key-value access in order to scale. But the most advanced NoSQL managed services went further, pushing the data ingest performance with LSM (log-structured merge) indexes rather than B*Tree in-place index maintenance. They have also implemented many features to autonomously maintain the partitions at their best for storage, performance and high availability. This presentation explains a few in the context of AWS DynamoDB:<br />
+<iframe loading="lazy" title="AWS re:Invent 2018: Amazon DynamoDB Under the Hood: How We Built a Hyper-Scale Database (DAT321)" width="500" height="281" src="https://www.youtube.com/embed/yvBR71D0nAQ?feature=oembed" frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" referrerpolicy="strict-origin-when-cross-origin" allowfullscreen></iframe><br />
+With DynamoDB you can&#8217;t get the execution plan, but you can ask for the <a href="https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_ConsumedCapacity.html" target="_blank" rel="noopener noreferrer">ConsumedCapacity</a> to be returned with the result. This helps to validate your understanding of the data access even without running on huge volume and expensive provisioned capacity. This is what I did in <a href="https://www.dbi-services.com/blog/rdbms-scales-the-algorithm/" target="_blank" rel="noopener noreferrer">https://www.dbi-services.com/blog/rdbms-scales-the-algorithm/</a> measuring the linear increase of RCU on a small 2 million items table, which is sufficient to extrapolate to larger data sets. Key-value access always scales in this way: response time remains constant when data grows. And It can remain constant when the users grow as well, by splitting partitions to more storage.</p>
+
+</div>
+</body>
+</html>

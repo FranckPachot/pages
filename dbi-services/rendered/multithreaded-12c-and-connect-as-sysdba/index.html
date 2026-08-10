@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/multithreaded-12c-and-connect-as-sysdba/">
+<title>Multithreaded 12c and &#8216;connect / as sysdba&#8217;</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/multithreaded-12c-and-connect-as-sysdba/">https://www.dbi-services.com/blog/multithreaded-12c-and-connect-as-sysdba/</a> (2015-06-24)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Multithreaded 12c and &#8216;connect / as sysdba&#8217;</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In Oracle 12c you can run Oracle processes as operating system threads, lowering the number of OS processes. But you can&#8217;t use OS authentification: you need to provide a password. Here is a way to set an environment so that you can still &#8216;connect / as sysdba&#8217; to a multithreaded instance.</p>
+<h3>Windows</h3>
+<p>I start with Windows because Oracle has always been multithreaded on windows. Are you able to use operating system authentication then? You  think so because you can &#8216;connect / as sysdba&#8217;. But look at your sqlnet.ora:</p>
+<pre><code>SQLNET.AUTHENTICATION_SERVICES = (NTS)</code></pre>
+<p>You need NTS to connect locally without a password, the same authentication as when you connect remotely. If you don&#8217;t set NTS then both local and remote connections need a password.</p>
+<h3>Threaded execution</h3>
+<p>Back to Linux, I&#8217;ve set my instance with multithreading:</p>
+<pre><code>NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+threaded_execution                   boolean     TRUE</code></pre>
+<p>If I try to connect witout a password I got an error:</p>
+<pre><code>SQL&gt; connect / as sysdba
+ERROR:
+ORA-01017: invalid username/password; logon denied</code></pre>
+<p>it&#8217;s exacly the same as if I set</p>
+<pre><code>SQLNET.AUTHENTICATION_SERVICES = (NONE)</code></pre>
+<p>by default on Unix/Linux the AUTHENTICATION_SERVICES is not set, which allows operating system suthentication for Bequeath connections.</p>
+<p>When multithreaded, I can only connect with a password:</p>
+<pre><code>SQL&gt; connect sys as sysdba
+Enter password:
+Connected.</code></pre>
+<p>But I don&#8217;t want that. I want to keep she same scripts and procedures as I had before going to multithread instance. I can put the password in an external password file (wallet) and then connect without typing the password. But then I have to use a network service name. I can use TWO_TASK environment variable to add that network service name to connections transparently, but &#8211; for waterver reason &#8211; I don&#8217;t want to connect through the listener. So let&#8217;s see how to set it up.</p>
+<h3>TNS_ADMIN</h3>
+<p>I&#8217;ll setup my own SQL*Net files in a custom directory and use TNS_ADMIN to use them.</p>
+<pre><code>$ mkdir /home/franck/tns
+$ export TNS_ADMIN=/home/franck/tns</code></pre>
+<p>Here are my ORACLE_HOME and ORACLE_SID:</p>
+<pre><code>$ env | grep ORACLE
+ORACLE_SID=DEMO11
+ORACLE_BASE=/u01/app/oracle
+ORACLE_HOME=/u01/app/oracle/product/12102EE</code></pre>
+<h3>External password file</h3>
+<p>It has been described before on our <a href="/use-a-wallet-to-encrypt-oracle-client-passwords">blog</a> by Nicolas Jardot.</p>
+<pre><code>$ mkstore -wrl $TNS_ADMIN -create
+$ mkstore -wrl $TNS_ADMIN -createCredential BEQ_DEMO11_SYS SYS</code></pre>
+<p>this as created the wallet containing my user (SYS) and password for the network service name BEQ_DEMO111_SYS</p>
+<pre><code>$ ls -l
+-rwxrwx---. 1 root vboxsf 589 Jun 23 23:29 cwallet.sso
+-rwxrwx---. 1 root vboxsf   0 Jun 23 23:29 cwallet.sso.lck
+-rwxrwx---. 1 root vboxsf 544 Jun 23 23:29 ewallet.p12
+-rwxrwx---. 1 root vboxsf   0 Jun 23 23:29 ewallet.p12.lck</code></pre>
+<p>I have to declare the wallet in my sqlnet.ora</p>
+<pre><code>$ cat sqlnet.ora
+WALLET_LOCATION=(SOURCE=(METHOD=FILE)(METHOD_DATA=(DIRECTORY=/home/franck/tns)))
+SQLNET.WALLET_OVERRIDE=TRUE</code></pre>
+<h3>Beqeath connection string</h3>
+<p>Now time to define that BEQ_DEMO11_SYS network service name. I want to connect locally (not through the listener) so I define a BEQ connection string:</p>
+<pre><code>$ cat tnsnames.ora
+BEQ_DEMO11_SYS=(ADDRESS=(PROTOCOL=BEQ)(PROGRAM=/u01/app/oracle/product/12102EE/bin/oracle)(ARGV0=oracleDEMO11)(ARGS='(DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=BEQ)))')(ENVS='ORACLE_HOME=/u01/app/oracle/product/12102EE,ORACLE_SID=DEMO11'))</code></pre>
+<p>Here is how a beaqueath (PROTOCOL=BEQ) connection is defined. You need to define the PROGRAM to be run (the oracle binary) and the ARGS. You need to pass the environement variables &#8211; at least ORACLE_HOME and ORACLE_SID</p>
+<p>The ARGV0 is the name that will be displayed by the ps &#8216;CMD&#8217; command, but you can put whatever you want in it (just saying&#8230; have fun but not in prod please). The convention is to add the ORACLE_SID to the binary name &#8216;oracle&#8217;.</p>
+<p>Then I can connect:</p>
+<pre><code>SQL&gt; connect /@BEQ_DEMO11_SYS as sysdba
+Connected.</code></pre>
+<h3>TWO_TASK</h3>
+<p>Finally, I don&#8217;t want to add the network service name in my scripts, then I can set the TWO_TASK environment variable to it.  I definitely don&#8217;t want to set it for all my environment because it can be misleading (you think you use the ORACLE_SID but you are not, you change environement with oraenv but TWO_TASK remains,&#8230;). So i set it locally when I run sqlplus.</p>
+<p>Here is an example where I set TNS_ADMIN and TWO_TASK only when calling sqlplus:</p>
+<pre><code>$ TNS_ADMIN=$PWD TWO_TASK=BEQ_DEMO11_SYS sqlplus / as sysdba
+
+SQL*Plus: Release 12.1.0.2.0 Production on Wed Jun 24 10:54:58 2015
+
+Copyright (c) 1982, 2014, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options</code></pre>
+<p>If the scripts does a &#8216;connect / as sysdba&#8217; it still work:</p>
+<pre><code>SQL&gt; connect / as sysdba
+Connected.</code></pre>
+<p>but you should now that if the script is connecting with another user, TWO_TASK is still used:</p>
+<pre><code>SQL&gt; connect scott/tiger
+Connected.</code></pre>
+<p>Note that those sessions are multithreaded even if you don&#8217;t set DEDICATED_THROUGH_BROKER for the listener, because you&#8217;re not connecting through the listener here. More information about it in Martin Bach&#8217;s <a href="https://martincarstenbach.wordpress.com/2014/07/21/implications-of-threaded_execution-true-in-12c/">post</a>.</p>
+<p>Here is how to check it &#8211; process and thread id from v$process:</p>
+<pre><code>SQL&gt; select spid, stid, program, execution_type from v$process where addr=(select paddr from v$session where sid=sys_context('userenv','sid'));
+
+SPID                     STID                     PROGRAM              EXECUTION_TYPE
+------------------------ ------------------------ -------------------- ------------------
+21107                    21107                    oracle@VM111         PROCESS
+</code></pre>
+<p>and the info about it from Linux:</p>
+<pre><code>SQL&gt; host ps -Lfp &amp;pid
+UID        PID  PPID   LWP  C NLWP STIME TTY          TIME CMD
+oracle   21107     1 21107  0    1 11:04 ?        00:00:00 oracleDEMO11 (DESCRIPTION=(LOCAL=YES)(ADDRESS=(PROTOCOL=BEQ)))
+</code></pre>
+<p>&nbsp;</p>
+<p>TWO_TASK is coming from very old version but will be useful to run old scripts in 12c. Here is an example with threaded instance. You can use it also to connect directly to a PDB (but through listener then &#8211; you need a service).</p>
+<h3>But&#8230;</h3>
+<p>There is one thing that doesn&#8217;t work as I want with external password files. DGMGRL keeps the password provided and uses it to connect to the remote instance &#8211; which is why you need same password for sys on standby. But let&#8217;s see if it works with external password file:</p>
+<pre><code>$ TNS_ADMIN=$PWD TWO_TASK=BEQ_DEMO11_SYS dgmgrl /
+DGMGRL for Linux: Version 12.1.0.2.0 - 64bit Production
+
+Copyright (c) 2000, 2013, Oracle. All rights reserved.
+
+Welcome to DGMGRL, type "help" for information.
+Connected as SYSDG.
+DGMGRL&gt; switchover to demo11
+Performing switchover NOW, please wait...
+New primary database "demo11" is opening...
+Operation requires start up of instance "DEMO12" on database "demo12"
+Starting instance "DEMO12"...
+ORA-01017: invalid username/password; logon denied
+
+Warning: You are no longer connected to ORACLE.
+
+Please complete the following steps to finish switchover:
+        start up instance "DEMO12" of database "demo12"
+</code></pre>
+<p>I have to finish the switchover manually because the password retreived from the wallet is not used here. Same behaviour than OS authentication here. Tip: if you connect to the primary to do the switchover, then the connection to remote is detected at the begining.</p>
+<h3>Final note</h3>
+<p>This is not best practice. Using external password file is a good practice of course because we should never put passwords in our scripts or in command line. Passwords are something to be only typed by human fingers. TWO_TASK and BEQ connection string are not a good practice, but only a workaround to keep old scripts compatible with new features.</p>
+
+</div>
+</body>
+</html>

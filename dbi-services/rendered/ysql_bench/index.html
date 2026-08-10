@@ -1,0 +1,114 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/ysql_bench/">
+<title>ysql_bench: the YugaByteDB version of pgbench</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/ysql_bench/">https://www.dbi-services.com/blog/ysql_bench/</a> (2020-03-09)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">ysql_bench: the YugaByteDB version of pgbench</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+This follows the previous post on testing YugaByteDB 2.1 performance with pgbench: <a href="https://www.dbi-services.com/blog/yugabytedb-2-1/" target="_blank" rel="noopener noreferrer"> https://www.dbi-services.com/blog/yugabytedb-2-1/</a><br />
+A distributed database needs to reduce inter-node synchronization latency and then replaces two-phase pessimistic locking by optimistic concurrency control in many places. This means more serialization errors where a transaction may have to be re-tried. But the PostgreSQL pgbench does not have this possibility and this makes benchmarking distributed database very hard. For example when <a href="https://cds.cern.ch/record/2686701/files/Albert_Iho_CERN_Report.pdf" target="_blank" rel="noopener noreferrer">CERN tested CoackroachDB</a> the conclusion was: &#8220;comparative benchmarking of CockroachDB was not possible with the current tools used&#8221;.</p>
+<h3>pgBench retry: the PL/pgSQL solution</h3>
+<p>In a <a href="https://medium.com/@FranckPachot/pgbench-retry-for-repeatable-read-transactions-first-re-tries-5c3795bc5d68" target="_blank" rel="noopener noreferrer">previous blog post</a> my workaround for this was to implement the retry in a PL/pgSQL procedure.</p>
+<p>Here is the PL/pgSQL procedure:</p>
+<pre><code>
+ysqlsh franck &lt;10 then
+        raise notice 'Give Up after % retries. tid=%',retries,p_tid;
+        raise;
+       end if;
+       -- continue the retry loop
+   end;
+   retries=retries+1;
+  end loop;
+  commit;
+  if retries &gt; 2 then
+   raise notice 'Required % retries (tid=%)',retries,p_tid;
+  end if;
+ END;
+ $ language plpgsql;
+PSQL
+</code></pre>
+<p>Here is the code to call it (same functionality as the &#8220;simple update&#8221; builtin):</p>
+<pre><code>
+cat &gt; /tmp/simple-update.sql &lt;&lt;'CAT'
+ -- simple-update
+ \set aid random(1, 100000 * :scale)
+ \set bid random(1, 1 * :scale)
+ \set tid random(1, 10 * :scale)
+ \set delta random(-5000, 5000)
+  call SIMPLE_UPDATE_RETRY(:aid, :bid, :tid, :delta);
+  SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+CAT
+</code></pre>
+<p>And how I run it for 30 seconds:</p>
+<pre><code>
+pgbench --no-vacuum --protocol=prepared --file=/tmp/simple-update.sql --time 30 --jobs=10 --client=10 -h localhost -p 5433 -U postgres franck
+</code></pre>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-38069" src="../../assets/Annotation-2020-03-07-202412.jpg" alt="" width="1024" height="351" /></p>
+<p>As I mentioned in my blog post, some serialization errors can still happen because of the limitations in PostgreSQL transaction control in procedures: I cannot retry the errors encountered at commit. This has been raised in the PostgreSQL hackers&#8217;s list: <a href="https://www.postgresql.org/message-id/flat/54C2FEA5-86FF-4A3C-A84B-4470A6998ACA%40thebuild.com#5a5a575ed5451603c906ba3167d043a1" target="_blank" rel="noopener noreferrer">https://www.postgresql.org/message-id/flat/54C2FEA5-86FF-4A3C-A84B-4470A6998ACA%40thebuild.com#5a5a575ed5451603c906ba3167d043a1</a></p>
+<h3>pgBench retry: the &#8220;max-tries&#8221; patch</h3>
+<p>Around the same time when I came with the PL/pgSQL workaround, YugabyteDB has implemented the mentioned patch in their fork of the postgres code: <a href="https://github.com/yugabyte/yugabyte-db/commit/af25ba570e11c59e41a1243126ff9f9edae9d422" target="_blank" rel="noopener noreferrer">https://github.com/yugabyte/yugabyte-db/commit/af25ba570e11c59e41a1243126ff9f9edae9d422</a>, which is a much better solution. Adding a patch to the community PostgreSQL is hard because this database engine is widely used and they must be conservative to ensure stability. That&#8217;s different for a startup company building a new database engine. And what&#8217;s awesome with YugaByteDB is that their fork is Open Source and their work can then easily be given back to the community. What YugaByteDB is improving in PostgreSQL is public, documented and open-source. And, good news, this postgres fork is shipped, with all tools, in the YugaByteDB distribution. Did you see in the previous post that I&#8217;ve set my PATH with ~/yugabyte-2.1.0.0/postgresql/bin in addition to ~/yugabyte-2.1.0.0/bin? This is where you find them, with the command line tools renamed. ysql_bench is the YugaByteDB version of pgBench. Here is a comparison of the community PostgreSQL and the one compiled with YugaByteDB:</p>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-38075" src="../../assets/Annotation-2020-03-07-210210.jpg" alt="" width="1024" height="235" /></p>
+<p>The YugaByteDB version of pgbench has the following differences in version 2.1:</p>
+<ul>
+<li>The default init steps do not include vacuum (as it makes no sense here): -I, &#8211;init-steps=[dtgvpf]+ (default &#8220;dtgvp&#8221;)</li>
+<li>The primary keys are declared in the CREATE TABLE rather than an ALTER TABLE</li>
+<li>The initialization can do intermediate commits, controlled with &#8211;batch-size</li>
+<li>The number of retries (before ending the client thread) is controlled by &#8211;max-tries which defaults to zero (no retries)</li>
+<li>The -r option reports not only the transactions that exceed &#8211;latency-limit but also the errors trapped for retry, and is renamed from &#8211;report-latencies to &#8211;report-per-command</li>
+<li>Finally, they also changed the table names: ysql_bench_% instead of pgbench_%</li>
+</ul>
+<p>To work on the same table names, I continue with a script file:</p>
+<pre><code>
+cat &gt; /tmp/simple-update.sql &lt;&lt;'CAT'                                                                                                                         -- simple-update
+ \set aid random(1, 100000 * :scale)
+ \set bid random(1, 1 * :scale)
+ \set tid random(1, 10 * :scale)
+ \set delta random(-5000, 5000)
+ BEGIN;
+   UPDATE pgbench_accounts SET abalance = abalance + :delta
+    WHERE aid = :aid;
+   SELECT abalance FROM pgbench_accounts WHERE aid = :aid;
+    INSERT INTO pgbench_history (tid, bid, aid, delta, mtime)
+     VALUES (:tid, :bid, :aid, :delta, CURRENT_TIMESTAMP);
+ END;
+CAT
+</code></pre>
+<p>and I run with a &#8220;max-tries&#8221; settings and &#8220;-r&#8221; to report the number of retries:</p>
+<pre><code>
+ysql_bench -r --max-tries=10 --no-vacuum --protocol=prepared --file=/tmp/simple-update.sql --time 30 --jobs=10 --client=10 -h localhost -p 5433 -U postgres franck
+</code></pre>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-38078" src="../../assets/Annotation-2020-03-07-215947-scaled.jpg" alt="" width="1024" height="321" /></p>
+<p>That is 493 transactions per second. Do not compare with the PL/pgSQL version because here we have more client-server roundtrips.</p>
+<p>In order to validate that I have the same result with the builtin script, I run it after renaming the tables because the YugaByte builtin scripts expect ysql_bench_% tables:</p>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-38082" src="../../assets/Annotation-2020-03-07-220826.jpg" alt="" width="1024" height="601" /></p>
+<pre><code>
+ysql_bench -r --max-tries=10 --no-vacuum --protocol=prepared --builtin=simple-update --time 30 --jobs=10 --client=10 -h localhost -p 5433 -U postgres franck
+</code></pre>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-38084" src="../../assets/Annotation-2020-03-07-221554-scaled.jpg" alt="" width="1024" height="360" /></p>
+<p>We are in still about 493 transactions per second here.</p>
+<h3>Compared with &#8220;monolith&#8221; PostgreSQL</h3>
+<p>Of course, those numbers are far from what is possible with a monolithic database. The distributed architecture, the cross-shard foreign key validation, the replication to other nodes, have a huge overhead when implemented as remote procedure calls. When you scale-up within one server without the need to scale out, the throughput is higher with the community PostgreSQL:</p>
+<pre><code>
+sudo su - postgres
+pg_ctl start
+time pgbench --initialize --init-steps=dtgvpf --host localhost -p 5432 -U postgres
+pgbench -r --no-vacuum --protocol=prepared --builtin=simple-update --time 30 --jobs=10 --client=10 -h localhost -p 5432 -U postgres
+</code></pre>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-38093" src="../../assets/Annotation-2020-03-08-104741.jpg" alt="" width="1024" height="465" /></p>
+<p>The advantage of a distributed database comes with the possibility to scale out to multiple servers, data centers and even regions. Note that I had no replication with the PostgreSQL test above and running YugaByteDB with no replication doubles the throughput that I had with replication factor 3:</p>
+<p><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-38092" src="../../assets/Annotation-2020-03-08-110529-1.jpg" alt="" width="1024" height="712" /></p>
+<p>So, there&#8217;s no fair comparison possible. Just use what you need: monolith to speed-up, or distributed to scale-out.</p>
+<p>The big advantage of YugaByteDB is that the YSQL API is more than just compatibility with PostgreSQL like what CockroachDB does. YugaByte re-uses the PostgreSQL upper layer. Then an application built for a PostgreSQL database with the best one-node performance can scale-out without changing the application when moving to YugaByteDB. And vice-versa. This looks similar to what Amazon is doing with AWS Aurora except that Aurora runs only on AWS but YugaByteDB is open-source and can run anywhere.</p>
+<p>There are many comparative benchmarks published but I think that being able to use pgbench is very important to compare a specific workload between PostgreSQL and YugabyteDB in order to make the right deployment decisions. My goal was also to emphasize the need to have a good exception handling strategy in your applications, with retry possibility.</p>
+
+</div>
+</body>
+</html>

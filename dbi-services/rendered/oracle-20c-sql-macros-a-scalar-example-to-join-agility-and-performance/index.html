@@ -1,0 +1,310 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-20c-sql-macros-a-scalar-example-to-join-agility-and-performance/">
+<title>Oracle 20c SQL Macros: a scalar example to join agility and performance</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-20c-sql-macros-a-scalar-example-to-join-agility-and-performance/">https://www.dbi-services.com/blog/oracle-20c-sql-macros-a-scalar-example-to-join-agility-and-performance/</a> (2020-02-24)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle 20c SQL Macros: a scalar example to join agility and performance</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Let&#8217;s say you have a PEOPLE table with FIRST_NAME and LAST_NAME and you want, in many places of your application, to display the full name. Usually my name will be displayed as &#8216;Franck Pachot&#8217; and I can simply add a virtual column to my table, or view, as: initcap(FIRST_NAME)||&#8217; &#8216;||initcap(LAST_NAME). Those are simple SQL functions. No need for procedural code there, right? But, one day, the business will come with new requirements. In some countries (I&#8217;ve heard about Hungary but there are others), my name may be displayed with last name&#8230; first, like: &#8216;Pachot Franck&#8217;. And in some context, it may have a comma like: &#8216;Pachot, Franck&#8217;.</p>
+<p>There comes a religious debate between Dev and Ops:</p>
+<ul>
+<li><b>Developer:</b> We need a function for that, so that the code can evolve without changing all SQL queries or views</li>
+<li><b>DBA</b>: That&#8217;s the worst you can do. Calling a function for each row is a context switch between SQL and PL/SQL engine. Not scalable.</li>
+<li><b>Developer</b>: Ok, let&#8217;s put all that business logic in the application so that we don&#8217;t have to argue with the DBA&#8230;</li>
+<li><b>DBA</b>: Oh, that&#8217;s even worse. The database cannot perform correctly with all those row-by-row calls!</li>
+<li><b>Developer</b>: No worry, we will put the database on Kubernetes, shard and distribute it, and scale as far as we need for acceptable throughput</li>
+</ul>
+<p>And this is where we arrive in an unsustainable situation. Because we didn&#8217;t find a tradeoff between code maintainability and application performance, we get the worst from each of them: crazy resource usage for medium performance.</p>
+<p>However, in Oracle 20c, we have a solution for that. Did you code some C programs where you replace functions by pre-processor macros? So that your code is readable and maintainable like when using modules and functions. But compiled as if those functions have been merged to the calling code at compile time? What was common in those 3rd generation languages is now possible in a 4th generation declarative language: Oracle SQL.</p>
+<p>Let&#8217;s take an example. I&#8217;m building a PEOPLE table using the Linux /usr/share/dict of words:</p>
+<pre><code>
+create or replace directory "/usr/share/dict" as '/usr/share/dict';
+create table people as
+with w as (
+select *
+ from external((word varchar2(60))
+ type oracle_loader default directory "/usr/share/dict" access parameters (nologfile) location('linux.words'))
+) select upper(w1.word) first_name , upper(w2.word) last_name
+from w w1,w w2 where w1.word like 'ora%' and w2.word like 'aut%'
+order by ora_hash(w1.word||w2.word)
+/
+</code></pre>
+<p>I have 100000 rows table here with first and last names.<br />
+Here is a sample:</p>
+<pre><code>
+SQL&gt; select count(*) from people;
+
+  COUNT(*)
+----------
+    110320
+
+SQL&gt; select * from people where rownum&lt;=10;
+
+FIRST_NAME                     LAST_NAME
+------------------------------ ------------------------------
+ORACULUM                       AUTOMAN
+ORANGITE                       AUTOCALL
+ORANGUTANG                     AUTHIGENOUS
+ORAL                           AUTOPHOBIA
+ORANGUTANG                     AUTOGENEAL
+ORATORIAN                      AUTOCORRELATION
+ORANGS                         AUTOGRAPHICAL
+ORATORIES                      AUTOCALL
+ORACULOUSLY                    AUTOPHOBY
+ORATRICES                      AUTOCRATICAL
+</code></pre>
+<h3>PL/SQL function</h3>
+<p>Here is my function that displays the full name, with the Hungarian specificity as an example but, as it is a function, it can evolve further:</p>
+<pre><code>
+create or replace function f_full_name(p_first_name varchar2,p_last_name varchar2)
+return varchar2
+as
+ territory varchar2(64);
+begin
+ select value into territory from nls_session_parameters
+ where parameter='NLS_TERRITORY';
+ case (territory)
+ when 'HUNGARY'then return initcap(p_last_name)||' '||initcap(p_first_name);
+ else               return initcap(p_first_name)||' '||initcap(p_last_name);
+ end case;
+end;
+/
+show errors
+</code></pre>
+<p>The functional result depends on my session settings:</p>
+<pre><code>
+SQL&gt; select f_full_name(p_first_name=&gt;first_name,p_last_name=&gt;last_name) from people
+     where rownum&lt;=10;
+
+FIRST_NAME,P_LAST_NAME=&gt;LAST_NAME)
+------------------------------------------------------------------------------------------------
+Oraculum Automan
+Orangite Autocall
+Orangutang Authigenous
+Oral Autophobia
+Orangutang Autogeneal
+Oratorian Autocorrelation
+Orangs Autographical
+Oratories Autocall
+Oraculously Autophoby
+Oratrices Autocratical
+
+10 rows selected.
+
+</code></pre>
+<p>But let&#8217;s run it on many rows, like using this function in the where clause, with autotrace:</p>
+<pre><code>
+SQL&gt; set timing on autotrace on
+select f_full_name(first_name,last_name) from people
+where f_full_name(p_first_name=&gt;first_name,p_last_name=&gt;last_name) like 'Oracle Autonomous';
+
+F_FULL_NAME(FIRST_NAME,LAST_NAME)
+------------------------------------------------------------------------------------------------------
+Oracle Autonomous
+
+Elapsed: 00:00:03.47
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 2528372185
+
+----------------------------------------------------------------------------
+| Id  | Operation         | Name   | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |        |  1103 | 25369 |   129   (8)| 00:00:01 |
+|*  1 |  TABLE ACCESS FULL| PEOPLE |  1103 | 25369 |   129   (8)| 00:00:01 |
+----------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter("F_FULL_NAME"("P_FIRST_NAME"=&gt;"FIRST_NAME","P_LAST_NAME"=&gt;
+              "LAST_NAME")='Oracle Autonomous')
+
+
+Statistics
+----------------------------------------------------------
+     110361  recursive calls
+          0  db block gets
+        426  consistent gets
+          0  physical reads
+          0  redo size
+        608  bytes sent via SQL*Net to client
+        506  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+</code></pre>
+<p>100000 recursive calls. That is bad and not scalable. The time spent in context switches from the SQL to the PL/SQL engine is a waste of CPU cycles.</p>
+<p>Note that this is difficult to improve because we cannot create on index for that predicate:</p>
+<pre><code>
+SQL&gt; create index people_full_name on people(f_full_name(first_name,last_name));
+create index people_full_name on people(f_full_name(first_name,last_name))
+                                        *
+ERROR at line 1:
+ORA-30553: The function is not deterministic
+</code></pre>
+<p>Yes, this function cannot be deterministic because it depends on many other parameters (like the territory in this example, in order to check if I am in Hungary)</p>
+<h3>Update 25-FEB-2020</h3>
+<p>If you have read this post yesterday, pleased note that I&#8217;ve updated it. I initially didn&#8217;t add the territory parameter, thinking that changing NLS_TERRITORY would re-parse the query but it seems that cursors are shared across different territories. Anyway, the <a href="https://docs.oracle.com/en/database/oracle/oracle-database/20/lnpls/plsql-language-elements.html#GUID-292C3A17-2A4B-4EFB-AD38-68DF6380E5F7" rel="noopener noreferrer" target="_blank">documentation</a> says:<br />
+<i>Although the DETERMINISTIC property cannot be specified, a SQL macro is always implicitly deterministic.</i><br />
+So, better not relying on child cursor sharing. Thanks to Stew Ashtom for the heads up on that:</p>
+<blockquote class="twitter-tweet" data-width="500" data-dnt="true">
+<p lang="en" dir="ltr">Ouch, I was wrong&#8230; different NLS_TERRITORY share the same cursor 😱 <a href="https://t.co/BvPTLXWWpY">pic.twitter.com/BvPTLXWWpY</a></p>
+<p>&mdash; Franck Pachot (@FranckPachot) <a href="https://twitter.com/FranckPachot/status/1232244899258552320?ref_src=twsrc%5Etfw">February 25, 2020</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<h3>SQL Macro</h3>
+<p>The solution in 20c, currently available in the Oracle Cloud, here is very easy. I create a new function, M_FULL_NAME, when the only differences with F_FULL_NAME are:</p>
+<ol>
+<li> I add the SQL_MACRO(SCALAR) keyword and change the return type to varchar2 (if not already)</li>
+<li> I enclose the return expression value in quotes (using q'[ &#8230; ]&#8217; for better readability) to return it as a varchar2 containing the expression string where variable names are just placeholders (no bind variables here!)</li>
+<li> I add all external values as parameters because the SQL_MACRO function must be deterministic</li>
+</ol>
+<pre><code>
+create or replace function m_full_name(p_first_name varchar2,p_last_name varchar2,territory varchar2)
+return varchar2 SQL_MACRO(SCALAR)
+as
+begin
+ case (territory)
+ when 'HUNGARY'then return q'[initcap(p_last_name)||' '||initcap(p_first_name)]';
+ else               return q'[initcap(p_first_name)||' '||initcap(p_last_name)]';
+ end case;
+end;
+/
+</code></pre>
+<p>Here is the difference if I call both of them:</p>
+<pre><code>
+SQL&gt; set serveroutput on
+SQL&gt; exec dbms_output.put_line(f_full_name('AAA','BBB'));
+Aaa Bbb
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; exec dbms_output.put_line(m_full_name('AAA','BBB','SWITZERLAND'));
+initcap(p_first_name)||' '||initcap(p_last_name)
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select m_full_name('AAA','BBB','SWITZERLAND') from dual;
+
+M_FULL_
+-------
+Aaa Bbb
+</code></pre>
+<p>One returns the function value, the other returns the expression that can be used to return the value. It is a SQL Macro that can be applied to a SQL text to replace part of it &#8211; a scalar expression in this case as I mentioned SQL_MACRO(SCALAR)</p>
+<p>The result is the same as with the previous function:</p>
+<pre><code>
+SQL&gt; select m_full_name(p_first_name=&gt;first_name,p_last_name=&gt;last_name,territory=&gt;'SWITZERLAND') from people
+     where rownum&lt;=10;
+
+M_FULL_NAME(P_FIRST_NAME=&gt;FIRST_NAME,P_LAST_NAME=&gt;LAST_NAME,TERRITORY=&gt;'SWITZERLAND')
+------------------------------------------------------------------------------------------------------------------------
+Oraculum Automan
+Orangite Autocall
+Orangutang Authigenous
+Oral Autophobia
+Orangutang Autogeneal
+Oratorian Autocorrelation
+Orangs Autographical
+Oratories Autocall
+Oraculously Autophoby
+Oratrices Autocratical
+
+
+10 rows selected.
+</code></pre>
+<p>And now let&#8217;s look at the query using this as a predicate:</p>
+<pre><code>
+SQL&gt; set timing on autotrace on
+SQL&gt; select m_full_name(first_name,last_name,territory=&gt;'SWITZERLAND') from people
+     where m_full_name(p_first_name=&gt;first_name,p_last_name=&gt;last_name,territory=&gt;'SWITZERLAND') like 'Oracle Autonomous';
+
+M_FULL_NAME(FIRST_NAME,LAST_NAME,TERRITORY=&gt;'SWITZERLAND')
+------------------------------------------------------------------------------------------------------------------------
+Oracle Autonomous
+
+Elapsed: 00:00:00.01
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 1341595178
+
+------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name                        | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |                             |     1 |    46 |     4   (0)| 00:00:01 |
+|*  1 |  INDEX RANGE SCAN| PEOPLE_FULL_NAME_FIRST_LAST |     1 |       |     3   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access(INITCAP("FIRST_NAME")||' '||INITCAP("LAST_NAME")='Oracle Autonomous')
+
+
+Statistics
+----------------------------------------------------------
+         42  recursive calls
+          0  db block gets
+         92  consistent gets
+          7  physical reads
+          0  redo size
+        633  bytes sent via SQL*Net to client
+        565  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+
+</code></pre>
+<p>I don&#8217;t have all those row-by-row recursive calls. And the difference is easy to see in the execution plan predicate sections: there&#8217;s no call to my PL/SQL function there. It was called only at parse time to transform the SQL statement: now only using the string returned by the macro, with parameter substitution.</p>
+<p>That was my goal: stay in SQL engine for the execution, calling only standard SQL functions. But while we are in the execution plan, can we do something to avoid the full table scan? My function is not deterministic but has a small number of variations. Two in my case. Then I can create an index for each one:</p>
+<pre><code>
+
+SQL&gt;
+SQL&gt; create index people_full_name_first_last on people(initcap(first_name)||' '||initcap(last_name));
+Index created.
+
+SQL&gt; create index people_full_name_first_first on people(initcap(last_name)||' '||initcap(first_name));
+Index created.
+</code></pre>
+<p>And run my query again:</p>
+<pre><code>
+SQL&gt; select m_full_name(first_name,last_name,'SWITZERLAND') from people
+     where m_full_name(p_first_name=&gt;first_name,p_last_name=&gt;last_name,'SWITZERLAND') like 'Autonomous Oracle';
+
+no rows selected
+
+Elapsed: 00:00:00.01
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 1341595178
+
+------------------------------------------------------------------------------------------------
+| Id  | Operation        | Name                        | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT |                             |  1103 | 25369 |   118   (0)| 00:00:01 |
+|*  1 |  INDEX RANGE SCAN| PEOPLE_FULL_NAME_FIRST_LAST |   441 |       |     3   (0)| 00:00:01 |
+------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - access(INITCAP("FIRST_NAME")||' '||INITCAP("LAST_NAME")='Autonomous Oracle')
+</code></pre>
+<h3>Performance and agility</h3>
+<p>Now we are ready to bring back the business logic into the database so that it is co-located with data and run within the same process. Thanks to SQL Macros, we can even run it within the same engine, SQL, calling the PL/SQL one only at compile time to resolve the macro. And we keep full code maintainability as the logic is defined in a function that can evolve and be used in many places without duplicating the code.</p>
+
+</div>
+</body>
+</html>

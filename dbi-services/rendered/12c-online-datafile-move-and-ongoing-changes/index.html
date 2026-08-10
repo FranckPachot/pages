@@ -1,0 +1,134 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-online-datafile-move-and-ongoing-changes/">
+<title>12c online datafile move and ongoing changes</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-online-datafile-move-and-ongoing-changes/">https://www.dbi-services.com/blog/12c-online-datafile-move-and-ongoing-changes/</a> (2016-02-12)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12c online datafile move and ongoing changes</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Here is a long answer for a question on our forum about online move:<br />
+<a href="http://dbi-services.com/blog/oracle-database-12c-moving-a-datafile-is-now-possible-online/#comment-2725" target="_blank" rel="noopener noreferrer">what is internal mechanism to store/keep ongoing changes in that particular datafile while copying is in progress</a>.<br />
+<!--more--><br />
+The short answer is that there is absolutely no lock, just small synchronization and messaging between sessions. And a very small overhead while the move is running: sessions that write to a part that has already been copied must double write until the end of the operation. Let&#8217;s take an example.</p>
+<h3>Online move</h3>
+<p>I create a tablespace</p>
+<pre><code>create tablespace TESTMOVE datafile '/tmp/TESTMOVE1.dbf' size 2000M;
+Tablespace created.</code></pre>
+<p>Then I move it online</p>
+<pre><code>alter database move datafile '/tmp/TESTMOVE1.dbf' to '/tmp/TESTMOVE2.dbf';</code></pre>
+<h3>session longops</h3>
+<p>While it is running, I can see the progress from V$SESSION_LONGOPS</p>
+<pre><code>   select * from v$session_longops where (sid,serial#) in ( select sid,serial# from v$session where sid=sys_context('userenv','sid') ) order by last_update_time desc;
+</code></pre>
+<p>Here is the result (sorry for the format &#8211; html table from ancient testcase, converted to simple monospaced text)</p>
+<pre><code>
+   SID SERIAL#        OPNAME         TARGET TARGET_DESC   SOFAR    TOTALWORK  UNITS     START_TIME      LAST_UPDATE_TIME  TIMESTAMP TIME_REMAINING ELAPSED_SECONDS CONTEXT                                   MESSAGE                                   USERNAME   SQL_ADDRESS    SQL_HASH_VALUE    SQL_ID     SQL_PLAN_HASH_VALUE   SQL_EXEC_START   SQL_EXEC_ID SQL_PLAN_LINE_ID SQL_PLAN_OPERATION SQL_PLAN_OPTIONS QCSID CON_ID
+    17      45 Online data file move 2      data file   2097152000 2097152000 bytes 05-jul-13 14:24:26 05-jul-13 14:26:55                        0             138       0 Online data file move: data file 2: 2097152000 out of 2097152000 bytes done FRANCK   000000007A68C930     2874426962 5qgz3pqpp8jkk                   0 05-jul-13 14:24:26    16777216
+</code></pre>
+<h3>some activity</h3>
+<p>Now I&#8217;m creating a table in that tablespace and a procedure do generated some DML on it:</p>
+<pre><code>create table TEST (num ,txt) tablespace TESTMOVE as select rownum,to_char( date'-4712-01-01'+rownum-1,'Jsp') from (select * from dual connect by level &lt;=1000),(select * from dual connect by level &lt;=1000) order by 2;
+Table created.
+create table TEST2 tablespace TESTMOVE  as select * from TEST;
+Table created.
+create or replace procedure TESTACTIVITY as
+ begin
+  commit;
+  execute immediate &#039;truncate table TEST2 reuse storage&#039;;
+  for i in 1..1 loop
+   lock table TEST in exclusive mode;
+   insert /*+ APPEND */ into TEST2 select -num,txt from TEST;
+   commit;
+   delete from TEST2;
+   commit;
+  end loop;
+ end;
+ /
+Procedure created.
+</code></pre>
+<p>I&#8217;m doing an APPEND insert so that my session is doing the writes (direct-write to the datafile)</p>
+<h3>without move</h3>
+<p>I run my procedure and query my session statistics</p>
+<pre><code>
+exec TESTACTIVITY;
+PL/SQL procedure successfully completed.
+select name,value from v$mystat join v$statname using(statistic#) where value&gt;0 and name like '%physical%bytes%' order by 1;
+&nbsp;
+   NAME                                    VALUE
+   cell physical IO interconnect bytes 220946432
+   physical read bytes                 148291584
+   physical read total bytes           148291584
+   physical write bytes                 72654848
+   physical write total bytes           72654848
+</code></pre>
+<p>The procedure writes 70 MB and reads 140 MB</p>
+<h3>with background move</h3>
+<p>Let&#8217;s run the datafile move in background:</p>
+<pre><code>
+variable job number
+exec dbms_job.submit(:job,q'[ begin execute immediate 'set role all'; execute immediate q'(alter database move datafile '/tmp/TESTMOVE2.dbf' to '/tmp/TESTMOVE1.dbf' )'; end; ]'); commit; dbms_lock.sleep(3);
+PL/SQL procedure successfully completed.</code></pre>
+<p>If I query DBA_DATA_FILES, it&#8217;s not yet moved:</p>
+<pre><code>
+select * from dba_data_files where tablespace_name='TESTMOVE';
+&amp;nnsp
+       FILE_NAME      FILE_ID TABLESPACE_NAME   BYTES    BLOCKS  STATUS   RELATIVE_FNO AUT MAXBYTES MAXBLOCKS INCREMENT_BY USER_BYTES USER_BLOCKS ONLINE_
+   /tmp/TESTMOVE2.dbf      20 TESTMOVE        2097152000 256000 AVAILABLE           20 NO         0         0            0 2096103424      255872 ONLINE</code></pre>
+<p>which mean that my query will still read from the original location.</p>
+<p>However, when I run my procedure again:</p>
+<pre><code>
+exec TESTACTIVITY;
+PL/SQL procedure successfully completed.
+select name,value from v$mystat join v$statname using(statistic#) where value&gt;0 and name like '%physical%bytes%' order by 1;
+&nbsp;
+   NAME                                    VALUE
+   cell physical IO interconnect bytes 292413440
+   physical read bytes                 147103744
+   physical read total bytes           147103744
+   physical write bytes                 72654848
+   physical write total bytes          145309696
+</code></pre>
+<p>You see the difference: &#8216;physical write total bytes&#8217; is the double of the 70M. The write is actually writing to both files.<br />
+This is how it works. During the move, all sessions read from the original files and write to the original file, which is consistent.<br />
+In addition to that, when the write is done on a block that has already been copied to the destination, then the session also writes to the destination. This is the double write. And the end, the destination file is consistent: all blocks are copied and maintained up to date.</p>
+<p>Actually, I&#8217;ve run my procedure several times and see the same statistics, and after several executions I get:</p>
+<pre><code>
+   NAME                                    VALUE
+   cell physical IO interconnect bytes 249946112
+   physical read bytes                 146915328
+   physical read total bytes           147423232
+   physical write bytes                 72654848
+   physical write total bytes          102522880
+</code></pre>
+<p>and my online move has finished during that time. Once the move is done, all session will read from the new file and then the double write is not needed.</p>
+<p>At the end, the dictionary is updated to address the new file, and the old one can be deleted:</p>
+<pre><code>
+select * from dba_data_files where tablespace_name='TESTMOVE';
+&nbsp;
+       FILE_NAME      FILE_ID TABLESPACE_NAME   BYTES    BLOCKS  STATUS   RELATIVE_FNO AUT MAXBYTES MAXBLOCKS INCREMENT_BY USER_BYTES USER_BLOCKS ONLINE_
+   /tmp/TESTMOVE1.dbf      20 TESTMOVE        2097152000 256000 AVAILABLE           20 NO         0         0            0 2096103424      255872 ONLINE
+</code></pre>
+<h3>trace and alert.log</h3>
+<p>Note that when you trace, you see the write wait events on both files, but they have the same FILE_ID</p>
+<p>In the alert.log you can see the different phases:</p>
+<pre><code>Moving datafile /tmp/TESTMOVE1.dbf (2) to /tmp/TESTMOVE2.dbf
+</code></pre>
+<p>From there, the move has created the second file and has signaled to the other sessions (including DBWR) that they must write to both, and the the copy starts (‘db file sequential read’ and ‘db file single write’ in 1MB chunks)</p>
+<p>Then when all blocks are copied:</p>
+<pre><code>Move operation committed for file /tmp/TESTMOVE2.dbf
+</code></pre>
+<p>and the sessions can read and write on the new file</p>
+<pre><code>Completed: alter database move datafile '/tmp/TESTMOVE1.dbf' to '/tmp/TESTMOVE2.dbf'</code></pre>
+<p>This is a very nice feature. Oracle introduced it for the ILM option (in order to move cold data to cheaper disks automatically &#8211; and automatically means that it must be online) but we can also use it to migrate to new storage, to ASM, or to balance the datafile on multiple filesystems.</p>
+<p>It&#8217;s possible in Enterprise Edition without options and it&#8217;s my preferred 12c new feature for database administration. We start with it when teaching our 12c new feature training. This year, because everybody waits for 12.2 we have not planned fixed dates for that workshop, but deliver it on demand: <a href="https://www.dbi-services.com/trainings/oracle-12c-new-features-workshop/" target="_blank" rel="noopener noreferrer">https://www.dbi-services.com/trainings/oracle-12c-new-features-workshop/</a></p>
+
+</div>
+</body>
+</html>

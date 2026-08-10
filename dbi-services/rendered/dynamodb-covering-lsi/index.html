@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/dynamodb-covering-lsi/">
+<title>DynamoDB: adding a Local covering index to reduce the cost</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/dynamodb-covering-lsi/">https://www.dbi-services.com/blog/dynamodb-covering-lsi/</a> (2020-03-16)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">DynamoDB: adding a Local covering index to reduce the cost</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+This is a continuation on the previous post on <a href="https://www.dbi-services.com/blog/dynamodb-covering-gsi" rel="noopener noreferrer" target="_blank">DynamoDB: adding a Global Covering Index to reduce the cost</a>. I have a DynamoDB partitioned on &#8220;MyKeyPart&#8221;,&#8221;MyKeySort&#8221; and I have many queries that retrieve a small &#8220;MyIndo001&#8221; attribute. And less frequent ones needing the large &#8220;MyData001&#8221; attribute. I have created a Global Secondary Index (GSI) that covers the same key and this small attribute. Now, because the index is prefixed by the partition key, I can create a Local Secondary Index (LSI) to do the same. But there are many limitations. The first one is that I cannot add a local index afterwards. I need to define it at the table creation.</p>
+<h3>Drop table</h3>
+<p>Here I am in a lab so that I can drop and re-create the table. In real live you may have to create a new one, copy the items, synchronize it (DynamoDB Stream),&#8230;</p>
+<pre><code>
+aws dynamodb delete-table --table-name Demo
+while aws --output json dynamodb describe-table --table-name Demo | grep '"TableStatus": "DELETING"' ; do sleep 1 ; done 2&gt;/dev/null | awk '{printf "."}END{print}'
+
+-------------------------------------------------------------------------------
+|                                 DeleteTable                                 |
++-----------------------------------------------------------------------------+
+||                             TableDescription                              ||
+|+----------------+----------------------------------------------------------+|
+||  ItemCount     |  0                                                       ||
+||  TableArn      |  arn:aws:dynamodb:eu-central-1:802756008554:table/Demo   ||
+||  TableId       |  d8238050-556c-4158-85e8-bf90d483d9e2                    ||
+||  TableName     |  Demo                                                    ||
+||  TableSizeBytes|  0                                                       ||
+||  TableStatus   |  DELETING                                                ||
+|+----------------+----------------------------------------------------------+|
+|||                          ProvisionedThroughput                          |||
+||+-----------------------------------------------------------+-------------+||
+|||  NumberOfDecreasesToday                                   |  0          |||
+|||  ReadCapacityUnits                                        |  25         |||
+|||  WriteCapacityUnits                                       |  25         |||
+||+-----------------------------------------------------------+-------------+||
+..        "TableStatus": "DELETING",
+</code></pre>
+<h3>Re-create table</h3>
+<p>I use the same create-table where I add the definition for a &#8220;DemoLSI&#8221; local index that includes &#8220;MyInfo001&#8221;:</p>
+<pre><code>
+aws dynamodb create-table \
+ --attribute-definitions \
+  AttributeName=MyKeyPart,AttributeType=N \
+  AttributeName=MyKeySort,AttributeType=N \
+ --key-schema \
+  AttributeName=MyKeyPart,KeyType=HASH \
+  AttributeName=MyKeySort,KeyType=RANGE \
+ --billing-mode PROVISIONED \
+ --provisioned-throughput ReadCapacityUnits=25,WriteCapacityUnits=25 \
+ --local-secondary-indexes ' [{
+  "IndexName": "DemoLSI",
+  "KeySchema":[
+   {"AttributeName":"MyKeyPart","KeyType":"HASH"},
+   {"AttributeName":"MyKeySort","KeyType":"RANGE"}
+  ],
+  "Projection":{"ProjectionType":"INCLUDE","NonKeyAttributes":["MyInfo001"]}
+  }] ' \
+ --table-name Demo
+
+while aws --output json dynamodb describe-table --table-name Demo | grep '"TableStatus": "CREATING"' ; do sleep 1 ; done 2&gt;/dev/null | awk '{printf "."}END{print}'
+</code></pre>
+<p>Here is the output:</p>
+<pre><code>
+-----------------------------------------------------------------------------------------------
+|                                         CreateTable                                         |
++---------------------------------------------------------------------------------------------+
+||                                     TableDescription                                      ||
+|+----------------------+--------------------------------------------------------------------+|
+||  CreationDateTime    |  1584347785.29                                                     ||
+||  ItemCount           |  0                                                                 ||
+||  TableArn            |  arn:aws:dynamodb:eu-central-1:802756008554:table/Demo             ||
+||  TableId             |  ebc9488a-fc5f-4022-b947-72b733784a6a                              ||
+||  TableName           |  Demo                                                              ||
+||  TableSizeBytes      |  0                                                                 ||
+||  TableStatus         |  CREATING                                                          ||
+|+----------------------+--------------------------------------------------------------------+|
+|||                                  AttributeDefinitions                                   |||
+||+-------------------------------------------+---------------------------------------------+||
+|||               AttributeName               |                AttributeType                |||
+||+-------------------------------------------+---------------------------------------------+||
+|||  MyKeyPart                                |  N                                          |||
+|||  MyKeySort                                |  N                                          |||
+||+-------------------------------------------+---------------------------------------------+||
+|||                                        KeySchema                                        |||
+||+-----------------------------------------------------+-----------------------------------+||
+|||                    AttributeName                    |              KeyType              |||
+||+-----------------------------------------------------+-----------------------------------+||
+|||  MyKeyPart                                          |  HASH                             |||
+|||  MyKeySort                                          |  RANGE                            |||
+||+-----------------------------------------------------+-----------------------------------+||
+|||                                  LocalSecondaryIndexes                                  |||
+||+----------------+------------------------------------------------------------------------+||
+|||  IndexArn      |  arn:aws:dynamodb:eu-central-1:802756008554:table/Demo/index/DemoLSI   |||
+|||  IndexName     |  DemoLSI                                                               |||
+|||  IndexSizeBytes|  0                                                                     |||
+|||  ItemCount     |  0                                                                     |||
+||+----------------+------------------------------------------------------------------------+||
+||||                                       KeySchema                                       ||||
+|||+----------------------------------------------------+----------------------------------+|||
+||||                    AttributeName                   |             KeyType              ||||
+|||+----------------------------------------------------+----------------------------------+|||
+||||  MyKeyPart                                         |  HASH                            ||||
+||||  MyKeySort                                         |  RANGE                           ||||
+|||+----------------------------------------------------+----------------------------------+|||
+||||                                      Projection                                       ||||
+|||+-----------------------------------------------------+---------------------------------+|||
+||||  ProjectionType                                     |  INCLUDE                        ||||
+|||+-----------------------------------------------------+---------------------------------+|||
+|||||                                  NonKeyAttributes                                   |||||
+||||+-------------------------------------------------------------------------------------+||||
+|||||  MyInfo001                                                                          |||||
+||||+-------------------------------------------------------------------------------------+||||
+|||                                  ProvisionedThroughput                                  |||
+||+------------------------------------------------------------------------+----------------+||
+|||  NumberOfDecreasesToday                                                |  0             |||
+|||  ReadCapacityUnits                                                     |  25            |||
+|||  WriteCapacityUnits                                                    |  25            |||
+||+------------------------------------------------------------------------+----------------+||
+.....        "TableStatus": "CREATING",
+</code></pre>
+<p>What is very different from the global index is that here I didn&#8217;t specify read and write capacity for it. The RCU and WCU is counted within the table provisioned ones. That gives more agility in my case as I don&#8217;t have to think about the ratio of my two use cases (read from the index only or read the whole item from the table).</p>
+<h3>Put items</h3>
+<p>I&#8217;m using the same script as in the previous post to put 8 items here. What is different is the output as I can see one additional WCU for the index entry:</p>
+<pre><code>
+----------------------------------
+|             PutItem            |
++--------------------------------+
+||       ConsumedCapacity       ||
+|+----------------+-------------+|
+||  CapacityUnits |  TableName  ||
+|+----------------+-------------+|
+||  246.0         |  Demo       ||
+|+----------------+-------------+|
+|||    LocalSecondaryIndexes   |||
+||+----------------------------+||
+||||          DemoLSI         ||||
+|||+------------------+-------+|||
+||||  CapacityUnits   |  1.0  ||||
+|||+------------------+-------+|||
+|||            Table           |||
+||+------------------+---------+||
+|||  CapacityUnits   |  245.0  |||
+||+------------------+---------+||
+||     ItemCollectionMetrics    ||
+|+------------------------------+|
+|||      ItemCollectionKey     |||
+||+----------------------------+||
+||||         MyKeyPart        ||||
+|||+------------+-------------+|||
+||||  N         |  2          ||||
+|||+------------+-------------+|||
+|||     SizeEstimateRangeGB    |||
+||+----------------------------+||
+|||  0.0                       |||
+|||  1.0                       |||
+||+----------------------------+||
+</code></pre>
+<h3>Query the local index</h3>
+<p>Again, as with the global one, the local index will be used only when explicitely mentioned. Reading only the small attributes, and mentioning only the table, still reads the whole item. Again, I read 4 items (all from the same partition key):</p>
+<pre><code>
+aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyInfo001" \
+ --no-consistent-read \
+ --table-name Demo
+...
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 122.5,
+        "TableName": "Demo",
+        "Table": {
+            "CapacityUnits": 122.5
+        }
+    }
+}
+</code></pre>
+<p>4 items of 245KB is 122.5 RCUs.<br />
+Here is the same query mentioning the local index:<br />
+<a href="../../assets/Annotation-2020-03-16-104450.png"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-16-104450.png" alt="" width="735" height="646" class="aligncenter size-full wp-image-38216" /></a><br />
+There, no RCU from the table and 0.5 from the index. This is exactly the same as what I had with the global index, and this is a similar way to optimize the queries that read only a small part of the item.</p>
+<h3>Consistent reads</h3>
+<p>One advatage of local indexes is that they support consistent reads (&#8211;consistent-read):</p>
+<pre><code>
+aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyKeyPart","MyKeySort","MyInfo001" \
+ --consistent-read \
+ --index-name DemoLSI \
+ --table-name Demo
+...
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 1.0,
+        "TableName": "Demo",
+        "LocalSecondaryIndexes": {
+            "DemoLSI": {
+                "CapacityUnits": 1.0
+            }
+        },
+        "Table": {
+            "CapacityUnits": 0.0
+        }
+    }
+}
+</code></pre>
+<p>The cost doubles for consistent reads: 1 RCU for 4 items (smaller than 4KB) instead of 0.5 with eventual consistency.<br />
+Another advantage of local indexes is that it automatically get the full item transparently when asking for an additional attribute projection which is not in the index:</p>
+<pre><code>
+aws --output json dynamodb query \
+ --key-condition-expression "MyKeyPart = :k" \
+ --expression-attribute-values  '{":k":{"N":"1"}}' \
+ --return-consumed-capacity TABLE \
+ --return-consumed-capacity INDEXES \
+ --select SPECIFIC_ATTRIBUTES \
+ --projection-expression="MyKeyPart","MyKeySort","MyInfo001","MyData001" \
+ --no-consistent-read \
+ --index-name DemoLSI \
+ --table-name Demo
+...
+    "ScannedCount": 4,
+    "ConsumedCapacity": {
+        "CapacityUnits": 124.5,
+        "TableName": "Demo",
+        "LocalSecondaryIndexes": {
+            "DemoLSI": {
+                "CapacityUnits": 0.5
+            }
+        },
+        "Table": {
+            "CapacityUnits": 124.0
+        }
+    }
+}
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-16-105717.png"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-16-105717.png" alt="" width="802" height="746" class="aligncenter size-full wp-image-38219" /></a><br />
+There, I still have 0.5 RCU from the index and now 124 RC from the table. So it is transparent, a bit more expensive than querying directly the table in this case (was 122.5 RCU).<br />
+Again, I am in a case where I read all items from a partitioned key so the index is not useful for filtering the items. This is a special case for this demo on covering indexes.</p>
+<h3>&#8220;Item Collection Size Limit&#8221;</h3>
+<p>In the previous blog post as in the current one I always mentioned &#8211;return-item-collection-metrics with the put-item. This returned nothing when the table had no local index but you can see above that, with local indexes, each put-item returned:</p>
+<pre><code>
+||+------------------+---------+||
+||     ItemCollectionMetrics    ||
+|+------------------------------+|
+|||      ItemCollectionKey     |||
+||+----------------------------+||
+||||         MyKeyPart        ||||
+|||+------------+-------------+|||
+||||  N         |  2          ||||
+|||+------------+-------------+|||
+|||     SizeEstimateRangeGB    |||
+||+----------------------------+||
+|||  0.0                       |||
+|||  1.0                       |||
+||+----------------------------+||
+</code></pre>
+<p>This is the size of the collection of items for MyKeyPart=2 and there&#8217;s a hard limit of 10GB. This happens when there are local indexes on the table. So, be certain to control the size of the item collection.</p>
+<p>Because we chose DynamoDB for its scalability (the storage can grow) and availability (the structure can evolve without downtime), the limitations of Local Secondary Indexes (collection size limit and rebuild the table to create them) make them not very appealing and Global Secondary Indexes may be prefered even when both are possible.</p>
+
+</div>
+</body>
+</html>

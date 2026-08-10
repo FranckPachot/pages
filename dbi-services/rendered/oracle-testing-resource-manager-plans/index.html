@@ -1,0 +1,227 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-testing-resource-manager-plans/">
+<title>Oracle &#8211; testing resource manager plans?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-testing-resource-manager-plans/">https://www.dbi-services.com/blog/oracle-testing-resource-manager-plans/</a> (2021-03-16)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle &#8211; testing resource manager plans?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+I never remember that in order to use instance caging you need to set a Resource Manager Plan but don&#8217;t need to set CPU_COUNT explicitly (was it the case in previous versions?). Here is how to test it quickly in a lab.</p>
+<pre><code>
+SQL&gt; startup force
+ORACLE instance started.
+
+SQL&gt; show spparameter resource_manager_plan
+
+SID      NAME                          TYPE        VALUE
+-------- ----------------------------- ----------- ----------------------------
+*        resource_manager_plan         string
+
+SQL&gt; show spparameter cpu_count
+
+SID      NAME                          TYPE        VALUE
+-------- ----------------------------- ----------- ----------------------------
+*        cpu_count                     integer
+
+SQL&gt; show parameter resource_manager_plan
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+resource_manager_plan                string
+
+SQL&gt; show parameter cpu_count
+
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+cpu_count                            integer     16
+
+</code></pre>
+<p>I have a VM with 16 CPU threads, no &#8220;cpu_count&#8221; or &#8220;resource_manager_plan&#8221; are set in SPFILE. I restarted the instance (it is a lab) to be sure that nothing is set on scope=memory.</p>
+<pre><code>sqlplus / as sysdba @ tmp.sql /dev/null
+for i in {1..16} ; do echo "exec loop null; end loop;" | sqlplus -s "c##franck/c##franck" &amp; done &gt;/dev/null
+sleep 10
+( cd /tmp &amp;&amp; git clone https://github.com/tanelpoder/tpt-oracle.git )
+sqlplus / as sysdba @ /tmp/tpt-oracle/snapper ash=event+username 30 1 all &lt; /dev/null
+pkill -f oracleCDB1A</code></pre>
+<p>I run 32 sessions working in memory (simple PL/SQL loops) and look at the sessions with Tanel Poder&#8217;s <a href="http://tech.e2sn.com/oracle-scripts-and-tools/session-snapper" target="_blank" rel="noopener">snapper</a> in order to show whether I am ON CPU or in Resource Manager wait. And then kill my sessions in a very hugly fashion (this is a lab)</p>
+<h3>Nothing set, all defaults: no instance caging</h3>
+<pre><code>-- Session Snapper v4.31 - by Tanel Poder ( http://blog.tanelpoder.com/snapper ) - Enjoy the Most Advanced Oracle Troubleshooting Script on the Planet! :)
+
+-------------------------------------------------------------------------------
+  ActSes   %Thread | EVENT                               | USERNAME
+-------------------------------------------------------------------------------
+   16.00   (1600%) | ON CPU                              | C##FRANCK
+   16.00   (1600%) | ON CPU                              | SYS
+
+--  End of ASH snap 1, end=2021-03-16 17:38:43, seconds=30, samples_taken=96, AAS=32</code></pre>
+<p>On my CPU_COUNT=16 (default but not set) instance, I have 32 sessions ON CPU -&gt; no instance caging</p>
+<h3>Only CPU_COUNT set, no resource manager plan: no instance caging</h3>
+<pre><code>
+SQL&gt; alter system set cpu_count=16  scope=memory;
+System altered.
+</code></pre>
+<p>I have set CPU_COUNT explicitely to 16 (just checking because this is where I always have a doubt)</p>
+<pre><code>-- Session Snapper v4.31 - by Tanel Poder ( http://blog.tanelpoder.com/snapper ) - Enjoy the Most Advanced Oracle Troubleshooting Script on the Planet! :)
+
+-------------------------------------------------------------------------------
+  ActSes   %Thread | EVENT                               | USERNAME
+-------------------------------------------------------------------------------
+   16.00   (1600%) | ON CPU                              | C##FRANCK
+   16.00   (1600%) | ON CPU                              | SYS
+     .03      (3%) | ON CPU                              |
+
+--  End of ASH snap 1, end=2021-03-16 18:03:50, seconds=5, samples_taken=37, AAS=32
+</code></pre>
+<p>Setting CPU_COUNT manually doesn&#8217;t change anything here.</p>
+<pre><code>
+SQL&gt; startup force
+ORACLE instance started.
+</code></pre>
+<p>For the next test I reset to the default to show that CPU_COUNT doesn&#8217;t have to be set explicitely in order to enable instance caging.</p>
+<h3>Resource manager set to DEFAULT_CDB_PLAN with default CPU_COUNT: instance caging</h3>
+<pre><code>SQL&gt; alter system set resource_manager_plan=DEFAULT_CDB_PLAN scope=memory;
+
+System altered.
+
+</code></pre>
+<p>I have set the default resource manager plan (I&#8217;m in multitenant and running from the CDB)</p>
+<pre><code>
+-- Session Snapper v4.31 - by Tanel Poder ( http://blog.tanelpoder.com/snapper ) - Enjoy the Most Advanced Oracle Troubleshooting Script on the Planet! :)
+
+-------------------------------------------------------------------------------
+  ActSes   %Thread | EVENT                               | USERNAME
+-------------------------------------------------------------------------------
+   13.07   (1307%) | ON CPU                              | SYS
+   12.20   (1220%) | resmgr:cpu quantum                  | C##FRANCK
+    3.80    (380%) | ON CPU                              | C##FRANCK
+    2.93    (293%) | resmgr:cpu quantum                  | SYS
+
+--  End of ASH snap 1, end=2021-03-16 18:21:24, seconds=30, samples_taken=94, AAS=32
+</code></pre>
+<p>Here only 16 sessions on average are ON CPU and the others are scheduled out by Resource Manager. Note that there&#8217;s a higher priority for SYS than for my user.</p>
+<h3>Resource manager set to DEFAULT_MAINTENANCE_PLAN with default CPU_COUNT: instance caging</h3>
+<pre><code>SQL&gt; alter system set resource_manager_plan=DEFAULT_MAINTENANCE_PLAN scope=memory;
+
+System altered.
+
+</code></pre>
+<p>I have set the default resource manager plan (I&#8217;m in multitenant and running from the CDB)</p>
+<pre><code>
+-- Session Snapper v4.31 - by Tanel Poder ( http://blog.tanelpoder.com/snapper ) - Enjoy the Most Advanced Oracle Troubleshooting Script on the Planet! :)
+
+-------------------------------------------------------------------------------
+  ActSes   %Thread | EVENT                               | USERNAME
+-------------------------------------------------------------------------------
+   13.22   (1322%) | ON CPU                              | SYS
+   12.31   (1231%) | resmgr:cpu quantum                  | C##FRANCK
+    3.69    (369%) | ON CPU                              | C##FRANCK
+    2.78    (278%) | resmgr:cpu quantum                  | SYS
+     .07      (7%) | ON CPU                              |
+     .04      (4%) | resmgr:cpu quantum                  |
+
+--  End of ASH snap 1, end=2021-03-16 18:29:31, seconds=30, samples_taken=95, AAS=32.1
+</code></pre>
+<p>Here only 16 sessions on average are ON CPU and the others are scheduled out by Resource Manager. Again, there&#8217;s a higher priority for SYS than for my user.</p>
+<h3>Same in a PDB</h3>
+<pre><code>
+for i in {1..16} ; do echo "exec loop null; end loop;" | ORACLE_PDB_SID=PDB1 sqlplus -s / as sysdba &amp; done &gt;/dev/null
+for i in {1..16} ; do echo "exec loop null; end loop;" | sqlplus -s "c##franck/c##franck"@//localhost/PDB1 &amp; done &gt;/dev/null
+</code></pre>
+<p>I&#8217;ve changed my connections to connect to the PDB</p>
+<pre><code>
+-- Session Snapper v4.31 - by Tanel Poder ( http://blog.tanelpoder.com/snapper ) - Enjoy the Most Advanced Oracle Troubleshooting Script on the Planet! :)
+
+
+----------------------------------------------------------------------------------------
+  ActSes   %Thread | EVENT                               | USERNAME             | CON_ID
+----------------------------------------------------------------------------------------
+   14.95   (1495%) | ON CPU                              | SYS                  |      3
+   14.27   (1427%) | resmgr:cpu quantum                  | C##FRANCK            |      3
+    1.73    (173%) | ON CPU                              | C##FRANCK            |      3
+    1.05    (105%) | resmgr:cpu quantum                  | SYS                  |      3
+     .01      (1%) | LGWR all worker groups              |                      |      0
+     .01      (1%) | ON CPU                              |                      |      0
+
+--  End of ASH snap 1, end=2021-03-16 19:14:52, seconds=30, samples_taken=93, AAS=32
+</code></pre>
+<p>I check the CON_ID to verify that I run in the PDB and here, with the CDB resource manager plan DEFAULT_MAINTENANCE_PLAN the SYS_GROUP (SYSDBA and SYSTEM) can take 90% of CPU. It is the same with DEFAULT_CDB_PLAN.</p>
+<h3>Adding a Simple Plan</h3>
+<pre><code>
+SQL&gt; alter session set container=PDB1;
+
+Session altered.
+
+SQL&gt; BEGIN
+  2  DBMS_RESOURCE_MANAGER.CREATE_SIMPLE_PLAN(SIMPLE_PLAN =&gt; 'SIMPLE_PLAN1',
+  3     CONSUMER_GROUP1 =&gt; 'MYGROUP1', GROUP1_PERCENT =&gt; 80,
+  4     CONSUMER_GROUP2 =&gt; 'MYGROUP2', GROUP2_PERCENT =&gt; 20);
+  5  END;
+  6  /
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; alter system set resource_manager_plan=SIMPLE_PLAN1 scope=memory;
+
+System altered.
+This is the simple plan example from the documentation (or <a href="https://blogs.oracle.com/db/oracle-resource-manager-and-dbmsresourcemanager" target="_blank" rel="noopener">here</a>).
+</code></pre>
+<pre><code>
+-- Session Snapper v4.31 - by Tanel Poder ( http://blog.tanelpoder.com/snapper ) - Enjoy the Most Advanced Oracle Troubleshooting Script on the Planet! :)
+
+----------------------------------------------------------------------------------------
+  ActSes   %Thread | EVENT                               | USERNAME             | CON_ID
+----------------------------------------------------------------------------------------
+    8.59    (859%) | ON CPU                              | SYS                  |      3
+    8.51    (851%) | ON CPU                              | C##FRANCK            |      3
+    7.49    (749%) | resmgr:cpu quantum                  | C##FRANCK            |      3
+    7.41    (741%) | resmgr:cpu quantum                  | SYS                  |      3
+     .04      (4%) | ON CPU                              |                      |      0
+
+--  End of ASH snap 1, end=2021-03-16 19:29:54, seconds=30, samples_taken=92, AAS=32
+</code></pre>
+<p>Now, with this simple plan, everything changed. The level 1 gives 100% to SYS_GROUP but it actually got 50%. Level 2 gives 80% and 20% to groups that are not used there. And level 3 gives 100% to OTHER_GROUPS. But those are the levels documented in pre-multitenant.</p>
+<h3>Mapping my user to one simple plan group</h3>
+<pre><code>
+SQL&gt; BEGIN
+  2  DBMS_RESOURCE_MANAGER.create_pending_area;
+  3  DBMS_RESOURCE_MANAGER.SET_CONSUMER_GROUP_MAPPING
+  4       (DBMS_RESOURCE_MANAGER.ORACLE_USER, 'C##FRANCK', 'MYGROUP2');
+  5  DBMS_RESOURCE_MANAGER.validate_pending_area;
+  6  DBMS_RESOURCE_MANAGER.submit_pending_area;
+  7  END;
+  8  /
+
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>I&#8217;ve assigned my C##FRANCK user which gets 20% at level 2</p>
+<pre><code>
+-- Session Snapper v4.31 - by Tanel Poder ( http://blog.tanelpoder.com/snapper ) - Enjoy the Most Advanced Oracle Troubleshooting Script on the Planet! :)
+
+----------------------------------------------------------------------------------------
+  ActSes   %Thread | EVENT                               | USERNAME             | CON_ID
+----------------------------------------------------------------------------------------
+   13.20   (1320%) | ON CPU                              | C##FRANCK            |      3
+   12.78   (1278%) | resmgr:cpu quantum                  | SYS                  |      3
+    3.22    (322%) | ON CPU                              | SYS                  |      3
+    2.80    (280%) | resmgr:cpu quantum                  | C##FRANCK            |      3
+     .02      (2%) | resmgr:cpu quantum                  |                      |      0
+     .01      (1%) | log file parallel write             |                      |      0
+     .01      (1%) | ON CPU                              |                      |      0
+
+--  End of ASH snap 1, end=2021-03-16 19:45:52, seconds=30, samples_taken=96, AAS=32
+</code></pre>
+<p>Now my user got 80% of the CPU resource and SYS only 20%</p>
+<p>Surprised? In a CDB the &#8220;simple plan&#8221; is the the same as described in pre-12c documentation &#8211; there&#8217;s only one level, and 80/20 shares:<br />
+<a href="../../assets/Screenshot-2021-03-16-205636.jpg"><img loading="lazy" decoding="async" class="aligncenter size-large wp-image-48545" src="../../assets/Screenshot-2021-03-16-205636.jpg" alt="" width="1024" height="397" /></a></p>
+<p>The main message here is: test it because what you get may not be what you think&#8230; Test and keep it simple.</p>
+
+</div>
+</body>
+</html>

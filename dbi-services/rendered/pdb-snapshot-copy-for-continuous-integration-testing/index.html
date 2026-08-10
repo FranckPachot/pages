@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/pdb-snapshot-copy-for-continuous-integration-testing/">
+<title>PDB snapshot copy for continuous integration testing</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/pdb-snapshot-copy-for-continuous-integration-testing/">https://www.dbi-services.com/blog/pdb-snapshot-copy-for-continuous-integration-testing/</a> (2016-01-01)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">PDB snapshot copy for continuous integration testing</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+How do you manage your continuous integration tests on the database? You need to restart at the same state for probably a hundred of tests. Recreating the schema and test data takes too long. Oracle is not optimized for DDL. Restoring the database takes too long. Even if you data is small, there is those SYSTEM, SYSAUX tablespaces. Flashback database can help, but it still takes time because it requires to restart the instance.<br />
+Let&#8217;s see how multitenant can help here.<br />
+<!--more--></p>
+<h3>Flashback database</h3>
+<p>The flashback database solution is a good solution, and I&#8217;ve implemented that for continuous integration tests. It seems that having thousands of incarnations is not a problem (at least for a test database) and in current versions I&#8217;ve not seen many bugs where flashback logs or archived logs remain without becoming obsolete. But there is a problem: you need to close the database, which means that you need to restart the instance to open it again. This takes time. There are a lot of processes in current versions and linux is not optimized for process creation.</p>
+<h3>Alter database close</h3>
+<p>But now multitenant is there. 12c Multitenant is a major change of oracle architecture. If you don&#8217;t share my opinion about it, just look at the first paragraph of Tom Kyte&#8217;s &#8216;Expert Oracle&#8217; about architecture overview: <i>An instance can mount and open at most one database in its life</i>. This statement is not true anymore with multitenant: you can re-open a closed pluggable database very quickly, without having to restart the instance.<br />
+This makes flashback database a very nice solution for our problem, as it can be done in few seconds, but for the moment, in 12.1, the problem is that you cannot flashback database at PDB level. So we need a workaround.</p>
+<h3>Thin provisioning</h3>
+<p>Here is the most simple workaround: once you have your reference PDB with your test data in the state you want at the beginning of each tests, you can make it read only, and then create new PDB from it for the tests. However, I don&#8217;t want to copy the SYSTEM and SYSAUX tablespaces each time, so I&#8217;ll use thin provisioning.</p>
+<h3>Snapshot copy</h3>
+<p>Here is the simple command to do that:</p>
+<pre><code>
+SQL&gt; create pluggable database PDBSNAP from PDB snapshot copy file_name_convert=('/PDB/','/PDBSNAP/');
+</code></pre>
+<p>but you need a storage that allow thin provisioning to use that or you get the following error:</p>
+<pre><code>
+create pluggable database PDBSNAP from PDB snapshot copy file_name_convert=('/PDB/','/PDBSNAP/')
+*
+ERROR at line 1:
+ORA-65169: error encountered while attempting to copy file
+/u02/app/oracle/oradata/CDB/PDB/system01.dbf
+ORA-17525: Database clone using storage snapshot not supported on file
+/u02/app/oracle/oradata/CDB/PDB/system01.dbf
+</code></pre>
+<p>The solution is:</p>
+<pre><code>
+$ oerr ora 17525
+17525, 00000, "Database clone using storage snapshot not supported on file %s"
+// *Cause:  Cloning a database using storage level snapshot is not supported on the underlying storage.
+// *Action: Use storage product that has snapshot based cloning support for Oracle.
+</code></pre>
+<h3>CLONEDB=true</h3>
+<p>But you can do it also without any special storage as long as your filesystem supports sparse files. Then, the original files will not be touched and only the modified blocks will be written in the new files (it&#8217;s copy-on-write). Which means two things:</p>
+<ul>
+<li>that the PDB creation is very fast as there is nothing to copy</li>
+<li>that once dropped, the base files are available to create a new one</li>
+</ul>
+<p>In order to use that, you need to set the instance parameter clonedb=true (needs restart):</p>
+<pre><code>
+SQL&gt; alter system set clonedb=true scope=spfile;
+System altered.
+SQL&gt; shutdown immediate
+Database closed.
+Database dismounted.
+SQL&gt; startup
+ORACLE instance started
+...
+Database mounted.
+Database opened.
+&nbsp;
+SQL&gt; show parameter clonedb
+&nbsp;
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+clonedb                              boolean     TRUE
+</code></pre>
+<p>and then I can thin clone my reference PDB in few seconds:</p>
+<pre><code>
+17:16:21 SQL&gt; create pluggable database PDBSNAP from PDB snapshot copy file_name_convert=('/PDB/','/PDBSNAP/');
+Pluggable database created.
+17:16:31 SQL&gt;
+</code></pre>
+<p>and if you look at the files you see that the new ones are very small:</p>
+<pre><code>
+17:16:31 SQL&gt; host  du -ka /u02/app/oracle/oradata/CDB/PDB*/*
+276488  /u02/app/oracle/oradata/CDB/PDB/system01.dbf
+614412  /u02/app/oracle/oradata/CDB/PDB/sysaux01.dbf
+1273612 /u02/app/oracle/oradata/CDB/PDB/example01.dbf
+15368   /u02/app/oracle/oradata/CDB/PDB/SAMPLE_SCHEMA_users01.dbf
+172     /u02/app/oracle/oradata/CDB/PDBSNAP/system01.dbf
+16      /u02/app/oracle/oradata/CDB/PDBSNAP/sysaux01.dbf
+16      /u02/app/oracle/oradata/CDB/PDBSNAP/example01.dbf
+16      /u02/app/oracle/oradata/CDB/PDBSNAP/SAMPLE_SCHEMA_users01.dbf
+</code></pre>
+<p>16k (two blocks) only are different for the application datafiles. SYSTEM had a few more change, but it&#8217;s only few blocks here.<br />
+It took 10 seconds here on 1GB datafiles and it will still take 10 seconds if you have 100GB. That makes the thin provisioning very fast.</p>
+<p>Then you open it and can use it in few seconds:</p>
+<pre><code>
+17:16:31 SQL&gt; alter pluggable database PDBSNAP open;
+Pluggable database altered.
+&nbsp;
+17:16:34 SQL&gt; connect hr/hr@//localhost/PDBSNAP
+Connected.
+</code></pre>
+<p>Do everything you want here and then drop it, which takes only few seconds again.</p>
+<pre><code>
+17:16:35 SQL&gt; connect / as sysdba
+Connected.
+17:16:35 SQL&gt; alter pluggable database PDBSNAP close;
+Pluggable database altered.
+17:16:36 SQL&gt; drop pluggable database PDBSNAP including datafiles;
+Pluggable database dropped.
+17:16:37 SQL&gt;
+</code></pre>
+<p>You can see that I&#8217;ve dropped it &#8216;including datafiles&#8217; and it drops only the sparse files:</p>
+<pre><code>
+17:16:37 SQL&gt; host  du -ka /u02/app/oracle/oradata/CDB/PDB*/*
+276488  /u02/app/oracle/oradata/CDB/PDB/system01.dbf
+614412  /u02/app/oracle/oradata/CDB/PDB/sysaux01.dbf
+1273612 /u02/app/oracle/oradata/CDB/PDB/example01.dbf
+15368   /u02/app/oracle/oradata/CDB/PDB/SAMPLE_SCHEMA_users01.dbf
+</code></pre>
+<p>The files from my reference PDB are still there, ready for another provisioning.</p>
+<h3>Expensive option?</h3>
+<p>CREATE PLUGGABLE DATABASE &#8230; SNAPSHOT COPY is a good alternative to flashback database here. However, keep in mind that you need to have more than one PDB in your CDB which means that you need to have multitenant option for that. You may find that expensive, but  think about what it can bring you: you can provision multiple test environments and run your test in parallel, you same lot of storage, you can provision one database for each developer without a big overhead,&#8230;</p>
+<h3>Cloud</h3>
+<p>The Oracle cloud service is a good solution for those environments. You probably don&#8217;t need the same number of databases for the whole application lifecycle. In the cloud you can provision those environments when a project needs it. And the cost of additional options is not very high there: the &#8216;high performance&#8217; service price is 30% higher than the &#8216;enterprise edition&#8217; one and brings nearly all options (except In-Memory and Active Data Guard). But take care: if you give that environment to your developers, they may use a lot of options that you don&#8217;t want to buy for production. Keep an eye on DBA_FEATURE_USAGE_STATISTICS.</p>
+<h3>single-tenant</h3>
+<p>If you don&#8217;t want to pay for the multitenant option yet you can have only one pluggable database (in addition to seed). And you can do snapshot copy from remote CDB through db link, so you keep one PDB per CDB. It seems to take a few more seconds (in &#8216;remote operation&#8217; and &#8216;external table read&#8217; to read opatch inventory from the remote database).</p>
+<p>Even without multitenant option, not having to re-start the instance, and to possibility to easily use thin provisioning is a very good reason to start to look at pluggable databases.</p>
+<h3>Update</h3>
+<p>In a new blog post I&#8217;ve detailed another solution in single-tenant with only one instance, using dbms_dnfs.clonedb_renamefile: <a href="https://www.dbi-services.com/blog/pdb-snapshot-using-dbms_dnfs-clonedb_renamefile/">https://www.dbi-services.com/blog/pdb-snapshot-using-dbms_dnfs-clonedb_renamefile/</a></p>
+
+</div>
+</body>
+</html>

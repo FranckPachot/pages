@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/create-schema-synonym-in-oracle-unsupported-feature/">
+<title>Creating a schema synonym in Oracle &#8211; an unsupported feature</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/create-schema-synonym-in-oracle-unsupported-feature/">https://www.dbi-services.com/blog/create-schema-synonym-in-oracle-unsupported-feature/</a> (2014-12-28)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Creating a schema synonym in Oracle &#8211; an unsupported feature</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Ivica Arsov (<a href="https://twitter.com/IvicaArsov">@IvicaArsov</a>) has made an interesting <a href="/oracle-12c-cdb-metadata-a-object-links-internals#comment-363">comment</a> about AUDIT_ACTIONS object link table. I&#8217;ll blog about it soon, but in the meantime when checking its definition in cataudit.sql it came upon the following:</p>
+<pre><code>/* SCHEMA SYNONYMS will be added in 12g */
+-- insert into audit_actions values (222, 'CREATE SCHEMA SYNONYM');
+-- insert into audit_actions values (224, 'DROP SCHEMA SYNONYM');
+</code></pre>
+<p>which caught my attention.</p>
+<p>So this blog post is not about mulitenant but about Schema Synonyms. There are a lot of internal references to 12g&#8217; written when the &#8216;c&#8217; was not yet decided. But that feature is not yet supported: its implementation has probably been postponed again. But that&#8217;s not a reason not to try it &#8211; in lab only of course.</p>
+<p>Let&#8217;s give a try to the syntax:</p>
+<pre><code>SQL&gt; create schema synonym DEMO2 for DEMO;
+create schema synonym DEMO2 for DEMO
+              *
+ERROR at line 1:
+ORA-00901: invalid CREATE command
+</code></pre>
+<h3>Undocumented parameter</h3>
+<p>Doesn&#8217;t work. But there is an undocumented parameter:</p>
+<pre><code>SQL&gt; select ksppinm, ksppstvl from x$ksppi a, x$ksppsv b where a.indx=b.indx and ksppinm like '%schema%synonym%';
+
+KSPPINM                   KSPPSTVL
+------------------------- ----------
+_enable_schema_synonyms   FALSE
+</code></pre>
+<p>Ok, let&#8217;s go:</p>
+<pre><code>SQL&gt; connect sys/oracle as sysdba
+Connected.
+
+SQL&gt; alter system set "_enable_schema_synonyms" = true scope=spfile;
+System altered.
+
+SQL&gt; startup force;
+</code></pre>
+<p>So I have a DEMO schema:</p>
+<pre><code>SQL&gt; select user_id,username from dba_users where username like 'DEMO%';
+
+   USER_ID USERNAME
+---------- --------------------
+       111 DEMO
+</code></pre>
+<pre><code>which is type 1 in user$ (type 0 is for roles):</code></pre>
+<pre><code>SQL&gt; select user#,name,type#,ctime from sys.user$ where name like 'DEMO%';
+
+     USER# NAME               TYPE# CTIME
+---------- ------------- ---------- ---------
+       111 DEMO                   1 09-NOV-14</code></pre>
+<p>And I create a synonym DEMO2 for it:</p>
+<pre><code>SQL&gt; create schema synonym DEMO2 for DEMO;
+Schema synonym created.
+</code></pre>
+<p>It&#8217;s not a user:</p>
+<pre><code>SQL&gt; select user_id,username from dba_users where username like 'DEMO%';
+
+   USER_ID USERNAME
+---------- --------------------
+       111 DEMO
+</code></pre>
+<p>but it&#8217;s another entry in user$ with type 3 which is for schema synonyms:</p>
+<pre><code>SQL&gt; select user#,name,type#,ctime,spare2 from sys.user$ where name like 'DEMO%';
+
+     USER# NAME            TYPE# CTIME         SPARE2
+---------- ---------- ---------- --------- ----------
+       111 DEMO                1 09-NOV-14
+       159 DEMO2               3 28-DEC-14        111
+</code></pre>
+<p>I&#8217;ve selected the SPARE2 because this is where the link to the target schema of the synonym is stored.</p>
+<h3>Usage</h3>
+<p>I can create a table using the schema synonym:</p>
+<pre><code>SQL&gt; create table DEMO2.MYTABLE as select * from dual;
+Table created.
+</code></pre>
+<p>and query it from both:</p>
+<pre><code>SQL&gt; select * from DEMO2.MYTABLE;
+
+D
+-
+X
+
+SQL&gt; select * from DEMO.MYTABLE;
+
+D
+-
+X
+</code></pre>
+<p>the execution plan show the schema synonym DEMO2 as the object owner:</p>
+<pre><code>SQL&gt; explain plan for select * from DEMO2.MYTABLE;
+Explained.
+
+SQL&gt; select operation,object_owner,object_name,object_type from plan_table order by id;
+
+OPERATION            OBJECT_OWN OBJECT_NAM OBJECT_TYP
+-------------------- ---------- ---------- ----------
+SELECT STATEMENT
+TABLE ACCESS         DEMO2      MYTABLE    TABLE
+</code></pre>
+<p>and the rowid shows that data comes from the DEMO table:</p>
+<pre><code>SQL&gt; select rowid, dbms_rowid.rowid_object(rowid),MYTABLE.* from DEMO2.MYTABLE;
+
+ROWID                   DBMS_ROWID.ROWID_OBJECT(ROWID) D
+------------------ ------------------------------ -
+AAAXaYAAGAAAuGbAAA                            95896 X
+
+SQL&gt; select owner,object_name,object_id,data_object_id from dba_objects where object_name = 'MYTABLE';
+
+OWNER           OBJECT_NAM  OBJECT_ID DATA_OBJECT_ID
+---------- ---------- ---------- --------------
+DEMO           MYTABLE           95896          95896
+</code></pre>
+<p>The locks are acquired on the base object:</p>
+<pre><code>SQL&gt; select * from DEMO2.MYTABLE for update;
+
+D
+-
+X
+
+SQL&gt; select object_id,locked_mode from v$locked_object;
+
+ OBJECT_ID LOCKED_MODE
+---------- -----------
+     95896           3
+
+SQL&gt; select owner,object_name,object_id from dba_objects where object_name = 'MYTABLE';
+
+OWNER      OBJECT_NAM  OBJECT_ID
+---------- ---------- ----------
+DEMO         MYTABLE       95896
+</code></pre>
+<h3>Limits</h3>
+<p>We can use the schema synonym as the default prefix:</p>
+<pre><code>SQL&gt; alter session set current_schema=DEMO2;
+Session altered.
+</code></pre>
+<p>and we cannot drop it when the underlying user is connected:</p>
+<pre><code>SQL&gt; connect DEMO/demo;
+Connected.
+SQL&gt; drop schema synonym DEMO2;
+drop schema synonym DEMO2
+*
+ERROR at line 1:
+ORA-42297: cannot drop a schema synonym for a schema of a user who is currently
+connected
+</code></pre>
+<p>we cannot create synonyms for system schemas:</p>
+<pre><code>SQL&gt; create schema synonym ROOT for SYS;
+create schema synonym ROOT for SYS
+                               *
+ERROR at line 1:
+ORA-42288: may not create a schema synonym for the specified schema
+</code></pre>
+<p>and schema synonyms is in the same namespace as users and roles:</p>
+<pre><code>SQL&gt; create role DEMO2;
+create role DEMO2
+            *
+ERROR at line 1:
+ORA-42294: role name conflicts with another user, role or schema synonym name
+</code></pre>
+<p>Those new error messages include &#8216;or schema synonym name&#8217; when the &#8220;_enable_schema_synonyms&#8221; is enabled.</p>
+<h3>Don&#8217;t use it!</h3>
+<p>Now playing with undocumented stuff comes with unexpected behaviour:</p>
+<pre><code>SQL&gt; truncate table DEMO2.MYTABLE;
+Table truncated.
+</code></pre>
+<p>I&#8217;ve truncated the table using the synonym, then let&#8217;s select from it though the synonym or with the real schema:</p>
+<pre><code>SQL&gt; select * from DEMO2.MYTABLE;
+no rows selected
+
+SQL&gt; select * from DEMO.MYTABLE;
+select * from DEMO.MYTABLE
+*
+ERROR at line 1:
+ORA-08103: object no longer exists
+</code></pre>
+<p>Ok it seems that some invalidations didn&#8217;t follow the synonyms&#8230;<br />
+Let&#8217;s try to flush the shared pool:</p>
+<pre><code>SQL&gt; alter system flush shared_pool;
+System altered.
+
+SQL&gt; select * from DEMO.MYTABLE;
+no rows selected
+
+SQL&gt; select * from DEMO2.MYTABLE;
+no rows selected
+</code></pre>
+<p>This is what happens when we use features that are not totally implemented&#8230;</p>
+<p>That feature is not yet totally implemented. Do you have a need for it? then maybe create an <a href="https://community.oracle.com/community/database/database-ideas/content?filterID=contentstatus[published]~objecttype~objecttype[idea]&amp;sortKey=score&amp;customTheme=otn">OTN database idea</a>.</p>
+
+</div>
+</body>
+</html>

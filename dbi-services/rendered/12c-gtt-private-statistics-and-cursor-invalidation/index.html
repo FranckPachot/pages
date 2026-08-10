@@ -1,0 +1,234 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-gtt-private-statistics-and-cursor-invalidation/">
+<title>12c GTT private statistics and cursor invalidation</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-gtt-private-statistics-and-cursor-invalidation/">https://www.dbi-services.com/blog/12c-gtt-private-statistics-and-cursor-invalidation/</a> (2016-10-27)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12c GTT private statistics and cursor invalidation</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Short summary of this post is that rolling invalidation do not occur when you gather statistics on Global Temporary Tables in 12c that have session statistic scope (which is the default) and this may cause too many hard parses. I&#8217;m sharing all details and comments are welcome.<br />
+<!--more--></p>
+<h3><em>Update28-OCT-16</em></h3>
+<p><em>I&#8217;ve written this having in mind a specific case I encountered. But what I said here is too wide: not all cursors are invalidated, but only those that have been created on same session private statistics. Thanks to Andrew Sayer (see comments) and to Mark from Oracle Support for their tests with cursors created by other sessions.</em></p>
+<p>When you gather statistics on a table, the goal is to get new plan if statistics have changed, so you can expect cursor invalidation. However, invalidating immediately all cursors that have a dependency with the table may cause a hard parse storm and this is why by default rolling invalidation occurs: invalidation of cursor will be planned randomly in a time window that follows next execution. 12c comes with a new feature, global temporary table private stats where execution plans are not shared between sessions. And there&#8217;s another feature where statistics gathering is automatic when you bulk insert into an empty table. </p>
+<p>In both cases, by default, invalidation is not rolling but immediate. Let&#8217;s see examples.</p>
+<h3>No GTT -&gt; rolling invalidation</h3>
+<p>Here is an example with a regular table to show rolling invalidation:</p>
+<pre><code>
+21:14:36 SQL&gt; create
+21:14:36   2  table DEMOGTT1 as select * from dual;
+Table created.
+&nbsp;
+21:14:38 SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMOGTT1');
+PL/SQL procedure successfully completed.
+&nbsp;
+21:14:39 SQL&gt; insert into DEMOGTT1 select * from dual;
+1 row created.
+&nbsp;
+21:14:39 SQL&gt; alter session set optimizer_mode=first_rows;
+Session altered.
+&nbsp;
+21:14:39 SQL&gt; insert into DEMOGTT1 select * from dual;
+1 row created.
+&nbsp;
+21:14:39 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 000000008368BB98 3223759815           1          1 N                              0
+VALID                          1 000000008368BB98 3223759815           1          1 N                              0
+&nbsp;
+21:14:40 SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMOGTT1',no_invalidate=&gt;null);
+PL/SQL procedure successfully completed.
+&nbsp;
+21:14:41 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 000000008368BB98 3223759815           1          1 Y                              0
+VALID                          1 000000008368BB98 3223759815           1          1 Y                              0
+&nbsp;
+21:14:41 SQL&gt; select table_name,scope,last_analyzed from user_tab_statistics where table_name='DEMOGTT1';
+&nbsp;
+TABLE_NAME                     SCOPE   LAST_ANA
+------------------------------ ------- --------
+DEMOGTT1                       SHARED  21:14:40
+</code></pre>
+<p>Statistics on non-GTT are shared and the dbms_stats using default no_invalidate do rolling invalidation.</p>
+<h3>GTT with session private stats -&gt; immediate invalidation</h3>
+<p>Here is the same example with a Global Temporary Table:</p>
+<pre><code>
+21:13:06 SQL&gt; create
+21:13:06   2  global temporary
+21:13:06   3  table DEMOGTT1 as select * from dual;
+Table created.
+...
+21:13:09 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 000000008096DF10 3223759815           1          1 N                              0
+VALID                          1 000000008096DF10 3223759815           1          1 N                              0
+&nbsp;
+21:13:10 SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMOGTT1',no_invalidate=&gt;null);
+PL/SQL procedure successfully completed.
+&nbsp;
+21:13:11 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+INVALID_UNAUTH                 0 000000008096DF10 3223759815           1          1 N                              1
+INVALID_UNAUTH                 1 000000008096DF10 3223759815           1          1 N                              1
+&nbsp;
+21:13:11 SQL&gt; select table_name,scope,last_analyzed from user_tab_statistics where table_name='DEMOGTT1';
+&nbsp;
+TABLE_NAME                     SCOPE   LAST_ANA
+------------------------------ ------- --------
+DEMOGTT1                       SHARED
+DEMOGTT1                       SESSION 21:13:10
+</code></pre>
+<p>By default, gathered statistics are private to the session and you see that all cursors have been invalidated immediately. Next execution will need to hard parse.</p>
+<h3>GTT with shared stats -&gt; no invalidation</h3>
+<p>When setting shared statistics on the GTT we come back to the 11g behavior:</p>
+<pre><code>
+21:28:52 SQL&gt; create
+21:28:52   2  global temporary
+21:28:52   3  table DEMOGTT1 as select * from dual;
+Table created.
+&nbsp;
+21:28:52 SQL&gt; exec dbms_stats.set_table_prefs(user,'DEMOGTT1','GLOBAL_TEMP_TABLE_STATS','SHARED');
+PL/SQL procedure successfully completed.
+...
+21:28:55 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 0000000079782A08 3223759815           1          1 N                              0
+VALID                          1 0000000079782A08 3223759815           1          1 N                              0
+&nbsp;
+21:28:56 SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMOGTT1',no_invalidate=&gt;null);
+PL/SQL procedure successfully completed.
+&nbsp;
+21:28:57 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 0000000079782A08 3223759815           1          1 Y                              0
+VALID                          1 0000000079782A08 3223759815           1          1 Y                              0
+&nbsp;
+21:28:57 SQL&gt; select table_name,scope,last_analyzed from user_tab_statistics where table_name='DEMOGTT1';
+&nbsp;
+TABLE_NAME                     SCOPE   LAST_ANA
+------------------------------ ------- --------
+DEMOGTT1                       SHARED  21:28:56
+</code></pre>
+<p>No invalidation: this is rolling invalidation</p>
+<h3>GTT with session stats but &#8220;_optimizer_use_gtt_session_stats&#8221;=false</h3>
+<p>Here is an exemple when disabling the private statistics feature:</p>
+<pre><code>
+21:15:36 SQL&gt; create
+21:15:36   2  global temporary
+21:15:36   3  table DEMOGTT1 as select * from dual;
+Table created.
+&nbsp;
+21:15:36 SQL&gt; alter session set "_optimizer_use_gtt_session_stats"=false;
+Session altered.
+...
+21:15:38 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 000000007A373A08 3223759815           1          1 N                              0
+VALID                          1 000000007A373A08 3223759815           1          1 N                              0
+&nbsp;
+21:15:39 SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMOGTT1',no_invalidate=&gt;null);
+PL/SQL procedure successfully completed.
+&nbsp;
+21:15:41 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 000000007A373A08 3223759815           1          1 N                              0
+VALID                          1 000000007A373A08 3223759815           1          1 N                              0
+&nbsp;
+21:15:41 SQL&gt; select table_name,scope,last_analyzed from user_tab_statistics where table_name='DEMOGTT1';
+&nbsp;
+TABLE_NAME                     SCOPE   LAST_ANA
+------------------------------ ------- --------
+DEMOGTT1                       SHARED
+DEMOGTT1                       SESSION 21:15:40
+</code></pre>
+<p>No invalidation here as in previous versions. But interesting thing is that I still have session statistics. The setting just disables its usage. But then, there were no invalidation and no rolling invalidation. Not sure how to interpret that&#8230;</p>
+<h3>Invalidation with online statistics gathering</h3>
+<p>In all those examples I&#8217;ve used dbms_stats with default no_invalidate. But in 12c statistics gathering can occur automatically during bulk insert. Let&#8217;s try that:</p>
+<pre><code>
+...
+21:38:50 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 000000007A9D8860 3223759815           1          1 N                              0
+VALID                          1 000000007A9D8860 3223759815           1          1 N                              0
+&nbsp;
+21:38:51 SQL&gt; truncate table DEMOGTT1;
+Table truncated.
+21:38:52 SQL&gt; insert /*+ append */ into  DEMOGTT1 select * from dual;
+1 row created.
+&nbsp;
+21:38:53 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+INVALID_UNAUTH                 0 000000007A9D8860 3223759815           1          1 N                              1
+INVALID_UNAUTH                 1 000000007A9D8860 3223759815           1          1 N                              1
+21:38:53 SQL&gt; select table_name,scope,last_analyzed from user_tab_statistics where table_name='DEMOGTT1';
+&nbsp;
+TABLE_NAME                     SCOPE   LAST_ANA
+------------------------------ ------- --------
+DEMOGTT1                       SHARED
+DEMOGTT1                       SESSION 21:38:52
+</code></pre>
+<p>Same behaviour here. The online statistics gathering has gathered private statistics and invalidated all cursors.</p>
+<h3>NO_INVALIDATE=true</h3>
+<p>We can explicitly disable invalidation with no_invalidate=&gt;true:</p>
+<pre><code>
+...
+21:43:25 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 0000000075873D60 3223759815           1          1 N                              0
+VALID                          1 0000000075873D60 3223759815           1          1 N                              0
+&nbsp;
+21:43:28 SQL&gt; exec dbms_stats.gather_table_stats('DEMO','DEMOGTT1',no_invalidate=&gt;true);
+PL/SQL procedure successfully completed.
+&nbsp;
+21:43:29 SQL&gt; select object_status,child_number,address,hash_value,parse_calls,executions,is_rolling_invalid,invalidations from v$sql where sql_id='1pmuu9z02day7';
+&nbsp;
+OBJECT_STATUS       CHILD_NUMBER ADDRESS          HASH_VALUE PARSE_CALLS EXECUTIONS IS_ROLLING_INVALID INVALIDATIONS
+------------------- ------------ ---------------- ---------- ----------- ---------- ------------------ -------------
+VALID                          0 0000000075873D60 3223759815           1          1 N                              0
+VALID                          1 0000000075873D60 3223759815           1          1 N                              0
+&nbsp;
+21:43:29 SQL&gt; select table_name,scope,last_analyzed from user_tab_statistics where table_name='DEMOGTT1';
+&nbsp;
+TABLE_NAME                     SCOPE   LAST_ANA
+------------------------------ ------- --------
+DEMOGTT1                       SHARED
+DEMOGTT1                       SESSION 21:43:28
+</code></pre>
+<p>Here, as requested, private statistics has been gathered but without cursor invalidation. However I&#8217;ll have new hard parse for my query because private statistics prevent sharing another cursor, but it&#8217;s not an invalidation of all cursors. The other sessions will continue to re-use their plan.</p>
+<h3>So what?</h3>
+<p>With those new features, we have the famous parsing dilemma again: do we want to avoid too many hard parses and share cursor with the risk of executing an execution plan that has been optimized for different data? Or do we prefer to optimize each query at the risk of more CPU consumption and shared pool contention? Given that 12c comes with adaptive dynamic sampling that can make hard parse longer, and sometimes very very long, all those new features may be gauged carefully. </p>
+<p>If you want to avoid hard parses, you should set preferences to SHARED statistics and then gather statistics when the GTT is filled with the data you want to optimize for, and then lock it. If you don&#8217;t, then you are back to the problem that private statistics tries to solve: sharing a plan optimized for few rows and executed on thousands.</p>
+
+</div>
+</body>
+</html>

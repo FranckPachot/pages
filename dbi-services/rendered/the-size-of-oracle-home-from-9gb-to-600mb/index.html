@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/the-size-of-oracle-home-from-9gb-to-600mb/">
+<title>The size of Oracle Home: from 9GB to 600MB</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/the-size-of-oracle-home-from-9gb-to-600mb/">https://www.dbi-services.com/blog/the-size-of-oracle-home-from-9gb-to-600mb/</a> (2018-08-16)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">The size of Oracle Home: from 9GB to 600MB</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+This is research only and totally unsupported. When building docker images to run Oracle Database in a container, we try to get the smallest image possible. One way is to remove some subdirectories that we know will not be used. For example, the patch history is not used anymore once we have the required version. The dbca templates can be removed as soon as we have created the database&#8230; In this post I take the opposite approach: run some workload on a normal Oracle Home, and keep only the files that were used.<br />
+<!--more--><br />
+I have Oracle Database 18c installed in /u00/app/oracle/product/18EE and it takes 9GB on my host:</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ du --human-readable --max-depth=1 $ORACLE_HOME | sort -h | tail -10
+&nbsp;
+352M    /u00/app/oracle/product/18EE/jdk
+383M    /u00/app/oracle/product/18EE/javavm
+423M    /u00/app/oracle/product/18EE/inventory
+437M    /u00/app/oracle/product/18EE/assistants
+605M    /u00/app/oracle/product/18EE/md
+630M    /u00/app/oracle/product/18EE/bin
+673M    /u00/app/oracle/product/18EE/apex
+1.4G    /u00/app/oracle/product/18EE/.patch_storage
+2.3G    /u00/app/oracle/product/18EE/lib
+9.4G    /u00/app/oracle/product/18EE
+</code></pre>
+<p>Gigabytes of libraries (most of them used only to link the executables), hundreds of megabytes of binaries, templates for new databases, applied patches, old object files, options, tools, command line and graphical interfaces,&#8230; Do we need all that?</p>
+<p>For a full installation in production, yes for sure. The more we have, the better it is. When you have to connect at 2 a.m because you are on-call and a critical alert wakes you up, then you will appreciate to have all tools on the server. Especially if you connect through a few security obstacles such as remote VPN, desktop, Wallix, tunnels to finally get a high latency tty with no copy-paste possibilities. With a full Oracle Home, you can face any issue. You have efficient command line interfaces (sqlplus and hopefully sqlcl) or graphical (SQLDeveloper, asmca,&#8230;). For severe problems, you can even re-link, apply or rollback patches, quickly create a new database to import something in it,&#8230;</p>
+<p>But what if you just want to provide a small container where a database is running, and no additional administration support? Where you will never re-install the software, apply patches, re-create the database, troubleshoot weird issues. Just have users connect through the listener port and never log to the container. Then, most of these 9.4 GB are useless.</p>
+<p>But how to know which files are useful or not?</p>
+<p>If you can rely on Linux &#8216;access time&#8217; then you may look at the files accessed during the last days &#8211; after any installation or database creation is done:</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ find $ORACLE_HOME -atime -1 -exec stat -L -c "%x %y %z %F %n" {} ; | sort
+</code></pre>
+<p>But this is not reliable. Access time depends on the file type, filesystem, mount options,&#8230; and is usually bypassed as much as possible because writing something just to log that you read something is not a very good idea.</p>
+<p>Here, I&#8217;ll trace all system calls related to file names (strace -e trace=file). I&#8217;ll trace them from the start of the database, so that I run strace on dbstart with the -f arguments to trace across forks. Then, I&#8217;ll trace the listener, the instance processes and any user process created through the listener.</p>
+<p>I pipe the output to an awk script which extracts the file names (which is enclosed in double quotes in the strace output). Basically, the awk is just setting the field separator with -F&#8221; and prints the $2 token for each line. There are many single and double quotes here because of shell interpretation.</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ dbshut $ORACLE_HOME ; strace -fe trace=file -o "|awk -F'"'"'"' '"'{print $2}'"'" sh -xc "dbstart $ORACLE_HOME &gt;&amp;2" | grep "^$ORACLE_HOME" | sort -u &gt; /tmp/files.txt &amp;
+</code></pre>
+<p>Then I run some activity. I did this on our <a href="https://www.dbi-services.com/trainings/oracle-performance-tuning-training/" target="_blank" rel="noopener noreferrer">Oracle Tuning training</a> workshop lab, when reviewing all exercises after upgrading the lab VM to 18c. This runs some usual SQL for application (we use Swingbench) and monitoring. The idea is to run through all features that you want to be available on the container you will build.</p>
+<p>When I&#8217;m done, I dbshut (remember this is for a lab only &#8211; strace is not for production) and then strace output gets deduplicated (sort -u) and written to a file.txt in /tmp.</p>
+<p>This file contains all files referenced by system calls. Surprisingly, there is one that is not captured here, the ldap messages file, but if I do not take it then the remote connections will fail with:</p>
+<pre><code>
+ORA-07445: exception encountered: core dump [gslumcCalloc()+41] [SIGSEGV] [ADDR:0x21520] [PC:0x60F92D9] [Address not mapped to object] []
+</code></pre>
+<p>I got it with a very empirical approach, will try to understand later. For the moment, I just add it to the list:</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ ls $ORACLE_HOME/ldap/mesg/ldapus.msb &gt;&gt; /tmp/files.txt
+</code></pre>
+<p>I also add adrci and dbshut scripts as they are small and may be useful:</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ ls $ORACLE_HOME/bin/adrci $ORACLE_HOME/bin/dbshut &gt;&gt; /tmp/files.txt
+</code></pre>
+<p>From this list, I check thise which are not directories, and tar all regular files and symbolic links into /tmp/smalloh.tar:</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ stat -c "%F %n" $(cat /tmp/files.txt) |  awk '!/^directory/{print $3}' | tar -cvf /tmp/smalloh.tar --dereference --files-from=-
+</code></pre>
+<p>This is a 600M tar:</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ du -h /tmp/smalloh.tar
+&nbsp;
+598M    /tmp/smalloh.tar
+</code></pre>
+<p>Then I can remove my Oracle Home </p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ cd $ORACLE_HOME/..
+[oracle@vmreforatun01 product]$ rm -rf 18EE
+[oracle@vmreforatun01 product]$ mkdir 18EE
+</code></pre>
+<p>and extract the files from my tar:</p>
+<pre><code>
+[oracle@vmreforatun01 /]$ tar -xf /tmp/smalloh.tar
+</code></pre>
+<p>I forgot that there are some setuid executables so I must be root to set them:</p>
+<pre><code>
+[oracle@vmreforatun01 /]$ ls -l $ORACLE_HOME/bin/oracle
+-rwxr-x--x. 1 oracle oinstall 437157251 Aug 11 18:40 /u00/app/oracle/product/18EE/bin/oracle
+[oracle@vmreforatun01 /]$ su
+Password:
+[root@vmreforatun01 /]# tar -xf /tmp/smalloh.tar
+[root@vmreforatun01 /]# exit
+[oracle@vmreforatun01 /]$ ls -l $ORACLE_HOME/bin/oracle
+-rwsr-s--x. 1 oracle oinstall 437157251 Aug 11 18:40 /u00/app/oracle/product/18EE/bin/oracle
+</code></pre>
+<p>That&#8217;s a 600MB Oracle Home then. You can reduce it further by stripping the binaries:</p>
+<pre><code>
+[oracle@vmreforatun01 18EE]$ du -hs $ORACLE_HOME
+599M    /u00/app/oracle/product/18EE
+[oracle@vmreforatun01 18EE]$ strip $ORACLE_HOME/bin/* $ORACLE_HOME/lib/*
+[oracle@vmreforatun01 18EE]$ du -hs $ORACLE_HOME
+570M    /u00/app/oracle/product/18EE
+</code></pre>
+<p>but for only 30MB I really prefer to have all symbols. As I&#8217;m doing something completely unsupported, I may have to do some toubleshooting.</p>
+<p>Now I&#8217;m ready to start the database and the listener:</p>
+<pre><code>
+[oracle@vmreforatun01 18EE]$ dbstart $ORACLE_HOME
+Processing Database instance "DB1": log file /u00/app/oracle/product/18EE/rdbms/log/startup.log
+</code></pre>
+<p>and I run some Swingbench workload to check that everything is fine:</p>
+<pre><code>
+[oracle@vmreforatun01 18EE]$ /home/oracle/swingbench/bin/charbench -cs //localhost:1521/APP -u soe -p soe -uc 10 -min 5 -max 20 -a -v
+Author  :        Dominic Giles
+Version :        2.5.0.932
+&nbsp;
+Results will be written to results.xml.
+&nbsp;
+Time            Users   TPM     TPS
+&nbsp;
+6:35:15 PM      0       0       0
+...
+6:35:44 PM      10      12      9
+6:35:45 PM      10      16      4
+6:35:46 PM      10      21      5
+6:35:47 PM      10      31      10
+</code></pre>
+<p>The only errors in alert.log are about checking the patches at install:</p>
+<pre><code>
+QPI: OPATCH_INST_DIR not present:/u00/app/oracle/product/18EE/OPatch
+Unable to obtain current patch information due to error: 20013, ORA-20013: DBMS_QOPATCH ran mostly in non install area
+ORA-06512: at "SYS.DBMS_QOPATCH", line 767
+ORA-06512: at "SYS.DBMS_QOPATCH", line 547
+ORA-06512: at "SYS.DBMS_QOPATCH", line 2124
+</code></pre>
+<p>Most of those 600MB are in the server executable (bin/oracle) and client shared library (lib/libclntsh.so):</p>
+<pre><code>
+[oracle@vmreforatun01 ~]$ size -td  /u00/app/oracle/product/18EE/bin/* /u00/app/oracle/product/18EE/lib/* | sort -n
+&nbsp;
+   text    data     bss     dec     hex filename
+   2423     780      48    3251     cb3 /u00/app/oracle/product/18EE/lib/libofs.so
+   4684     644      48    5376    1500 /u00/app/oracle/product/18EE/lib/libskgxn2.so
+   5301     732      48    6081    17c1 /u00/app/oracle/product/18EE/lib/libodm18.so
+  10806    2304    1144   14254    37ae /u00/app/oracle/product/18EE/bin/sqlplus
+  13993    2800    1136   17929    4609 /u00/app/oracle/product/18EE/bin/adrci
+  46456    3008     160   49624    c1d8 /u00/app/oracle/product/18EE/lib/libnque18.so
+  74314    4824    1248   80386   13a02 /u00/app/oracle/product/18EE/bin/oradism
+  86396   23968    1144  111508   1b394 /u00/app/oracle/product/18EE/bin/lsnrctl
+ 115523    2196      48  117767   1cc07 /u00/app/oracle/product/18EE/lib/libocrutl18.so
+ 144591    3032     160  147783   24147 /u00/app/oracle/product/18EE/lib/libdbcfg18.so
+ 216972    2564      48  219584   359c0 /u00/app/oracle/product/18EE/lib/libclsra18.so
+ 270692   13008     160  283860   454d4 /u00/app/oracle/product/18EE/lib/libskjcx18.so
+ 321701    5024     352  327077   4fda5 /u00/app/oracle/product/18EE/lib/libons.so
+ 373988    7096    9536  390620   5f5dc /u00/app/oracle/product/18EE/lib/libmql1.so
+ 717398   23224  110088  850710   cfb16 /u00/app/oracle/product/18EE/bin/orabaseconfig
+ 717398   23224  110088  850710   cfb16 /u00/app/oracle/product/18EE/bin/orabasehome
+ 878351   36800    1144  916295   dfb47 /u00/app/oracle/product/18EE/bin/tnslsnr
+ 928382  108920     512 1037814   fd5f6 /u00/app/oracle/product/18EE/lib/libcell18.so
+ 940122   56176    2376  998674   f3d12 /u00/app/oracle/product/18EE/lib/libsqlplus.so
+1118019   16156      48 1134223  114e8f /u00/app/oracle/product/18EE/lib/libocr18.so
+1128954    5936     160 1135050  1151ca /u00/app/oracle/product/18EE/lib/libskgxp18.so
+1376814   18548      48 1395410  154ad2 /u00/app/oracle/product/18EE/lib/libocrb18.so
+1685576  130464     160 1816200  1bb688 /u00/app/oracle/product/18EE/lib/libasmclntsh18.so
+2517125   16496   15584 2549205  26e5d5 /u00/app/oracle/product/18EE/lib/libipc1.so
+3916867   86504  111912 4115283  3ecb53 /u00/app/oracle/product/18EE/lib/libclntshcore.so.18.1
+4160241   26320   69264 4255825  40f051 /u00/app/oracle/product/18EE/lib/libmkl_rt.so
+5120001  459984    7784 5587769  554339 /u00/app/oracle/product/18EE/lib/libnnz18.so
+10822468         302312   21752 11146532         aa1524 /u00/app/oracle/product/18EE/lib/libhasgen18.so
+11747579         135320     160 11883059         b55233 /u00/app/oracle/product/18EE/lib/libshpkavx218.so
+61758209        2520896  134808 64413913        3d6e0d9 /u00/app/oracle/product/18EE/lib/libclntsh.so.18.1
+376147897       3067672  602776 379818345       16a39169        /u00/app/oracle/product/18EE/bin/oracle
+487369241       7106932 1203944 495680117       1d8b7a75        (TOTALS)
+</code></pre>
+<p>Of course, this is probably not sufficient, especially if you want to run APEX, OJVM, OracleText. The method is there: run a workload that covers everything you need, and build the Oracle Home from the files used there. I used strace here, but auditd can also be a good idea. Ideally, this job will be done one day by Oracle itself in a supported way, so that we can build a core container for Oracle Database and add features as Dockerfile layers. This had be done to release Oracle XE 11g which is 300MB only. However Oracle XE 18c announced for October will probably be larger as it includes nearly all option.</p>
+
+</div>
+</body>
+</html>

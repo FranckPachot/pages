@@ -1,0 +1,241 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-12cr2-pluggable-database-relocation/">
+<title>Oracle 12cR2: Pluggable database relocation</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-12cr2-pluggable-database-relocation/">https://www.dbi-services.com/blog/oracle-12cr2-pluggable-database-relocation/</a> (2016-11-11)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle 12cR2: Pluggable database relocation</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Here is, in my opinion, the most beautiful feature of the multitenant architecture. You know how I love Transportable Tablespaces. But here:</p>
+<ul>
+<li>No need to put the source in read/only</li>
+<li>No need to export/import the metadata logically</li>
+<li>No need for any option: available even in Standard Edition</li>
+</ul>
+<p><!--more--></p>
+<h3>Standard Edition</h3>
+<p>I am in Standard Edition here in both source and target, no option required for this:</p>
+<pre><code>
+SQL*Plus: Release 12.2.0.1.0 Production on Thu Nov 10 13:40:05 2016
+Copyright (c) 1982, 2016, Oracle.  All rights reserved.
+&nbsp;
+Connected to:
+Oracle Database 12c Standard Edition Release 12.2.0.1.0 - 64bit Production
+</code></pre>
+<h3>Source: PDB1 on CDB1</h3>
+<p>On server opc1 I have a container database CDB1 with one pluggable database PDB1 where I create a new table:</p>
+<pre><code>
+23:40:20 (opc1)CDB1 SQL&gt;alter session set container=PDB1;
+Session altered.
+23:40:20 (opc1)CDB1 SQL&gt;create table DEMO as select current_timestamp insert_timestamp,instance_name from v$instance;
+Table created.
+23:40:21 (opc1)CDB1 SQL&gt;insert into DEMO select current_timestamp,instance_name from v$instance;
+1 row created.
+23:40:21 (opc1)CDB1 SQL&gt;select * from DEMO;
+&nbsp;
+INSERT_TIMESTAMP                    INSTANCE_NAME
+----------------------------------- ----------------
+10-NOV-16 11.40.20.902761 PM +00:00 CDB1
+10-NOV-16 11.40.21.966815 PM +00:00 CDB1
+</code></pre>
+<h3>Export encryption key</h3>
+<p>I&#8217;m in Oracle Public Cloud where tablespaces are encrypted. To ship a pluggable database I must export the keys. Here is the query to get them:</p>
+<pre><code>
+23:40:23 (opc1)CDB1 SQL&gt;select key_id from v$encryption_keys where creator_pdbname='PDB1';
+&nbsp;
+KEY_ID
+------------------------------------------------------------------------------
+AWlnBaUXG0/gv4evS9Ywu8EAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+</code></pre>
+<p>And I can filter with this query to export it:</p>
+<pre><code>
+23:40:23 (opc1)CDB1 SQL&gt;administer key management export encryption keys with secret "oracle" to '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d" with identifier in (select key_id from v$encryption_keys where creator_pdbname='PDB1');
+administer key management export encryption keys with secret "oracle" to '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d" with identifier in (select key_id from v$encryption_keys where creator_pdbname='PDB1')
+*
+ERROR at line 1:
+ORA-28417: password-based keystore is not open
+</code></pre>
+<p>I can&#8217;t do that with auto-login wallet.</p>
+<pre><code>
+23:40:23 (opc1)CDB1 SQL&gt;select wrl_type,wrl_parameter,wallet_type from v$encryption_wallet;
+&nbsp;
+WRL_TYPE WRL_PARAMETER                          WALLET_TY
+-------- -------------------------------------- ---------
+FILE     /u01/app/oracle/admin/CDB1/tde_wallet/ AUTOLOGIN
+</code></pre>
+<p> Let&#8217;s open the wallet with password:</p>
+<pre><code>
+23:40:23 (opc1)CDB1 SQL&gt;administer key management set keystore close;
+keystore altered.
+23:40:23 (opc1)CDB1 SQL&gt;administer key management set keystore open identified by "Ach1z0#d";
+keystore altered.
+23:40:23 (opc1)CDB1 SQL&gt;select wrl_type,wrl_parameter,wallet_type from v$encryption_wallet;
+&nbsp;
+WRL_TYPE WRL_PARAMETER                          WALLET_TY
+-------- -------------------------------------- ---------
+FILE     /u01/app/oracle/admin/CDB1/tde_wallet/ PASSWORD
+</code></pre>
+<p>and re-try my export:</p>
+<pre><code>
+23:40:23 (opc1)CDB1 SQL&gt;administer key management export encryption keys with secret "oracle" to '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d" with identifier in (select key_id from v$encryption_keys where creator_pdbname='PDB1');
+keystore altered.
+</code></pre>
+<p>This file must be copied to the destination server. I did it with scp. You can also use dbms_file_transfer as you will need a database link anyway for the remote clone.</p>
+<h3>Import encryption key</h3>
+<p>On the destination server, where I have no CDB (I&#8217;m limited to one PDB here without the multitenant option)</p>
+<pre><code>
+23:40:31 (opc2)CDB2 SQL&gt;show pdbs
+&nbsp;
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+</code></pre>
+<p>I have to import the encryption key:</p>
+<pre><code>
+23:40:31 (opc2)CDB2 SQL&gt;administer key management set keystore open identified by "Ach1z0#d";
+keystore altered.
+&nbsp;
+23:40:31 (opc2)CDB2 SQL&gt;administer key management import encryption keys with secret "oracle" from '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d";
+keystore altered.
+</code></pre>
+<p>I&#8217;m now ready to relocate my PDB as I&#8217;m sure I&#8217;ll be ready to open it.</p>
+<h3>Database link</h3>
+<p>The remote clone is done through a DB link. I&#8217;ve a TNS entry named CDB1:</p>
+<pre><code>
+23:40:31 (opc2)CDB2 SQL&gt;select dbms_tns.resolve_tnsname('CDB1') from dual;
+&nbsp;
+DBMS_TNS.RESOLVE_TNSNAME('CDB1')
+--------------------------------------------------------------------------------
+(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=opc1)(PORT=1521))(CONNECT_DAT
+A=(SERVER=DEDICATED)(SERVICE_NAME=CDB1.opcoct.oraclecloud.internal)(CID=(PROGRAM
+=oracle)(HOST=SE222.compute-opcoct.oraclecloud.internal)(USER=oracle))))
+&nbsp;
+23:40:31 (opc2)CDB2 SQL&gt;create database link CDB1 connect to C##DBA identified by oracle using 'CDB1';
+Database link created.
+</code></pre>
+<h3>DML on source</h3>
+<p>In order to show that the source doesn&#8217;t have to be read only as in previous release, I&#8217;m running the following inserts every 5 minutes:</p>
+<pre><code>
+23:40:44 (opc1)CDB1 SQL&gt;commit;
+Commit complete.
+23:40:44 (opc1)CDB1 SQL&gt;insert into DEMO select current_timestamp,instance_name from v$instance;
+1 row created.
+23:40:44 (opc1)CDB1 SQL&gt;select * from DEMO;
+&nbsp;
+INSERT_TIMESTAMP                    INSTANCE_NAME
+----------------------------------- ----------------
+10-NOV-16 11.40.20.902761 PM +00:00 CDB1
+10-NOV-16 11.40.21.966815 PM +00:00 CDB1
+10-NOV-16 11.40.29.136529 PM +00:00 CDB1
+10-NOV-16 11.40.34.214467 PM +00:00 CDB1
+10-NOV-16 11.40.39.304515 PM +00:00 CDB1
+10-NOV-16 11.40.44.376796 PM +00:00 CDB1
+6 rows selected.
+</code></pre>
+<h3>PDB remote clone</h3>
+<p>Here is the syntax.<br />
+I need to provide the masterkey of the source wallet.<br />
+The RELOCATE is this new feature where the source PDB will be relocated to the destination when the clone is opened.</p>
+<pre><code>
+23:40:48 (opc2)CDB2 SQL&gt;create pluggable database PDB1 from PDB1@CDB1 keystore identified by "Ach1z0#d" relocate;
+Pluggable database created.
+23:41:08 (opc2)CDB2 SQL&gt;
+</code></pre>
+<p>It took some time, shipping the datafiles through the DB link, but this is online.<br />
+I was still inserting during this time:</p>
+<pre><code>
+23:41:04 (opc1)CDB1 SQL&gt;select * from DEMO;
+&nbsp;
+INSERT_TIMESTAMP                    INSTANCE_NAME
+----------------------------------- ----------------
+10-NOV-16 11.40.20.902761 PM +00:00 CDB1
+10-NOV-16 11.40.21.966815 PM +00:00 CDB1
+10-NOV-16 11.40.29.136529 PM +00:00 CDB1
+10-NOV-16 11.40.34.214467 PM +00:00 CDB1
+10-NOV-16 11.40.39.304515 PM +00:00 CDB1
+10-NOV-16 11.40.44.376796 PM +00:00 CDB1
+10-NOV-16 11.40.49.454661 PM +00:00 CDB1
+10-NOV-16 11.40.54.532699 PM +00:00 CDB1
+10-NOV-16 11.40.59.614745 PM +00:00 CDB1
+10-NOV-16 11.41.04.692784 PM +00:00 CDB1
+&nbsp;
+10 rows selected.
+</code></pre>
+<p>Note that you need to be in ARCHIVELOG and LOCAL UNDO to be able to do this because syncronisation will be made by media recovery when we open the clone.</p>
+<h3>Open the clone</h3>
+<p>Now, the theory is that when we open the clone, DML is quiesced on source during the recovery of the target and sessions can continue on the target once opened.</p>
+<pre><code>
+23:41:09 (opc2)CDB2 SQL&gt;alter pluggable database PDB1 open;
+alter pluggable database PDB1 open
+*
+ERROR at line 1:
+ORA-00060: deadlock detected while waiting for resource
+23:41:26 (opc2)CDB2 SQL&gt;
+</code></pre>
+<p>Bad luck. Every time I tested this scenario, the first open after the relocate fails in deadlock and the session on the source crashes:</p>
+<pre><code>
+23:41:09 (opc1)CDB1 SQL&gt;select * from DEMO;
+&nbsp;
+INSERT_TIMESTAMP                    INSTANCE_NAME
+----------------------------------- ----------------
+10-NOV-16 11.40.20.902761 PM +00:00 CDB1
+10-NOV-16 11.40.21.966815 PM +00:00 CDB1
+10-NOV-16 11.40.29.136529 PM +00:00 CDB1
+10-NOV-16 11.40.34.214467 PM +00:00 CDB1
+10-NOV-16 11.40.39.304515 PM +00:00 CDB1
+10-NOV-16 11.40.44.376796 PM +00:00 CDB1
+10-NOV-16 11.40.49.454661 PM +00:00 CDB1
+10-NOV-16 11.40.54.532699 PM +00:00 CDB1
+10-NOV-16 11.40.59.614745 PM +00:00 CDB1
+10-NOV-16 11.41.04.692784 PM +00:00 CDB1
+10-NOV-16 11.41.09.773300 PM +00:00 CDB1
+&nbsp;
+11 rows selected.
+&nbsp;
+23:41:14 (opc1)CDB1 SQL&gt; commit;
+ERROR:
+ORA-03114: not connected to ORACLE
+</code></pre>
+<p>It&#8217;s a good occasion to look at the traces.<br />
+We can see some messages about the recovery:</p>
+<pre><code>
+*** 2016-11-10T23:41:12.660402+00:00 (PDB1(3))
+Media Recovery Log /u03/app/oracle/fast_recovery_area/CDB1/foreign_archivelog/PDB1/2016_11_10/o1_mf_1_24_2025109931_.arc
+Log read is SYNCHRONOUS though disk_asynch_io is enabled!
+</code></pre>
+<p>Those FOREIGN ARCHIVED LOG is a new type of file that you will see in the FRA in 12.2.</p>
+<p>So I lost my session on source and now if I try again it works:</p>
+<pre><code>
+23:42:20 (opc2)CDB2 SQL&gt;alter pluggable database PDB1 open;
+Pluggable database altered.
+23:42:24 (opc2)CDB2 SQL&gt;select * from DEMO;
+&nbsp;
+INSERT_TIMESTAMP                    INSTANCE_NAME
+----------------------------------- ----------------
+10-NOV-16 11.40.20.902761 PM +00:00 CDB1
+10-NOV-16 11.40.21.966815 PM +00:00 CDB1
+10-NOV-16 11.40.29.136529 PM +00:00 CDB1
+10-NOV-16 11.40.34.214467 PM +00:00 CDB1
+10-NOV-16 11.40.39.304515 PM +00:00 CDB1
+10-NOV-16 11.40.44.376796 PM +00:00 CDB1
+10-NOV-16 11.40.49.454661 PM +00:00 CDB1
+10-NOV-16 11.40.54.532699 PM +00:00 CDB1
+10-NOV-16 11.40.59.614745 PM +00:00 CDB1
+10-NOV-16 11.41.04.692784 PM +00:00 CDB1
+&nbsp;
+10 rows selected.
+</code></pre>
+<p>All the inserts that were commited on the source are there.<br />
+Even with this deadlock bug (SR 3-13618219421), it&#8217;s the easiest and fastest way to migrate a database, with the minimum of downtime. Especially in Standard Edition where transportable tablespaces import is not enabled.<br />
+Without the deadlock bug, the sessions on the source are supposed to be still running , only paused during the recovery, and then continue on the destination.</p>
+
+</div>
+</body>
+</html>

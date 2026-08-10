@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/index-on-truncdate-do-you-still-need-old-index-1/">
+<title>Index on SUBSTR(string,1,n) &#8211; do you still need old index?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/index-on-truncdate-do-you-still-need-old-index-1/">https://www.dbi-services.com/blog/index-on-truncdate-do-you-still-need-old-index-1/</a> (2015-03-27)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Index on SUBSTR(string,1,n) &#8211; do you still need old index?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In a previous <a href="https://www.dbi-services.com/index.php/blog/entry/index-on-truncdate-do-you-still-need-old-index">post</a> I&#8217;ve shown that from 12.1.0.2 when you have an index on trunc(date) you don&#8217;t need additional index. If you need the column with full precision, then you can add it to the index on trunc(). A comment from Rainer Stenzel asked if that optimization is available for other functions. And Mohamed Houri has linked to his post where he shows that it&#8217;s the same with a trunc() on a number.</p>
+<p>Besides that, there is the same kind of optimization with SUBSTR(string,1,n) so here is the demo, with a little warning at the end.</p>
+<p>I start with the same testcase as the previous post.</p>
+<pre><code>SQL&gt; create table DEMO as select prod_id,prod_name,prod_eff_from +rownum/0.3 prod_date from sh.products,(select * from dual connect by level&gt;=1000);
+Table created.
+
+SQL&gt; create index PROD_NAME on DEMO(prod_name);
+Index created.
+
+SQL&gt; create index PROD_DATE on DEMO(prod_date);
+Index created.
+</code></pre>
+<p>&nbsp;</p>
+<h3>string&gt;Z</h3>
+<p>I&#8217;ve an index on the PROD_NAME and I can use it with equality or inequality predicates:</p>
+<pre><code>SQL&gt; set autotrace on explain
+SQL&gt; select distinct prod_name from DEMO where prod_name &gt; 'Z';
+no rows selected
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 72593368
+
+--------------------------------------------------------
+| Id  | Operation          | Name      | Rows  | Bytes |
+--------------------------------------------------------
+|   0 | SELECT STATEMENT   |           |     1 |    27 |
+|   1 |  SORT UNIQUE NOSORT|           |     1 |    27 |
+|*  2 |   INDEX RANGE SCAN | PROD_NAME |     1 |    27 |
+--------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("PROD_NAME"&gt;'Z')
+
+</code></pre>
+<p>&nbsp;<br />
+And I also can use it with a LIKE when there is no starting joker:</p>
+<pre><code>SQL&gt; select distinct prod_name from DEMO where prod_name like 'Z%';
+no rows selected
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 72593368
+
+--------------------------------------------------------
+| Id  | Operation          | Name      | Rows  | Bytes |
+--------------------------------------------------------
+|   0 | SELECT STATEMENT   |           |     1 |    27 |
+|   1 |  SORT UNIQUE NOSORT|           |     1 |    27 |
+|*  2 |   INDEX RANGE SCAN | PROD_NAME |     1 |    27 |
+--------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("PROD_NAME" LIKE 'Z%')
+       filter("PROD_NAME" LIKE 'Z%')
+
+</code></pre>
+<p>&nbsp;<br />
+That optimization is available for several releases (9.2 if I remember well but I didn&#8217; check).</p>
+<h3>substr(string,1,n)</h3>
+<p>But sometimes, when we want to check if a column starts with a string, the application uses SUBSTR instead of LIKE:</p>
+<pre><code>SQL&gt; select distinct prod_name from DEMO where substr(prod_name,1,1) = 'Z';
+no rows selected
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 1665545956
+
+--------------------------------------------------------
+| Id  | Operation          | Name      | Rows  | Bytes |
+--------------------------------------------------------
+|   0 | SELECT STATEMENT   |           |     1 |    27 |
+|   1 |  SORT UNIQUE NOSORT|           |     1 |    27 |
+|*  2 |   INDEX FULL SCAN  | PROD_NAME |     1 |    27 |
+--------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(SUBSTR("PROD_NAME",1,1)='Z')
+
+</code></pre>
+<p>&nbsp;<br />
+But &#8211; as you see &#8211; there is no access predicate here. The whole index has to be read.<br />
+Of course, I can use a function based index for that:</p>
+<pre><code>SQL&gt; create index PROD_NAME_SUBSTR on DEMO( substr(prod_name,1,1) );
+Index created.
+
+SQL&gt; select distinct prod_name from DEMO where substr(prod_name,1,1) = 'Z';
+no rows selected
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 4209586087
+
+-------------------------------------------------------------------------
+| Id  | Operation                    | Name             | Rows  | Bytes |
+-------------------------------------------------------------------------
+|   0 | SELECT STATEMENT             |                  |     1 |    31 |
+|   1 |  HASH UNIQUE                 |                  |     1 |    31 |
+|   2 |   TABLE ACCESS BY INDEX ROWID| DEMO             |     1 |    31 |
+|*  3 |    INDEX RANGE SCAN          | PROD_NAME_SUBSTR |     1 |       |
+-------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   3 - access(SUBSTR("PROD_NAME",1,1)='Z')
+</code></pre>
+<p>&nbsp;</p>
+<h3>One index only?</h3>
+<p>Then, as in the previous post about TRUNC I&#8217;ll check if that new index is sufficient. Let&#8217;s fdrop the first one.</p>
+<pre><code>SQL&gt; drop index PROD_NAME;
+Index dropped.
+</code></pre>
+<p>The previous index is dropped. Let&#8217;s see if the index on SUBSTR can be used with an equality predicate:</p>
+<pre><code>SQL&gt; select distinct prod_name from DEMO where prod_name = 'Zero';
+no rows selected
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 953445334
+
+-------------------------------------------------------------------------
+| Id  | Operation                    | Name             | Rows  | Bytes |
+-------------------------------------------------------------------------
+|   0 | SELECT STATEMENT             |                  |     1 |    27 |
+|   1 |  SORT UNIQUE NOSORT          |                  |     1 |    27 |
+|*  2 |   TABLE ACCESS BY INDEX ROWID| DEMO             |     1 |    27 |
+|*  3 |    INDEX RANGE SCAN          | PROD_NAME_SUBSTR |     1 |       |
+-------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("PROD_NAME"='Zero')
+   3 - access(SUBSTR("PROD_NAME",1,1)='Z')
+
+</code></pre>
+<p>&nbsp;<br />
+Good. The index on substring is used for index range scan on the prefix, and then the filter occurs on the result. This is fine as long as the prefix is selective enough.<br />
+It is also available with inequality:</p>
+<pre><code>SQL&gt; select distinct prod_name from DEMO where prod_name &gt; 'Z';
+no rows selected
+
+...</code></pre>
+<pre><code>Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("PROD_NAME"&gt;'Z')
+   3 - access(SUBSTR("PROD_NAME",1,1)&gt;='Z')
+
+</code></pre>
+<pre><code>And we can use it even when using a substring with a different number of characters:</code></pre>
+<pre><code>SQL&gt; select distinct prod_name from DEMO where substr(prod_name,1,4) = 'Zero';
+no rows selected</code></pre>
+<pre><code>...
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(SUBSTR("PROD_NAME",1,4)='Zero')
+   3 - access(SUBSTR("PROD_NAME",1,1)='Z')
+
+</code></pre>
+<p>&nbsp;<br />
+<strong>However, if we use the LIKE syntax:</strong></p>
+<pre><code>SQL&gt; select distinct prod_name from DEMO where prod_name like 'Z%';
+no rows selected
+
+Execution Plan
+----------------------------------------------------------
+Plan hash value: 51067428
+
+---------------------------------------------------
+| Id  | Operation          | Name | Rows  | Bytes |
+---------------------------------------------------
+|   0 | SELECT STATEMENT   |      |     1 |    27 |
+|   1 |  HASH UNIQUE       |      |     1 |    27 |
+|*  2 |   TABLE ACCESS FULL| DEMO |     1 |    27 |
+---------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter("PROD_NAME" LIKE 'Z%')
+
+</code></pre>
+<p>&nbsp;<br />
+The LIKE snytax does not allow to filter from the index on SUBSTR. So there are cases where we have to keep all indexes. Index on full column for LIKE predicates, and index on substring for SUBSTR predicates.<br />
+Note that indexes on SUBSTR are mandatory when you have columns larger than your block size, which is probably the case if you allow <a href="https://www.dbi-services.com/index.php/blog/entry/12c-extended-datatypes-better-than-clob">extended datatypes (VARCHAR2 up to 32k)</a></p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/segment-maintenance-online-compress/">
+<title>&#8220;Segment Maintenance Online Compress&#8221; feature usage</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/segment-maintenance-online-compress/">https://www.dbi-services.com/blog/segment-maintenance-online-compress/</a> (2020-04-19)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">&#8220;Segment Maintenance Online Compress&#8221; feature usage</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+On Twitter, Ludovico Caldara mentioned the #licensing #pitfall when using the Online Partition Move with Basic Compression. Those two features are available in Enterprise Edition without additional option, but when used together (moving online a compressed partition) they enable the usage of Advance Compression Option:</p>
+<blockquote class="twitter-tweet" data-width="500" data-dnt="true">
+<p lang="en" dir="ltr">Will it be reflected in dba_feature_usage_statistics?</p>
+<p>&mdash; Niels Jespersen (@njesp) <a href="https://twitter.com/njesp/status/1251961678020960257?ref_src=twsrc%5Etfw">April 19, 2020</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script><br />
+And there was a qustion about detection of this feature. I&#8217;ll show how this is detected. Basically, the ALTER TABLE MOVE PARTITION sets the &#8220;fragment was compressed online&#8221; flag in TABPART$ or TABSUBPART$ when the segment was compressed during the online move.</p>
+<p>I create a partitioned table:</p>
+<pre><code>
+SQL&gt; create table SCOTT.DEMO(id,x) partition by hash(id) partitions 2 as select rownum,lpad('x',100,'x') from xmltable('1 to 1000');
+
+Table created.
+</code></pre>
+<p>I set basic compression, which does not compress anything yet but only for future direct loads:</p>
+<pre><code>
+SQL&gt; alter table SCOTT.DEMO modify partition for (42) compress;
+
+Table altered.
+</code></pre>
+<p>I move without the &#8216;online&#8217; keyword:</p>
+<pre><code>
+SQL&gt; alter table SCOTT.DEMO move partition for (42);
+
+Table altered.
+</code></pre>
+<p>This does not enable the online compression flag (which is 0x2000000):</p>
+<pre><code>
+SQL&gt; select obj#,dataobj#,part#,flags,to_char(flags,'FMXXXXXXXXXXXXX') from SYS.TABPART$ where obj# in ( select object_id from dba_objects where owner='SCOTT' and objec
+t_name='DEMO');
+
+      OBJ#   DATAOBJ#      PART#      FLAGS TO_CHAR(FLAGS,
+---------- ---------- ---------- ---------- --------------
+     75608      75608          1          0 0
+     75609      75610          2         18 12
+</code></pre>
+<p>The 0x12 is about the presence of statistics (the MOVE does online statistics gathering in 12c).</p>
+<pre><code>
+SQL&gt; exec sys.dbms_feature_usage_internal.exec_db_usage_sampling(sysdate)
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select name,detected_usages,currently_used,feature_info from dba_feature_usage_statistics where name='Segment Maintenance Online Compress';
+
+NAME                                     DETECTED_USAGES CURRE FEATURE_INFO
+---------------------------------------- --------------- ----- --------------------------------------------------------------------------------
+Segment Maintenance Online Compress                    0 FALSE
+</code></pre>
+<h3>Online Move of compressed partition</h3>
+<p>Now moving online this compressed segment:</p>
+<pre><code>
+SQL&gt; alter table SCOTT.DEMO move partition for (42) online;
+
+Table altered.
+</code></pre>
+<p>This has enabled the 0x2000000 flag:</p>
+<pre><code>
+SQL&gt; select obj#,dataobj#,part#,flags,to_char(flags,'FMXXXXXXXXXXXXX') from SYS.TABPART$ where obj# in ( select object_id from dba_objects where owner='SCOTT' and objec
+t_name='DEMO');
+
+      OBJ#   DATAOBJ#      PART#      FLAGS TO_CHAR(FLAGS,
+---------- ---------- ---------- ---------- --------------
+     75608      75608          1          0 0
+     75611      75611          2   33554450 2000012
+</code></pre>
+<p>And, of course, is logged by the feature usage detection:</p>
+<pre><code>
+SQL&gt; exec sys.dbms_feature_usage_internal.exec_db_usage_sampling(sysdate)
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select name,detected_usages,currently_used,feature_info from dba_feature_usage_statistics where name='Segment Maintenance Online Compress';
+
+NAME                                     DETECTED_USAGES CURRE FEATURE_INFO
+---------------------------------------- --------------- ----- --------------------------------------------------------------------------------
+Segment Maintenance Online Compress                    1 FALSE Partition Obj# list: 75611:
+</code></pre>
+<p>The FEATURE_INFO mentions the object_id for the concerned partitions (for the last detection only).</p>
+<h3>No Compress</h3>
+<p>The only way I know to disable this flag is to uncompress the partition, and this can be done online:</p>
+<pre><code>
+SQL&gt; alter table SCOTT.DEMO move partition for (42) nocompress online;
+
+Table altered.
+
+SQL&gt; select obj#,dataobj#,part#,flags,to_char(flags,'FMXXXXXXXXXXXXX') from SYS.TABPART$ where obj# in ( select object_id from dba_objects where owner='SCOTT' and object_name='DEMO');
+
+      OBJ#   DATAOBJ#      PART#      FLAGS TO_CHAR(FLAGS,
+---------- ---------- ---------- ---------- --------------
+     75608      75608          1          0 0
+     75618      75618          2         18 12
+</code></pre>
+<h3>DBMS_REDEFINITION</h3>
+<p>As a workaround, DBMS_REDEFINITION does not use the Advanced Compression Option. For example, this does not enable any flag:</p>
+<pre><code>
+SYS@CDB$ROOT&gt;
+SYS@CDB$ROOT&gt; alter table SCOTT.DEMO rename partition for (24) to PART1;
+
+Table altered.
+
+SYS@CDB$ROOT&gt; create table SCOTT.DEMO_X for exchange with table SCOTT.DEMO;
+
+Table created.
+
+SYS@CDB$ROOT&gt; alter table SCOTT.DEMO_X compress;
+
+Table altered.
+
+SYS@CDB$ROOT&gt; exec dbms_redefinition.start_redef_table(uname=&gt;'SCOTT',orig_table=&gt;'DEMO',int_table=&gt;'DEMO_X',part_name=&gt;'PART1',options_flag=&gt;dbms_redefinition.cons_use
+_rowid);
+
+PL/SQL procedure successfully completed.
+
+SYS@CDB$ROOT&gt; exec dbms_redefinition.finish_redef_table(uname=&gt;'SCOTT',orig_table=&gt;'DEMO',int_table=&gt;'DEMO_X',part_name=&gt;'PART1');
+
+PL/SQL procedure successfully completed.
+
+SYS@CDB$ROOT&gt; drop table SCOTT.DEMO_X;
+Table dropped.
+
+</code></pre>
+<p>But of course, the difference is that only the blocks that are direct-path inserted into the interim table are compressed. Not the online modifications.</p>
+<h3>Only for partitions?</h3>
+<p>As far as I know, this is detected only for partitions and subpartitions, the online partition move operation which came in 12cR1. Since 12cR2 we can also move online a non-partitioned table and this, as far as I know, is not detected by dba_feature_usage_statistics. But don&#8217;t count on this as this may be considered as a bug which may be fixed one day.</p>
+
+</div>
+</body>
+</html>

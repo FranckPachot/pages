@@ -1,0 +1,305 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-12c-clustering/">
+<title>Oracle 12c &#8211; reorg and split table with clustering</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-12c-clustering/">https://www.dbi-services.com/blog/oracle-12c-clustering/</a> (2020-06-10)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle 12c &#8211; reorg and split table with clustering</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In this series of small examples on recent features, I have imported in a <a href="https://www.dbi-services.com/blog/oracle-index-on-joins/oracle-select-from-file" rel="noopener noreferrer" target="_blank">previous post</a>, the statistics of covid-19 per day and per countries. This is typical of data that comes as a time-series ordered by date, because this is how it is generated day after day, but where you probably want to query from another dimension, like per countries.</p>
+<p>If you want to ingest data faster, you keep it in the order of arrival, and insert it in heap table blocks. If you want to optimize for the future queries on the other dimension, you may load it in a table with a specialized organization where each row has its place: an Index Organized Table, a Hash Cluster, a partitioned table, or a combination of those. With Oracle we are used to storing data without the need to reorganize it. It is a multi-purpose database. But in 12c we have many features that make this reorganization easier, like partitioning, online move and online split. We can then think about a two-phase lifecycle for some operational tables that are used later for analytics:</p>
+<ul>
+<li>Fast ingest and query on short time window: we insert data on the flow, with conventional inserts, into a conventional heap table. Queries on recent data is fast as the rows are colocated as they arrived.</li>
+<li>Optimal query on history: regularly we reorganize physically the latest ingested rows, to be clustered on another dimension, because we will query for a large time range on this other dimension</li>
+</ul>
+<p>Partitioning is the way to do those operations. We can have a weekly partition for the current week. When the week is over new rows will go to a new partition (11g PARTITION BY RANGE &#8230; INTERVAL) and we can optionally merge the old partition with the one containing old data, per month or year for example, to get larger time ranges for the past data. This merge is easy (18c MERGE PARTITIONS &#8230; ONLINE). And while doing that we can reorganize rows to be clustered together. This is what I&#8217;m doing in this post.</p>
+<h3>Partitioning </h3>
+<p>From the table, I have created in the previous post I create an index on GEOID (as the goal is to query by countries) and I partition it by range on DATEREP:</p>
+<pre><code>
+SQL&gt; create index covid_geoid on covid(geoid);
+
+Index created.
+
+SQL&gt; alter table covid modify partition by range(daterep) interval (numToYMinterval(1,'year')) ( partition old values less than (date '2020-01-01') , partition new values less than (date '2021-01-01') ) online;
+
+Table altered.
+</code></pre>
+<p>This is an online operation in 12cR2. So I have two partitions, one for &#8220;old&#8221; data and one for &#8220;new&#8221; data.</p>
+<p>I query all dates for one specific country:</p>
+<pre><code>
+SQL&gt; select trunc(daterep,'mon'), max(cases) from covid where geoid='US' group by trunc(daterep,'mon') order by 1
+  2  /
+   TRUNC(DATEREP,'MON')    MAX(CASES)
+_______________________ _____________
+01-DEC-19                           0
+01-JAN-20                           3
+01-FEB-20                          19
+01-MAR-20                       21595
+01-APR-20                       48529
+01-MAY-20                       33955
+01-JUN-20                       25178
+</code></pre>
+<p>This reads rows scattered through the whole table because they were inserted day after day.</p>
+<p>This is visible in the execution plan: the optimizer does not use the index but a full table scan:</p>
+<pre><code>
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'+cost iostats last')
+  2  /
+                                                                                       PLAN_TABLE_OUTPUT
+________________________________________________________________________________________________________
+SQL_ID  2nyu7m59d7spv, child number 0
+-------------------------------------
+select trunc(daterep,'mon'), max(cases) from covid where geoid='US'
+group by trunc(daterep,'mon') order by 1
+
+Plan hash value: 4091160977
+
+-----------------------------------------------------------------------------------------------------
+| Id  | Operation            | Name  | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT     |       |      1 |        |    55 (100)|      7 |00:00:00.01 |     180 |
+|   1 |  SORT ORDER BY       |       |      1 |     77 |    55   (4)|      7 |00:00:00.01 |     180 |
+|   2 |   PARTITION RANGE ALL|       |      1 |     77 |    55   (4)|      7 |00:00:00.01 |     180 |
+|   3 |    HASH GROUP BY     |       |      2 |     77 |    55   (4)|      7 |00:00:00.01 |     180 |
+|*  4 |     TABLE ACCESS FULL| COVID |      2 |    105 |    53   (0)|    160 |00:00:00.01 |     180 |
+-----------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - filter("GEOID"='US')
+</code></pre>
+<p>This has read 180 blocks, with multiblock reads.</p>
+<p>I force the access by index in order to compare the cost:</p>
+<pre><code>
+SQL&gt; select /*+ index(covid) */ trunc(daterep,'mon'), max(cases) from covid where geoid='US' group by trunc(daterep,'mon') order by 1
+  2  /
+
+   TRUNC(DATEREP,'MON')    MAX(CASES)
+_______________________ _____________
+01-DEC-19                           0
+01-JAN-20                           3
+01-FEB-20                          19
+01-MAR-20                       21595
+01-APR-20                       48529
+01-MAY-20                       33955
+01-JUN-20                       25178
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'+cost iostats last')
+  2  /
+                                                                                                                     PLAN_TABLE_OUTPUT
+______________________________________________________________________________________________________________________________________
+SQL_ID  2whykac7cnjks, child number 0
+-------------------------------------
+select /*+ index(covid) */ trunc(daterep,'mon'), max(cases) from covid
+where geoid='US' group by trunc(daterep,'mon') order by 1
+
+Plan hash value: 2816502185
+
+-----------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                    | Name        | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                             |             |      1 |        |    95 (100)|      7 |00:00:00.01 |     125 |
+|   1 |  SORT ORDER BY                               |             |      1 |     77 |    95   (3)|      7 |00:00:00.01 |     125 |
+|   2 |   HASH GROUP BY                              |             |      1 |     77 |    95   (3)|      7 |00:00:00.01 |     125 |
+|   3 |    TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| COVID       |      1 |    105 |    93   (0)|    160 |00:00:00.01 |     125 |
+|*  4 |     INDEX RANGE SCAN                         | COVID_GEOID |      1 |    105 |     1   (0)|    160 |00:00:00.01 |       2 |
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - access("GEOID"='US')
+</code></pre>
+<p>Even if the number of blocks is a bit smaller, 125 blocks, they are single block reads and then the cost is higher: 95 for index access when the full table scan was 55. Using hints and comparing the cost is how I often try to understand the optimizer choice and here the reason is clear: because rows are scattered, the clustering factor of the index access is really bad.</p>
+<p>I said that I want to merge the partitions. And maybe reorg with an online table move. But now, for this second phase of the lifecycle, I want to cluster rows on the country dimension rather than on arrival date.</p>
+<h3>Attribute clustering</h3>
+<p>This preference can be declared on the table with 12c Attribute Clustering:</p>
+<pre><code>
+SQL&gt; alter table covid add clustering by linear order (continentexp, countriesandterritories);
+
+Table altered.
+</code></pre>
+<p>You see that I can mention multiple columns and I don&#8217;t need to use the GEOID column that I will use to query. This is not an index. This just a preference to cluster rows and, if they are clustered on the country name, they will be also clustered on continent, country code, geoid,&#8230; I have chosen those columns for clarity when reading the DDL:</p>
+<pre><code>
+SQL&gt; exec dbms_metadata.set_transform_param(DBMS_METADATA.SESSION_TRANSFORM,'SEGMENT_ATTRIBUTES',false);
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; ddl covid
+
+  CREATE TABLE "COVID"
+   (    "DATEREP" DATE,
+        "N_DAY" NUMBER,
+        "N_MONTH" NUMBER,
+        "N_YEAR" NUMBER,
+        "CASES" NUMBER,
+        "DEATHS" NUMBER,
+        "COUNTRIESANDTERRITORIES" VARCHAR2(50),
+        "GEOID" VARCHAR2(10),
+        "COUNTRYTERRITORYCODE" VARCHAR2(3),
+        "POPDATA2018" NUMBER,
+        "CONTINENTEXP" VARCHAR2(10)
+   )
+ CLUSTERING
+ BY LINEAR ORDER ("COVID"."CONTINENTEXP",
+  "COVID"."COUNTRIESANDTERRITORIES")
+   YES ON LOAD  YES ON DATA MOVEMENT
+ WITHOUT MATERIALIZED ZONEMAP
+  PARTITION BY RANGE ("DATEREP") INTERVAL (NUMTOYMINTERVAL(1,'YEAR'))
+ (PARTITION "OLD"  VALUES LESS THAN (TO_DATE(' 2020-01-01 00:00:00', 'SYYYY-MM-DD HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')) ,
+ PARTITION "NEW"  VALUES LESS THAN (TO_DATE(' 2021-01-01 00:00:00', 'SYYYY-MM-DD HH24:MI:SS', 'NLS_CALENDAR=GREGORIAN')) ) ;
+
+  CREATE INDEX "COVID_GEOID" ON "COVID" ("GEOID")
+  ;
+</code></pre>
+<p>As you can see the default is YES for ON LOAD which means that direct-path inserts will cluster rows, and ON DATA MOVEMENT is also YES which is why merging partitions will also cluster rows.</p>
+<p>I&#8217;ve done that afterward here but this is something you can do at table creation. You mention on which attributes you want to cluster. You mention when: direct-path inserts (YES ON LOAD) and/or table reorganization (YES ON DATA MOVEMENT). This is defined at table level. Beyond those defaults, the table reorganizations (ALTER TABLE &#8230; MOVE, ALTER TABLE &#8230; MERGE PARTITIONS) can explicitly DISALLOW CLUSTERING or ALLOW CLUSTERING.</p>
+<h3>Move Partition</h3>
+<p>When I have ingested some data and think that it would be better to cluster them, maybe at the time this partition is completed and new inserts go to a higher interval, I can reorganize it with a simple ALTER TABLE &#8230; MOVE:</p>
+<pre><code>
+SQL&gt; alter table covid move partition new online allow clustering;
+
+Table altered.
+</code></pre>
+<p>This will cluster rows together on the clustering attributes. I mentioned ALLOW CLUSTERING to show the syntax but it is the default (YES ON DATA MOVEMENT) anyway here.</p>
+<p>At that point, you may also want to compress the old partitions with basic compression (the compression that does not require an additional option but is possible only with bulk load or data movement). However, be careful: the combination of online operation and basic compression requires the Advanced Compression Option. More info in a previous post on <a href="https://www.dbi-services.com/blog/segment-maintenance-online-compress/" rel="noopener noreferrer" target="_blank">“Segment Maintenance Online Compress” feature usage</a>.</p>
+<h3>Merge Partition</h3>
+<p>As my goal is to cluster data on a different dimension than the time one, I may want to have larger partitions for the past ones. Something like the current partition holding a week of data at maximum, but the past partitions being on quarter or yearly ranges. That can be done with partition merging, which is an online operation in 18c (and note that I have a global index here and an online operation does not invalidate indexes):</p>
+<pre><code>
+SQL&gt; alter table covid merge partitions old,new into partition oldmerged online allow clustering;
+
+Table altered.
+</code></pre>
+<p>This is a row movement and clustering on data movement is enabled. Again I mentioned ALLOW CLUSTERING just to show the syntax.</p>
+<p>Let&#8217;s see the number of buffers read now with index accesss. The statistics of the index (clustering factor) has not been updated, so the optimizer may not choose the index access yet (until dbms_stats runs on stale tables). I&#8217;m forcing with an hint:</p>
+<pre><code>
+SQL&gt; select /*+ index(covid) */ trunc(daterep,'mon'), max(cases) from covid where geoid='US' group by trunc(daterep,'mon') order by 1;
+
+   TRUNC(DATEREP,'MON')    MAX(CASES)
+_______________________ _____________
+01-DEC-19                           0
+01-JAN-20                           3
+01-FEB-20                          19
+01-MAR-20                       21595
+01-APR-20                       48529
+01-MAY-20                       33955
+01-JUN-20                       25178
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'+cost iostats last')
+  2  /
+                                                                                                                     PLAN_TABLE_OUTPUT
+______________________________________________________________________________________________________________________________________
+SQL_ID  2whykac7cnjks, child number 0
+-------------------------------------
+select /*+ index(covid) */ trunc(daterep,'mon'), max(cases) from covid
+where geoid='US' group by trunc(daterep,'mon') order by 1
+
+Plan hash value: 2816502185
+
+-----------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                    | Name        | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                             |             |      1 |        |    95 (100)|      7 |00:00:00.01 |       8 |
+|   1 |  SORT ORDER BY                               |             |      1 |     77 |    95   (3)|      7 |00:00:00.01 |       8 |
+|   2 |   HASH GROUP BY                              |             |      1 |     77 |    95   (3)|      7 |00:00:00.01 |       8 |
+|   3 |    TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| COVID       |      1 |    105 |    93   (0)|    160 |00:00:00.01 |       8 |
+|*  4 |     INDEX RANGE SCAN                         | COVID_GEOID |      1 |    105 |     1   (0)|    160 |00:00:00.01 |       5 |
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - access("GEOID"='US')
+       filter(TBL$OR$IDX$PART$NUM(,0,8,0,"COVID".ROWID)=1)
+</code></pre>
+<p>The cost has not changed (because of the statistics) but the number of buffers read is minimal: only the 8 buffers where all my rows for this country are clustered. Remember that I clustered on the country name but use the GEOID here in my predicate. That doesn&#8217;t matter as long as the rows are together.</p>
+<h3>Asynchronous global index maintenance</h3>
+<p>Note the strange predicate on TBL$OR$IDX$PART$NUM(,0,8,0,&#8221;COVID&#8221;.ROWID)=1 that results from another 12c feature where global indexes are maintained usable during the partition maintenance (which is required for an online operation) but optimized to be cleaned-out asynchronously later. This is visible from DBA_INDEXES:</p>
+<pre><code>
+SQL&gt; select index_name,to_char(last_analyzed,'hh24:mi:ss') last_analyzed,clustering_factor,orphaned_entries from user_indexes where table_name='COVID';
+
+    INDEX_NAME    LAST_ANALYZED    CLUSTERING_FACTOR    ORPHANED_ENTRIES
+______________ ________________ ____________________ ___________________
+COVID_GEOID    08:33:34                        19206 YES
+
+</code></pre>
+<p>Orphaned entries mean that some entries in the global index may reference the dropped segment after my MOVE or MERGE and the query has to ignore them.</p>
+<p>Those ranges of rowid are determined from the segment concerned, stored in the dictionary:</p>
+<pre><code>
+SQL&gt; select * from sys.index_orphaned_entry$;
+   INDEXOBJ#    TABPARTDOBJ#    HIDDEN
+____________ _______________ _________
+       79972           79970 O
+       79972           79971 O
+       79972           79980 O
+       79972           79973 O
+</code></pre>
+<p>HIDDEN=&#8217;O&#8217; means Orphaned and the ROWIDs addressing these partitions are filtered out from the dirty index entries buy the predicated filter(TBL$OR$IDX$PART$NUM(,0,8,0,&#8221;COVID&#8221;.ROWID)=1) above. </p>
+<p>This maintenance of the dirty index will be done during the maintenance window but I can do it immediately to finish my reorganization correctly:</p>
+<pre><code>
+SQL&gt; alter index COVID_GEOID coalesce cleanup;
+
+Index altered.
+
+SQL&gt; select index_name,to_char(last_analyzed,'hh24:mi:ss') last_analyzed,clustering_factor,orphaned_entries from user_indexes where table_name='COVID';
+
+    INDEX_NAME    LAST_ANALYZED    CLUSTERING_FACTOR    ORPHANED_ENTRIES
+______________ ________________ ____________________ ___________________
+COVID_GEOID    08:33:34                        19206 NO
+
+</code></pre>
+<p>No orphaned index entries anymore. Note that I could also have called the DBMS_PART.CLEANUP_GIDX procedure to do the same.</p>
+<p>This is fine for the query, but as the statistics were not updated, the optimizer doesn&#8217;t know yet how clustered is my table. In order to complete my reorganization and have queries benefiting from this immediately, I gather the statistics:</p>
+<pre><code>
+SQL&gt; exec dbms_stats.gather_table_stats(user,'COVID',options=&gt;'gather auto');
+
+PL/SQL procedure successfully completed.
+
+SQL&gt; select index_name,to_char(last_analyzed,'hh24:mi:ss') last_analyzed,clustering_factor,orphaned_entries from user_indexes where table_name='COVID';
+
+    INDEX_NAME    LAST_ANALYZED    CLUSTERING_FACTOR    ORPHANED_ENTRIES
+______________ ________________ ____________________ ___________________
+COVID_GEOID    08:38:40                          369 NO
+
+</code></pre>
+<p>GATHER AUTO gathers only the stale ones, and, as soon as I did my MOVE or MERGE, the index was marked as stale (note that the ALTER INDEX COALESCE does not mark them a stale by itself).</p>
+<p>And now my query will use this optimal index without the need for any hint:</p>
+<pre><code>
+SQL_ID  2nyu7m59d7spv, child number 0
+-------------------------------------
+select trunc(daterep,'mon'), max(cases) from covid where geoid='US'
+group by trunc(daterep,'mon') order by 1
+
+Plan hash value: 2816502185
+
+-----------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                    | Name        | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                             |             |      1 |        |     7 (100)|      7 |00:00:00.01 |       5 |
+|   1 |  SORT ORDER BY                               |             |      1 |    101 |     7  (29)|      7 |00:00:00.01 |       5 |
+|   2 |   HASH GROUP BY                              |             |      1 |    101 |     7  (29)|      7 |00:00:00.01 |       5 |
+|   3 |    TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| COVID       |      1 |    160 |     5   (0)|    160 |00:00:00.01 |       5 |
+|*  4 |     INDEX RANGE SCAN                         | COVID_GEOID |      1 |    160 |     2   (0)|    160 |00:00:00.01 |       2 |
+-----------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - access("GEOID"='US')
+
+</code></pre>
+<p>and, thanks to the coalesce cleanup, there&#8217;s no predicate on orphan ROWIDs anymore.</p>
+<p>With this pattern, you may realize that my global index on countries is useful only for past data. Not for the recent one that has not been clustered yet. Then, we can even avoid maintaining the index for this partition. We will see that in the <a href="https://www.dbi-services.com/blog/oracle-12c-global-partial-index" rel="noopener noreferrer" target="_blank">next post</a>. it is called partial indexing.</p>
+<p>With this pattern, we can even doubt about the need to maintain an index for the old partitions. As all my rows for GEOID=&#8217;US&#8217; were packed in a few contiguous blocks, why not just store the range of ROWIDs rather than the list of it? This is called Zone Maps. But this is only available on Exadata and I like to think about Oracle as a multiplatform database.</p>
+<p>Those many features came in the recent releases thanks to the development of the Autonomous Database. When the DBA is a cloud provider, whether it is automated or not, all maintenance must be done online without stopping the application. Those features are the bricks to build automatic lifecycle management and performance optimization.</p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,125 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-system-statistics-display-auxstats-with-calculated-values-and-formulas/">
+<title>Oracle system statistics: Display AUX_STATS$ with calculated values and formulas</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-system-statistics-display-auxstats-with-calculated-values-and-formulas/">https://www.dbi-services.com/blog/oracle-system-statistics-display-auxstats-with-calculated-values-and-formulas/</a> (2014-10-15)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle system statistics: Display AUX_STATS$ with calculated values and formulas</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+System statistics can be gathered in NOWORKLOAD or WORKLOAD mode. Different values will be set depending on that and the others will be calculated &#8211; derived from them. We can see defined values from SYS.AUX_STATS$ but here is a script that shows the calculated ones as well.</p>
+<p>With no system statistics or NOWORKLOAD the values of IOSEEKTIM (latency in ms) and IOTFRSPEED (transfer in bytes/ms) are set and the SREADTIM (time to read 1 block in ms) and MREADTIM (for multiblock read) are calculated from them. MBRC depends on the defaults or the db_file_multiblock_read_count settings.</p>
+<p>With WORKLOAD statistics, the SREADTIM and MREADTIM as well as MBRC are measured and those are the ones that are used by the optimizer.</p>
+<p>Here is my script:</p>
+<pre><code>set echo off
+set linesize 200 pagesize 1000
+column pname format a30
+column sname format a20
+column pval2 format a20
+select pname,pval2 from sys.aux_stats$ where sname='SYSSTATS_INFO';
+select pname,pval1,calculated,formula from sys.aux_stats$ where sname='SYSSTATS_MAIN'
+model
+  reference sga on (
+    select name,value from v$sga
+        ) dimension by (name) measures(value)
+  reference parameter on (
+    select name,decode(type,3,to_number(value)) value from v$parameter where name='db_file_multiblock_read_count' and ismodified!='FALSE'
+    union all
+    select name,decode(type,3,to_number(value)) value from v$parameter where name='sessions'
+    union all
+    select name,decode(type,3,to_number(value)) value from v$parameter where name='db_block_size'
+        ) dimension by (name) measures(value)
+partition by (sname) dimension by (pname) measures (pval1,pval2,cast(null as number) as calculated,cast(null as varchar2(60)) as formula) rules(
+  calculated['MBRC']=coalesce(pval1['MBRC'],parameter.value['db_file_multiblock_read_count'],parameter.value['_db_file_optimizer_read_count'],8),
+  calculated['MREADTIM']=coalesce(pval1['MREADTIM'],pval1['IOSEEKTIM'] + (parameter.value['db_block_size'] * calculated['MBRC'] ) / pval1['IOTFRSPEED']),
+  calculated['SREADTIM']=coalesce(pval1['SREADTIM'],pval1['IOSEEKTIM'] + parameter.value['db_block_size'] / pval1['IOTFRSPEED']),
+  calculated['   multi block Cost per block']=round(1/calculated['MBRC']*calculated['MREADTIM']/calculated['SREADTIM'],4),
+  calculated['   single block Cost per block']=1,
+  formula['MBRC']=case when pval1['MBRC'] is not null then 'MBRC' when parameter.value['db_file_multiblock_read_count'] is not null then 'db_file_multiblock_read_count' when parameter.value['_db_file_optimizer_read_count'] is not null then '_db_file_optimizer_read_count' else '= _db_file_optimizer_read_count' end,
+  formula['MREADTIM']=case when pval1['MREADTIM'] is null then '= IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED' end,
+  formula['SREADTIM']=case when pval1['SREADTIM'] is null then '= IOSEEKTIM + db_block_size        / IOTFRSPEED' end,
+  formula['   multi block Cost per block']='= 1/MBRC * MREADTIM/SREADTIM',
+  formula['   single block Cost per block']='by definition',
+  calculated['   maximum mbrc']=sga.value['Database Buffers']/(parameter.value['db_block_size']*parameter.value['sessions']),
+  formula['   maximum mbrc']='= buffer cache size in blocks / sessions'
+);
+set echo on</code></pre>
+<p>Here is an exemple with <strong>default statistics</strong>:</p>
+<pre><code>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1519
+IOSEEKTIM                              10
+IOTFRSPEED                           4096
+SREADTIM                                          12 = IOSEEKTIM + db_block_size        / IOTFRSPEED
+MREADTIM                                          26 = IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED
+CPUSPEED
+MBRC                                               8 = _db_file_optimizer_read_count
+MAXTHR
+SLAVETHR
+   maximum mbrc                           117.152542 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                  .2708 = 1/MBRC * MREADTIM/SREADTIM
+</code></pre>
+<p>You see the calculated values for everything. Note the &#8216;maximum mbrc&#8217; which limits the multiblock reads when the buffer cache is small. It divides the buffer cache size (at startup &#8211; can depend on ASMM and AMM settings) by the sessions parameter.</p>
+<p>Here is an example with <strong>workload system statistics</strong> gathering:</p>
+<pre><code>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1511
+IOSEEKTIM                              15
+IOTFRSPEED                           4096
+SREADTIM                            1.178      1.178
+MREADTIM                              .03        .03
+CPUSPEED                             3004
+MBRC                                    8          8 MBRC
+MAXTHR                            6861824
+SLAVETHR
+   maximum mbrc                           114.983051 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                  .0032 = 1/MBRC * MREADTIM/SREADTIM
+</code></pre>
+<p>here all values are explicitly set (added after comment from Raul: those are probably completely wrong as MREADTIM should be &gt; SREADTIM)</p>
+<p>And an example with <strong>exadata system statistics</strong> that defines noworkload values and sets also the MBRC (see <a href="http://antognini.ch/2013/10/system-statistics-gathered-in-exadata-mode-when-are-they-relevant/#trackback">Chris Antognini post</a> about it)</p>
+<pre><code>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1539
+IOSEEKTIM                              16
+IOTFRSPEED                         204800
+SREADTIM                                       16.04 = IOSEEKTIM + db_block_size        / IOTFRSPEED
+MREADTIM                                       18.28 = IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED
+CPUSPEED
+MBRC                                   57         57 MBRC
+MAXTHR
+SLAVETHR
+   maximum mbrc                           114.983051 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                    .02 = 1/MBRC * MREADTIM/SREADTIM
+</code></pre>
+<p>And finally here is a <strong>workload system statistics </strong>result but with explicitly setting the db_file_multiblock_read_count to 128:</p>
+<pre><code>PNAME                               PVAL1 CALCULATED FORMULA
+------------------------------ ---------- ---------- --------------------------------------------------
+CPUSPEEDNW                           1539
+IOSEEKTIM                              15
+IOTFRSPEED                           4096
+SREADTIM                                          17 = IOSEEKTIM + db_block_size        / IOTFRSPEED
+MREADTIM                                         271 = IOSEEKTIM + db_block_size * MBRC / IOTFRSPEED
+CPUSPEED
+MBRC                                             128 db_file_multiblock_read_count
+MAXTHR
+SLAVETHR
+   maximum mbrc                           114.983051 = buffer cache size in blocks / sessions
+   single block Cost per block                     1 by definition
+   multi block Cost per block                  .1245 = 1/MBRC * MREADTIM/SREADTIM
+</code></pre>
+<p>Here you see that the MBRC in noworkload is coming from the value which is set by the db_file_multiblock_read_count rather from the value 8 which is used by default by the optimizer when it is not set. And the MREADTIM is calculated from that i/o size</p>
+<p>For more historical information about system statistics and how multiblock reads are costed (index vs. full table scan choice) see my article on latest <a href="http://viewer.zmags.com/publication/a8a4c4aa#/a8a4c4aa/62#54">OracleScene</a></p>
+<p>As usual, if you find anything to improve in that script, please share.</p>
+
+</div>
+</body>
+</html>

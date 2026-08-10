@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12cr2-upgrade-by-remote-clone-with-tde-in-dbaas/">
+<title>12cR2: Upgrade by remote clone with TDE in DBaaS</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12cr2-upgrade-by-remote-clone-with-tde-in-dbaas/">https://www.dbi-services.com/blog/12cr2-upgrade-by-remote-clone-with-tde-in-dbaas/</a> (2016-11-23)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12cR2: Upgrade by remote clone with TDE in DBaaS</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Upgrading from 12.1 to 12.2 is easy in Oracle Public Cloud DBaaS because you are in multitenant. Here is how to clone a 12.1 PDB to 12.2 service.<br />
+<!--more--><br />
+I&#8217;ve a service HP121 in 12.1.0.2 with one pluggable database PDB1 and a service HP122 in 12.2.0.1 with an empty CDB (only CDB$ROOT and PDB$SEED containers).</p>
+<h3>Export TDE key</h3>
+<p>The Oracle Public Cloud uses Transparent Data Encryption to secure the datafiles. When you move the pluggable databases you need to export/import the encryption keys.</p>
+<p>Here is the key:</p>
+<pre><code>
+18:42:58 HP121 SQL&gt;select wrl_type,wrl_parameter,wallet_type from v$encryption_wallet;
+&nbsp;
+WRL_TYPE WRL_PARAMETER                            WALLET_TY
+-------- ---------------------------------------- ---------
+FILE     /u01/app/oracle/admin/HP121/tde_wallet/  AUTOLOGIN
+&nbsp;
+18:42:58 HP121 SQL&gt;select key_id from v$encryption_keys where creator_pdbname='PDB1';
+&nbsp;
+KEY_ID
+------------------------------------------------------------------------------
+AQqCc8XWV09uvxkaw0Bm5XUAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+</code></pre>
+<p>The instance uses an auto-login wallet and you cannot export the keys from that:</p>
+<pre><code>
+18:42:58 HP121 SQL&gt;administer key management export encryption keys with secret "oracle" to '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d" with identifier in (select key_id from v$encryption_keys where creator_pdbname='PDB1');
+administer key management export encryption keys with secret "oracle" to '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d" with identifier in (select key_id from v$encryption_keys where creator_pdbname='PDB1')
+*
+ERROR at line 1:
+ORA-28417: password-based keystore is not open
+</code></pre>
+<p>You need to open it with the password:</p>
+<pre><code>
+18:42:58 HP121 SQL&gt;administer key management set keystore close;
+keystore altered.
+&nbsp;
+18:42:58 HP121 SQL&gt;administer key management set keystore open identified by "Ach1z0#d";
+keystore altered.
+&nbsp;
+18:42:58 HP121 SQL&gt;select wrl_type,wrl_parameter,wallet_type from v$encryption_wallet;
+&nbsp;
+WRL_TYPE WRL_PARAMETER                            WALLET_TY
+-------- ---------------------------------------- ---------
+FILE     /u01/app/oracle/admin/HP121/tde_wallet/  PASSWORD
+</code></pre>
+<p>And then you can export it:</p>
+<pre><code>
+18:42:58 HP121 SQL&gt;administer key management export encryption keys with secret "oracle" to '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d" with identifier in (select key_id from v$encryption_keys where creator_pdbname='PDB1');
+keystore altered.
+</code></pre>
+<h3>Import TDE key</h3>
+<p>I copy the file /tmp/cdb2pdb1.p12 to the destination (scp) and then I can import it, giving the same &#8216;secret&#8217; identifier. Here again i have to open the wallet with password because it cannot be imported when opened </p>
+<pre><code>
+18:43:04 HP122 SQL&gt;administer key management set keystore close;
+keystore altered.
+18:43:04 HP122 SQL&gt;administer key management set keystore open identified by "Ach1z0#d";
+keystore altered.
+18:43:04 HP122 SQL&gt;administer key management import encryption keys with secret "oracle" from '/tmp/cdb2pdb1.p12' identified by "Ach1z0#d";
+keystore altered.
+</code></pre>
+<h3>Database link</h3>
+<p>We need to create a database link to the source (don&#8217;t forget to open the port for the listener):</p>
+<pre><code>
+18:43:04 HP122 SQL&gt;select dbms_tns.resolve_tnsname('//HP121/HP121.demnov.oraclecloud.internal') from dual;
+&nbsp;
+DBMS_TNS.RESOLVE_TNSNAME('//HP121/HP121.DEMNOV.ORACLECLOUD.INTERNAL')
+--------------------------------------------------------------------------------
+(DESCRIPTION=(CONNECT_DATA=(SERVICE_NAME=HP121.demnov.oraclecloud.internal)(CID=
+(PROGRAM=oracle)(HOST=HP122.compute-demnov.oraclecloud.internal)(USER=oracle)))(
+ADDRESS=(PROTOCOL=TCP)(HOST=10.196.202.47)(PORT=1521)))
+&nbsp;
+18:43:04 HP122 SQL&gt;create database link  HP121@HP121 connect to system identified by "Ach1z0#d" using '//HP121/HP121.demnov.oraclecloud.internal';
+Database link created.
+&nbsp;
+18:43:04 HP122 SQL&gt;select host_name from v$instance@HP121@HP121;
+&nbsp;
+HOST_NAME
+----------------------------------------------------------------
+HP121.compute-demnov.oraclecloud.internal
+</code></pre>
+<h3>Remote clone</h3>
+<p>You need to have the source PDB1 opened read-only, and the cloning is only one command:</p>
+<pre><code>
+18:43:09 HP122 SQL&gt;create pluggable database PDB1 from PDB1@HP121@HP121 keystore identified by "Ach1z0#d";
+Pluggable database created.
+</code></pre>
+<h3>Upgrade</h3>
+<p>Now that you have the PDB you can open it (because you have imported the TDE key) but the dictionary is still in 12.1 so you have to run:</p>
+<pre><code>
+[oracle@HP122 ~]$ dbupgrade -c PDB1
+</code></pre>
+<p>This is described in previous post: <a href="http://dbi-services.com/blog/12cr2-how-long-to-upgrade-a-pdb/" target="_blank" rel="noopener noreferrer">http://dbi-services.com/blog/12cr2-how-long-to-upgrade-a-pdb/</a></p>
+
+</div>
+</body>
+</html>

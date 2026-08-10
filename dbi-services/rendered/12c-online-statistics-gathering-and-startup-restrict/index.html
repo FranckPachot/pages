@@ -1,0 +1,206 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-online-statistics-gathering-and-startup-restrict/">
+<title>12c online statistics gathering and startup restrict</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-online-statistics-gathering-and-startup-restrict/">https://www.dbi-services.com/blog/12c-online-statistics-gathering-and-startup-restrict/</a> (2015-02-21)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12c online statistics gathering and startup restrict</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+I&#8217;ve written about 12c online statistics gathering in a UKOUG OracleScene <a href="http://viewer.zmags.com/publication/07edc028#/07edc028/46">article</a>. My opinion is clear about it: you sill need to gather stale stats afterwards or you have mising, stale and inconsistent object statistics. This post is about cases where online statistics gathering does not occur (and are not documented) &#8211; which is another reason why we can&#8217;t rely on it.</p>
+<h3>The case where it works</h3>
+<p>You can check on the article about how online gathering statistics works (or come to our <a href="index.php/products/dbi-insite-workshops/oracle-12c-new-features-workshop">12c new feature workshop</a> where we cover and practice all 12c optimizer new features)<br />
+In order to do something else here I&#8217;m showing how to trace it by activating the 0x10000 trace flag for dbms_stats:</p>
+<pre><code>SQL&gt; connect demo/demo@//localhost/PDB1
+Connected.
+SQL&gt; set serveroutput on
+SQL&gt; exec dbms_stats.set_global_prefs('TRACE',1+65536);
+PL/SQL procedure successfully completed.
+
+SQL&gt; drop table DEMO;
+Table dropped.
+
+SQL&gt; create table DEMO ( n number ) pctfree 99;
+Table created.
+
+SQL&gt; insert /*+ append */ into DEMO select rownum from dual connect by 1000&gt;=level;
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 1         1         1         to_char(count("N"))                        100
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 2         1         1         substrb(dump(min("N"),16,0,64),1,240)      9
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 3         1         1         substrb(dump(max("N"),16,0,64),1,240)      17
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 1         1         1         to_char(count("N"))                        100
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 2         1         1         substrb(dump(min("N"),16,0,64),1,240)      9
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 3         1         1         substrb(dump(max("N"),16,0,64),1,240)      17
+DBMS_STATS: postprocess online optimizer stats gathering for DEMO.DEMO: save statis
+DBMS_STATS: RAWIDX    SELMAPPOS RES                            NNV       NDV
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 1         1          1000      1000      0         2891      1000
+DBMS_STATS: RAWIDX    SELMAPPOS RES                            NNV       NDV
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 2         2         Typ=2 Len=2: c1,2              NULL      NULL
+DBMS_STATS: RAWIDX    SELMAPPOS RES                            NNV       NDV
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 3         3         Typ=2 Len=2: c2,b              NULL      NULL
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 1         1         1         to_char(count("N"))                        100
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 2         1         1         substrb(dump(min("N"),16,0,64),1,240)      9
+DBMS_STATS: SELMAPPOS CLISTIDX  INTCOL    SELITEM                                    GATHFLG
+DBMS_STATS: ------------------------------------------------------------------------
+DBMS_STATS: 3         1         1         substrb(dump(max("N"),16,0,64),1,240)      17
+
+1000 rows created.
+
+</code></pre>
+<p>From the trace, online statistics gathering occured for that direct-path load.<br />
+We can see it also in the execution plan:</p>
+<pre><code>SQL&gt; select * from table(dbms_xplan.display_cursor('1k2r9n41c7xba'));
+
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------------
+SQL_ID  1k2r9n41c7xba, child number 0
+-------------------------------------
+insert /*+ append */ into DEMO select rownum from dual connect by 1000&gt;=level
+
+Plan hash value: 1600317434
+
+---------------------------------------------------------------------------------
+| Id  | Operation                        | Name | Rows  | Cost (%CPU)| Time     |
+---------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT                 |      |       |     2 (100)|          |
+|   1 |  LOAD AS SELECT                  |      |       |            |          |
+|   2 |   OPTIMIZER STATISTICS GATHERING |      |     1 |     2   (0)| 00:00:01 |
+|   3 |    COUNT                         |      |       |            |          |
+|   4 |     CONNECT BY WITHOUT FILTERING |      |       |            |          |
+|   5 |      FAST DUAL                   |      |     1 |     2   (0)| 00:00:01 |
+---------------------------------------------------------------------------------
+</code></pre>
+<p>and statistics are there:</p>
+<pre><code>SQL&gt; select last_analyzed,num_rows,blocks from user_tables where table_name='DEMO';
+
+LAST_ANAL   NUM_ROWS     BLOCKS
+--------- ---------- ----------
+21-FEB-15       1000        179
+</code></pre>
+<p>Don&#8217;t forget to set the trace off:</p>
+<pre><code>SQL&gt; exec dbms_stats.set_global_prefs('TRACE',0);
+PL/SQL procedure successfully completed.
+</code></pre>
+<p>Ok. That is the known case. Table statistics are there.</p>
+<h3>startup restrict</h3>
+<p>When you want to do some online maintenance, being sure that the application is not connected, you start the database in restrict mode.</p>
+<pre><code>SQL&gt; alter system enable restricted session;
+System altered.
+</code></pre>
+<p>Then you can do you imports, reorg, bulk load, etc. and be sure that nobody will write or read into the table you are working on. Imagine you have tested the previous load and you have observed that the online gathered statistics are sufficient. Now you run the same in production in restricted mode.</p>
+<pre><code>SQL&gt; connect demo/demo@//localhost/PDB1
+Connected.
+SQL&gt; set serveroutput on
+SQL&gt; exec dbms_stats.set_global_prefs('TRACE',1+65536);
+PL/SQL procedure successfully completed.
+
+SQL&gt; drop table DEMO;
+Table dropped.
+
+SQL&gt; create table DEMO ( n number ) pctfree 99;
+Table created.
+
+SQL&gt; insert /*+ append */ into DEMO select rownum from dual connect by 1000&gt;=level;
+1000 rows created.
+</code></pre>
+<p>No trace related to online statistics gathering.</p>
+<pre><code>SQL&gt; select * from table(dbms_xplan.display_cursor('1k2r9n41c7xba'));
+
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------------
+SQL_ID  1k2r9n41c7xba, child number 0
+-------------------------------------
+insert /*+ append */ into DEMO select rownum from dual connect by 1000&gt;=level
+
+Plan hash value: 1600317434
+
+-------------------------------------------------------------------------------
+| Id  | Operation                      | Name | Rows  | Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT               |      |       |     2 (100)|          |
+|   1 |  LOAD AS SELECT                |      |       |            |          |
+|   2 |   COUNT                        |      |       |            |          |
+|   3 |    CONNECT BY WITHOUT FILTERING|      |       |            |          |
+|   4 |     FAST DUAL                  |      |     1 |     2   (0)| 00:00:01 |
+-------------------------------------------------------------------------------
+</code></pre>
+<p>no STATISTICS GATHERING operation.</p>
+<pre><code>SQL&gt; select last_analyzed,num_rows,blocks from user_tables where table_name='DEMO';
+
+LAST_ANAL   NUM_ROWS     BLOCKS
+--------- ---------- ----------
+
+</code></pre>
+<p>and no statistics.</p>
+<h3>10053 trace</h3>
+<p>Because we can&#8217;t see the STATISTICS GATHERING operation in the execution plan, I know that it&#8217;s an optimizer decision done at compilation time. I&#8217;ve dump the 10053 trace and got the following line:</p>
+<pre><code>ONLINEST: Checking validity of online stats gathering
+ONLINEST: Failed validity check: database not open, in restricted/migrate mode, suspended, readonly, instance not open or OCI not available.
+</code></pre>
+<p>So we have a few reasons where online statistics does not occur and that are not documented as <a href="https://docs.oracle.com/database/121/TGSQL/tgsql_statscon.htm#TGSQL344">Restrictions for Online Statistics Gathering for Bulk Loads</a>and restricted mode is one of them.</p>
+<h3>Thin JDBC</h3>
+<p>Because the preceding line mentions OCI I wanted to be sure that online statistics gathering occurs even when connected though thin jdbc, and I used the sqlcl beta from SQL Developer 4.1 Early Adopter. Note that I&#8217;m not in restricted session anymore.</p>
+<pre><code>sql.bat demo/demo@//192.168.78.113/pdb1
+
+SQLcl: Release 4.1.0 Beta on Sat Feb 21 21:10:59 2015
+
+Copyright (c) 1982, 2015, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+
+SQL&gt; show jdbc
+-- Database Info --
+Database Product Name: Oracle
+Database Product Version: Oracle Database 12c Enterprise Edition Release 12.1.0.2.0 - 64bit Production
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+Database Major Version: 12
+Database Minor Version: 1
+-- Driver Info --
+Driver Name: Oracle JDBC driver
+Driver Version: 12.1.0.2.0
+Driver Major Version: 12
+Driver Minor Version: 1
+Driver URL: jdbc:oracle:thin:@//192.168.78.113/pdb1
+
+SQL&gt; create table DEMO ( n number ) pctfree 99;
+
+Table DEMO created.
+
+SQL&gt; insert /*+ append */ into DEMO select rownum from dual connect by level select last_analyzed,num_rows,blocks from user_tables where table_name='DEMO';
+
+LAST_ANALYZED                 NUM_ROWS     BLOCKS
+--------------------------- ---------- ----------
+21.02.15                          1000        100
+</code></pre>
+<p>Ok. no problem. I don&#8217;t know what that &#8216;OCI not available&#8217; is but it works even though JDBC Thin.</p>
+<h3>Conclusion</h3>
+<p>As I already said for other reasons, don&#8217;t rely on online statistics gathering and always gather stale stats afterwards. It&#8217;s good to have it as it saves some work to do by dbms_stats later. There are cases where it is better than no statistics (when combined with GTT private statistics for example) but don&#8217;t rely on it. but don&#8217;t rely on it.</p>
+
+</div>
+</body>
+</html>

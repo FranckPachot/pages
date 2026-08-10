@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-12c-global-partial-index/">
+<title>Oracle 12c &#8211; global partial index</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-12c-global-partial-index/">https://www.dbi-services.com/blog/oracle-12c-global-partial-index/</a> (2020-06-10)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle 12c &#8211; global partial index</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+We have an incredible number of possibilities with Oracle. Yes, an index can be global (indexing many partitions without having to be partitioned itself on the same key) and partial (skipping some of the table partitions where we don&#8217;t need indexing). In the <a href="https://www.dbi-services.com/blog/oracle-12c-clustering" rel="noopener noreferrer" target="_blank">previous post</a> of this series of small examples on recent features I partitioned a table, with covid-19 cases per day and per country, partitioned on range of date by interval. The index on the country code (GEOID) was not very efficient for data ingested per day, because countries are scattered through all the table. And then I have reorganized the old partitions to cluster them on countries. </p>
+<p>My global index on country code is defined as:</p>
+<pre><code>
+SQL&gt; create index covid_geoid on covid(geoid);
+
+Index created.
+</code></pre>
+<p>This is efficient, thanks to clustering, except for the new rows coming again in time order. As those go to a new partition that is small (the idea in the post was to have short time range for the current partition, and larger ones for the old, using the ALTER TABLE &#8230; MERGE ONLINE to merge the newly old one to the others). For the current partition only, it is preferable to full scan this last partition. And even avoid maintaining the index entries for this partition as this will accelerate data ingestion.</p>
+<p>I think that partial indexing is well known for local indexes, as this is like marking some index partitions as unusable. But here I&#8217;m showing it on a global index.</p>
+<h3>Splitting partitions</h3>
+<p>In order to continue from the previous <a href="https://www.dbi-services.com/blog/oracle-12c-clustering" rel="noopener noreferrer" target="_blank">previous post</a> where I merged all partitions, I&#8217;ll split them again, and this can be an online operation in 12cR2:</p>
+<pre><code>
+SQL&gt; alter table covid split partition oldmerged at (date '2020-04-01') into (partition old, partition new) online;
+
+Table altered.
+
+SQL&gt; alter index COVID_GEOID coalesce cleanup;
+
+Index altered.
+
+</code></pre>
+<p>I have two partitions, &#8220;old&#8221; and &#8220;new&#8221;, and a global index. I also cleaned up the orphaned index entries to get clean execution plans. And it has to be done anyway.</p>
+<p>Here is my query, using the index:</p>
+<pre><code>
+SQL&gt; explain plan for select trunc(daterep,'mon'), max(cases) from covid where geoid='US' group by trunc(daterep,'mon') order by 1;
+
+Explained.
+
+SQL&gt; select * from dbms_xplan.display();
+                                                                                                              PLAN_TABLE_OUTPUT
+_______________________________________________________________________________________________________________________________
+Plan hash value: 2816502185
+
+----------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                    | Name        | Rows  | Bytes | Cost (%CPU)| Time     | Pstart| Pstop |
+----------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                             |             |   101 |  1515 |     6  (34)| 00:00:01 |       |       |
+|   1 |  SORT ORDER BY                               |             |   101 |  1515 |     6  (34)| 00:00:01 |       |       |
+|   2 |   HASH GROUP BY                              |             |   101 |  1515 |     6  (34)| 00:00:01 |       |       |
+|   3 |    TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| COVID       |   160 |  2400 |     4   (0)| 00:00:01 | ROWID | ROWID |
+|*  4 |     INDEX RANGE SCAN                         | COVID_GEOID |   160 |       |     1   (0)| 00:00:01 |       |       |
+----------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   4 - access("GEOID"='US')
+
+</code></pre>
+<p>This goes to all partitions, as the ROWID in a global index carries the partition information through the data object id. We see that with Pstart/Pstop=ROWID.</p>
+<h3>Partial indexing</h3>
+<p>Now I want to set my global index on countries to be a partial index:</p>
+<pre><code>
+SQL&gt; alter index covid_geoid indexing partial;
+
+Index altered.
+</code></pre>
+<p>This doesnt change anything for the moment. The indexing of partitions will depend on the partition attributes which is by default INDEXING ON.</p>
+<p>I set the &#8220;new&#8221; partition to not maintain indexes (INDEXING OFF), for this partition only.</p>
+<pre><code>
+SQL&gt; alter table covid modify partition new indexing off;
+
+Table altered.
+</code></pre>
+<p>This means that partial indexes will not reference the &#8220;new&#8221; partition. Whether they are local (which then means no index partition) or global (which then means no index entries for this partition).</p>
+<p>And that&#8217;s all. Now there will be no overhead in maintaining this index when ingesting new data in this partition.</p>
+<h3>Table Expansion</h3>
+<p>And then, the optimizer has a transformation to split the execution plan in two branches: one for the index access and one without. This transformation was introduced in 11g for unusable local partitions and is now used even with global indexes. :</p>
+<pre><code>
+SQL&gt; explain plan for /*+ index(covid) */ select trunc(daterep,'mon'), max(cases) from covid where geoid='US' group by trunc(daterep,'mon') order by 1;
+
+Explained.
+
+SQL&gt; select * from dbms_xplan.display();
+                                                                                                                PLAN_TABLE_OUTPUT
+_________________________________________________________________________________________________________________________________
+Plan hash value: 1031592504
+
+------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                      | Name        | Rows  | Bytes | Cost (%CPU)| Time     | Pstart| Pstop |
+------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                               |             |   321 |  7062 |    37   (6)| 00:00:01 |       |       |
+|   1 |  SORT ORDER BY                                 |             |   321 |  7062 |    37   (6)| 00:00:01 |       |       |
+|   2 |   HASH GROUP BY                                |             |   321 |  7062 |    37   (6)| 00:00:01 |       |       |
+|   3 |    VIEW                                        | VW_TE_2     |   321 |  7062 |    35   (0)| 00:00:01 |       |       |
+|   4 |     UNION-ALL                                  |             |       |       |            |          |       |       |
+|*  5 |      TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| COVID       |    93 |  1395 |     4   (0)| 00:00:01 |     1 |     1 |
+|*  6 |       INDEX RANGE SCAN                         | COVID_GEOID |   160 |       |     1   (0)| 00:00:01 |       |       |
+|   7 |      PARTITION RANGE SINGLE                    |             |    68 |  1020 |    27   (0)| 00:00:01 |     2 |     2 |
+|*  8 |       TABLE ACCESS FULL                        | COVID       |    68 |  1020 |    27   (0)| 00:00:01 |     2 |     2 |
+|   9 |      TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| COVID       |   160 |  4320 |     4   (0)| 00:00:01 | ROWID | ROWID |
+|* 10 |       INDEX RANGE SCAN                         | COVID_GEOID |   160 |       |     1   (0)| 00:00:01 |       |       |
+------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   5 - filter("COVID"."DATEREP"=TO_DATE(' 2020-04-01 00:00:00', 'syyyy-mm-dd hh24:mi:ss') AND
+              "COVID"."DATEREP"&lt;TO_DATE(&#039; 2021-01-01 00:00:00&#039;, &#039;syyyy-mm-dd hh24:mi:ss&#039;))
+  10 - access(&quot;GEOID&quot;=&#039;US&#039;)
+       filter(TBL$OR$IDX$PART$NUM(&quot;COVID&quot;,0,8,0,ROWID)=1 AND TBL$OR$IDX$PART$NUM(&quot;COVID&quot;,0,0,65535,ROWID)1 AND
+              TBL$OR$IDX$PART$NUM("COVID",0,0,65535,ROWID)2)
+
+</code></pre>
+<p>The TABLE ACCESS BY GLOBAL INDEX ROWID is for partition 1 as mentioned by Pstart/Pstop, which is the &#8220;old&#8221; one with INDEXING ON. The TABLE ACCESS FULL is for partition 2, the &#8220;new&#8221; one, that has INDEXING OFF. The optimizer uses predicates on the partition key to select the branch safely.</p>
+<p>But this plan has also an additional branch and this TBL$OR$IDX$PART$NUM again because I have interval partitioning. With interval partitioning, there is no known Pstop, it then it has handle the cases where a new partition has been created (with indexing on). Then, the third branch can access by index ROWID for the partitions that are not hardcoded in this plan.</p>
+<p>Let&#8217;s remove interval partitioning just to get the plan easier to read:</p>
+<pre><code>
+SQL&gt; alter table covid set interval();
+
+Table altered.
+
+
+SQL&gt; explain plan for select trunc(daterep,'mon'), max(cases) from covid where geoid='US' group by trunc(daterep,'mon') order by 1;
+
+Explained.
+
+SQL&gt; select * from dbms_xplan.display();
+                                                                                                                PLAN_TABLE_OUTPUT
+_________________________________________________________________________________________________________________________________
+Plan hash value: 3529087922
+
+------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                      | Name        | Rows  | Bytes | Cost (%CPU)| Time     | Pstart| Pstop |
+------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                               |             |   161 |  3542 |    35   (6)| 00:00:01 |       |       |
+|   1 |  SORT ORDER BY                                 |             |   161 |  3542 |    35   (6)| 00:00:01 |       |       |
+|   2 |   HASH GROUP BY                                |             |   161 |  3542 |    35   (6)| 00:00:01 |       |       |
+|   3 |    VIEW                                        | VW_TE_2     |   161 |  3542 |    33   (0)| 00:00:01 |       |       |
+|   4 |     UNION-ALL                                  |             |       |       |            |          |       |       |
+|*  5 |      TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| COVID       |    93 |  1395 |     6   (0)| 00:00:01 |     1 |     1 |
+|*  6 |       INDEX RANGE SCAN                         | COVID_GEOID |   160 |       |     1   (0)| 00:00:01 |       |       |
+|   7 |      PARTITION RANGE SINGLE                    |             |    68 |  1020 |    27   (0)| 00:00:01 |     2 |     2 |
+|*  8 |       TABLE ACCESS FULL                        | COVID       |    68 |  1020 |    27   (0)| 00:00:01 |     2 |     2 |
+------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   5 - filter("COVID"."DATEREP"&lt;TO_DATE(&#039; 2020-04-01 00:00:00&#039;, &#039;syyyy-mm-dd hh24:mi:ss&#039;))
+   6 - access(&quot;GEOID&quot;=&#039;US&#039;)
+   8 - filter(&quot;GEOID&quot;=&#039;US&#039;)
+
+</code></pre>
+<p>Here it is clear: access by index to the partition 1 and full table scan for partition 2. This is exactly what I wanted because I know the clustering factor on the new partition is not very good until I reorganize it (move or merge as I did in the previous post).</p>
+<p>All these features help to manage the lifecycle of data. That&#8217;s a completely different approach from purpose-built databases where you have one database service for fast ingest with simple queries on recent data (NoSQL folks may think about DynamoDB for that), then streaming data to a relational database for more OLTP queries (RDS to continue with the AWS analogy), and move old data into a database dedicated to analytics (that could be Redshift then). With Oracle, which has always been a multi-purpose database, the goal is to avoid duplication and replication and manage data in-place for all usage. Through the 40 years of this database engine, many approaches have been implemented to cluster data: CLUSTER and IOT can sort (or hash) data as soon as it is inserted, in order to put them at their optimal place for future queries. But the agility of heap tables finally wins. Now, with the ease of in-database data movement (partitioning and online operations) and improvement of full scan (multiblock reads, direct-path reads, storage indexes) we can get the best of both: heap tables with few indexes for fast ingest of current data, reorganize regularly to be clustered, with additional indexes.</p>
+<p>I mentioned NoSQL and I mentioned fast ingest. Actually, there&#8217;s a feature called Fast Ingest for IoT (lowercase &#8216;o&#8217; there) that goes further with this idea. Instead of inserting into a persistent segment and reorganize later, rows are buffered in a &#8216;memoptimized rowstore&#8217; before going to the heap segment in bulk. But that&#8217;s an Exadata feature and I like to think about Oracle as a multiplatform database.</p>
+
+</div>
+</body>
+</html>

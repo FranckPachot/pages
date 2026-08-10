@@ -32,7 +32,9 @@ SOURCE_NAMES = {
     "linkedin": "LinkedIn",
     "medium": "Medium",
     "microsoft-techcommunity": "Microsoft Tech Community",
+    "oracle-scene": "Oracle Scene",
     "slideshare": "SlideShare",
+    "soug": "SOUG",
     "yugabyte": "Yugabyte",
 }
 
@@ -157,6 +159,10 @@ def normalize_text(value: str) -> str:
 def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
     path = root / article["archive_path"]
     source = article["source"]
+    if source in {"oracle-scene", "soug"}:
+        description = normalize_text(article.get("description", ""))
+        signal = " ".join([article["title"], description, " ".join(article.get("tags", []))])
+        return normalize_text(signal), description
     if source in {"developpez", "medium", "microsoft-techcommunity", "slideshare"} or (
         source == "dbi-services" and path.suffix.casefold() == ".html"
     ):
@@ -244,10 +250,15 @@ def infer_versions(signal: str, databases: list[str]) -> list[str]:
 
 def publication_urls(root: Path, article: dict[str, Any]) -> tuple[str, str]:
     archive_url = article["archive_path"]
+    if article["source"] in {"oracle-scene", "soug"}:
+        return archive_url, article["canonical_url"]
     if article["source"] == "dbi-services" and archive_url.endswith(".json"):
         legacy_url = f"2013-2018/{article['source_id']}/index.html"
         if (root / legacy_url).is_file():
             return legacy_url, ""
+        rendered_url = f"dbi-services/rendered/{article['source_id']}/index.html"
+        if (root / rendered_url).is_file():
+            return rendered_url, article["canonical_url"]
         return article["canonical_url"], ""
 
     read_url = archive_url if article["source"] == "medium" else article["canonical_url"]

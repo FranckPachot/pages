@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/partial-join-evaluation-in-oracle-12c/">
+<title>Partial Join Evaluation in Oracle 12c</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/partial-join-evaluation-in-oracle-12c/">https://www.dbi-services.com/blog/partial-join-evaluation-in-oracle-12c/</a> (2014-07-14)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Partial Join Evaluation in Oracle 12c</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Do you think that it&#8217;s better to write semi-join SQL statements with IN(), EXISTS(), or to do a JOIN? Usually, the optimizer will evaluate the cost and do the transformation for you. And in this area, one more transformation has been introduced in 12c which is the Partial Join Evaluation (PJE).</p>
+<p>First, let&#8217;s have a look at the 11g behaviour. For that example, I use the SCOTT schema, but I hire a lot more employees in departement 40:</p>
+<pre><code>
+SQL&gt; alter table EMP modify empno number(10);
+Table altered.
+SQL&gt; insert into EMP(empno,deptno) select rownum+10000,40 from EMP,(select * from dual connect by level
+</code></pre>
+<p>Why department 40? I&#8217;ll explain it below, but I let you think about it before. In the default SCOTT schema, there is a department 40 in DEPT table, but which has no employees in EMP. And the new transformation is not useful in that case.</p>
+<h3>11g behaviour</h3>
+<p>Now, I&#8217;m running the following query to check all the departments that have at least one employee:<br />
+I can write it with IN:</p>
+<pre><code>
+PLAN_TABLE_OUTPUT
+ ------------------------------------------------------------------------
+ SQL_ID 6y71msam9w32r, child number 0
+ -------------------------------------
+ select distinct deptno,dname from dept
+ where deptno in ( select deptno from emp)
+&nbsp;
+Plan hash value: 1754319153
+&nbsp;
+------------------------------------------------------------------------
+| Id  | Operation          | Name | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |      |      1 |        |      4 |      15 |
+|*  1 |  HASH JOIN SEMI    |      |      1 |      4 |      4 |      15 |
+|   2 |   TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   3 |   TABLE ACCESS FULL| EMP  |      1 |  15068 |    388 |       8 |
+------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+ ---------------------------------------------------
+&nbsp;
+   1 - access("DEPTNO"="DEPTNO")
+</code></pre>
+<p>or with EXISTS:</p>
+<pre><code>
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------
+SQL_ID  cbpa3zjtzfzrn, child number 0
+-------------------------------------
+select distinct deptno,dname from dept
+ where exists ( select 1 from emp where emp.deptno=dept.deptno)
+&nbsp;
+Plan hash value: 1754319153
+&nbsp;
+------------------------------------------------------------------------
+| Id  | Operation          | Name | Starts | E-Rows | A-Rows | Buffers |
+------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |      |      1 |        |      4 |      15 |
+|*  1 |  HASH JOIN SEMI    |      |      1 |      4 |      4 |      15 |
+|   2 |   TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   3 |   TABLE ACCESS FULL| EMP  |      1 |  15068 |    388 |       8 |
+------------------------------------------------------------------------
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   1 - access("DEPTNO"="DEPTNO")
+</code></pre>
+<p>Both are good. We didn&#8217;t have to read the whole EMP table. I have 15000 rows in my table, I do a full scan on it, but look at the A-Rows: only 388 rows were actually read.</p>
+<p>The HASH JOIN first read the DEPT table in order to build the hash table. So it already knows that we cannot have more than 4 distinct departments.</p>
+<p>Then we do the join to EMP just to check which of those departments have an employee. But we can stop as soon as we find the 4 departments. This is the reason why we have read only 388 rows here. And this is exactly what a Semi Join is: we don&#8217;t need all the matching rows, we return at most one row per matching pair.</p>
+<p>Ok. What if we write the join ourselves?</p>
+<pre><code>
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------
+SQL_ID  2xjj9jybqja87, child number 1
+-------------------------------------
+select distinct deptno,dname from dept join emp using(deptno)
+&nbsp;
+Plan hash value: 2962452962
+&nbsp;
+-------------------------------------------------------------------------
+| Id  | Operation           | Name | Starts | E-Rows | A-Rows | Buffers |
+-------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |      |      1 |        |      4 |     129 |
+|   1 |  HASH UNIQUE        |      |      1 |  15068 |      4 |     129 |
+|*  2 |   HASH JOIN         |      |      1 |  15068 |  14014 |     129 |
+|   3 |    TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   4 |    TABLE ACCESS FULL| EMP  |      1 |  15068 |  14014 |     122 |
+-------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - access("DEPT"."DEPTNO"="EMP"."DEPTNO")
+</code></pre>
+<p>Bad luck. We have to read all the rows. More rows and more buffers.</p>
+<h3>12c behaviour</h3>
+<p>Let&#8217;s do the same in 12.1.0.1:</p>
+<pre><code>
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------
+SQL_ID  2xjj9jybqja87, child number 0
+-------------------------------------
+select distinct deptno,dname from dept join emp using(deptno)
+&nbsp;
+Plan hash value: 1629510749
+&nbsp;
+-------------------------------------------------------------------------
+| Id  | Operation           | Name | Starts | E-Rows | A-Rows | Buffers |
+-------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |      |      1 |        |      4 |      14 |
+|   1 |  HASH UNIQUE        |      |      1 |      4 |      4 |      14 |
+|*  2 |   HASH JOIN SEMI    |      |      1 |      4 |      4 |      14 |
+|   3 |    TABLE ACCESS FULL| DEPT |      1 |      4 |      4 |       7 |
+|   4 |    TABLE ACCESS FULL| EMP  |      1 |  15068 |    388 |       7 |
+-------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - access("DEPT"."DEPTNO"="EMP"."DEPTNO")
+</code></pre>
+<p>Same plan but less rows have been read. If we check the outlines, we see the new feature:</p>
+<pre><code>
+      PARTIAL_JOIN(@"SEL$58A6D7F6" "EMP"@"SEL$1")
+</code></pre>
+<p>And here is what we see in the optimizer trace:</p>
+<pre><code>
+OPTIMIZER STATISTICS AND COMPUTATIONS
+PJE: Checking validity of partial join eval on query block SEL$58A6D7F6 (#1)
+PJE: Passed validity of partial join eval by query block SEL$58A6D7F6 (#1)
+PJE: Partial join eval conversion for query block SEL$58A6D7F6 (#1).
+PJE: Table marked for partial join eval: EMP[EMP]#1
+</code></pre>
+<p>The hints that control the feature are PARTIAL_JOIN and NO_PARTIAL_JOIN and the transformation is enabled by _optimizer_partial_join_eval which appeared in 12<i>c</i>.</p>
+<p>But of course, the optimization is useful only when we have all the values at the beginning of the table. This is why I added at least one employee in department 40. If there are some rows in DEPT that have no matching row in EMP, then Oracle cannot know the result before reaching the end of the table.</p>
+
+</div>
+</body>
+</html>

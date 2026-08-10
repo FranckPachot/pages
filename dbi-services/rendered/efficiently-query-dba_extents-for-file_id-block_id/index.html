@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/efficiently-query-dba_extents-for-file_id-block_id/">
+<title>Efficiently query DBA_EXTENTS for FILE_ID / BLOCK_ID</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/efficiently-query-dba_extents-for-file_id-block_id/">https://www.dbi-services.com/blog/efficiently-query-dba_extents-for-file_id-block_id/</a> (2020-12-15)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Efficiently query DBA_EXTENTS for FILE_ID / BLOCK_ID</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+<i>This was initially posted to CERN Database blog on Thursday, 27 September 2018 where it seems to be lost. Here is a copy thanks to <a href="https://web.archive.org/web/20191229201611/https://db-blog.web.cern.ch/blog/franck-pachot/2018-09-efficiently-query-dbaextents-fileid-blockid" target="_blank" rel="noopener noreferrer">web.archive.org</a></i></p>
+<p>Did you ever try to query DBA_EXTENTS on a very large database with LMT tablespaces? I had to, in the past, in order to find which segment a corrupt block belonged to. The information about extent allocation is stored in the datafiles headers, visible though X$KTFBUE, and queries on it can be very expensive. In addition to that, the optimizer tends to start with the segments and get to this X$KTFBUE for each of them. At this time, I had quickly created a view on the internal dictionary tables, forcing to start by X$KTFBUE with materialized CTE, to replace DBA_EXTENTS. I published this on <a href="https://www.dba-village.com/village/dvp_scripts.ScriptDetails?ScriptIdA=2543" target="_blank" rel="noopener noreferrer">dba-village</a> in 2006.</p>
+<p>I recently wanted to know the segment/extend for a hot block, identified by its file_id and block_id on a 900TB database with 7000 datafiles and 90000 extents, so I went back to this old query and I got my result in 1 second. The idea is to be sure that we start with the file (X$KCCFE) and then get to the extent allocation (X$KTFBUE) before going to the segments:</p>
+<p><a href="../../assets/CaptureExtentMap.png"><img loading="lazy" decoding="async" class="aligncenter size-full wp-image-46158" src="../../assets/CaptureExtentMap.png" alt="" width="1262" height="730" /></a></p>
+<p>So here is the query:</p>
+<pre><code>
+column owner format a6
+column segment_type format a20
+column segment_name format a15
+column partition_name format a15
+set linesize 200
+set timing on time on echo on autotrace on stat
+WITH
+ l AS ( /* LMT extents indexed on ktfbuesegtsn,ktfbuesegfno,ktfbuesegbno */
+  SELECT ktfbuesegtsn segtsn,ktfbuesegfno segrfn,ktfbuesegbno segbid, ktfbuefno extrfn,
+         ktfbuebno fstbid,ktfbuebno + ktfbueblks - 1 lstbid,ktfbueblks extblks,ktfbueextno extno
+  FROM sys.x$ktfbue
+ ),
+ d AS ( /* DMT extents ts#, segfile#, segblock# */
+  SELECT ts# segtsn,segfile# segrfn,segblock# segbid, file# extrfn,
+         block# fstbid,block# + length - 1 lstbid,length extblks, ext# extno
+  FROM sys.uet$
+ ),
+ s AS ( /* segment information for the tablespace that contains afn file */
+  SELECT /*+ materialized */
+  f1.fenum afn,f1.ferfn rfn,s.ts# segtsn,s.FILE# segrfn,s.BLOCK# segbid ,s.TYPE# segtype,f2.fenum segafn,t.name tsname,blocksize
+  FROM sys.seg$ s, sys.ts$ t, sys.x$kccfe f1,sys.x$kccfe f2
+  WHERE s.ts#=t.ts# AND t.ts#=f1.fetsn AND s.FILE#=f2.ferfn AND s.ts#=f2.fetsn
+ ),
+ m AS ( /* extent mapping for the tablespace that contains afn file */
+SELECT /*+ use_nl(e) ordered */
+ s.afn,s.segtsn,s.segrfn,s.segbid,extrfn,fstbid,lstbid,extblks,extno, segtype,s.rfn, tsname,blocksize
+ FROM s,l e
+ WHERE e.segtsn=s.segtsn AND e.segrfn=s.segrfn AND e.segbid=s.segbid
+ UNION ALL
+ SELECT /*+ use_nl(e) ordered */
+ s.afn,s.segtsn,s.segrfn,s.segbid,extrfn,fstbid,lstbid,extblks,extno, segtype,s.rfn, tsname,blocksize
+ FROM s,d e
+  WHERE e.segtsn=s.segtsn AND e.segrfn=s.segrfn AND e.segbid=s.segbid
+ UNION ALL
+ SELECT /*+ use_nl(e) use_nl(t) ordered */
+ f.fenum afn,null segtsn,null segrfn,null segbid,f.ferfn extrfn,e.ktfbfebno fstbid,e.ktfbfebno+e.ktfbfeblks-1 lstbid,e.ktfbfeblks extblks,null extno, null segtype,f.ferfn rfn,name tsname,blocksize
+ FROM sys.x$kccfe f,sys.x$ktfbfe e,sys.ts$ t
+ WHERE t.ts#=f.fetsn and e.ktfbfetsn=f.fetsn and e.ktfbfefno=f.ferfn
+ UNION ALL
+ SELECT /*+ use_nl(e) use_nl(t) ordered */
+ f.fenum afn,null segtsn,null segrfn,null segbid,f.ferfn extrfn,e.block# fstbid,e.block#+e.length-1 lstbid,e.length extblks,null extno, null segtype,f.ferfn rfn,name tsname,blocksize
+ FROM sys.x$kccfe f,sys.fet$ e,sys.ts$ t
+ WHERE t.ts#=f.fetsn and e.ts#=f.fetsn and e.file#=f.ferfn
+ ),
+ o AS (
+  SELECT s.tablespace_id segtsn,s.relative_fno segrfn,s.header_block   segbid,s.segment_type,s.owner,s.segment_name,s.partition_name
+  FROM SYS_DBA_SEGS s
+ ),
+datafile_map as (
+SELECT
+ afn file_id,fstbid block_id,extblks blocks,nvl(segment_type,decode(segtype,null,'free space','type='||segtype)) segment_type,
+ owner,segment_name,partition_name,extno extent_id,extblks*blocksize bytes,
+ tsname tablespace_name,rfn relative_fno,m.segtsn,m.segrfn,m.segbid
+ FROM m,o WHERE extrfn=rfn and m.segtsn=o.segtsn(+) AND m.segrfn=o.segrfn(+) AND m.segbid=o.segbid(+)
+UNION ALL
+SELECT
+ file_id+(select to_number(value) from v$parameter WHERE name='db_files') file_id,
+ 1 block_id,blocks,'tempfile' segment_type,
+ '' owner,file_name segment_name,'' partition_name,0 extent_id,bytes,
+  tablespace_name,relative_fno,0 segtsn,0 segrfn,0 segbid
+ FROM dba_temp_files
+)
+select * from datafile_map where file_id=5495 and 11970455 between block_id and block_id+blocks
+</code></pre>
+<p>And here is the result, with execution statistics:</p>
+<pre><code>
+
+   FILE_ID   BLOCK_ID     BLOCKS SEGMENT_TYPE         OWNER  SEGMENT_NAME    PARTITION_NAME    EXTENT_ID      BYTES TABLESPACE_NAME      RELATIVE_FNO     SEGTSN     SEGRFN    SEGBID
+---------- ---------- ---------- -------------------- ------ --------------- ---------------- ---------- ---------- -------------------- ------------ ---------- ---------- ----------
+      5495   11964544            8192 INDEX PARTITION LHCLOG DN_PK           PART_DN_20161022 1342         67108864 LOG_DATA_20161022            1024       6364       1024        162
+
+Elapsed: 00:00:01.25
+
+Statistics
+----------------------------------------------------------
+        103  recursive calls
+       1071  db block gets
+      21685  consistent gets
+        782  physical reads
+        840  redo size
+       1548  bytes sent via SQL*Net to client
+        520  bytes received via SQL*Net from client
+          2  SQL*Net roundtrips to/from client
+          0  sorts (memory)
+          0  sorts (disk)
+          1  rows processed
+</code></pre>
+<p>Knowing the segment from the block address is important in performance tuning, when we get the file_id/block_id from wait event parameters. It is even more important when a block corrution is detected ans having a fast query may help.</p>
+
+</div>
+</body>
+</html>

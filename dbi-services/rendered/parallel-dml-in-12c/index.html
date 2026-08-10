@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/parallel-dml-in-12c/">
+<title>Parallel DML in 12c</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/parallel-dml-in-12c/">https://www.dbi-services.com/blog/parallel-dml-in-12c/</a> (2015-06-12)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Parallel DML in 12c</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Following a <a href="https://community.oracle.com/message/13118790?et=watches.email.thread#13117716">question</a> from Randolf Geist (who can imagine that there is something about parallel query that Randolf didn&#8217;t know?), I get back to some notes I&#8217;ve taken when 12c was out and I&#8217;ve tested them again on 12.1.0.2 &#8211; it&#8217;s about the ability to enable parallel DML at query level.</p>
+<h3>Test case</h3>
+<p>In 12.1.0.2 I create two tables. DEMO1 has 100000 rows and is about 80MB. DEMO2 is empty. DEMO1 is parallel.</p>
+<pre><code>SQL&gt; create table DEMO1 parallel 2 as
+  2  select rownum id , ora_hash(rownum,10) a from xmltable('1 to 1000000');
+
+Table created.
+
+SQL&gt; select table_name,num_rows,blocks from user_tables where table_name='DEMO';
+
+TABLE_NAME   NUM_ROWS     BLOCKS
+---------- ---------- ----------
+DEMO           100000      10143
+
+SQL&gt;
+SQL&gt; create table DEMO2 as select * from DEMO1 where null is not null;
+
+Table created.
+
+SQL&gt;
+SQL&gt; alter session set statistics_level=all;
+
+Session altered.
+
+</code></pre>
+<h3>insert &#8230; select &#8230;</h3>
+<p>Here is a simple insert as select:</p>
+<pre><code>SQL&gt; insert into DEMO2 select * from DEMO1;
+
+1000000 rows created.
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+-----------------------------------------------------------------------------------------------
+SQL_ID  bx27xdnkr7dvw, child number 0
+-------------------------------------
+insert into DEMO2 select * from DEMO1
+
+Plan hash value: 4271246053
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation                | Name     | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT         |          |      1 |        |      0 |00:00:17.40 |   24311 |
+|   1 |  LOAD TABLE CONVENTIONAL | DEMO2    |      1 |        |      0 |00:00:17.40 |   24311 |
+|   2 |   PX COORDINATOR         |          |      1 |        |   1000K|00:00:04.49 |       5 |
+|   3 |    PX SEND QC (RANDOM)   | :TQ10000 |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|   4 |     PX BLOCK ITERATOR    |          |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|*  5 |      TABLE ACCESS FULL   | DEMO1    |      0 |   1000K|      0 |00:00:00.01 |       0 |
+-----------------------------------------------------------------------------------------------
+
+Note
+-----
+   - Degree of Parallelism is 2 because of table property
+   - PDML is disabled in current session
+
+</code></pre>
+<p>The select part is done in parallel (it&#8217;s below the coordinator) but the insert part (LOAD TABLE) is above the coordinator, which means that it is done in serial by the coordinator. In 12.1.0.2 you have no doubt: dbms_xplan has a note to tell you that PDML was not used and it gives the reason: it&#8217;s not enabled in the session.</p>
+<p>When you have tuning pack the parallel queries are monitored by default, so we can get the SQL Monitor Plan. You can get it as text, html or flash but I&#8217;ll use <a href="http://www.orachrome.com/en/index.html">Lighty</a> here as I find it awesome for that as well:</p>
+<p><a class="easyblog-thumb-preview" title="PDML1.png" href="../../assets/PDML1.png"><img decoding="async" title="PDML1.png" src="../../assets/PDML1.png" alt="PDML1.png" /></a></p>
+<p>Look at the bottom right which details the highlighted plan line: 100% of the load has been done by my session process.</p>
+<h3>Enable parallel dml</h3>
+<p>So we need to enable parallel DML for our session. Do you know why? Because inserting in parallel requires to lock the table (or partition) it is inserted into, so the optimizer cannot decide that without our permission. So let&#8217;s enable parallel DML:</p>
+<pre><code>SQL&gt; alter session enable parallel dml;
+ERROR:
+ORA-12841: Cannot alter the session parallel DML state within a transaction
+
+</code></pre>
+<p>I cannot do that here because I have a transaction in progress. But in 12c you can also enable parallel DML at query level, with the ENABLE_PARALLEL_DML hint. I&#8217;ve seen it when 12c came out, but it was undocumented. But I discover today that it is documented in the <a href="https://docs.oracle.com/database/121/VLDBG/GUID-5EB01FA8-030B-45BB-9B16-2D13881F6010.htm">Enable Parallel DML Mode</a> of the Database VLDB and Partitioning Guide.</p>
+<p>With the DISABLE_PARALLEL_DML hint you can disable PDML at query level when you have enabled it in the session. And with the ENABLE_PARALLEL_DML hint you can enable PDML for one query even when it&#8217;s not enabled in the session. And you can do that even if you have a transaction in progress:</p>
+<pre><code>SQL&gt; insert /*+ enable_parallel_dml */ into DEMO2 select * from DEMO1;
+
+1000000 rows created.
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+-----------------------------------------------------------------------------------------------
+SQL_ID  707bk8y125hp4, child number 0
+-------------------------------------
+insert /*+ enable_parallel_dml */ into DEMO2 select * from DEMO1
+
+Plan hash value: 4271246053
+
+-----------------------------------------------------------------------------------------------
+| Id  | Operation                | Name     | Starts | E-Rows | A-Rows |   A-Time   | Buffers |
+-----------------------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT         |          |      1 |        |      0 |00:00:18.76 |   22343 |
+|   1 |  LOAD TABLE CONVENTIONAL | DEMO2    |      1 |        |      0 |00:00:18.76 |   22343 |
+|   2 |   PX COORDINATOR         |          |      1 |        |   1000K|00:00:04.22 |       5 |
+|   3 |    PX SEND QC (RANDOM)   | :TQ10000 |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|   4 |     PX BLOCK ITERATOR    |          |      0 |   1000K|      0 |00:00:00.01 |       0 |
+|*  5 |      TABLE ACCESS FULL   | DEMO1    |      0 |   1000K|      0 |00:00:00.01 |       0 |
+-----------------------------------------------------------------------------------------------
+
+Note
+-----
+   - Degree of Parallelism is 2 because of table property
+   - PDML disabled because object is not decorated with parallel clause
+   - Direct Load disabled because no append hint given and not executing in parallel
+
+</code></pre>
+<p>Ok. I&#8217;ve enabled PDML but PDML occurs only when in parallel. Here the table has no parallel degree and there is no PARALLEL hint. Once again dbms_xplan gives us the reason. And because it&#8217;s not PDML and there is no append hint, then it&#8217;s not loaded in direct-path.</p>
+<p>Here is the SQL Monitoring plan. Note that is the same as the previous one except that it&#8217;s not the same cost. I don&#8217;t know why yet. If you have any idea, please comment.</p>
+<p><a class="easyblog-thumb-preview" title="PDML2.png" href="../../assets/PDML2.png"><img decoding="async" title="PDML2.png" src="../../assets/PDML2.png" alt="PDML2.png" /></a></p>
+<h3>Enable parallel DML while in a transaction</h3>
+<p>I disable PDML and start a transaction:</p>
+<pre><code>SQL&gt; commit;
+
+Commit complete.
+
+SQL&gt; alter session disable parallel dml;
+
+Session altered.
+
+SQL&gt; delete from DEMO1 where rownum
+SQL&gt; select status,used_urec from v$transaction where ses_addr=(select saddr from v$session where sid=sys_context('userenv','sid'));
+
+STATUS            USED_UREC
+---------------- ----------
+ACTIVE                 1000
+
+</code></pre>
+<p>And while I&#8217;m within that transaction, Let&#8217;s do the parallel insert enabled by hint:</p>
+<pre><code>SQL&gt; insert /*+ parallel enable_parallel_dml */ into DEMO2 select * from DEMO1;
+
+999000 rows created.
+
+SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'allstats last'));
+
+PLAN_TABLE_OUTPUT
+-------------------------------------------------------------------------------------------------------
+SQL_ID  2b8q4k902pbdx, child number 1
+-------------------------------------
+insert /*+ parallel enable_parallel_dml */ into DEMO2 select * from DEMO1
+
+Plan hash value: 86785878
+
+-------------------------------------------------------------------------------------------------------
+| Id  | Operation                          | Name | Starts | A-Rows | Buffers | OMem |1Mem | Used-Mem |
+-------------------------------------------------------------------------------------------------------
+|   0 | INSERT STATEMENT                   |      |      1 |      4 |     136 |      |     |          |
+|   1 |  PX COORDINATOR                    |      |      1 |      4 |     136 |      |     |          |
+|   2 |   PX SEND QC (RANDOM)              | :TQ10|      0 |      0 |       0 |      |     |          |
+|   3 |    LOAD AS SELECT (HYBRID TSM/HWMB)|      |      0 |      0 |       0 |   33M|  33M| 2068K (0)|
+|   4 |     OPTIMIZER STATISTICS GATHERING |      |      0 |      0 |       0 |      |     |          |
+|   5 |      PX BLOCK ITERATOR             |      |      0 |      0 |       0 |      |     |          |
+|*  6 |       TABLE ACCESS FULL            | DEMO1|      0 |      0 |       0 |      |     |          |
+-------------------------------------------------------------------------------------------------------
+
+Note
+-----
+   - automatic DOP: Computed Degree of Parallelism is 2
+
+</code></pre>
+<p>Here PDML occurred. We know that because of the load operator under the coordinator (Note to self: HYBRID TSM/HWMB is something to investigate &#8211; once again comments welcome). I&#8217;ve displayed the plan with &#8216;allstats last&#8217; which show only the coordinator activity. SQL Monitor can show all:</p>
+<p><a class="easyblog-thumb-preview" title="PDML5.png" href="../../assets/PDML5.png"><img decoding="async" title="PDML5.png" src="../../assets/PDML5.png" alt="PDML5.png" /></a></p>
+<h3>Conclusion</h3>
+<p>Yes you can enable PDML at query level in 12c and it is documented. And you can do it even when within a transaction which is a restriction only for &#8216;alter session enable parallel dml&#8217; but not for that hint.</p>
+
+</div>
+</body>
+</html>

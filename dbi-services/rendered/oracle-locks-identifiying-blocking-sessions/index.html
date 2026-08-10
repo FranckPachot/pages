@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-locks-identifiying-blocking-sessions/">
+<title>Oracle locks: Identifying blocking sessions</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-locks-identifiying-blocking-sessions/">https://www.dbi-services.com/blog/oracle-locks-identifiying-blocking-sessions/</a> (2014-11-17)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle locks: Identifying blocking sessions</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+When you have sessions blocked on locks, you probably have all information about the waiters (they call you and anyway their waiting session is visible in v$session our ASH). But you usually need to get enough information that help to identify the blocker.</p>
+<p>Here is a query I use to get that quickly, based on V$WAIT_CHAINS</p>
+<p>Here is the result I want to get:</p>
+<pre class="brush: actionscript3; gutter: false; first-line: 1">session                 wait event                                      minutes USER PRO
+----------------------- ----------------------------------------------- ------- ---- ---
+ ABCLBP1 '831,54109@1'  SQL*Net message from client                        13.5 SYS  sql
+  ABCLBP4 '395,21891@4' enq: TX - row lock contention on TABLE             13.2 SYS  SQL
+                          "SYS"."TEST_FRANCK" on rowid AAC0aCAAnAAABSCAAA
+
+</pre>
+<p>I have information about blocking session, waiting session, the type of lock (here TX &#8211; row lock) and because it is a row lock I want to know the ROWID of the locked row.</p>
+<p>Here is the query I used to get it:</p>
+<pre class="brush: actionscript3; gutter: false; first-line: 1">column "wait event" format a50 word_wrap
+column "session" format a25
+column "minutes" format 9999D9
+column CHAIN_ID noprint
+column N noprint
+column l noprint
+with w as (
+select
+ chain_id,rownum n,level l
+ ,lpad(' ',level,' ')||(select instance_name from gv$instance where inst_id=w.instance)||' '''||w.sid||','||w.sess_serial#||'@'||w.instance||'''' "session"
+ ,lpad(' ',level,' ')||w.wait_event_text ||
+   case
+   when w.wait_event_text like 'enq: TM%' then
+    ' mode '||decode(w.p1 ,1414332418,'Row-S' ,1414332419,'Row-X' ,1414332420,'Share' ,1414332421,'Share RX' ,1414332422,'eXclusive')
+     ||( select ' on '||object_type||' "'||owner||'"."'||object_name||'" ' from all_objects where object_id=w.p2 )
+   when w.wait_event_text like 'enq: TX%' then
+    (
+     select ' on '||object_type||' "'||owner||'"."'||object_name||'" on rowid '
+     ||dbms_rowid.rowid_create(1,data_object_id,relative_fno,w.row_wait_block#,w.row_wait_row#)
+     from all_objects ,dba_data_files where object_id=w.row_wait_obj# and w.row_wait_file#=file_id
+    )
+   end "wait event"
+ , w.in_wait_secs/60 "minutes"
+ , s.username , s.program
+ from v$wait_chains w join gv$session s on (s.sid=w.sid and s.serial#=w.sess_serial# and s.inst_id=w.instance)
+ connect by prior w.sid=w.blocker_sid and prior w.sess_serial#=w.blocker_sess_serial# and prior w.instance = w.blocker_instance
+ start with w.blocker_sid is null
+)
+select * from w where chain_id in (select chain_id from w group by chain_id having max("minutes") &gt;= 1 and max(l)&gt;1 )
+order by n
+/
+</pre>
+<p>This query retrieves the wait chains where a session is waiting for more than one minute on a table lock (TM) or row lock (TX) .</p>
+<p>When it is a table lock (TM), I get the locked object_id from the P2 parameter, in order to know the table name.</p>
+<p>When it is a row lock, I get the table and rowid from V$SESSION. Note that I have to join with dba_data_files in order to convert the absolute file_id to a relative one, and to join to dba_objects in order to convert the object_id to the data_object_id one &#8211; in order to built the ROWID.</p>
+<p>More information about ROWID, relative file number and data object id in my previous post: <a href="/from-80-extended-rowid-to-12c-pluggable-db-or-why-oracle-database-is-still-a-great-software">From 8.0 extended rowid to 12c pluggable db: Why Oracle Database is still a great software</a></p>
+
+</div>
+</body>
+</html>

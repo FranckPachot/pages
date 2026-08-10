@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-12cr2-multitenant-local-undo/">
+<title>Oracle 12cR2 multitenant: Local UNDO</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-12cr2-multitenant-local-undo/">https://www.dbi-services.com/blog/oracle-12cr2-multitenant-local-undo/</a> (2016-11-08)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle 12cR2 multitenant: Local UNDO</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Pluggable Databases are supposed to be isolated, containing the whole of user data and metadata. This is the definition of dictionary separation coming with multitenant architecture: only system data and metadata are at CDB level. User data and metadata are in separate tablespaces belonging to the PDB.  And this is what makes the unplug/plug available: because PDB tablespaces contain everything, you can transport their datafiles from one CDB to another.<br />
+However, if they are so isolated, can you explain why</p>
+<ul>
+<li>You cannot flashback a PDB?</li>
+<li>You need an auxiliary instance for PDB Point-In-Time recovery?</li>
+<li>You need to put the PDB read-only before cloning it?</li>
+</ul>
+<p><!--more--><br />
+There is something that is not contained in your PDB but is at CDB level, and which contains user data. The UNDO tablespace is shared:</p>
+<p><a href="../../assets/CaptureLocalUndo001.png"><img loading="lazy" decoding="async" src="../../assets/CaptureLocalUndo001.png" alt="CaptureLocalUndo001" width="888" height="476" class="alignnone size-full wp-image-10686" /></a></p>
+<p>You cannot flashback a PDB because doing so requires to rollback the ongoing transactions at the time you flashback. Information was in UNDO tablespace at that time, but is not there anymore.</p>
+<p>It&#8217;s the same idea with Point-In-Time recovery of PDB. You need to restore the UNDO tablespace to get those UNDO records from the Point-In-Time. But you cannot restore it in place because it&#8217;s shared with other PDBs that need current information. This is why you need an auxiliary instance for PDBPITR in 12.1</p>
+<p>To clone a PDB cannot be done with ongoing transactions because their UNDO is not in the PDB. This is why it can be done only when the PDB is read-only.</p>
+<h3>12.2 Local UNDO</h2>
+<p>In 12.2 you can choose to have one UNDO tablespace per PDB, in local undo mode, which is the default in DBCA:</p>
+<p><a href="../../assets/CaptureLocalUndo000.png"><img loading="lazy" decoding="async" src="../../assets/CaptureLocalUndo000.png" alt="CaptureLocalUndo000" width="753" height="244" class="alignnone size-full wp-image-10687" /></a></p>
+<p>With local undo PDBs are truly isolated even when opened with ongoing transactions:</p>
+<p><a href="../../assets/CaptureLocalUndo002.png"><img loading="lazy" decoding="async" src="../../assets/CaptureLocalUndo002.png" alt="CaptureLocalUndo002" width="876" height="476" class="alignnone size-full wp-image-10685" /></a></p>
+<p>Look at the &#8216;RB segs&#8217; column from RMAN report schema:<br />
+<code><br />
+[oracle@OPC122 ~]$ rman target /<br />
+&nbsp;<br />
+Recovery Manager: Release 12.2.0.1.0 - Production on Tue Nov 8 18:53:46 2016<br />
+&nbsp;<br />
+Copyright (c) 1982, 2016, Oracle and/or its affiliates.  All rights reserved.<br />
+&nbsp;<br />
+connected to target database: CDB1 (DBID=901060295)<br />
+&nbsp;<br />
+RMAN&gt; report schema;<br />
+&nbsp;<br />
+using target database control file instead of recovery catalog<br />
+Report of database schema for database with db_unique_name CDB1<br />
+&nbsp;<br />
+List of Permanent Datafiles<br />
+===========================<br />
+File Size(MB) Tablespace           RB segs Datafile Name<br />
+---- -------- -------------------- ------- ------------------------<br />
+1    880      SYSTEM               YES     /u02/app/oracle/oradata/CDB1/system01.dbf<br />
+3    710      SYSAUX               NO      /u02/app/oracle/oradata/CDB1/sysaux01.dbf<br />
+4    215      UNDOTBS1             YES     /u02/app/oracle/oradata/CDB1/undotbs01.dbf<br />
+5    270      PDB$SEED:SYSTEM      NO      /u02/app/oracle/oradata/CDB1/pdbseed/system01.dbf<br />
+6    560      PDB$SEED:SYSAUX      NO      /u02/app/oracle/oradata/CDB1/pdbseed/sysaux01.dbf<br />
+7    5        USERS                NO      /u02/app/oracle/oradata/CDB1/users01.dbf<br />
+8    180      PDB$SEED:UNDOTBS1    NO      /u02/app/oracle/oradata/CDB1/pdbseed/undotbs01.dbf<br />
+9    270      PDB1:SYSTEM          YES     /u02/app/oracle/oradata/CDB1/PDB1/system01.dbf<br />
+10   590      PDB1:SYSAUX          NO      /u02/app/oracle/oradata/CDB1/PDB1/sysaux01.dbf<br />
+11   180      PDB1:UNDOTBS1        YES     /u02/app/oracle/oradata/CDB1/PDB1/undotbs01.dbf<br />
+12   5        PDB1:USERS           NO      /u02/app/oracle/oradata/CDB1/PDB1/users01.dbf<br />
+&nbsp;<br />
+List of Temporary Files<br />
+=======================<br />
+File Size(MB) Tablespace           Maxsize(MB) Tempfile Name<br />
+---- -------- -------------------- ----------- --------------------<br />
+1    33       TEMP                 32767       /u04/app/oracle/oradata/temp/temp01.dbf<br />
+2    64       PDB$SEED:TEMP        32767       /u04/app/oracle/oradata/temp/temp012016-10-04_11-34-07-330-AM.dbf<br />
+3    100      PDB1:TEMP            100         /u04/app/oracle/oradata/CDB1/PDB1/temp012016-10-04_11-34-07-330-AM.dbf<br />
+</code></p>
+<p>You have an UNDO tablespace in ROOT, in PDB$SEED and in each user PDB.</p>
+<p>If you have a database in shared undo mode, you can move to local undo mode while in &#8216;startup migrate&#8217;. PDBs when opened will have an UNDO tablespace created. You can also create an UNDO tablespace in PDB$SEED. </p>
+<p>Yes, in 12.2, you can open the PDB$SEED read/write for this purpose:</p>
+<p><code><br />
+18:55:59 SQL&gt; alter pluggable database PDB$SEED open read write force;<br />
+&nbsp;<br />
+Pluggable database altered.<br />
+&nbsp;<br />
+18:56:18 SQL&gt; show pdbs;<br />
+&nbsp;<br />
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED<br />
+---------- ------------------------------ ---------- ----------<br />
+         2 PDB$SEED                       READ WRITE NO<br />
+         3 PDB1                           READ WRITE NO<br />
+18:56:23 SQL&gt; alter pluggable database PDB$SEED open read only force;<br />
+&nbsp;<br />
+Pluggable database altered.<br />
+</code><br />
+But remember this is only allowed for local undo migration.</p>
+<p>The recommandation is to run in local undo mode, even in Single-Tenant.</p>
+<p>More about it in the <a href="http://12cr2multitenant.pachot.net">12cR2 Multitenant book</a>:<br />
+<a href="http://12cr2multitenant.pachot.net"><img decoding="async" src="../../assets/51UkZp1tqGL._SX397_BO1204203200_.jpg" alt="" /></a></p>
+
+</div>
+</body>
+</html>

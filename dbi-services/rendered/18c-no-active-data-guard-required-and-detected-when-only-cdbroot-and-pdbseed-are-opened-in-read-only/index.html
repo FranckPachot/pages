@@ -1,0 +1,252 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/18c-no-active-data-guard-required-and-detected-when-only-cdbroot-and-pdbseed-are-opened-in-read-only/">
+<title>18c: No Active Data Guard required (and detected) when only CDB$ROOT and PDB$SEED are opened in read-only</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/18c-no-active-data-guard-required-and-detected-when-only-cdbroot-and-pdbseed-are-opened-in-read-only/">https://www.dbi-services.com/blog/18c-no-active-data-guard-required-and-detected-when-only-cdbroot-and-pdbseed-are-opened-in-read-only/</a> (2018-06-24)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">18c: No Active Data Guard required (and detected) when only CDB$ROOT and PDB$SEED are opened in read-only</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+When you clone a PDB on the primary CDB, you want that the same is automatically done on the standby ones. Unfortunately, for this operation, the CDB must be opened read-only. In 12.1 even the PDB needed to be opened read-only (Ludovico Caldara reported this in <a href="http://www.ludovicocaldara.net/dba/clone-pdb-asm-dg-no-network-transfer/" target="_blank" rel="noopener noreferrer">his blog</a>). This, as far as I know, was fixed in 12.2 where MRP reads the files without the need to have the PDB opened. But another problem comes with online cloning, as reported by Alain Fuhrer in <a href="https://mobiliardbblog.wordpress.com/2017/05/30/oracle-multitenant-12-2-the-big-challenge-of-pdb-hot-cloning-in-maa-environments/" target="_blank" rel="noopener noreferrer">his blog</a>, where the CDB needs to be opened read-only with real-time apply. This again requires the Active Data Guard option, which is then mandatory to use all power from the multitenant option. This brings the use of multitenant from x1.36 the price for this option to x1.61 for both, on the primary and the standby servers. Hopefully, this has been addressed in 18c where you don&#8217;t need the Active Data Guard to have the CDB opened in read-only with real-time apply, as long as you ensure that the user PDB are always closed when apply is on.<br />
+<!--more--><br />
+This test was done on the Oracle Cloud DBaaS because it is very easy to provision a Data Guard configuration. It is 18.1 because this is what is created and the patch apply for 18.2 is not so easy. But behaviour the same in 18.2</p>
+<h3>CDB in MOUNT do not requires ADG</h3>
+<p>The standby is not opened:</p>
+<pre><code>
+SQL&gt; select dbid,name,open_mode,database_role from v$database;
+&nbsp;
+      DBID NAME      OPEN_MODE            DATABASE_ROLE
+---------- --------- -------------------- ----------------
+1507386248 ORCL      MOUNTED              PHYSICAL STANDBY
+&nbsp;
+SQL&gt; show pdbs
+&nbsp;
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       MOUNTED
+         4 PDB1                           MOUNTED
+</code></pre>
+<p>In the primary, we see that the standby destination is in real time apply, but not opened:</p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status;
+&nbsp;
+   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         MOUNTED-STANDBY MANAGED REAL TIME APPLY
+         3 LOG_ARCHIVE_DEST_3   INACTIVE  LOCAL            UNKNOWN         IDLE
+         4 LOG_ARCHIVE_DEST_4   INACTIVE  LOCAL            UNKNOWN         IDLE
+</code></pre>
+<p>This is the information that is logged into DBA_FEATURE_USAGE_STATISTICS. Here is the query that counts the usage of real-time query which is one of the features that require ADG option:</p>
+<pre><code>
+SQL&gt; select count(*) from v$archive_dest_status where status = 'VALID' and recovery_mode like 'MANAGED%QUERY' and database_mode = 'OPEN_READ-ONLY';
+&nbsp;
+  COUNT(*)
+----------
+         0
+</code></pre>
+<p>Here we have no ADG usage recorded because the database is not opened read-only. But if you try some PDB cloning on the primary you will quickly encounter the problems: the PDB on the standby has no datafiles.</p>
+<h3>CDB in READ and PDB closed do not require ADG in 18c</h3>
+<p>I&#8217;ll now open the standby read-only:</p>
+<pre><code>
+SQL&gt; alter database open;
+Database altered.
+&nbsp;
+SQL&gt; show pdbs;
+&nbsp;
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB1                           READ ONLY  NO
+</code></pre>
+<p>Unfortunately, this has also opened the PDB because the saved state was OPEN for the primary database and we cannot manage that properly on the standby (except with Grid Infrastructure or Oracle Restart or custom scripts or database triggers). I close it quickly before the ADG usage is recorded:</p>
+<pre><code>
+SQL&gt; alter pluggable database pdb1 close;
+Pluggable database altered.
+</code></pre>
+<p>So, my standby is opened read-only with real-time apply:</p>
+<pre><code>
+SQL&gt; select dbid,name,open_mode,database_role from v$database;
+&nbsp;
+      DBID NAME      OPEN_MODE            DATABASE_ROLE
+---------- --------- -------------------- ----------------
+1507386248 ORCL      READ ONLY WITH APPLY PHYSICAL STANDBY
+</code></pre>
+<p>but all the user PDBs are not opened:</p>
+<pre><code>
+SQL&gt; show pdbs
+&nbsp;
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB1                           MOUNTED
+</code></pre>
+<p>Here is what we see from the primary about this archive destination:</p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status;
+&nbsp;
+   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         OPEN_READ-ONLY  MANAGED REAL TIME APPLY
+         3 LOG_ARCHIVE_DEST_3   INACTIVE  LOCAL            UNKNOWN         IDLE
+         4 LOG_ARCHIVE_DEST_4   INACTIVE  LOCAL            UNKNOWN         IDLE
+</code></pre>
+<p>This in 12.2 would have recorded the usage of real-time query usage because the standby is opened for queries and we are in managed recovery mode. Here was the 12.2 query to detect it (you can see it in catfusrg.sql):</p>
+<pre><code>
+SQL&gt; select count(*) from v$archive_dest_status where status = 'VALID' and recovery_mode like 'MANAGED%' and database_mode = 'OPEN_READ-ONLY';
+&nbsp;
+  COUNT(*)
+----------
+         1
+</code></pre>
+<p>But the pattern has been changed in 18c to include &#8216;QUERY&#8217;:</p>
+<pre><code>
+SQL&gt; select count(*) from v$archive_dest_status where status = 'VALID' and recovery_mode like 'MANAGED%QUERY' and database_mode = 'OPEN_READ-ONLY';
+&nbsp;
+  COUNT(*)
+----------
+         0
+</code></pre>
+<p>and this &#8216;QUERY&#8217; word is added only when some user pluggable databases are not in MOUNT but opened for queries.</p>
+<p>I check quickly that a PDB clone on the primary:</p>
+<pre><code>
+SQL&gt; create pluggable database PDB2 from PDB1 keystore identified by "Ach1z0#d";
+Pluggable database created.
+&nbsp;
+SQL&gt; alter pluggable database PDB2 open;
+Pluggable database altered.
+</code></pre>
+<p>has the clone created on the standby, in closed mode:</p>
+<pre><code>
+SQL&gt; show pdbs
+&nbsp;
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB1                           MOUNTED
+         5 PDB2                           MOUNTED
+</code></pre>
+<p>So, finally, we have a good way to use multitenant features without the need for Active Data Guard. This is good for DBaaS where we want easy cloning, protect their availability with Data Guard, but with no need to query them on the standby.</p>
+<h3>CDB in READ and PDB opened requires ADG in 18c</h3>
+<p>Now, if I open the PDB:</p>
+<pre><code>
+SQL&gt; select dbid,name,open_mode,database_role from v$database;
+&nbsp;
+      DBID NAME      OPEN_MODE            DATABASE_ROLE
+---------- --------- -------------------- ----------------
+1507386248 ORCL      READ ONLY WITH APPLY PHYSICAL STANDBY
+&nbsp;
+SQL&gt; alter pluggable database pdb1 open;
+&nbsp;
+Pluggable database PDB1 altered.
+&nbsp;
+SQL&gt; show pdbs
+&nbsp;
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB1                           READ ONLY  NO
+</code></pre>
+<p>From the primary, the recovery mode for this standby mentions &#8216;WITH QUERY&#8217; for the managed real time apply:</p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status;
+&nbsp;
+   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         OPEN_READ-ONLY  MANAGED REAL TIME APPLY WITH QUERY
+         3 LOG_ARCHIVE_DEST_3   INACTIVE  LOCAL            UNKNOWN         IDLE
+         4 LOG_ARCHIVE_DEST_4   INACTIVE  LOCAL            UNKNOWN         IDLE
+</code></pre>
+<p>And only in this case the ADG usage is recorded:</p>
+<pre><code>
+SQL&gt; select count(*) from v$archive_dest_status where status = 'VALID' and recovery_mode like 'MANAGED%QUERY' and database_mode = 'OPEN_READ-ONLY';
+&nbsp;
+  COUNT(*)
+----------
+         1
+</code></pre>
+<h3>The proper way to open without activating ADG </h3>
+<p>In the previous test, I had the PDB opened for a short time when I opened the CDB because of the saved state. If you want to avoid this, the proper way is to ensure that the apply is off when you open it so that you do not have, at the same time, a PDB opened and real time apply.</p>
+<p>I&#8217;m back to the state where the standby is in mount and apply on:</p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status where status='VALID';
+&nbsp;
+   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         MOUNTED-STANDBY MANAGED REAL TIME APPLY
+</code></pre>
+<p>I stop the apply in the standby:</p>
+<pre><code>
+DGMGRL&gt; edit database "ORCL_02" set state=apply-off;
+Succeeded.
+</code></pre>
+<p>I check that the primary sees that apply is off:</p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status where status='VALID';
+&nbsp;
+   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         MOUNTED-STANDBY IDLE
+</code></pre>
+<p>I open the standby CDB read-only and ensures that all PDB are closed:</p>
+<pre><code>
+SQL&gt; alter database open;
+Database altered.
+&nbsp;
+SQL&gt; alter pluggable database all close;
+Pluggable database altered.
+&nbsp;
+SQL&gt; show pdbs
+&nbsp;
+    CON_ID CON_NAME                       OPEN MODE  RESTRICTED
+---------- ------------------------------ ---------- ----------
+         2 PDB$SEED                       READ ONLY  NO
+         4 PDB1                           MOUNTED
+</code></pre>
+<p>The primary sees the open state:</p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status where status='VALID';
+&nbsp;
+   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         OPEN_READ-ONLY  IDLE
+</code></pre>
+<p>I can now restart the apply:</p>
+<pre><code>
+DGMGRL&gt; edit database "ORCL_02" set state=apply-on;
+Succeeded.
+</code></pre>
+<p>Then the primary detects the managed recovery </p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status where status='VALID';
+&nbsp;
+   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         OPEN_READ-ONLY  MANAGED
+</code></pre>
+<p>Then once the gap is resolved, we are in real time apply:</p>
+<pre><code>
+SQL&gt; select dest_id,dest_name,status,type,database_mode,recovery_mode from v$archive_dest_status where status='VALID';
+&nbsp;   DEST_ID DEST_NAME            STATUS    TYPE             DATABASE_MODE   RECOVERY_MODE
+---------- -------------------- --------- ---------------- --------------- ----------------------------------
+         1 LOG_ARCHIVE_DEST_1   VALID     LOCAL            OPEN            IDLE
+         2 LOG_ARCHIVE_DEST_2   VALID     PHYSICAL         OPEN_READ-ONLY  MANAGED REAL TIME APPLY
+</code></pre>
+<p>But there is no mention of &#8216;WITH QUERY&#8217; thanks to the closed PDBs, which means that no ADG usage is recorded. In summary, 18c has added two possible values for RECOVERY_MODE: &#8216;MANAGED WITH QUERY&#8217; and &#8216;MANAGED REAL TIME APPLY WITH QUERY&#8217;, and those ones, in multitenant, are for standby CDB opened read-only when at least one user PDB is also opened read-only.</p>
+<p>For DBaaS, you probably run with Grid Infrastructure (because Oracle Restart do not allow databases on ACFS). For single-tenant, this new feature can solve the problem of activating ADG option by mistake, at least if we have good control of PDB states depending on the role.</p>
+
+</div>
+</body>
+</html>

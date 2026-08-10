@@ -1,0 +1,173 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/phantom-session-environment-in-multitenant/">
+<title>Phantom session environment in multitenant?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/phantom-session-environment-in-multitenant/">https://www.dbi-services.com/blog/phantom-session-environment-in-multitenant/</a> (2015-12-27)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Phantom session environment in multitenant?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In multitenant a session can switch from one container to another. There are a few restrictions such as a transaction cannot span multiple containers. But how do sessions parameters behave? It seems that there is a small inconsistency.<br />
+<!--more--><br />
+I was looking at some adaptive plan and SPM behavior (see this tweeter <a href="https://twitter.com/MarisElsins/status/677990324308992000" target="_blank" rel="noopener noreferrer">conversation</a>) and played with the optimizer environment to reproduce the plan I wanted, and then came to a strange behavior. I can understand that a session keep its parameter settings when switching to another container. But not when closing and re-opening the pluggable database. The default values should come then.</p>
+<p>Here is an example.</p>
+<h3>Change in memory value of optimizer parameter</h3>
+<p>This is in 12.1.0.2 latest PSU. I connect to PDB</p>
+<pre><code>
+19:13:10 SQL&gt; alter session set container=PDB;
+Session altered.
+</code></pre>
+<p>and check parameter optimizer_index_cost_adj from memory:</p>
+<pre><code>
+19:13:10 SQL&gt; show parameter optimizer_index_cost_adj;
+&nbsp;
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_index_cost_adj             integer     100
+</code></pre>
+<p>It&#8217;s the default.</p>
+<p>then I set it to one in memory only:</p>
+<pre><code>
+19:37:17 SQL&gt; alter system set optimizer_index_cost_adj=1 scope=memory;
+System altered.
+</code></pre>
+<p>And I run a query and check that the optimizer used that value</p>
+<pre><code>
+19:37:18 SQL&gt; select * from dual;
+&nbsp;
+D
+-
+X
+&nbsp;
+19:37:19 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'+outline'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+--------------------------------------------------------------------------
+SQL_ID  a5ks9fhw2v9s1, child number 0
+-------------------------------------
+select * from dual
+&nbsp;
+Plan hash value: 272002086
+&nbsp;
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+&nbsp;
+Outline Data
+-------------
+&nbsp;
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      OPT_PARAM('optimizer_index_cost_adj' 1)
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$1")
+      FULL(@"SEL$1" "DUAL"@"SEL$1")
+      END_OUTLINE_DATA
+  */
+&nbsp;
+</code></pre>
+<p>Si this is expected, my custom value has been used to optimize the cursor.</p>
+<h3>close and re-open the PDB</h3>
+<p>I close and restart my PDB:</p>
+<pre><code>
+19:37:19 SQL&gt; shutdown immediate
+Pluggable Database closed.
+19:37:21 SQL&gt; startup
+Pluggable Database opened.
+</code></pre>
+<p>As the value was set in memory, it&#8217;s now back to default:</p>
+<pre><code>
+19:36:48 SQL&gt; show parameter optimizer_index_cost_adj;
+&nbsp;
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_index_cost_adj             integer     100
+&nbsp;
+</code></pre>
+<p>and of course, my cursor is not there anymore:</p>
+<pre><code>
+19:36:48 SQL&gt; select sql_id,child_number,first_load_time,con_id from v$sql where sql_id='a5ks9fhw2v9s1';
+&nbsp;
+no rows selected
+</code></pre>
+<p>So now I run again my query and expect the default optimizer environement:</p>
+<pre><code>
+19:36:48 SQL&gt; select dummy from dual;
+&nbsp;
+D
+-
+X
+&nbsp;
+19:36:48 SQL&gt; select * from table(dbms_xplan.display_cursor(format=&gt;'+outline'));
+&nbsp;
+PLAN_TABLE_OUTPUT
+---------------------------------------------------------------------------
+SQL_ID  4au7rzs3y6kzn, child number 0
+-------------------------------------
+select dummy from dual
+&nbsp;
+Plan hash value: 272002086
+&nbsp;
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |       |       |     2 (100)|          |
+|   1 |  TABLE ACCESS FULL| DUAL |     1 |     2 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+&nbsp;
+Outline Data
+-------------
+&nbsp;
+  /*+
+      BEGIN_OUTLINE_DATA
+      IGNORE_OPTIM_EMBEDDED_HINTS
+      OPTIMIZER_FEATURES_ENABLE('12.1.0.2')
+      DB_VERSION('12.1.0.2')
+      OPT_PARAM('optimizer_index_cost_adj' 1)
+      ALL_ROWS
+      OUTLINE_LEAF(@"SEL$1")
+      FULL(@"SEL$1" "DUAL"@"SEL$1")
+      END_OUTLINE_DATA
+  */
+</code></pre>
+<p>And my new cursor has used the optimizer_index_cost_adj=1 which is not what I expected at all.<br />
+Does that mean that session parameters remain across PDB close/start?<br />
+No according to &#8216;show parameter&#8217;:</p>
+<pre><code>
+19:37:07 SQL&gt; show parameter optimizer_index_cost_adj;
+&nbsp;
+NAME                                 TYPE        VALUE
+------------------------------------ ----------- ------------------------------
+optimizer_index_cost_adj             integer     100
+&nbsp;
+</code></pre>
+<p>but yes according to V$SES_OPTIMIZER_ENV:</p>
+<pre><code>
+19:37:07 SQL&gt; select sid,name,value from v$ses_optimizer_env where name='optimizer_index_cost_adj' and sid=sys_context('userenv','sid');
+&nbsp;
+       SID NAME                                     VALUE
+---------- ---------------------------------------- -------------------------
+        35 optimizer_index_cost_adj                 1
+&nbsp;
+</code></pre>
+<h3>Conclusion</h3>
+<p>I&#8217;ve reproduced the same when re-connecting (instead of changing session container) and even when connecting to another PDB.<br />
+In my opinion, this is a bug. The session parameters should be reinitialized when re-connecting. So be careful.</p>
+<h3>Update 12-JUL-2016</h3>
+<p>See Maciej Tokar <a href="http://dba24.pl/2016/07/07/alter-system-cdb-params-hack-from-pdb-a-bug-or-a-feature/">post</a> about this issue (my case being only one effect)</p>
+
+</div>
+</body>
+</html>

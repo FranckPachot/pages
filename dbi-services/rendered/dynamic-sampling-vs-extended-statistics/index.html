@@ -1,0 +1,153 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/dynamic-sampling-vs-extended-statistics/">
+<title>Dynamic Sampling vs. Extended Statistics</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/dynamic-sampling-vs-extended-statistics/">https://www.dbi-services.com/blog/dynamic-sampling-vs-extended-statistics/</a> (2017-11-14)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Dynamic Sampling vs. Extended Statistics</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+On datawarehouse databases, I frequently recommend increasing the level of dynamic sampling because:</p>
+<ul>
+<li>Queries have complex predicates with AND, OR, IN(), ranges and correlated values for which the optimizer cannot estimate the cardinality properly</li>
+<li>Queries are long anyway (compared to OLTP) and can afford more parse time to get an optimized execution plan</li>
+</ul>
+<p>However, there&#8217;s a drawback with this approach because sometimes the dynamic sampling estimation may give bad estimations, and supersedes the static statistics which were better. Here is an example in 12.2.0.1<br />
+<!--more--><br />
+I run with the following parameters:</p>
+<pre><code>
+SQL&gt; show parameter adaptive;
+NAME                              TYPE    VALUE
+--------------------------------- ------- -----
+optimizer_adaptive_plans          boolean TRUE
+optimizer_adaptive_reporting_only boolean FALSE
+optimizer_adaptive_statistics     boolean FALSE
+optimizer_dynamic_sampling        integer 4
+</code></pre>
+<p>The Dynamic Sampling level comes from previous version (11<em>g</em>) and the Adaptive Statistics have been disabled because of all the problems seen in 12<em>c</em>R1 with Adaptive Dynamic Sampling bugs.</p>
+<p>I have a query with very bad response time for some values, going to nested loops for 50000 rows. The reason is an under-estimate in the following part of the query:</p>
+<pre><code>
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+&amp;nbspM
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID |    82 |   574 |   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - filter(UPPER("OPRID")='QWERTZ')
+&nbsp;
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=4)
+</code></pre>
+<p>The estimation is 82 rows but there are actually 50000 rows. We can see dynamic sampling. The misestimate is probably caused by a sample too small.</p>
+<p>Ok, a query with an UPPER() function on the column is not a good idea. Let&#8217;s try to gather statistics for the expression:</p>
+<pre><code>
+SQL&gt; exec dbms_stats.gather_table_stats('APP_OWNR','TBL_APPLICATION1_ID',method_opt=&gt;'for all columns size auto for columns (upper(OPRID)) size auto');
+PL/SQL procedure successfully completed.
+&nbsp;
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+&nbsp;
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID |    82 |   574 |   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - filter(UPPER("OPRID")='QWERTZ')
+PLAN_TABLE_OUTPUT
+&nbsp;
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=4)
+</code></pre>
+<p>We have the same misestimate. But the problem is not our statistics on expression. This query is still doing dynamic sampling.</p>
+<p>Here&#8217;s the proof that we have good static statistics:</p>
+<pre><code>
+SQL&gt; alter session set optimizer_dynamic_sampling=2;
+Session altered.
+&nbsp;
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+&nbsp;
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID | 48594 |   332K|   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - filter(UPPER("OPRID")='QWERTZ')
+</code></pre>
+<p>Dynamic Sampling did not occur at level 2. Now the estimation is ok thanks to the extended statistics. I have a top-frequency histogram where the cardinality of popular value is exact.</p>
+<p>The problem is that dynamic sampling is supposed to add more information to the optimizer, but in this case, it replaces the static statistics. In level 4, dynamic sampling is done as soon as there is a complex predicate in the where clause. And the use of the UPPER() function is considered as a complex predicate. However, in this case, because I have extended statistics, it should be considered as a simple column=value predicate. </p>
+<p>Here I&#8217;ve set dynamic sampling manually, but this is also what happens when SQL Plan Directives trigger the use of Dynamic Sampling and the good histogram is ignored. This reminds me a <a href="http://www.ludovicocaldara.net/dba/sql-plan-directives-problem/" target="_blank" rel="noopener noreferrer">Ludovico Caldara blog post about SPD</a>.</p>
+<p>Here, maybe, the solution would be Adaptive Dynamic Sampling which may increase the level of sampling when needed:</p>
+<pre><code>
+SQL&gt; alter session set optimizer_dynamic_sampling=11;
+Session altered.
+&nbsp;
+SQL&gt; explain plan for
+  2  SELECT count(*) FROM "APP_OWNR"."TBL_APPLICATION1_ID" "TBL_APPLICATION1_ID"  WHERE upper("TBL_APPLICATION1_ID"."OPRID") =upper ('qwertz');
+Explained.
+SQL&gt; select * from table(dbms_xplan.display);
+PLAN_TABLE_OUTPUT
+Plan hash value: 2187255533
+&nbsp;
+------------------------------------------------------------------------------------------
+| Id  | Operation          | Name                | Rows  | Bytes | Cost (%CPU)| Time     |
+------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |                     |     1 |     7 |   964   (1)| 00:00:01 |
+|   1 |  SORT AGGREGATE    |                     |     1 |     7 |            |          |
+|*  2 |   TABLE ACCESS FULL| TBL_APPLICATION1_ID | 37831 |   258K|   964   (1)| 00:00:01 |
+------------------------------------------------------------------------------------------
+&nbsp;
+Predicate Information (identified by operation id):
+---------------------------------------------------
+&nbsp;
+   2 - filter(UPPER("OPRID")='QWERTZ')
+&nbsp;
+Note
+-----
+   - dynamic statistics used: dynamic sampling (level=AUTO)
+</code></pre>
+<p>In this case, Adaptive Dynamic Sampling is a good approximation. But it would be better to have a level of dynamic sampling that does not consider a predicate as a complex one when the extended statistics exactly match the predicate. Before there is enough artificial intelligence to cope with this, the best recommendation is to focus on design. In this case, ensuring that we have only uppercase values is the best way to keep queries and estimations simple.</p>
+
+</div>
+</body>
+</html>

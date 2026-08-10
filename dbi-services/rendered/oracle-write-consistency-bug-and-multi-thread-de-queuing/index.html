@@ -1,0 +1,135 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-write-consistency-bug-and-multi-thread-de-queuing/">
+<title>Oracle write consistency bug and multi-thread de-queuing</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-write-consistency-bug-and-multi-thread-de-queuing/">https://www.dbi-services.com/blog/oracle-write-consistency-bug-and-multi-thread-de-queuing/</a> (2020-12-14)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle write consistency bug and multi-thread de-queuing</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+<i>This was initially posted on CERN Database blog where it seems to be lost. Here is a copy thanks to <a href="https://web.archive.org/web/20191229171006/https://db-blog.web.cern.ch/blog/franck-pachot/2018-09-oracle-write-consistency-bug-and-multi-thread-de-queuing" target="_blank" rel="noopener noreferrer">web.archive.org</a><br />
+<strong>Additional notes:</strong><br />
+&#8211; I&#8217;ve tested and got the same behaviour in Oracle 21c<br />
+&#8211; you will probably enjoy reading Hatem Mahmoud going further on <a href="https://mahmoudhatem.wordpress.com/2018/10/05/write-consistency-and-dml-restart/" target="_blank" rel="noopener noreferrer">Write consistency and DML restart</a> </i></p>
+<p>Posted by <a class="username" title="View user profile." href="https://twitter.com/FranckPachot">Franck Pachot</a> on Thursday, 27 September 2018</p>
+<p>Here is a quick test I did after encountering an abnormal behavior in write consistency and before finding some references to a bug on <a href="https://stackoverflow.com/questions/7577836/write-consistency-with-nested-subquery-in-oracle" target="_blank" rel="noopener noreferrer">StackOverflow</a> (yes, write consistency questions on StackOverflow!) and <a href="https://asktom.oracle.com/pls/asktom/asktom.search?tag=write-consistency#3954570100346946285" target="_blank" rel="noopener noreferrer">AskTOM</a>. And a bug opened by Tom Kyte in 2011, that is still there in 18c.</p>
+<p>The original issue was with a task management system to run jobs. Here is the simple table where all rows have a &#8216;NEW&#8217; status and the goal is to have several threads processing them by updating them to the &#8216;HOLDING&#8217; status&#8217; and adding the process name.</p>
+<pre><code>
+set echo on
+drop table DEMO;
+create table DEMO (ID primary key,STATUS,NAME,CREATED)
+ as select rownum,cast('NEW' as varchar2(10)),cast(null as varchar2(10)),sysdate+rownum/24/60 from xmltable('1 to 10')
+/
+</code></pre>
+<p>Now here is the query that selects the 5 oldest rows in status &#8216;NEW&#8217; and updates them to the &#8216;HOLDING&#8217; status:</p>
+<pre><code>
+UPDATE DEMO SET NAME = 'NUMBER1', STATUS = 'HOLDING'
+WHERE ID IN (
+ SELECT ID FROM (
+  SELECT ID, rownum as counter
+  FROM DEMO
+  WHERE STATUS = 'NEW'
+  ORDER BY CREATED
+ )
+WHERE counter &lt;= 5)
+;
+</code></pre>
+<p>Note that the update also sets the name of the session which has processed the rows, here &#8216;NUMBER1&#8217;.</p>
+<p>Once the query started, and before the commit, I&#8217;ve run the same query from another session, but with &#8216;NUMBER2&#8217;.</p>
+<pre><code>
+UPDATE DEMO SET NAME = 'NUMBER2', STATUS = 'HOLDING'
+WHERE ID IN (
+ SELECT ID FROM (
+  SELECT ID, rownum as counter
+  FROM DEMO
+  WHERE STATUS = 'NEW'
+  ORDER BY CREATED
+ )
+WHERE counter &lt;= 5)
+;</code></pre>
+<p>Of course, this waits on row lock from the first session as it has selected the same rows. Then I commit the first session, and check, from the first session what has been updated:</p>
+<pre><code>
+commit;
+set pagesize 1000
+select versions_operation,versions_xid,DEMO.* from DEMO versions between scn minvalue and maxvalue order by ID,2;
+
+V VERSIONS_XID             ID STATUS     NAME       CREATED
+- ---------------- ---------- ---------- ---------- ---------------
+U 0500110041040000          1 HOLDING    NUMBER1    27-SEP-18 16:48
+                            1 NEW                   27-SEP-18 16:48
+U 0500110041040000          2 HOLDING    NUMBER1    27-SEP-18 16:49
+                            2 NEW                   27-SEP-18 16:49
+U 0500110041040000          3 HOLDING    NUMBER1    27-SEP-18 16:50
+                            3 NEW                   27-SEP-18 16:50
+U 0500110041040000          4 HOLDING    NUMBER1    27-SEP-18 16:51
+                            4 NEW                   27-SEP-18 16:51
+U 0500110041040000          5 HOLDING    NUMBER1    27-SEP-18 16:52
+                            5 NEW                   27-SEP-18 16:52
+                            6 NEW                   27-SEP-18 16:53
+                            7 NEW                   27-SEP-18 16:54
+                            8 NEW                   27-SEP-18 16:55
+                            9 NEW                   27-SEP-18 16:56
+                           10 NEW                   27-SEP-18 16:57</code></pre>
+<p>I have used flashback query to see all versions of the rows. All 10 have been created and the the first 5 of them have been updated by NUMBER1.</p>
+<p>Now, my second session continues, updating to NUMBER2. I commit and look at the row versions again:</p>
+<pre><code>
+commit;
+set pagesize 1000
+select versions_operation,versions_xid,DEMO.* from DEMO versions between scn minvalue and maxvalue order by ID,2;
+</code></pre>
+<pre><code>
+V VERSIONS_XID             ID STATUS     NAME       CREATED
+- ---------------- ---------- ---------- ---------- ---------------
+U 04001B0057030000          1 HOLDING    NUMBER2    27-SEP-18 16:48
+U 0500110041040000          1 HOLDING    NUMBER1    27-SEP-18 16:48
+                            1 NEW                   27-SEP-18 16:48
+U 04001B0057030000          2 HOLDING    NUMBER2    27-SEP-18 16:49
+U 0500110041040000          2 HOLDING    NUMBER1    27-SEP-18 16:49
+                            2 NEW                   27-SEP-18 16:49
+U 04001B0057030000          3 HOLDING    NUMBER2    27-SEP-18 16:50
+U 0500110041040000          3 HOLDING    NUMBER1    27-SEP-18 16:50
+                            3 NEW                   27-SEP-18 16:50
+U 04001B0057030000          4 HOLDING    NUMBER2    27-SEP-18 16:51
+U 0500110041040000          4 HOLDING    NUMBER1    27-SEP-18 16:51
+                            4 NEW                   27-SEP-18 16:51
+U 04001B0057030000          5 HOLDING    NUMBER2    27-SEP-18 16:52
+U 0500110041040000          5 HOLDING    NUMBER1    27-SEP-18 16:52
+                            5 NEW                   27-SEP-18 16:52
+                            6 NEW                   27-SEP-18 16:53
+                            7 NEW                   27-SEP-18 16:54
+                            8 NEW                   27-SEP-18 16:55
+                            9 NEW                   27-SEP-18 16:56
+                           10 NEW                   27-SEP-18 16:57
+</code></pre>
+<p>This is not what I expected. I wanted my second session to process the other rows, but here it seems that it has processed the same rows as the first one. What has been done by the NUMBER1 has been lost and overwritten by NUMBER2. This is inconsistent, violates ACID properties, and should not happen. An SQL statement must ensure write consistency: either by locking all the rows as soon as they are read (for non-MVCC databases where reads block writes), or re-starting the update when a mutating row is encountered. Oracle default behaviour is in the second case, NUMBER2 query reads the rows 1 to 5, because the changes by NUMBER1, not committed yet, are invisible from NUMBER2. But the execution should keep track of the columns referenced in the where clause. When attempting to update a row, now that the concurrent change is visible, the update is possible only if the WHERE clause used to select the rows still selects this row. If not, the database should raise an error (this is what happens in serializable isolation level) or re-start the update when in the default statement-level consistency.</p>
+<p>Here, probably because of the nested subquery, the write consistency is not guaranteed and this is a bug.</p>
+<p>One workaround is not to use subqueries. However, as we need to ORDER BY the rows in order to process the oldest first, we cannot avoid the subquery. The workaround for this is to add STATUS = &#8216;NEW&#8217; in the WHERE clause of the update, so that the update restart works correctly.</p>
+<p>However, the goal of multithreading those processes is to be scalable, and multiple update restarts may finally serialize all those updates.</p>
+<p>The preferred solution for this is to ensure that the updates do not attempt to touch the same rows. This can be achieved by a SELECT &#8230; FOR UPDATE SKIP LOCKED. As this cannot be added directly to the update statement, we need a cursor. Something like this can do the job:</p>
+<pre><code>
+declare counter number:=5;
+begin
+ for c in (select /*+ first_rows(5) */ ID FROM DEMO
+           where STATUS = 'NEW'
+           order by CREATED
+           for update skip locked)
+ loop
+  counter:=counter-1;
+  update DEMO set NAME = 'NUMBER1', STATUS = 'HOLDING'  where ID = c.ID and STATUS = 'NEW';
+  exit when counter=0;
+ end loop;
+end;
+/
+commit;
+</code></pre>
+<p>This can be optimized further but just gives an idea of what is needed for a scalable solution. Waiting for locks is not scalable.</p>
+
+</div>
+</body>
+</html>

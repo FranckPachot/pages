@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-rownum-vs-rownumber-and-12c-fetch-first/">
+<title>ROWNUM vs ROW_NUMBER() and 12c fetch first</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-rownum-vs-rownumber-and-12c-fetch-first/">https://www.dbi-services.com/blog/oracle-rownum-vs-rownumber-and-12c-fetch-first/</a> (2014-05-05)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">ROWNUM vs ROW_NUMBER() and 12c fetch first</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Prior to Oracle 12c, there were two ways to do &#8216;top-n&#8217; queries:</p>
+<ul>
+<li>use rownum after sorting rows with &#8220;order by&#8221;</li>
+<li>use row_number() over (order by)</li>
+</ul>
+<p>Top-n queries are usually required for result pagination. The application shows the first 10 rows, then the next 10 on the following page, etc. In these queries, user interactions are often stateless, so we cannot just open a cursor and fetch 10 rows on each user request.</p>
+<p>In both case you will need a subquery. In the former case you need it because otherwise the order by will be applied after the rownum filter. In the latter case you need it because you cannot use analytic functions in the where clause.</p>
+<p>But there is a big difference, which is very important to get the optimal plan, and this is what I will expose here before showing the new 12c syntax.</p>
+<h3>Query with rownum</h3>
+<pre><code>PLAN_TABLE_OUTPUT
+ SQL_ID 7x2wat0fhwdn9, child number 0
+  -------------------------------------
+  select * from (
+     select * from test where contract_id=500
+     order by start_validity
+  ) where rownum &lt;=10
+  order by start_validity
+  Plan hash value: 2207676858
+  --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      14 |
+  |*  1 |  COUNT STOPKEY                |         |      1 |        |     10 |      14 |
+  |   2 |   VIEW                        |         |      1 |     10 |     10 |      14 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |     10 |     10 |      14 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |        |     16 |       4 |
+  --------------------------------------------------------------------------------------
+  Predicate Information (identified by operation id):
+  ---------------------------------------------------
+  1 - filter(ROWNUM&lt;=10)
+  4 - access("CONTRACT_ID"=500)</code></pre>
+<p>This is good. The optimizer knows that we retrieve only 10 rows and the index access was chosen for that because it returns rows in the right order without the need to sort them.</p>
+<h3>Query with row_number()</h3>
+<pre><code> PLAN_TABLE_OUTPUT
+  SQL_ID gmmz59f64zftf, child number 0
+  -------------------------------------
+  select * from (
+    select test.*,row_number()over(order by start_validity) rn 
+    from test where contract_id=500
+  ) where rn &lt;=10
+ order by start_validity
+ Plan hash value: 1795822849
+ ------------------------------------------------------------------------------
+  | Id  | Operation                | Name | Starts | E-Rows | A-Rows | Buffers |
+  ------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT         |      |      1 |        |     10 |    4397 |
+  |*  1 |  VIEW                    |      |      1 |     10 |     10 |    4397 |
+  |*  2 |   WINDOW SORT PUSHED RANK|      |      1 |   2000 |     10 |    4397 |
+  |*  3 |    TABLE ACCESS FULL     | TEST |      1 |   2000 |   2000 |    4397 |
+  ------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("RN"&lt;=10) 
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "START_VALIDITY")&lt;=10) 
+ 3 - filter("CONTRACT_ID"=500)</code></pre>
+<p>This is not good. A full table scan reads all rows, whereas an index can give those 10 rows quickly. Reading and sorting thousands of rows instead of just reading a dozen. So why the index scan was not chosen? In that case I usually force the plan to the one that I expect, so that I can see which bad estimation has driven the CBO choice. Let&#8217;s see the execution plan when forcing range scan :</p>
+<pre><code> PLAN_TABLE_OUTPUT
+  SQL_ID axxrwar6s9275, child number 0
+  -------------------------------------
+  select * from (
+    select /*+ index(TEST) */ test.*,row_number()over(order by start_validity) rn 
+    from test where contract_id=500
+ ) where rn&lt;=10
+ order by start_validity
+  Plan hash value: 1912639229
+ --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      15 |
+  |*  1 |  VIEW                         |         |      1 |     10 |     10 |      15 |
+  |*  2 |   WINDOW NOSORT STOPKEY       |         |      1 |   2000 |     10 |      15 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |   2000 |     11 |      15 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |   2000 |     11 |       4 |
+  --------------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("RN"&lt;=10)
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "START_VALIDITY")&lt;=10)
+  4 - access("CONTRACT_ID"=500)</code></pre>
+<p>I didn&#8217;t show the cost here. The estimated number of rows is sufficient to understand. The optimizer has estimated the cost of the index access without knowing that we retreive at most 10 rows. When using rownum &lt; 10, the optimizer implicitly add a first_rows(10). But not with row_number().</p>
+<p>With the row_number() we have to do it ourselves:</p>
+<pre><code>PLAN_TABLE_OUTPUT
+  SQL_ID 32m4yadk1ypsn, child number 0
+  -------------------------------------
+  select /*+ FIRST_ROWS(10) */ * from (
+    select test.*,row_number()over(order by start_validity) rn 
+    from test where contract_id=500
+  ) where rn&lt;=10
+ order by start_validity 
+  Plan hash value: 1912639229
+ --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      15 |
+  |*  1 |  VIEW                         |         |      1 |     10 |     10 |      15 |
+  |*  2 |   WINDOW NOSORT STOPKEY       |         |      1 |     10 |     10 |      15 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |     10 |     11 |      15 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |        |     11 |       4 |
+  --------------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("RN"&lt;=10) 
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "START_VALIDITY")&lt;=10) 
+ 4 - access("CONTRACT_ID"=500)</code></pre>
+<p>Now the index range scan is chosen, with the right cardinality estimation.</p>
+<p>So which solution it the best one? I prefer row_number() for several reasons:</p>
+<ul>
+<li>I like analytic functions. They have larger possibilities, such as setting the limit as a percentage of total number of rows for example.</li>
+<li>11g documentation for rownum says:<br />
+The ROW_NUMBER built-in SQL function provides superior support for ordering the results of a query</li>
+<li>12c allows the ANSI syntax ORDER BY&#8230;FETCH FIRST&#8230;ROWS ONLY which is translated to row_number() predicate</li>
+<li>12c documentation for rownum adds:<br />
+The row_limiting_clause of the SELECT statement provides superior support</li>
+<li>rownum has <a href="http://jonathanlewis.wordpress.com/2008/11/11/first_rows_n/trackback">first_rows_n issues</a> as well</li>
+</ul>
+<p>As you can see, Oracle does not say that rownum is de-supported. Just that there is another function with &#8216;superior support&#8217;. Which is the same I presume.</p>
+<p>So, I use row_number() in 11g or the ANSI syntax in 12c but in both cases I have to add the FIRST_ROWS(n) hint in orde rto get the right plan. Warning: don&#8217;t use the old FIRST_ROWS hint anymore which was rule based and is deprecated. The right way to tell Oracle that you will fetch only n rows is the FIRST_ROWS(n) hint.</p>
+<p>Now here is the same query with the 12c syntax.</p>
+<h3>Query with 12c syntax</h3>
+<pre><code>PLAN_TABLE_OUTPUT
+  SQL_ID 49m5a3f33cmd0, child number 0
+  -------------------------------------
+  select /*+ FIRST_ROWS(10) */ * from test where contract_id=500 
+  order by start_validity fetch first 10 rows only
+ Plan hash value: 1912639229
+ --------------------------------------------------------------------------------------
+  | Id  | Operation                     | Name    | Starts | E-Rows | A-Rows | Buffers |
+  --------------------------------------------------------------------------------------
+  |   0 | SELECT STATEMENT              |         |      1 |        |     10 |      15 |
+  |*  1 |  VIEW                         |         |      1 |     10 |     10 |      15 |
+  |*  2 |   WINDOW NOSORT STOPKEY       |         |      1 |     10 |     10 |      15 |
+  |   3 |    TABLE ACCESS BY INDEX ROWID| TEST    |      1 |     10 |     11 |      15 |
+  |*  4 |     INDEX RANGE SCAN          | TEST_PK |      1 |        |     11 |       4 |
+  --------------------------------------------------------------------------------------
+ Predicate Information (identified by operation id):
+  ---------------------------------------------------
+ 1 - filter("from$_subquery$_002"."rowlimit_$$_rownumber" &lt;=10)
+ 2 - filter(ROW_NUMBER() OVER ( ORDER BY "TEST"."START_VALIDITY") &lt;=10 )  
+ 4 - access("CONTRACT_ID"=500)</code></pre>
+<p>The 12c syntax has been translated with row_number() predicates and I added the FIRST_ROWS(10) hint in order to have the right estimations.</p>
+
+</div>
+</body>
+</html>

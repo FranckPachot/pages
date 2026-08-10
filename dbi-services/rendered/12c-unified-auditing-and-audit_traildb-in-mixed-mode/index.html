@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-unified-auditing-and-audit_traildb-in-mixed-mode/">
+<title>12c Unified Auditing and AUDIT_TRAIL=DB in mixed mode</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-unified-auditing-and-audit_traildb-in-mixed-mode/">https://www.dbi-services.com/blog/12c-unified-auditing-and-audit_traildb-in-mixed-mode/</a> (2017-02-23)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12c Unified Auditing and AUDIT_TRAIL=DB in mixed mode</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Oracle enables some auditing by default, and if you don&#8217;t do anything, the tables where it is stored will grow in SYSAUX. Don&#8217;t wait to get an alert when it is too late. Everything that fills something automatically must be managed to archive or purge automatically. If not, one day you will have a problem.<br />
+<!--more--><br />
+Imagine that you have 5 features doing something similar but in a different way because they were implemented one at a time. You want to stop this and have only 1 unified feature. That&#8217;s great. But you are also required to maintain compatibility with previous version, which means that you actually implemented a 5+1=6th feature 🙁</p>
+<h3>Unified Auditing</h3>
+<p>This exactly what happens with Unified Auditing. Because of this compatibility requirement, it is declined in two modes:</p>
+<ul>
+<li>The &#8216;mixed mode&#8217; that keeps all compatibility as the 5+1 case in my example</li>
+<li>The &#8216;pure mode&#8217; that do not take care of the past and is actually the one that unifies all. The real &#8216;Unified&#8217; one.</li>
+</ul>
+<p>You are in &#8216;mixed mode&#8217; by default and you see it as if there is nothing new enabled:</p>
+<pre><code>
+SQL&gt; select parameter,value from v$option where parameter='Unified Auditing';
+&nbsp;
+PARAMETER         VALUE
+---------         -----
+Unified Auditing  FALSE
+</code></pre>
+<p>But there may be something enabled if the old auditing is enabled, because it is actually a mixed mode.</p>
+<h3>AUDIT_TRAIL=DB</h3>
+<p>Let me explain. I use the old auditing:</p>
+<pre><code>SQL&gt; show parameter audit
+NAME                         TYPE    VALUE
+---------------------------- ------- --------------------------------
+audit_trail                  string  DB</code></pre>
+<p>This means that I have the default audits (such as logon, logoff, ALTER/CREATE/DROP/GRANT ANY, and so on.<br />
+In addition to that, I enabled the audit of create table:</p>
+<pre><code>
+SQL&gt; audit create table;
+Audit succeeded.
+</code></pre>
+<p>I do some of these stuff and I can see info in the old audit trail:</p>
+<pre><code>SQL&gt; select action_name,sql_text from dba_audit_trail;
+&nbsp;
+ACTION_NAME   SQL_TEXT
+-----------   --------
+CREATE TABLE
+LOGON
+SELECT
+LOGON
+LOGOFF</code></pre>
+<p>If you are in that case, you probably manage this trail. Our recommandation is either to disable audit, or to manage it.</p>
+<p>But once upgraded to 12c, did you think about managing the new unified audit trail?</p>
+<pre><code>SQL&gt; select audit_type,unified_audit_policies,action_name,return_code,count(*) from unified_audit_trail group by audit_type,unified_audit_policies,action_name,return_code order by 1,2,3;
+---- ------ ------------------------------------------------------------------ ---- ------------------- ----- -- --------------------------------------------------------- ----- -- ------
+AUDIT_TYPE  UNIFIED_AUDIT_POLICIES  ACTION_NAME  RETURN_CODE  COUNT(*)
+Standard    ORA_LOGON_FAILURES      LOGON        0            2
+Standard    ORA_LOGON_FAILURES      LOGON        1017         1
+Standard    ORA_SECURECONFIG        CREATE ROLE  0            1
+Standard    ORA_SECURECONFIG        DROP ROLE    0            1
+Standard                            EXECUTE      0            1</code></pre>
+<p>Even with Unified Auditing set to off, some operations are audited when AUDIT_TRAIL=DB. If you don&#8217;t want them you have to disable them:</p>
+<pre><code>noaudit policy ORA_SECURECONFIG;
+noaudit policy ORA_LOGON_FAILURES;</code></pre>
+<p>As you see, in mixed mode the new unified auditing is enabled, and AUDIT_TRAIL is not ignored. This is the mode to use until you have migrated all your policies and audit trail queries to the new one. However you can see that in mixed mode, there is no double auditing but only new default policies. The old policies are only logged to the old audit trail.</p>
+<p>But if you don&#8217;t use auditing, then you don&#8217;t want the mixed mode.</p>
+<h3>uniaud_on</h3>
+<p>This is done with an instance shutdown, relinking onLinux or renaming a ddl  on Windows.</p>
+<pre><code>
+SQL&gt; shutdown immediate;
+ORACLE instance shut down.
+SQL&gt; host ( cd $ORACLE_HOME/rdbms/lib ; make -f ins_rdbms.mk uniaud_&amp;2 ioracle ORACLE_HOME=$ORACLE_HOME )
+/usr/bin/ar d /u01/app/oracle/product/12.2.0/dbhome_1/rdbms/lib/libknlopt.a kzanang.o
+/usr/bin/ar cr /u01/app/oracle/product/12.2.0/dbhome_1/rdbms/lib/libknlopt.a /u01/app/oracle/product/12.2.0/dbhome_1/rdbms/lib/kzaiang.o
+chmod 755 /u01/app/oracle/product/12.2.0/dbhome_1/bin
+&nbsp;
+ - Linking Oracle
+...
+</code></pre>
+<p>And then you are in &#8216;pure mode&#8217;:</p>
+<pre><code>
+SQL&gt; select parameter,value from v$option where parameter='Unified Auditing';
+&nbsp;
+PARAMETER         VALUE
+---------         -----
+Unified Auditing  TRUE
+</code></pre>
+<p>In that mode, AUDIT_TRAIL is ignored and you will never see new rows in the old AUD$:</p>
+<pre><code>SQL&gt; select action_name,sql_text from dba_audit_trail;
+&nbsp;
+no rows selected</code></pre>
+<p>However, as in the mixed mode you will have to manage the new audit trail. My best recommandation is to keep it and add a purge job. One day you may want to have a look at unsuccessful logins of the past few days. But you still have the choice to disable the default polices, and then the only things you will see are the operations done on the trail:</p>
+<pre><code>
+AUDIT_TYPE  UNIFIED_AUDIT_POLICIES  ACTION_NAME  SQL_TEXT
+----------  ----------------------  -----------  --------
+Standard                            EXECUTE      BEGIN dbms_audit_mgmt.flush_unified_audit_trail; END;^@
+Standard                            EXECUTE      BEGIN dbms_audit_mgmt.clean_audit_trail(audit_trail_type =&gt; dbms_audit_mgmt.audi
+Standard                            EXECUTE      BEGIN dbms_audit_mgmt.flush_unified_audit_trail; END;^@
+</code></pre>
+<p>The reason is that if a hacker getting super administrator rights has tried to whipe his traces, then at least this suspect operation remains.</p>
+<h3>Test it</h3>
+<p>To validate this blog post, I&#8217;ve tested all scenarios on 12.2.0.1 with the combination of:</p>
+<ul>
+<li>audit_trail=db or audit_trail=none</li>
+<li>uniaud_on or uniaud_off</li>
+<li>audit or noaudit policy for ORA_SECURECONFIG and ORA_LOGON_FAILURES</li>
+</ul>
+<p>For each combination, I&#8217;ve purged both audit trails (AUD$ and AUD$UNIFIED) and run a few statements that are logged by default or by explicit audit.</p>
+<h3>So what?</h3>
+<p>Basically, the recommandation is still the same as before: either disable the audit or schedule a purge. There is no purge by default because auditing is different than logging. When your security policy is to audit some operations, they must not be purged before being archived, or processed.</p>
+<p>When you upgrade to 12<em>c</em>:</p>
+<ol>
+<li>If you want to manage only the old audit, then you should disable ORA_LOGON_FAILURES and ORA_SECURECONFIG.</li>
+<li>If you want to manage both, then add a job to purge the unified audit trail (audit_trail_type=&gt;dbms_audit_mgmt.audit_trail_unified).</li>
+<li>If you don&#8217;t use the old auditing, then enable the &#8216;pure mode&#8217;. But then, AUDIT_TRAIL=NONE is ignored, so:</li>
+<li>If you don&#8217;t use the new unified auditing, then disable ORA_LOGON_FAILURES and ORA_SECURECONFIG.</li>
+<li>Or use the new unified auditing and set a job to purge it regularly.</li>
+</ol>
+<p>And control the growth of SYSAUX:</p>
+<pre><code>
+SQL&gt; select occupant_name,schema_name,occupant_desc,space_usage_kbytes from v$sysaux_occupants where occupant_name like 'AUD%';
+&nbsp;
+OCCUPANT_NAME  SCHEMA_NAME  OCCUPANT_DESC          SPACE_USAGE_KBYTES
+-------------  -----------  -------------          ------------------
+AUDSYS         AUDSYS       AUDSYS schema objects  1280
+AUDIT_TABLES   SYS          DB audit tables        0
+</code></pre>
+<p>SYS &#8216;DB audit tables&#8217; is the old one, filled in &#8216;mixed mode&#8217; only. AUDSYS &#8216;AUDSYS schema objects&#8217; is the new unified one, filled in both modes.</p>
+<p>But I have something to add. The default policies do not audit something that you are supposed to do so frequently, it should not fills hundreds of MB before several decades.<br />
+If you get this during the last hour:</p>
+<pre><code>SQL&gt; select audit_type,unified_audit_policies,action_name,return_code,count(*)
+  2  from unified_audit_trail where event_timestamp&gt;sysdate-1
+  3  group by audit_type,unified_audit_policies,action_name,return_code
+  4  order by count(*);
+AUDIT_TYPE  UNIFIED_AUDIT_POLICIES  ACTION_NAME  RETURN_CODE  COUNT(*)
+----------  ----------------------  -----------  -----------  --------
+Standard                            AUDIT        0                2
+Standard                            EXECUTE      0                4
+Standard      ORA_SECURECONFIG      CREATE ROLE  0             9268
+Standard    ORA_LOGON_FAILURES      LOGON        1017           348  </code></pre>
+<p>then the problem is not auditing but an attack, either from a hacker of because of your application design connecting for each execution or running DDL all the time.</p>
+
+</div>
+</body>
+</html>

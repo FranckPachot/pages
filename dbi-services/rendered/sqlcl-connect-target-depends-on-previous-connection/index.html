@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/sqlcl-connect-target-depends-on-previous-connection/">
+<title>SQLcl connect target depends on previous connection</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/sqlcl-connect-target-depends-on-previous-connection/">https://www.dbi-services.com/blog/sqlcl-connect-target-depends-on-previous-connection/</a> (2018-06-01)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">SQLcl connect target depends on previous connection</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+I thought it was a bug for two reasons: first, because I don&#8217;t like that my connect destination depends on the context, and then because it is a different behavior than in SQL*Plus. But finally, it is the correct behavior, and the 100% compatibility with SQL*Plus is expected only when SET CLASSIC=ON. And as I was surprised, and I think it can be dangerous, here is a blog post about it. Basically, be very careful if you are connected with a service name and you want to connect locally.<br />
+<!--more--><br />
+Basically, if you attended my demo about &#8216;From Transportable Tablespaces to Pluggable Databases&#8217;, where I switch between different instances you may have seen that I had to run &#8216;connect / as sysdba&#8217; two times because the first one failed with invalid username/password</p>
+<pre><code>
+SQL&gt; connect scott/tiger@//localhost/PDB1
+Connected.
+...
+SQL&gt; connect / as sysdba
+USER =
+URL = jdbc:oracle:oci8:@//localhost/PDB1
+Error Message = ORA-01017: invalid username/password; logon denied
+&nbsp;
+Warning: You are no longer connected to ORACLE.
+&nbsp;
+SQL&gt; connect / as sysdba
+Connected.
+</code></pre>
+<p>This is not a big deal, but that means that it tries to connect to //localhost/PDB1 when I wanted to connect locally to my ORACLE_SID environment variable. Here, expecting a bequeath connection, I didn&#8217;t provide a password, then I cannot connect to the PDB. But imagine that I use a password, and the password is the same in the two databases&#8230; I would have been connected to the wrong database. Just imagine this:</p>
+<pre><code>
+SQL&gt; host echo $ORACLE_SID
+TEST
+SQL&gt; connect sys/password as sysdba
+Connected.
+-- checking something on PROD
+SQL&gt; connect sys/password@PROD as sysdba
+Connected.
+...
+-- back to TEST (or at least I think so)
+SQL&gt; host echo $ORACLE_SID
+TEST
+SQL&gt; connect sys/password as sysdba
+Connected.
+-- do terrible things
+SQL&gt; drop table VERY_IMPORTANT_TABLE;
+Table VERY_IMPORTANT_TABLE dropped.
+-- now look where I am:
+SQL&gt; show connection
+CONNECTION:
+SYS@jdbc:oracle:oci8:@PROD AS SYSDBA
+CONNECTION_IDENTIFIER:
+PROD
+</code></pre>
+<p>Actually, what happens is that when SQLcl is already connected with a connection string (i.e not locally using bequeath) the next connect command will use the same connection string. This means that:</p>
+<pre><code>
+connect user/password
+</code></pre>
+<p>is actually equivalent to</p>
+<pre><code>
+connect user/password@&amp;_CONNECT_IDENTIFIER
+</code></pre>
+<h3>SQL*Plus</h3>
+<p>This behavior has been introduced in SQLcl but this is not how SQL*Plus works:</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/PDB1 as sysdba
+Connected.
+SQL&gt; connect / as sysdba
+Connected.
+SQL&gt; define _CONNECT_IDENTIFIER
+DEFINE _CONNECT_IDENTIFIER = "CDB1" (CHAR)
+</code></pre>
+<h3>Disconnect</h3>
+<p>The first solution to avoid this in SQLcl is to always disconnect before you want to connect to a different service:</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/PDB1 as sysdba
+Connected.
+SQL&gt; disc
+&nbsp;
+Disconnected from Oracle Database 18c Enterprise Edition Release 18.0.0.0.0 - Production
+Version 18.2.0.0.0
+SQL&gt; connect sys/oracle as sysdba
+Connected.
+SQL&gt; show connection
+CONNECTION:
+SYS@jdbc:oracle:oci8:@ AS SYSDBA
+CONNECTION_IDENTIFIER:
+CDB$ROOT
+</code></pre>
+<p>This is why the second time was ok in my case: first one failed with invalid password and then I was disconnected.</p>
+<h3>TWO_TASK</h3>
+<p>The second solution is to set an impossible TWO_TASK (or LOCAL in Windows) so that local connections are impossible:</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/PDB1 as sysdba
+Connected.
+SQL&gt; connect sys/oracle as sysdba
+USER = sys
+URL = jdbc:oracle:oci8:@NoWhere
+Error Message = ORA-12154: TNS:could not resolve the connect identifier specified
+USER = sys
+URL = jdbc:oracle:thin:@NoWhere
+Error Message = IO Error: Unknown host specified
+USER = sys
+URL = jdbc:oracle:thin:@NoWhere:1521/NoWhere
+Error Message = IO Error: Unknown host specified
+</code></pre>
+<h3>CLASSIC=ON</h3>
+<p>The third solution is to run SQLcl in SQL*Plus 100% compatible mode:</p>
+<pre><code>
+SQL&gt; connect sys/oracle@//localhost/PDB1 as sysdba
+Connected.
+SQL&gt; set classic on
+SQL&gt; show classic
+SQL*Plus mode: ON
+SQL&gt; connect / as sysdba
+Connected.
+</code></pre>
+<p>Here we have the same behavior as SQL*Plus: no use of current connection string.</p>
+<p>The SQL CLASSIC ON is usually for the output (error messages, autotrace statistics, and a few enhancement made to SQLcl). And the online help still says that it is about output:</p>
+<pre><code>
+SQL&gt; help set classic
+SET CLASSIC
+SET CLASSIC [ ON | OFF ]
+Set classic SQL*Plus Settings on
+This will allow scripts which expect traditional output to be honored.
+</code></pre>
+<p>However, it seems that this CLASSIC mode is also very important for connection.</p>
+<h3>Test and show _CONNECTION_STRING</h3>
+<p>If you show the connection string at the prompt, this may prevent errors:</p>
+<pre><code>
+SQL&gt; set sqlprompt "_connect_identifier&gt; "
+//localhost/CDB2&gt; connect sys/oracle@//localhost/CDB1 as sysdba
+Connected.
+//localhost/CDB1&gt; connect sys/oracle as sysdba
+Connected.
+</code></pre>
+<h3>Always check which database</h3>
+<p>By the way, when I prepare a script that can make some damages when not run at the correct place, I usually add a test on DBID on top of it:</p>
+<pre><code>
+CDB1&gt; whenever sqlerror exit failure;
+CDB1&gt; select 0/decode(dbid,'944121612',1,0) from v$database;
+&nbsp;
+Error starting at line : 1 in command -
+select 0/decode(dbid,'944121612',1,0) from v$database
+Error report -
+ORA-01476: divisor is equal to zero
+</code></pre>
+<h3>Different passwords</h3>
+<p>Of course, you should have different passwords on prod and test databases. However, I prefer to have passwords in a wallet (external password file) and then you will always have the correct identification as it is recorded for each service name.</p>
+
+</div>
+</body>
+</html>

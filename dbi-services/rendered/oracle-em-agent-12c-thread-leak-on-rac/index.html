@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/oracle-em-agent-12c-thread-leak-on-rac/">
+<title>Oracle EM agent 12c thread leak on RAC</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/oracle-em-agent-12c-thread-leak-on-rac/">https://www.dbi-services.com/blog/oracle-em-agent-12c-thread-leak-on-rac/</a> (2014-07-18)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Oracle EM agent 12c thread leak on RAC</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In a previous post about <a href="/linux-how-to-monitor-the-nproc-limit-1">nproc limit</a>, I wrote that I had to investigate the nproc limit with the number of threads because my Oracle 12c EM agent was having thousands of threads. This post is a short feedback about this issue and the way I have found the root cause. It concerns the enterprise manager agent 12c on Grid Infrasctructure &gt;= 11.2.0.2</p>
+<h3>NLWP</h3>
+<p>The issue was:</p>
+<pre><code>ps -o nlwp,pid,lwp,args -u oracle | sort -n
+NLWP   PID   LWP COMMAND
+   1  8444  8444 oracleOPRODP3 (LOCAL=NO)
+   1  9397  9397 oracleOPRODP3 (LOCAL=NO)
+   1  9542  9542 oracleOPRODP3 (LOCAL=NO)
+   1  9803  9803 /u00/app/oracle/product/agent12c/core/12.1.0.3.0/perl/bin/perl /u00/app/oracle/product/agent12c/core/12.1.0.3.0/bin/emwd.pl agent /u00/app/oracle/product/agent12c/agent_inst/sysman/log/emagent.nohup
+  19 11966 11966 /u00/app/11.2.0/grid/bin/oraagent.bin
+1114  9963  9963 /u00/app/oracle/product/agent12c/core/12.1.0.3.0/jdk/bin/java ... emagentSDK.jar oracle.sysman.gcagent.tmmain.TMMain
+</code></pre>
+<p>By default ps has only one entry per process, but each processes can have several threads &#8211; implemented on linux as light-weight process (LWP). Here, the NLWP column shows that I have 1114 threads for my EM 12c agent &#8211; and it was increasing every day until it reached the limit and the node failed (&#8216;Resource temporarily unavailable&#8217;).</p>
+<p>The first thing to do is to know what those threads are. The ps entries do not have a lot of information, but I discovered <strong>jstack</strong> which every java developer should know, I presume. You probably know that java has very verbose (lengthy) stack traces. Jstack was able to show me thousands of them in only one command:</p>
+<h3>Jstack</h3>
+<pre><code>$ jstack 9963
+2014-06-03 13:29:04
+Full thread dump Java HotSpot(TM) 64-Bit Server VM (20.14-b01 mixed mode):
+
+"Attach Listener" daemon prio=10 tid=0x00007f3368002000 nid=0x4c9b waiting on condition [0x0000000000000000]
+   java.lang.Thread.State: RUNNABLE
+
+"CRSeOns" prio=10 tid=0x00007f32c80b6800 nid=0x3863 in Object.wait() [0x00007f31fe11f000]
+   java.lang.Thread.State: TIMED_WAITING (on object monitor)
+	at java.lang.Object.wait(Native Method)
+	at oracle.eons.impl.NotificationQueue.internalDequeue(NotificationQueue.java:278)
+	- locked  (a java.lang.Object)
+	at oracle.eons.impl.NotificationQueue.dequeue(NotificationQueue.java:255)
+	at oracle.eons.proxy.impl.client.base.SubscriberImpl.receive(SubscriberImpl.java:98)
+	at oracle.eons.proxy.impl.client.base.SubscriberImpl.receive(SubscriberImpl.java:79)
+	at oracle.eons.proxy.impl.client.ProxySubscriber.receive(ProxySubscriber.java:29)
+	at oracle.sysman.db.receivelet.eons.EonsMetric.beginSubscription(EonsMetric.java:872)
+	at oracle.sysman.db.receivelet.eons.EonsMetricWlm.run(EonsMetricWlm.java:139)
+	at oracle.sysman.gcagent.target.interaction.execution.ReceiveletInteractionMgr$3$1.run(ReceiveletInteractionMgr.java:1401)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.runTask(ThreadPoolExecutor.java:895)
+	at java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:918)
+	at oracle.sysman.gcagent.util.system.GCAThread$RunnableWrapper.run(GCAThread.java:184)
+	at java.lang.Thread.run(Thread.java:662)
+...
+</code></pre>
+<h3>CRSeOns</h3>
+<p>I don&#8217;t paste all of them here. We have the &#8216;main&#8217;, we have a few GCs and &#8216;Gang workers&#8217; which are present in all JVMs and we have a few enterprise manager threads. And what was interesting was that I had thousands of &#8220;CRSeOns&#8221; that seemed to be increasing.</p>
+<p>Some guesses: I&#8217;m on RAC, and I have a &#8216;ons&#8217; resource and the EM agent tries to subscribe to it. Goggle search returned nothing, and that&#8217;s the reason I put that in a blog post now. Then I searched MOS, and bingo, there is a note: <a href="https://support.oracle.com/epmos/faces/DocContentDisplay?id=1486626.1">Doc ID 1486626.1</a>. It has nothing to do with my issue, but has an interesting comment in it:</p>
+<p>In cluster version 11.2.0.2 and higher, the ora.eons resource functionality has been moved to EVM. Because of this the ora.eons resource no longer exists or is controlled by crsctl.</p>
+<p>It also explains how to disable EM agent subscription:</p>
+<pre><code>emctl setproperty agent -name disableEonsRcvlet -value true</code></pre>
+<p>I&#8217;m in 11.2.0.3 and I have thousands of threads related to a functionality that doesn&#8217;t exist anymore. And that leads to some failures in my 4 nodes cluster.</p>
+<p>The solution was simple: disable it.</p>
+<p>For a long time I have seen a lot of memory leaks or CPU usage leaks related to the enterprise manager agent. With this new issue, I discovered a thread leak and I also faced a SR leak when trying to get support for the &#8216;Resource temporarily unavailable&#8217; error, going back and forth between OS, Database, Cluster and EM support teams&#8230;</p>
+
+</div>
+</body>
+</html>

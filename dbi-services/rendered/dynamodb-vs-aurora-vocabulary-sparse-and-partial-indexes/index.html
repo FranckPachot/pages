@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/dynamodb-vs-aurora-vocabulary-sparse-and-partial-indexes/">
+<title>DynamoDB / Aurora: sparse and partial indexes</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/dynamodb-vs-aurora-vocabulary-sparse-and-partial-indexes/">https://www.dbi-services.com/blog/dynamodb-vs-aurora-vocabulary-sparse-and-partial-indexes/</a> (2021-04-15)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">DynamoDB / Aurora: sparse and partial indexes</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+In a <a href="https://dev.to/aws-heroes/amazon-dynamodb-a-r-el-ational-glossary-30ci" rel="noopener" target="_blank">previous post</a> I tried to build a glossary about Amazon DynamoDB terms that look like relational database terms, but with a different technical meaning. Here is more about it. If you work with AWS Databases and frequently switch between DynamoDB and Aurora, or other RDS databases, you may be confused by the same terms used for different meanings.</p>
+<p>An index is a redundant structure that is maintained by the database to provide faster and ordered access when querying on a small part of the table. Basically, rather than scanning a table, or a partition, reading all values, and filtering afterwards, you can access to a small part of it that you don&#8217;t have to filter too much, and sort afterwards. This small part is a subset of rows and columns, or items and attributes.</p>
+<p>Let&#8217;s take an example in Aurora with PostgreSQL compatibility in order to explain what is a covering index and a partial index in the relational database vocabulary.</p>
+<pre><code>
+postgres=&gt; c postgres://reader:NWDMCE5xdipIjRrp@hh-pgsql-public.ebi.ac.uk:5432/pfmegrnargs
+
+pfmegrnargs=&gt; ! rm /var/tmp/rna.csv
+pfmegrnargs=&gt; copy rna to '/var/tmp/rna.csv' csv header
+COPY
+
+pfmegrnargs=&gt; ! du -h /var/tmp/rna.csv
+24G     /var/tmp/rna.csv
+</code></pre>
+<p>I&#8217;ve downloaded the RNA table, from <a href="https://twitter.com/rnacentral" rel="noopener" target="_blank">@RNAcentral</a>, to local csv, about 25 GB.</p>
+<pre><code>
+postgres=&gt; c postgres://postgres:postgres@database-1.cluster-cvlvfe1jv6n5.eu-west-1.rds.amazonaws.com:5432/postgres
+You are now connected to database "postgres" as user "postgres".
+</code></pre>
+<p>I&#8217;ve created an RDS Aurora with PostgreSQL compatibility (a small db.r6g.large 2 cVPU 16GB RAM)</p>
+<pre><code>
+postgres=&gt; CREATE TABLE rna (id int8 null, upi varchar(30) not null, "timestamp" timestamp null, userstamp varchar(60) null, crc64 bpchar(16) null, len int4 null, seq_short varchar(4000) null, seq_long text null, md5 varchar(64) null, constraint rna_pkey primary key (upi));
+CREATE TABLE
+</code></pre>
+<p>Here is the same table as the source, but without any index except the primary key</p>
+<pre><code>
+postgres=&gt; copy rna from '/var/tmp/rna.csv' csv header
+COPY
+postgres=&gt; vacuum rna;
+VACUUM
+</code></pre>
+<p>This loaded the 35 million rows from the  CSV.</p>
+<p>I&#8217;ll query on a small time range, the latest rows from this year:</p>
+<pre><code>
+postgres=&gt; explain (analyze,verbose,buffers) select upi from rna where timestamp &gt; date '2021-01-01';
+
+                                                                 QUERY PLAN
+--------------------------------------------------------------------------------------------------------------------------------------------
+ Gather  (cost=1000.00..3179976.11 rows=254424 width=14) (actual time=38927.822..43965.577 rows=407181 loops=1)
+   Output: upi
+   Workers Planned: 2
+   Workers Launched: 2
+   Buffers: shared hit=1265727 read=1702515
+   I/O Timings: read=36.660
+   -&gt;  Parallel Seq Scan on public.rna  (cost=0.00..3153533.71 rows=106010 width=14) (actual time=38924.249..43688.330 rows=135727 loops=3)
+         Output: upi
+         Filter: (rna."timestamp" &gt; '2021-01-01'::date)
+         Rows Removed by Filter: 11722942
+         Buffers: shared hit=1265727 read=1702515
+         I/O Timings: read=36.660
+         Worker 0: actual time=38908.360..43841.438 rows=120508 loops=1
+           Buffers: shared hit=463939 read=561349
+           I/O Timings: read=13.017
+         Worker 1: actual time=38936.741..43374.967 rows=172038 loops=1
+           Buffers: shared hit=377612 read=564988
+           I/O Timings: read=11.924
+ Planning Time: 0.112 ms
+ Execution Time: 44001.385 ms
+</code></pre>
+<p>Without any index, there&#8217;s not other choice than scanning the whole table (or partition if it were partitioned). This is long, but automatically parallelized, so it depends on your instance shape and I/O throughput</p>
+<pre><code>
+postgres=&gt; create index demo_index on rna(timestamp);
+CREATE INDEX
+</code></pre>
+<p>This creates an index on the timestamp column, the one that I use in my where clause.</p>
+<pre><code>
+postgres=&gt; explain (analyze,verbose,buffers) select upi from rna where timestamp &gt; date '2021-01-01';
+
+                                                               QUERY PLAN
+-----------------------------------------------------------------------------------------------------------------------------------------
+ Index Scan using demo_index on public.rna  (cost=0.56..236038.54 rows=254424 width=14) (actual time=0.018..237.076 rows=407181 loops=1)
+   Output: upi
+   Index Cond: (rna."timestamp" &gt; '2021-01-01'::date)
+   Buffers: shared hit=34667 read=28
+ Planning Time: 0.172 ms
+ Execution Time: 260.792 ms
+
+</code></pre>
+<p>This is an Index Scan: the time range in my where clause is transformed to an index range scan: use the B-Tree structure to go to the first page for this value and follow the link to the next pages until the end value is reached. Those index entries have a reference to the page in the table where the row is, to get the selected column &#8220;upi&#8221;. This is ok here (3500 page read for 400000 rows) thanks to the good clustering, but it could be worse. If this is a critical use case, we can do better.</p>
+<pre><code>
+postgres=&gt; create index demo_covering_index on rna(timestamp, upi);
+CREATE INDEX
+</code></pre>
+<p>That&#8217;s another index where I added the &#8220;upi&#8221; column to the index.</p>
+<pre><code>
+postgres=&gt; explain (analyze,verbose,buffers) select upi from rna where timestamp &gt; date '2021-01-01';
+
+                                                                     QUERY PLAN
+
+----------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo_covering_index on public.rna  (cost=0.56..9488.99 rows=254424 width=14) (actual time=0.017..57.300 rows=407181 loops=1)
+   Output: upi
+   Index Cond: (rna."timestamp" &gt; '2021-01-01'::date)
+   Heap Fetches: 0
+   Buffers: shared hit=4464
+ Planning Time: 0.182 ms
+ Execution Time: 80.701 ms
+</code></pre>
+<p>Now, the same access to the index leaves doesn&#8217;t have to fetch from the table because the &#8220;uid&#8221; column is also stored there. This is an Index Only Scan. In database vocabulary, this index is called a covering index. And it has read only 4000 buffers, with more chances to get them from a cache hit.</p>
+<p>The DynamoDB term for this is <a href="https://docs.aws.amazon.com/amazondynamodb/latest/APIReference/API_Projection.html" rel="noopener" target="_blank">projection</a>. In relational databases, the projection is the operations that filters a subset of the columns from a query. So, exactly the opposite of this one where we store (not filter) a superset (not subset) of the columns to index.</p>
+<pre><code>
+create index demo_partial_index on rna(timestamp, upi) where timestamp &gt; date '2021-01-01';
+</code></pre>
+<p>That&#8217;s another index with a where clause. This is called a partial index in SQL databases: not all rows are indexed. Here, for example, a reason can be row lifecycle. For fresh data, we query on specific dates. For older data, larger range where a scan is better (partitioned by year for example).</p>
+<pre><code>
+postgres=&gt; explain (analyze,verbose,buffers) select upi from rna where timestamp &gt; date '2021-01-01';
+
+                                                                    QUERY PLAN
+
+---------------------------------------------------------------------------------------------------------------------------------------------------
+ Index Only Scan using demo_partial_index on public.rna  (cost=0.42..8856.78 rows=254424 width=14) (actual time=0.016..52.719 rows=407181 loops=1)
+   Output: upi
+   Heap Fetches: 0
+   Buffers: shared hit=4462
+ Planning Time: 0.244 ms
+ Execution Time: 76.214 ms
+</code></pre>
+<p>Note that I&#8217;m running the same query here. In relational databases, the indexes are transparently maintained and used. You don&#8217;t have to query them explicitely. You always query a logical view (the table or a view on it) and the query planner will find the best access path for it. Here, because the index is smaller, the access is cheaper, and this one has been chosen. So, in addition to the Index Only Scan, we benefit from partial indexing. The difference is not huge here for a range scan because a B-Tree index is very efficient already. But for larger tables, the depth of the index is smaller. The important thing is that updates on rows that are out of this partial index do not have the overhead of index maintenance.</p>
+<p>The DynamoDB term for this, especially in the case of WHERE &#8230; IS NOT NULL, is <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/bp-indexes-general-sparse-indexes.html" rel="noopener" target="_blank">sparse index</a>. In database concepts, a sparse index is something different. But That&#8217;s difficult to explain in PostgreSQL where indexes are always dense.</p>
+<p>If you take the same example with AWS Aurora with MySQL compatibility, you will not have the same possibilities. MySQL doesn&#8217;t have partial indexes. But if you look at the the primary key, you will not see an index. Because InnoDB actually stores the table in an index structure (like a covering index extended to all columns). Because it is physically ordered, you don&#8217;t need an additional index structure. The leaves of the B-Tree are the table and the branches are the index. This index is not dense: you don&#8217;t need to index each entry. Only the first value of each table page (leaf block here) is sufficient because everything is ordered. This is what is called a sparse index in databases. Sparse indexes are possible only with primary indexes, the ones that can define the physical organization of the table. But DynamoDB uses the term &#8220;sparse&#8221; for secondary indexes only, where a attribute can nonexistent (primary key attributes are mandatory) in an item, and then not indexed, in the same way as what relational databases call partial indexes.</p>
+<p>RDBMS and NoSQL, often presented as opposite, have many similarities: you can store JSON documents in RDS, hash partition those tables on their primary key, and you have a NoSQL data structure. And you can query the NoSQL databases with an API that looks like SQL (PartiQL for example). And I think that the same converged data platform could be used by both APIs, in order to de-correlate the microservices isolation from the distributed infrastructure. Actually the storage design of Aurora and DynamoDB have some similarities. The big difference is in what NoSQL calls &#8220;eventual consistency&#8221; but that&#8217;s for a next post. The difference of vocabulary is really misleading and it starts with NoSQL articles using the term &#8220;SQL&#8221; as an umbrella for strong typing, relational modeling, declarative language query, ACID properties,&#8230; So, the most important is to understand the concepts behing those terms. In summary:</p>
+<ul>
+<li>A projection in RDS is restricting the columns that are read by the SELECT</li>
+<li>A projection in DynamoDB is adding more columns to the index to avoid a table access per item</li>
+<li>A covering index in RDS is adding more columns to the index, with no need to sort on them, and to avoid a table access</li>
+<li>A partial index in RDS is maintaining index entries only for a subset of the rows, to get a smaller B-Tree</li>
+<li>A sparse index in DynamoDB is partially indexing by bypassing secondary index entries for nonexistent attributes</li>
+<li>A sparse index in RDS is avoiding a dense primary index entries thanks to a physically ordered table</li>
+</ul>
+
+</div>
+</body>
+</html>

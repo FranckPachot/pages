@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/transport_connect_timeout-and-retry_count/">
+<title>TRANSPORT_CONNECT_TIMEOUT and RETRY_COUNT</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/transport_connect_timeout-and-retry_count/">https://www.dbi-services.com/blog/transport_connect_timeout-and-retry_count/</a> (2018-08-10)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">TRANSPORT_CONNECT_TIMEOUT and RETRY_COUNT</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+When you have a Data Guard configuration, you want the application to connect to the right server, where the primary is, without taking too much time. The default TCP timeout is 1 minute which is too long. When you don&#8217;t want to configure a virtual IP address (VIP) you can simply list all the addresses in the client connection string. But then you need to reduce the timeout. A short duration in 1 to 5 seconds will be ok most of the time, but in case of network issue, you want to give a chance to retry with a longer timeout. This post is about the connection string parameters to define this. Of course, all is <a href="https://docs.oracle.com/en/database/oracle/oracle-database/18/netrf/local-naming-parameters-in-tnsnames-ora-file.html#GUID-0CE85944-98CE-4984-8B5D-A7942B30F446" target="_blank" rel="noopener noreferrer">documented</a> but the goal of this post is also to show how to quickly test it. Because a reliable understanding of how it works relies on both documentation and test.<br />
+<!--more--><br />
+Here is a simple client failover configuration where the connection tries 10.10.10.10 and, if it fails, tries 10.10.10.11</p>
+<pre><code>
+DEFAULT=
+ (DESCRIPTION=
+  (CONNECT_DATA=(SERVICE_NAME=pdb1))
+  (ADDRESS_LIST=
+   (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521))
+   (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))
+  )
+ )
+</code></pre>
+<p>The problem with that is when the 10.10.10.10 is down then the 10.10.10.11 will be tried only after 60 seconds, the default TCP timeout. You can completely avoid waiting for the timeout by using a virtual IP that will always be up, started on the failed-over server. But you can also reduce the TCP timeout to a few seconds.</p>
+<p>Here is a tnsping with the above tnsnames.ora entry and when both servers are down:</p>
+<pre><code>
+$ time tnsping DESCRIPTION
+&nbsp;
+TNS Ping Utility for Linux: Version 18.0.0.0.0 - Production on 10-AUG-2018 15:15:55
+&nbsp;
+Copyright (c) 1997, 2018, Oracle.  All rights reserved.
+&nbsp;
+Used parameter files:
+&nbsp;
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION= (CONNECT_DATA=(SERVICE_NAME=pdb1)) (ADDRESS_LIST= (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521)) (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))))
+TNS-12535: TNS:operation timed out
+&nbsp;
+real    2m0.051s
+user    0m0.005s
+sys     0m0.011s
+</code></pre>
+<p>That&#8217;s 2 minutes because there is a 1 minute timeout for each address.</p>
+<h3>TRANSPORT_CONNECT_TIMEOUT</h3>
+<p>Now, just adding the TRANSPORT_CONNECT_TIMEOUT to the connection string description to reduce the timout to 4 seconds:</p>
+<pre><code>
+DESCRIPTION=
+ (DESCRIPTION=
+  (CONNECT_DATA=(SERVICE_NAME=pdb1))
+  (TRANSPORT_CONNECT_TIMEOUT=4)
+  (ADDRESS_LIST=
+   (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521))
+   (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))
+  )
+ )
+</code></pre>
+<p>The total time to get the answer from both addresses is 8 seconds &#8211; 4 second for each:</p>
+<pre><code>
+$ time tnsping DESCRIPTION
+&nbsp;
+TNS Ping Utility for Linux: Version 18.0.0.0.0 - Production on 10-AUG-2018 15:15:55
+&nbsp;
+Copyright (c) 1997, 2018, Oracle.  All rights reserved.
+&nbsp;
+Used parameter files:
+&nbsp;
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION= (CONNECT_DATA=(SERVICE_NAME=pdb1)) (TRANSPORT_CONNECT_TIMEOUT=4) (ADDRESS_LIST= (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521)) (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))))
+TNS-12535: TNS:operation timed out
+&nbsp;
+real    0m8.023s
+user    0m0.010s
+sys     0m0.006s
+</code></pre>
+<h3>RETRY_COUNT</h3>
+<p>If you lower the timeout, you may give a chance to retry a few times with RETRY_COUNT. There, RETRY_COUNT=2 will give 3 attempts ( 1 + 2 retries ) to the address list:</p>
+<pre><code>
+$ time tnsping RETRY_COUNT
+&nbsp;
+TNS Ping Utility for Linux: Version 18.0.0.0.0 - Production on 10-AUG-2018 15:49:34
+&nbsp;
+Copyright (c) 1997, 2018, Oracle.  All rights reserved.
+&nbsp;
+Used parameter files:
+&nbsp;
+Used TNSNAMES adapter to resolve the alias
+Attempting to contact (DESCRIPTION= (CONNECT_DATA=(SERVICE_NAME=pdb1)) (TRANSPORT_CONNECT_TIMEOUT=4) (RETRY_COUNT=2) (ADDRESS_LIST= (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521)) (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))))
+TNS-12535: TNS:operation timed out
+&nbsp;
+real    0m24.049s
+user    0m0.011s
+sys     0m0.010s
+</code></pre>
+<p>This has tried 10.10.10.10 and then 10.10.10.11 for 4 seconds each, and then retried 2 times wich in total takes 4+4+2*(4+4)=24 seconds</p>
+<h3>DESCRIPTION_LIST</h3>
+<p>The TRANSPORT and RETRY_COUNT are used only in the DESCRIPTION. You may want to give several attempts with an increasing timeout. For example: try each address for one second to get a quick connection to the primary, wherever it is, when the network is in good health. Then give two attempts with a 5 seconds timeout for bad network times. And then one final attempt to each with the default timeout to be sure that the servers are down.</p>
+<p>You can use a DESCRIPTION_LIST for this:</p>
+<pre><code>
+INCREASING=
+ (DESCRIPTION_LIST=
+  (LOAD_BALANCE=off)
+  (DESCRIPTION=
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+   (TRANSPORT_CONNECT_TIMEOUT=1)
+   (ADDRESS_LIST=
+    (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))
+   )
+  )
+  (DESCRIPTION=
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+   (TRANSPORT_CONNECT_TIMEOUT=5)
+   (RETRY_COUNT=1)
+   (ADDRESS_LIST=
+    (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))
+   )
+  )
+  (DESCRIPTION=
+   (CONNECT_DATA=(SERVICE_NAME=pdb1))
+   (TRANSPORT_CONNECT_TIMEOUT=2)
+   (ADDRESS_LIST=
+    (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.10)(PORT=1521))
+    (ADDRESS=(PROTOCOL=TCP)(HOST=10.10.10.11)(PORT=1521))
+   )
+  )
+ )
+</code></pre>
+<p>Rather than just time the total attempts, I&#8217;ll strace each connections:</p>
+<pre><code>
+$ strace -tT tnsping INCREASING 2&gt;&amp;1 | grep -C1 --color=auto -E 'poll.*|inet_addr[()".0-9]*'
+&nbsp;
+16:15:49 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000008&gt;
+16:15:49 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.10")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000087&gt;
+16:15:49 times(NULL)                    = 434920117 &lt;0.000011&gt;
+16:15:49 mmap(NULL, 528384, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7efce31bc000 &lt;0.000013&gt;
+16:15:49 poll([{fd=4, events=POLLOUT}], 1, 1000) = 0 (Timeout) &lt;1.001435&gt;
+16:15:50 close(4)                       = 0 &lt;0.000256&gt;
+--
+16:15:50 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000060&gt;
+16:15:50 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.11")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000495&gt;
+16:15:50 times(NULL)                    = 434920218 &lt;0.000062&gt;
+16:15:50 poll([{fd=4, events=POLLOUT}], 1, 1000) = 0 (Timeout) &lt;1.000768&gt;
+16:15:51 close(4)                       = 0 &lt;0.000050&gt;
+--
+16:15:51 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000015&gt;
+16:15:51 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.10")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000060&gt;
+16:15:51 times(NULL)                    = 434920318 &lt;0.000010&gt;
+16:15:51 poll([{fd=4, events=POLLOUT}], 1, 5000) = 0 (Timeout) &lt;5.005563&gt;
+16:15:56 close(4)                       = 0 &lt;0.000027&gt;
+--
+16:15:56 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000012&gt;
+16:15:56 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.11")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000081&gt;
+16:15:56 times(NULL)                    = 434920819 &lt;0.000015&gt;
+16:15:56 poll([{fd=4, events=POLLOUT}], 1, 5000) = 0 (Timeout) &lt;5.006265&gt;
+16:16:01 close(4)                       = 0 &lt;0.000192&gt;
+--
+16:16:01 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000079&gt;
+16:16:01 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.10")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000486&gt;
+16:16:01 times(NULL)                    = 434921320 &lt;0.000087&gt;
+16:16:01 poll([{fd=4, events=POLLOUT}], 1, 5000) = 0 (Timeout) &lt;5.004660&gt;
+16:16:06 close(4)                       = 0 &lt;0.000611&gt;
+--
+16:16:06 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000114&gt;
+16:16:06 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.11")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000536&gt;
+16:16:06 times(NULL)                    = 434921822 &lt;0.000097&gt;
+16:16:06 poll([{fd=4, events=POLLOUT}], 1, 5000) = 0 (Timeout) &lt;5.008128&gt;
+16:16:11 close(4)                       = 0 &lt;0.000135&gt;
+--
+16:16:11 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000137&gt;
+16:16:11 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.10")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000584&gt;
+16:16:11 times(NULL)                    = 434922323 &lt;0.000079&gt;
+16:16:11 poll([{fd=4, events=POLLOUT}], 1, 60000) = 0 (Timeout) &lt;60.053782&gt;
+16:17:11 close(4)                       = 0 &lt;0.000166&gt;
+--
+16:17:11 fcntl(4, F_SETFL, O_RDONLY|O_NONBLOCK) = 0 &lt;0.000195&gt;
+16:17:11 connect(4, {sa_family=AF_INET, sin_port=htons(1521), sin_addr=inet_addr("10.10.10.11")}, 16) = -1 EINPROGRESS (Operation now in progress) &lt;0.000549&gt;
+16:17:11 times(NULL)                    = 434928329 &lt;0.000488&gt;
+16:17:11 poll([{fd=4, events=POLLOUT}], 1, 60000) = 0 (Timeout) &lt;60.007246&gt;
+16:18:11 close(4)                       = 0 &lt;0.000043&gt;
+</code></pre>
+<p>With &#8216;-T&#8217; strace shows the duration of the poll() system call between brackets after the return code. You can see here 1-second timeout attempts to each address, then 2 attempts with 5 seconds timeout and then 60 seconds.</p>
+<p>Note that I have added (LOAD_BALANCE=OFF) here because the default is ON in a DESCRIPTION_LIST but here I want to take them in the order I specified them.</p>
+
+</div>
+</body>
+</html>

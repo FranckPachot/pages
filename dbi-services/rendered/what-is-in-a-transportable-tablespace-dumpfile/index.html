@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/what-is-in-a-transportable-tablespace-dumpfile/">
+<title>What is in a transportable tablespace dumpfile?</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/what-is-in-a-transportable-tablespace-dumpfile/">https://www.dbi-services.com/blog/what-is-in-a-transportable-tablespace-dumpfile/</a> (2017-05-08)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">What is in a transportable tablespace dumpfile?</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+On 31st of May in Düsseldorf, at <a href="https://datenbank.doag.org/de/home/" target="_blank" rel="noopener noreferrer">DOAG Datenbank</a>, I&#8217;ll talk about transportable tablespaces and pluggable databases. Both methods are transporting data physically, the difference is in the transport of the metadata, which can be more flexible when transported logically, as with TTS, but faster when transported physically with PDB. I have a lot of demos to show transportable tablespaces with RMAN, and the different cloning features available in 12<em>c</em>R2. If I have time I&#8217;ll show what is inside the dumpfile when using Data Pump to export the metadata. Here is the idea.<br />
+<!--more--></p>
+<h3>expdp transport_tablespaces</h3>
+<p>Here is how we export metadata with Data Pump for transportable tablespaces.</p>
+<pre><code>
+expdp system/oracle@//localhost/PDB1 directory=VAR_TMP dumpfile=expdat.tmp transport_tablespaces=USERS exclude=table_statistics,index_statistics;
+&nbsp;
+...
+Processing object type TRANSPORTABLE_EXPORT/PLUGTS_BLK
+ Processing object type TRANSPORTABLE_EXPORT/POST_INSTANCE/PLUGTS_BLK
+ Processing object type TRANSPORTABLE_EXPORT/TABLE
+ Processing object type TRANSPORTABLE_EXPORT/CONSTRAINT/CONSTRAINT
+ Processing object type TRANSPORTABLE_EXPORT/CONSTRAINT/REF_CONSTRAINT
+ Master table "SYSTEM"."SYS_EXPORT_TRANSPORTABLE_01" successfully loaded/unloaded
+ ******************************************************************************
+ Dump file set for SYSTEM.SYS_EXPORT_TRANSPORTABLE_01 is:
+   /u01/oradata/tmp/expdat.dmp
+ ******************************************************************************
+ Datafiles required for transportable tablespace USERS:
+   /u01/oradata/CDB1/PDB1/users01.dbf
+</code></pre>
+<p>The metadata is exported into expdata.dmp and the data resides in the original datafile. The dumpfile is a binary file but there is a way to extract metadata as DDL using impdp</p>
+<h3>impdp sqlfile</h3>
+<p>Here I run impdp with sqlfile to generate all DDL into this file. Nothing is imported and the datafiles are not read, reason why I&#8217;ve just put something wrong to transport_datafiles:</p>
+<pre><code>
+impdp system/oracle@//localhost/PDB1 directory=VAR_TMP transport_datafiles=blahblahblah sqlfile=sqlfile.sql ;
+</code></pre>
+<p>No error. Only the dumpfile has been read and here is an extract of the DDP in sqlfile.sql concerning the PK_DEPT and PK_EMP indexes:</p>
+<pre><code>
+-- new object type path: TRANSPORTABLE_EXPORT/CONSTRAINT/CONSTRAINT
+ALTER TABLE "SCOTT"."DEPT" ADD CONSTRAINT "PK_DEPT" PRIMARY KEY ("DEPTNO")
+  USING INDEX (CREATE UNIQUE INDEX "SCOTT"."PK_DEPT" ON "SCOTT"."DEPT" ("DEPTNO")
+  PCTFREE 10 INITRANS 2 MAXTRANS 255
+  STORAGE(SEG_FILE 26 SEG_BLOCK 138 OBJNO_REUSE 73197
+  INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "USERS" )  ENABLE;
+ALTER TABLE "SCOTT"."EMP" ADD CONSTRAINT "PK_EMP" PRIMARY KEY ("EMPNO")
+  USING INDEX (CREATE UNIQUE INDEX "SCOTT"."PK_EMP" ON "SCOTT"."EMP" ("EMPNO")
+  PCTFREE 10 INITRANS 2 MAXTRANS 255
+  STORAGE(SEG_FILE 26 SEG_BLOCK 154 OBJNO_REUSE 73205
+  INITIAL 65536 NEXT 1048576 MINEXTENTS 1 MAXEXTENTS 2147483645
+  PCTINCREASE 0 FREELISTS 1 FREELIST GROUPS 1
+  BUFFER_POOL DEFAULT FLASH_CACHE DEFAULT CELL_FLASH_CACHE DEFAULT)
+  TABLESPACE "USERS" )  ENABLE;
+-- new object type path: TRANSPORTABLE_EXPORT/INDEX_STATISTICS
+-- new object type path: TRANSPORTABLE_EXPORT/CONSTRAINT/REF_CONSTRAINT
+ALTER TABLE "SCOTT"."EMP" ADD CONSTRAINT "FK_DEPTNO" FOREIGN KEY ("DEPTNO")
+          REFERENCES "SCOTT"."DEPT" ("DEPTNO") ENABLE;
+-- new object type path: TRANSPORTABLE_EXPORT/TABLE_STATISTICS
+-- new object type path: TRANSPORTABLE_EXPORT/STATISTICS/MARKER
+-- new object type path: TRANSPORTABLE_EXPORT/POST_INSTANCE/PLUGTS_BLK
+</code></pre>
+<p>This looks like the DDL used to re-create the same table except that we can see two storage attributes that are not documented:</p>
+<ul>
+<li>SEG_FILE and SEG_BLOCK</li>
+<li>OBJNO_REUSE</li>
+</ul>
+<h3>SEG_FILE and SEG_BLOCK</h3>
+<p>When you create an empty table, you just provide the tablespace name and Oracle will allocate the first extent, with the segment header. You don&#8217;t choose the data placement within the tablespace. But here we are in a different case: the extents already exist in the datafiles that we transport, and the DDL must just map to it. This is why in this case the segment header file number and block number is specified. The remaining extent allocation information is stored within the datafiles (Locally Managed Tablespace), only the segment header must be known by the dictionary.</p>
+<p>As an example, when I look at the database where the export comes from, I can see that the attributes for PK_EMP (SEG_FILE 26 SEG_BLOCK 154) are the relative file number and header block number of the PK_EMP segment:</p>
+<pre><code>
+10:49:10 SQL&gt; select owner,segment_name,header_file,header_block,blocks,extents,tablespace_name,relative_fno from dba_segments where owner='SCOTT';
+&nbsp;
+OWNER  SEGMENT_NAME  HEADER_FILE  HEADER_BLOCK  BLOCKS  EXTENTS  TABLESPACE_NAME  RELATIVE_FNO
+-----  ------------  -----------  ------------  ------  -------  ---------------  ------------
+SCOTT  DEPT          31           130           8       1        USERS            26
+SCOTT  EMP           31           146           8       1        USERS            26
+SCOTT  SALGRADE      31           162           8       1        USERS            26
+SCOTT  PK_DEPT       31           138           8       1        USERS            26
+SCOTT  PK_EMP        31           154           8       1        USERS            26
+</code></pre>
+<p>This file identifier is a relative file number within the tablespace, which means that there is no need to change it when a tablespace is transported.</p>
+<p>You will see exactly the same information in the database where you import the tablespace (except for HEADER_FILE which is the absolute file number).</p>
+<h3>OBJNO_REUSE</h3>
+<p>Each segment has a DATA_OBJECT_ID, which is referenced in each block, the ROWIDs. This must not change when we transport a tablespace because the goal is that nothing has to be modified in the datafiles. For this reason, the data object id is exported with the metadata, as we can see for this PK_EMP example (OBJNO_REUSE 73205), and set to the same in the target dictionary. Here are the data object IDs for the objects exported here:</p>
+<pre><code>
+10:49:20 SQL&gt; select owner,object_name,object_type,object_id,data_object_id from dba_objects where owner='SCOTT';
+&nbsp;
+OWNER  OBJECT_NAME  OBJECT_TYPE  OBJECT_ID  DATA_OBJECT_ID
+-----  -----------  -----------  ---------  --------------
+SCOTT  DEPT         TABLE        73196      73196
+SCOTT  PK_DEPT      INDEX        73197      73197
+SCOTT  EMP          TABLE        73198      73206
+SCOTT  PK_EMP       INDEX        73199      73205
+SCOTT  BONUS        TABLE        73200      73200
+SCOTT  SALGRADE     TABLE        73201      73201
+</code></pre>
+<p>The OBJECT_ID will be different in the target, assigned in the same way as when we create an object, but this one is not referenced anywhere within the datafiles.</p>
+<h3>So what?</h3>
+<p>Usually, the metadata precedes the data. With transportable tablespaces, it is the opposite: data is there and metadata is re-created to map the data. This metadata is what is stored into the dumpfile exported to transport tablespaces.<br />
+From what you have seen, you can understand now that the RELATIVE_FNO and the DATA_OBJECT_ID are not unique within a database, but only within a tablespace. You can understand also that Transportable Tablespace import duration does not depend on the size of data, but is proportional to the number of objects (metadata). This is where Pluggable Databases is more efficient: metadata is transported physically and import duration does not depend on the number of objects, especially when it does not involve an upgrade to new version and object recompilation.</p>
+
+</div>
+</body>
+</html>

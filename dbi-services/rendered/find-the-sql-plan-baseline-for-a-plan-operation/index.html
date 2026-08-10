@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/find-the-sql-plan-baseline-for-a-plan-operation/">
+<title>Find the SQL Plan Baseline for a plan operation</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/find-the-sql-plan-baseline-for-a-plan-operation/">https://www.dbi-services.com/blog/find-the-sql-plan-baseline-for-a-plan-operation/</a> (2020-04-17)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Find the SQL Plan Baseline for a plan operation</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+If you decide to capture SQL Plan Baselines, you achieve plan stability by being conservative: if the optimizer comes with a new execution plan, it is loaded into the SQL Plan Management base, but not accepted. One day, you may add an index to improve some queries. Then you should check if there is any SQL Plan Baseline for queries with the same access predicate. Because the optimizer will probably find this index attractive, and add the new plan in the SPM base, but it will not be used unless you evolve it to accept it. Or you may remove the SQL Plan Baseline for these queries now that you know you provided a very efficient access path.</p>
+<p>But how do you find all SQL Plan Baselines that are concerned? Here is an example.</p>
+<p>I start with the SCOTT schema where I capture the SQL Plan Baselines for the following queries:</p>
+<pre><code>
+set time on sqlprompt 'SQL&gt; '
+host TWO_TASK=//localhost/CDB1A_PDB1.subnet.vcn.oraclevcn.com sqlplus sys/"demo##OracleDB20c" as sysdba @ ?/rdbms/admin/utlsampl.sql
+connect scott/tiger@//localhost/CDB1A_PDB1.subnet.vcn.oraclevcn.com
+alter session set optimizer_mode=first_rows optimizer_capture_sql_plan_baselines=true;
+select * from emp where ename='SCOTT';
+select * from emp where ename='SCOTT';
+</code></pre>
+<p>This is a full table scap because I have no index here.<br />
+Now I create an index that helps for this kind of queries:</p>
+<pre><code>
+alter session set optimizer_mode=first_rows optimizer_capture_sql_plan_baselines=false;
+host sleep 1
+create index emp_ename on emp(ename);
+host sleep 1
+select * from emp where ename='SCOTT';
+</code></pre>
+<p>I have now, in addition to the accepted FULL TABLE SCAN baseline, the loaded, but not accepted, plan with INDEX access.<br />
+Here is the detail the list of plans:</p>
+<pre><code>
+SQL&gt; select sql_handle,plan_name,created,enabled ENA,accepted ACC,fixed FIX,origin from dba_sql_plan_baselines;
+
+             SQL_HANDLE                         PLAN_NAME            CREATED    ENA    ACC    FIX          ORIGIN
+_______________________ _________________________________ __________________ ______ ______ ______ _______________
+SQL_62193752b864a1e8    SQL_PLAN_6469raaw698g854d6b671    17-apr-20 19:37    YES    NO     NO     AUTO-CAPTURE
+SQL_62193752b864a1e8    SQL_PLAN_6469raaw698g8d8a279cc    17-apr-20 19:37    YES    YES    NO     AUTO-CAPTURE
+</code></pre>
+<p>Full table scan:</p>
+<pre><code>
+SQL&gt; select * from dbms_xplan.display_sql_plan_baseline('SQL_62193752b864a1e8','SQL_PLAN_6469raaw698g8d8a279cc'
+);
+
+                                                                  PLAN_TABLE_OUTPUT
+___________________________________________________________________________________
+
+--------------------------------------------------------------------------------
+SQL handle: SQL_62193752b864a1e8
+SQL text: select * from emp where ename='SCOTT'
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Plan name: SQL_PLAN_6469raaw698g8d8a279cc         Plan id: 3634526668
+Enabled: YES     Fixed: NO      Accepted: YES     Origin: AUTO-CAPTURE
+Plan rows: From dictionary
+--------------------------------------------------------------------------------
+
+Plan hash value: 3956160932
+
+--------------------------------------------------------------------------
+| Id  | Operation         | Name | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |      |     1 |    87 |     2   (0)| 00:00:01 |
+|*  1 |  TABLE ACCESS FULL| EMP  |     1 |    87 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   1 - filter("ENAME"='SCOTT')
+</code></pre>
+<p>Index access &#8211; not accepted</p>
+<pre><code>
+SQL&gt; select * from dbms_xplan.display_sql_plan_baseline('SQL_62193752b864a1e8','SQL_PLAN_6469raaw698g854d6b671'
+);
+
+                                                                                   PLAN_TABLE_OUTPUT
+____________________________________________________________________________________________________
+
+--------------------------------------------------------------------------------
+SQL handle: SQL_62193752b864a1e8
+SQL text: select * from emp where ename='SCOTT'
+--------------------------------------------------------------------------------
+
+--------------------------------------------------------------------------------
+Plan name: SQL_PLAN_6469raaw698g854d6b671         Plan id: 1423357553
+Enabled: YES     Fixed: NO      Accepted: NO      Origin: AUTO-CAPTURE
+Plan rows: From dictionary
+--------------------------------------------------------------------------------
+
+Plan hash value: 2855689319
+
+-------------------------------------------------------------------------------------------------
+| Id  | Operation                           | Name      | Rows  | Bytes | Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                    |           |     1 |    87 |     2   (0)| 00:00:01 |
+|   1 |  TABLE ACCESS BY INDEX ROWID BATCHED| EMP       |     1 |    87 |     2   (0)| 00:00:01 |
+|*  2 |   INDEX RANGE SCAN                  | EMP_ENAME |     1 |       |     1   (0)| 00:00:01 |
+-------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("ENAME"='SCOTT')
+
+</code></pre>
+<h3>SQL Plan Baseline lookup by plan operation</h3>
+<p>Now, I want to know all queries in this case, where a SQL Plan Baseline references this index because I&#8217;ll probably want to delete all plans for this query, or maybe evolve the index access to be accepted.<br />
+Here is my query on sys.sqlobj$plan</p>
+<pre><code>
+select sql_handle,plan_name,created,enabled ENA,accepted ACC,fixed FIX,origin
+ ,operation,options,object_name
+from (
+ -- SPM execution plans
+ select signature,category,obj_type,plan_id
+ ,operation, options, object_name
+ from sys.sqlobj$plan
+) natural join (
+ -- SQL Plan Baselines
+ select signature,category,obj_type,plan_id
+ ,name plan_name
+ from sys.sqlobj$
+ where obj_type=2
+) natural join (
+ select plan_name
+ ,sql_handle,created,enabled,accepted,fixed,origin
+ from dba_sql_plan_baselines
+)
+where operation='INDEX' and object_name like 'EMP_ENAME'
+/
+</code></pre>
+<p>This gets the signature and plan identification from sys.sqlobj$plan then joins to sys.sqlobj$ to get the plan name, and finally dba_sql_plan_baselines to get additional information:</p>
+<pre><code>
+             SQL_HANDLE                         PLAN_NAME            CREATED    ENA    ACC    FIX          ORIGIN    OPERATION       OPTIONS    OBJECT_NAME
+_______________________ _________________________________ __________________ ______ ______ ______ _______________ ____________ _____________ ______________
+SQL_62193752b864a1e8    SQL_PLAN_6469raaw698g854d6b671    17-apr-20 19:37    YES    NO     NO     AUTO-CAPTURE    INDEX        RANGE SCAN    EMP_ENAME
+</code></pre>
+<p>You can see that I like natural joins but be aware that I do that only when I fully control the columns by defining, in subqueries, the column projections before the join.</p>
+<p>I have the following variant if I want to lookup by the outline hints:</p>
+<pre><code>
+select sql_handle,plan_name,created,enabled ENA,accepted ACC,fixed FIX,origin
+ ,operation,options,object_name
+ ,outline_data
+from (
+ -- SPM execution plans
+ select signature,category,obj_type,plan_id
+ ,operation, options, object_name
+ ,case when other_xml like '%outline_data%' then extract(xmltype(other_xml),'/*/outline_data').getStringVal() end outline_data
+ from sys.sqlobj$plan
+) natural join (
+ -- SQL Plan Baselines
+ select signature,category,obj_type,plan_id
+ ,name plan_name
+ from sys.sqlobj$
+ where obj_type=2
+) natural join (
+ select plan_name
+ ,sql_handle,created,enabled,accepted,fixed,origin
+ from dba_sql_plan_baselines
+)
+where outline_data like '%INDEX%'
+/
+</code></pre>
+<p>This is what we find on the OTHER_XML and it is faster to filter here rather than calling dbms_xplan for each:</p>
+<pre><code>
+             SQL_HANDLE                         PLAN_NAME            CREATED    ENA    ACC    FIX          ORIGIN       OPERATION                   OPTIONS    OBJECT_NAME                                                                                                                                                                                                                                                                                                                                                                                                                             OUTLINE_DATA
+_______________________ _________________________________ __________________ ______ ______ ______ _______________ _______________ _________________________ ______________ ________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________________
+SQL_62193752b864a1e8    SQL_PLAN_6469raaw698g854d6b671    17-apr-20 19:37    YES    NO     NO     AUTO-CAPTURE    TABLE ACCESS    BY INDEX ROWID BATCHED    EMP            &lt;outline_data&gt;&lt;hint&gt;&lt;![CDATA[BATCH_TABLE_ACCESS_BY_ROWID(@"SEL$1" "EMP"@"SEL$1")]]&gt;&lt;/hint&gt;&lt;hint&gt;&lt;![CDATA[INDEX_RS_ASC(@"SEL$1" "EMP"@"SEL$1" ("EMP"."ENAME"))]]&gt;&lt;/hint&gt;&lt;hint&gt;&lt;![CDATA[OUTLINE_LEAF(@"SEL$1")]]&gt;&lt;/hint&gt;&lt;hint&gt;&lt;![CDATA[FIRST_ROWS]]&gt;&lt;/hint&gt;&lt;hint&gt;&lt;![CDATA[DB_VERSION('20.1.0')]]&gt;&lt;/hint&gt;&lt;hint&gt;&lt;![CDATA[OPTIMIZER_FEATURES_ENABLE('20.1.0')]]&gt;&lt;/hint&gt;&lt;hint&gt;&lt;![CDATA[IGNORE_OPTIM_EMBEDDED_HINTS]]&gt;&lt;/hint&gt;&lt;/outline_data&gt;
+</code></pre>
+<p>Those SYS.SQLOBJ$ tables are the tables where Oracle stores the queries for the SQL Management Base (SQL Profiles, SQL Plan Baselines, SQL Patches, SQL Quarantine). </p>
+<p>If you want to find the SQL_ID from a SQL Plan Baseline, I have a query in a previous post:<br />
+<a href="https://medium.com/@FranckPachot/oracle-dba-sql-plan-baseline-sql-id-and-plan-hash-value-8ffa811a7c68" rel="noopener noreferrer" target="_blank">https://medium.com/@FranckPachot/oracle-dba-sql-plan-baseline-sql-id-and-plan-hash-value-8ffa811a7c68</a></p>
+
+</div>
+</body>
+</html>

@@ -1,0 +1,281 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/encryption-in-oracle-public-cloud/">
+<title>Encryption in Oracle Public Cloud</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/encryption-in-oracle-public-cloud/">https://www.dbi-services.com/blog/encryption-in-oracle-public-cloud/</a> (2016-11-29)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">Encryption in Oracle Public Cloud</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+Oracle Transparent Data Encryption is available without option on the Oracle Public Cloud: Standard Edition as well as Enterprise Edition (EE, EE-HP EE-EP, ECS). More than that, the DBaaS enforces TDE for any user tablespace even when not specifying in the CREATE TABLESPACE. It you are not familiar with TDE key management (wallets) then you have probably encountered <strong>ORA-28374: typed master key not found in wallet</strong>.<br />
+Rather than another tutorial on TDE I&#8217;ll try to explain it from the errors you may encounter when simply creating a tablespace.<br />
+<!--more--><br />
+I have created a new pluggable database PDB2 from the command line:</p>
+<pre><code>
+SQL&gt; create pluggable database PDB2 admin user admin identified by "admin";
+Pluggable database PDB2 created.
+&nbsp;
+SQL&gt; alter pluggable database PDB2 open read write;
+Pluggable database PDB2 altered.
+&nbsp;
+SQL&gt; show pdbs
+CON_ID  CON_NAME  OPEN MODE   RESTRICTED
+------- --------- ----------- ----------
+2       PDB$SEED  READ ONLY   NO
+3       PDB1      READ WRITE  NO
+7       PDB2      READ WRITE  NO
+</code></pre>
+<p>I go to the PDB2 container and try to create a tablespace:</p>
+<pre><code>
+SQL&gt; alter session set container=PDB2;
+Session altered.
+&nbsp;
+SQL&gt; create tablespace mytablespace;
+&nbsp;
+Error starting at line 1 in command -
+create tablespace mytablespace
+Error report -
+ORA-28374: typed master key not found in wallet
+28374. 0000 -  "typed master key not found in wallet"
+*Cause:    You attempted to access encrypted tablespace or redo logs with
+           a typed master key not existing in the wallet.
+*Action:   Copy the correct Oracle Wallet from the instance where the tablespace
+           was created.
+</code></pre>
+<p>So, this message is related with TDE wallet. </p>
+<h3>encrypt_new_tablespaces</h3>
+<p>I didn&#8217;t specify any encryption clause in the CREATE TABLESPACE command but it is activated by default by the following parameter:</p>
+<pre><code>
+SQL&gt; show parameter encrypt_new_tablespaces
+&nbsp;
+NAME                    TYPE   VALUE
+----------------------- ------ ----------
+encrypt_new_tablespaces string CLOUD_ONLY
+</code></pre>
+<p>The values can be DDL (the old behavior where encryption must be defined in the CREATE TABLESPACE statement), ALWAYS (AES128 encryption by default), or CLOUD_ONLY which is the same as ALWAYS when the instance is on the Cloud, or as DDL if the instance is on-premises. The default is CLOUD_ONLY.<br />
+This parameter has been introduced in 12.2 and has been backported to 11.2.0.4 and 12.1.0.2 with bug 21281607 that is applied on any Oracle Public Cloud DBaaS instance.</p>
+<p>So, one solution to create our tablespace is to set encrypt_new_tablespaces to DDL but as it is recommended to encrypt all user tablespaces, let&#8217;s continue with it.</p>
+<h3>ORA-28374: typed master key not found in wallet</h3>
+<p>So the error message means that I don&#8217;t have a master key in the wallet for my newly created PDB because in multitenant each PDB has it&#8217;s own master key (but there&#8217;s only one wallet for the CDB).<br />
+The wallet is opened:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_wallet;
+&nbsp;
+WRL_TYPE  WRL_PARAMETER  STATUS              WALLET_TYPE  WALLET_ORDER  FULLY_BACKED_UP  CON_ID
+-------- --------------- ------------------- ------------ ------------- ---------------- ------
+FILE                     OPEN_NO_MASTER_KEY  AUTOLOGIN    SINGLE        UNDEFINED        7
+</code></pre>
+<p>But empty (I&#8217;m still in the PDB2 container)</p>
+<pre><code>
+SQL&gt; select * from v$encryption_keys order by creation_time;
+no rows selected
+</code></pre>
+<h3>SET KEY</h3>
+<p>So the idea is to set a key:</p>
+<pre><code>
+SQL&gt; administer key management set key identified by "Ach1z0#d";
+</code></pre>
+<p>but:</p>
+<pre><code>
+Error starting at line 1 in command -
+administer key management set key identified by "Ach1z0#d"
+Error report -
+ORA-28417: password-based keystore is not open
+28417. 0000 -  "password-based keystore is not open"
+*Cause:    Password-based keystore was not opened.
+*Action:   Close the auto login keystore, if required, and open a
+           password-based keystore.
+</code></pre>
+<p>Ok. An error because the wallet is not opened. Let&#8217;s try to open it:</p>
+<pre><code>SQL&gt; administer key management set keystore open identified by "Ach1z0#d";
+&nbsp;
+Error starting at line 1 in command -
+administer key management set keystore open identified by "Ach1z0#d"
+Error report -
+ORA-28354: Encryption wallet, auto login wallet, or HSM is already open
+28354. 0000 -  "Encryption wallet, auto login wallet, or HSM is already open"
+*Cause:    Encryption wallet, auto login wallet, or HSM was already opened.
+*Action:   None.</code></pre>
+<p>Actually, the wallet is opened. We have seen that the opened wallet is AUTOLOGIN:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_wallet;
+&nbsp;
+WRL_TYPE  WRL_PARAMETER  STATUS              WALLET_TYPE  WALLET_ORDER  FULLY_BACKED_UP  CON_ID
+-------- --------------- ------------------- ------------ ------------- ---------------- ------
+FILE                     OPEN_NO_MASTER_KEY  AUTOLOGIN    SINGLE        UNDEFINED        7
+</code></pre>
+<p>On DBaaS an AUTOLOGIN wallet is used to be able to have the database automatically restarted without manual intervention. Without AUTOLOGIN wallet you have to provide the password. </p>
+<p>But AUTOLOGIN wallet is limited to use it to access the tablespaces.<br />
+When administering the wallet, we need to provide the password manually:</p>
+<p>We need to close the AUTOLOGIN one:</p>
+<pre><code>
+SQL&gt; administer key management set keystore close;
+Key MANAGEMENT succeeded.
+</code></pre>
+<p>Now that it is closed, we can try to open it and open it with the password:</p>
+<pre><code>
+SQL&gt; administer key management set keystore open identified by "Ach1z0#d";
+&nbsp;
+Error starting at line : 1 in command -
+administer key management set keystore open identified by "Ach1z0#d"
+Error report -
+ORA-28417: password-based keystore is not open
+28417. 0000 -  "password-based keystore is not open"
+*Cause:    Password-based keystore was not opened.
+*Action:   Close the auto login keystore, if required, and open a
+           password-based keystore.
+</code></pre>
+<p>Oh&#8230; it is opened AUTOLOGIN once again:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_wallet;
+&nbsp;
+WRL_TYPE  WRL_PARAMETER  STATUS              WALLET_TYPE  WALLET_ORDER  FULLY_BACKED_UP  CON_ID
+-------- --------------- ------------------- ------------ ------------- ---------------- ------
+FILE                     OPEN_NO_MASTER_KEY  AUTOLOGIN    SINGLE        UNDEFINED        7
+</code></pre>
+<p></code></p>
+<h3>CDB$ROOT</h3>
+<p>You need to open the wallet with password from CDB$ROOT:</p>
+<pre><code>
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+&nbsp;
+SQL&gt; administer key management set keystore close;
+Key MANAGEMENT succeeded.
+&nbsp;
+SQL&gt; administer key management set keystore open identified by "Ach1z0#d";
+Key MANAGEMENT succeeded.
+</code></pre>
+<p>So here is the right way to start: in CDB$ROOT close the AUTOLOGIN wallet and open it with the password.</p>
+<h3>PDB</h3>
+<p>Now ready to go further in the PDB2.</p>
+<pre><code>
+SQL&gt; alter session set container=PDB2;
+Session altered.
+</code></pre>
+<p>The wallet is now closed for the PDB:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_wallet;
+WRL_TYPE  WRL_PARAMETER  STATUS  WALLET_TYPE  WALLET_ORDER  FULLY_BACKED_UP  CON_ID
+--------- -------------- ------- ------------ ------------- ---------------- ------
+FILE                     CLOSED  UNKNOWN      SINGLE        UNDEFINED        7
+</code></pre>
+<p>Let&#8217;s open it manually:</p>
+<pre><code>
+SQL&gt; administer key management set keystore open identified by "Ach1z0#d";
+Key MANAGEMENT succeeded.
+</code></pre>
+<p>We have no encryption key:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_keys order by creation_time;
+no rows selected
+</code></pre>
+<p>Let&#8217;s do what we want to do from the get-go: create an encryption key for our PDB:</p>
+<pre><code>
+SQL&gt; administer key management set key identified by "Ach1z0#d";
+&nbsp;
+Error starting at line 1 in command -
+administer key management set key identified by "Ach1z0#d"
+Error report -
+ORA-46631: keystore needs to be backed up
+46631. 00000 -  "keystore needs to be backed up"
+*Cause:    The keystore was not backed up. For this operation to proceed, the
+           keystore must be backed up.
+*Action:   Backup the keystore and try again.
+</code></pre>
+<p>Oh yes. Any change must be backed up. That&#8217;s easy:</p>
+<pre><code>
+SQL&gt; administer key management set key identified by "Ach1z0#d" with backup;
+Key MANAGEMENT succeeded.
+</code></pre>
+<p>Here we are. The key is there:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_keys order by creation_time;
+&nbsp;
+KEY_ID                                                TAG  CREATION_TIME                           ACTIVATION_TIME                         CREATOR  CREATOR_ID  USER  USER_ID  KEY_USE     KEYSTORE_TYPE      ORIGIN  BACKED_UP  CREATOR_DBNAME  CREATOR_DBID  CREATOR_INSTANCE_NAME  CREATOR_INSTANCE_NUMBER  CREATOR_INSTANCE_SERIAL  CREATOR_PDBNAME  CREATOR_PDBID  CREATOR_PDBUID  CREATOR_PDBGUID                   ACTIVATING_DBNAME  ACTIVATING_DBID  ACTIVATING_INSTANCE_NAME  ACTIVATING_INSTANCE_NUMBER  ACTIVATING_INSTANCE_SERIAL  ACTIVATING_PDBNAME  ACTIVATING_PDBID  ACTIVATING_PDBUID  ACTIVATING_PDBGUID                CON_ID
+----------------------------------------------------- ---- --------------------------------------- --------------------------------------- -------- ----------- ----- -------- ----------- ------------------ ------- ---------- --------------- ------------- ---------------------- ------------------------ ------------------------ ---------------- -------------- --------------- --------------------------------- ------------------ ---------------- ------------------------- --------------------------- --------------------------- ------------------- ----------------- ------------------ --------------------------------- ------
+AXP3BIrVW0+Evwfx7okZtcgAAAAAAAAAAAAAAAAAAAAAAAAAAAAA       28-NOV-16 08.41.20.629496000 PM +00:00  28-NOV-16 08.41.20.629498000 PM +00:00  SYS      0           SYS   0        TDE IN PDB  SOFTWARE KEYSTORE  LOCAL   NO         CDB1            902797638     CDB1                   1                        4294967295               PDB2             7              96676154        42637D7C7F7A3315E053DA116A0A2666  CDB1               902797638        CDB1                      1                           4294967295                  PDB2                7                 96676154           42637D7C7F7A3315E053DA116A0A2666  7
+</code></pre>
+<p>All is perfect but the wallet is still opened with the password:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_wallet;
+WRL_TYPE  WRL_PARAMETER  STATUS  WALLET_TYPE  WALLET_ORDER  FULLY_BACKED_UP  CON_ID
+-------- --------------- ------- ------------ ------------- --------------- -------
+FILE                     OPEN    PASSWORD     SINGLE        NO               7
+</code></pre>
+<p>In order to get back to the initial state, it is sufficient to close it (from the CDB$ROOT):</p>
+<pre><code>
+SQL&gt; alter session set container=CDB$ROOT;
+Session altered.
+&nbsp;
+SQL&gt; administer key management set keystore close;
+&nbsp;
+Error starting at line 1 in command -
+administer key management set keystore close
+Error report -
+ORA-28389: cannot close auto login wallet
+28389. 00000 -  "cannot close auto login wallet"
+*Cause:    Auto login wallet could not be closed because it was opened with
+           another wallet or HSM requiring a password.
+*Action:   Close the wallet or HSM with a password.
+</code></pre>
+<p>Ok. The &#8216;close&#8217; command needs the password as it was not opened with AUTOLOGIN one.</p>
+<pre><code>
+SQL&gt; administer key management set keystore close identified by "Ach1z0#d";
+Key MANAGEMENT succeeded.
+</code></pre>
+<p>It is immediately automatically re-opened with the AUTOLOGIN one:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_wallet;
+&nbsp;
+WRL_TYPE  WRL_PARAMETER                           STATUS  WALLET_TYPE  WALLET_ORDER  FULLY_BACKED_UP  CON_ID
+--------- --------------------------------------- ------- ------------ ------------- ---------------- ------
+FILE      /u01/app/oracle/admin/CDB1/tde_wallet/  OPEN    AUTOLOGIN    SINGLE        NO               1
+</code></pre>
+<p>and from the CDB$ROOT I can see all of them:</p>
+<pre><code>
+SQL&gt; select * from v$encryption_keys order by creation_time;
+&nbsp;
+KEY_ID                                                TAG        CREATION_TIME                           ACTIVATION_TIME                         CREATOR  CREATOR_ID  USER  USER_ID  KEY_USE     KEYSTORE_TYPE      ORIGIN  BACKED_UP  CREATOR_DBNAME  CREATOR_DBID  CREATOR_INSTANCE_NAME  CREATOR_INSTANCE_NUMBER  CREATOR_INSTANCE_SERIAL  CREATOR_PDBNAME  CREATOR_PDBID  CREATOR_PDBUID  CREATOR_PDBGUID                   ACTIVATING_DBNAME  ACTIVATING_DBID  ACTIVATING_INSTANCE_NAME  ACTIVATING_INSTANCE_NUMBER  ACTIVATING_INSTANCE_SERIAL  ACTIVATING_PDBNAME  ACTIVATING_PDBID  ACTIVATING_PDBUID  ACTIVATING_PDBGUID                CON_ID
+----------------------------------------------------- ---- --------------------------------------- --------------------------------------- -------- ----------- ----- -------- ----------- ------------------ ------- ---------- --------------- ------------- ---------------------- ------------------------ ------------------------ ---------------- -------------- --------------- --------------------------------- ------------------ ---------------- ------------------------- --------------------------- --------------------------- ------------------- ----------------- ------------------ --------------------------------- ------
+ATxUk1G7gU/0v3Ygk1MbZj8AAAAAAAAAAAAAAAAAAAAAAAAAAAAA             27-NOV-16 09.02.18.050676000 PM +00:00  27-NOV-16 09.02.18.130705000 PM +00:00  SYS      0           SYS   0        TDE IN PDB  SOFTWARE KEYSTORE  LOCAL   YES        CDB1            902797638     CDB1                   1                        4294967295               CDB$ROOT         1              1               3D94C45E41CA19A9E05391E5E50AB8D8  CDB1               902797638        CDB1                      1                           4294967295                  CDB$ROOT            1                 1                  3D94C45E41CA19A9E05391E5E50AB8D8  1
+AWSs1Gr0WE86vyfWc123xccAAAAAAAAAAAAAAAAAAAAAAAAAAAAA             27-NOV-16 09.02.18.089346000 PM +00:00  27-NOV-16 09.02.18.722365000 PM +00:00  SYS      0           SYS   0        TDE IN PDB  SOFTWARE KEYSTORE  LOCAL   YES        CDB1            902797638     CDB1                   1                        4294967295               PDB1             3              2687567370      424FA3D9C61927FFE053DA116A0A85F7  CDB1               902797638        CDB1                      1                           4294967295                  PDB1                3                 2687567370         424FA3D9C61927FFE053DA116A0A85F7  3
+AfwqzZP/Rk+5v5WqiNK5nl0AAAAAAAAAAAAAAAAAAAAAAAAAAAAA             28-NOV-16 08.36.43.980717000 PM +00:00  28-NOV-16 08.36.43.980720000 PM +00:00  SYS      0           SYS   0        TDE IN PDB  SOFTWARE KEYSTORE  LOCAL   YES        CDB1            902797638     CDB1                   1                        4294967295               PDB2             5              2602763579      42636D1380072BE7E053DA116A0A8E2D  CDB1               902797638        CDB1                      1                           4294967295                  PDB2                5                 2602763579         42636D1380072BE7E053DA116A0A8E2D  5
+AXP3BIrVW0+Evwfx7okZtcgAAAAAAAAAAAAAAAAAAAAAAAAAAAAA             28-NOV-16 08.41.20.629496000 PM +00:00  28-NOV-16 08.41.20.629498000 PM +00:00  SYS      0           SYS   0        TDE IN PDB  SOFTWARE KEYSTORE  LOCAL   NO         CDB1            902797638     CDB1                   1                        4294967295               PDB2             7              96676154        42637D7C7F7A3315E053DA116A0A2666  CDB1               902797638        CDB1                      1                           4294967295                  PDB2                7                 96676154           42637D7C7F7A3315E053DA116A0A2666  7
+</code></pre>
+<p>As you can see I did two attempts with the PDB2 to write this blog post. The previous keys are all in the wallet.</p>
+<p>I check that the AUTOLOGIN is opened in PDB2:</p>
+<pre><code>
+SQL&gt; alter session set container=PDB2;
+Session altered.
+&nbsp;;
+SQL&gt; select * from v$encryption_wallet;
+WRL_TYPE  WRL_PARAMETER  STATUS  WALLET_TYPE  WALLET_ORDER  FULLY_BACKED_UP  CON_ID
+--------- -------------- ------- ------------ ------------- ---------------- ------
+FILE                     OPEN    AUTOLOGIN    SINGLE        NO               7
+</code></pre>
+<p>And finally I can create my tablespace</p>
+<pre><code>
+SQL&gt; create tablespace mytablespace;
+Tablespace MYTABLESPACE created.
+</code></pre>
+<p>Easy, isn&#8217;t it? </p>
+<p>If you create your PDB with the DBaaS monitor interface all is done automatically with the &#8216;create PDB&#8217; button:</p>
+<ul>
+<li>Close the AUTOLOGIN wallet (from CDB$ROOT)</li>
+<li>Open the wallet with password</li>
+<li>Create the pluggable database and open it</li>
+<li>Open the wallet from the PDB, with password</li>
+<li>Set the masterkey for the PDB</li>
+<li>Close the wallet to get it opened with AUTOLOGIN</li>
+</ul>
+
+</div>
+</body>
+</html>

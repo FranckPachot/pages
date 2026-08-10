@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/12c-nologging-and-data-guard/">
+<title>12c nologging and Data Guard</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/12c-nologging-and-data-guard/">https://www.dbi-services.com/blog/12c-nologging-and-data-guard/</a> (2017-05-03)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">12c nologging and Data Guard</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+The title sounds weird because Data Guard synchronisation is based on the redo stream, so it makes no sense to do nologging operations on the primary. And this is the reason why we set FORCE LOGGING on a Data Guard configuration. However, to lower the downtime of a migration done with Data Pump, you may want to import with minimal logging and then re-synchronize the standby. This post is about the re-synchronisation in 12.1<br />
+<!--more--></p>
+<h3>Nologging Data Pump</h3>
+<p>When you want to lower the downtime for a migration, you can disable force logging (alter database no force logging), and run impdp with the following: </p>
+<pre><code>transform=disable_archive_logging:y</code></pre>
+<p>Don&#8217;t forget to re-enable force_logging at the end and to re-synchronize the standby.</p>
+<h3>nonlogged (aka unrecoverable)</h3>
+<p>So, you have nonlogged blocks, we also call that unrecoverable because it cannot be recovered with the redo stream. If you are in 12.2 then everything is easy with </p>
+<pre><code>recover database nonlogged block;</code></pre>
+<p> and I explained that in a previous post: <a href="https://www.dbi-services.com/blog/12cr2-recover-nonlogged-blocks-after-nologging-in-data-guard/" target="_blank" rel="noopener noreferrer">https://www.dbi-services.com/blog/12cr2-recover-nonlogged-blocks-after-nologging-in-data-guard/</a></p>
+<p>If you are in 12.2 then it is half easy only. You can see where you have nonlogged blocks:</p>
+<pre><code>RMAN&gt; select file#,reason,count(*) from v$nonlogged_block group by file#,reason;
+&amp;bsp;
+     FILE# REASON    COUNT(*)
+---------- ------- ----------
+         5 UNKNOWN        158
+         6 UNKNOWN        159
+         7 UNKNOWN        336
+         8 UNKNOWN         94
+         9 UNKNOWN         16
+        10 UNKNOWN         14</code></pre>
+<p>and this is the right way to query them. If you use RMAN &#8216;report unrecoverable&#8217; it will not display the datafiles that had nologging operations on the primary.</p>
+<p>In 12.1 you can RESTORE FROM SERVICE to recover from the primary rather than from a backup. It is straightforward. I&#8217;m just writing this blog post in case you see the following when you try to do this because the message can be misinterpreted:</p>
+<pre><code>
+RMAN&gt; restore database from service 'MYDB_SITE1_dgmgrl';
+&nbsp;
+Starting restore at 03-MAY-2017 13:22:12
+using channel ORA_DISK_1
+&nbsp;
+skipping datafile 1; already restored to SCN 3849354
+skipping datafile 2; already restored to SCN 3849356
+skipping datafile 3; already restored to SCN 3849358
+skipping datafile 4; already restored to SCN 3849360
+skipping datafile 5; already restored to SCN 3849365
+skipping datafile 6; already restored to SCN 3849372
+skipping datafile 7; already restored to SCN 3849382
+skipping datafile 8; already restored to SCN 3849389
+skipping datafile 9; already restored to SCN 3849395
+skipping datafile 10; already restored to SCN 3849398
+restore not done; all files read only, offline, or already restored
+Finished restore at 03-MAY-2017 13:22:12
+</code></pre>
+<p>RMAN is clever enough: the data files are ok, according to their header and it skipped the restore. But you know that they are not ok, because some blocks are marked as corrupt because of nologging operations. Then what to do? There is a FORCE option in the restore command. But you probably don&#8217;t need it. If you get the previous message, it means that the datafiles are synchronized, which means that the APPLY is running. And, anyway, in order to restore you need to stop the APPLY.</p>
+<pre><code>
+DGMGRL&gt; edit database orclb set state=apply-off;
+</code></pre>
+<p>Of course, once you stopped the apply, you run your RESTORE DATABASE FORCE. But you probably don&#8217;t need it. Now, the datafiles are stale and RMAN will not skip them even without the FORCE keyword.</p>
+<pre><code>
+RMAN&gt; restore database from service 'MYDB_SITE1_dgmgrl';
+&nbsp;
+Starting restore at 03-MAY-2017 13:22:37
+using channel ORA_DISK_1
+&nbsp;
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: using network backup set from service MYDB_SITE1_dgmgrl
+channel ORA_DISK_1: specifying datafile(s) to restore from backup set
+channel ORA_DISK_1: restoring datafile 00001 to /media/raid-db/MYDB/system01.dbf
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:07
+channel ORA_DISK_1: starting datafile backup set restore
+channel ORA_DISK_1: using network backup set from service MYDB_SITE1_dgmgrl
+...
+channel ORA_DISK_1: restore complete, elapsed time: 00:00:07
+Finished restore at 03-MAY-2017 13:25:30
+RMAN&gt; exit
+</code></pre>
+<p>Don&#8217;t forget to re-enable the Data Guard Apply at the end.</p>
+<h3>So what?</h3>
+<p>When you see all datafiles skipped, that probably means that you didn&#8217;t stop the APPLY. With APPLY stopped, and you probably stop it before the import as you plan to restore the standby later, then you probably don&#8217;t need the FORCE command. However, I&#8217;ll always recommend using the FORCE in this case because RMAN will skip the files without looking at the unlogged blocks. Imagine that you put a tablespace in read-only after the non-logged import but before stopping the apply. Then this one will be skipped.</p>
+
+</div>
+</body>
+</html>

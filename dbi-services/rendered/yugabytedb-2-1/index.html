@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://www.dbi-services.com/blog/yugabytedb-2-1/">
+<title>YugaByteDB 2.1: the Open Source multi-region distributed database with PostgreSQL API is in GA with huge performance improvement</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<p class="firstpub">This was first published on <a href="https://www.dbi-services.com/blog/yugabytedb-2-1/">https://www.dbi-services.com/blog/yugabytedb-2-1/</a> (2020-03-08)<br>Republishing here for new followers. The content is related to the versions available at the publication date.</p>
+<h1 class="entry-title">YugaByteDB 2.1: the Open Source multi-region distributed database with PostgreSQL API is in GA with huge performance improvement</h1>
+<div class="content-inner">
+<h2>By Franck Pachot</h2>
+<p>.<br />
+9 months ago I was looking at YugaByteDB which was still in beta version for its &#8216;YSQL&#8217; API. I published my first test on Medium: <a href="https://medium.com/@FranckPachot/running-pgbench-on-yugabytedb-1-3-3a15450dfa42" rel="noopener noreferrer" target="_blank">https://medium.com/@FranckPachot/running-pgbench-on-yugabytedb-1-3-3a15450dfa42</a>. I have been very enthusiastic about the idea, the architecture, the way they open-sourced it and how all was documented in their blog. I&#8217;ve even met them in Sunnyvale when I traveled to California for Oracle Open World. Great people with a great vision on the future of databases. From this first test, I was not impressed by the performance but it was an early beta and a multi-master/multi-index database has many challenges to solve before tuning the details of implementation. This tuning task has been done for the General Availability version 2.1 released in February. I was eager to test it, but this first month back to dbi-services consulting was very busy. So finally here it is.<br />
+<!--more--><br />
+This post takes the same test I did last July and the result is impressive: the pgbench initialization time is fully fixed and the pgbench run shows 9x higher throughput. </p>
+<p>I&#8217;m on the same VM which, as funny as it might sound, is an Oracle Linux 7 running on the Oracle Cloud.</p>
+<h3>Install and start:</h3>
+<p>I install this version 2.1 in the same way I installed the 1.3 in the past. All is documented: <a href="https://docs.yugabyte.com/latest/quick-start/install/linux/" rel="noopener noreferrer" target="_blank">https://docs.yugabyte.com/latest/quick-start/install/linux/</a></p>
+<pre><code>
+wget -O yugabyte-2.1.0.0-linux.tar.gz  https://downloads.yugabyte.com/yugabyte-2.1.0.0-linux.tar.gz
+tar -xzvf yugabyte-2.1.0.0-linux.tar.gz
+yugabyte-2.1.0.0/bin/post_install.sh
+export PATH="~/yugabyte-2.1.0.0/bin:~/yugabyte-2.1.0.0/postgresql/bin:$PATH"
+</code></pre>
+<p>I create a 3 nodes cluster with replication factor 3, with all nodes in the same host for this test:</p>
+<pre><code>
+yb-ctl --rf 3 create
+yb-ctl status
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-06-142758.png"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-06-142758.png" alt="" width="1024" height="743" class="aligncenter size-large wp-image-38010" /></a></p>
+<p>I create database for this:</p>
+<pre><code>
+ysqlsh
+ \timing on
+ drop database if exists franck;
+ create database franck;
+ \q
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-06-142900.png"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-06-142900.png" alt="" width="1024" height="290" class="aligncenter size-large wp-image-38008" /></a></p>
+<h3>pgbench initialization</h3>
+<p>I use pgbench that I have from a &#8220;normal&#8221; PostgreSQL installation on the same server.</p>
+<pre><code>
+[opc@db192 ~]$ type pgbench
+pgbench is hashed (/usr/pgsql-11/bin/pgbench)
+time pgbench --initialize --host localhost -p 5433 -U postgres franck
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-06-143108.png"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-06-143108.png" alt="" width="1024" height="423" class="aligncenter size-large wp-image-38007" /></a> </p>
+<p>If you compare with the previous post on version 1.3 you will see many differences.</p>
+<ul>
+<li>No &#8220;ERROR: DROP multiple objects not supported yet&#8221; here. This issue has been fixed.</li>
+<li>No &#8220;ERROR: VACUUM not supported yet&#8221; but just a warning because there&#8217;s no vaccum here in the YugaByteDB storage layer</li>
+<li>And the best: 8 seconds instead of the 2 minutes we had before</li>
+</ul>
+<p>However the &#8220;ALTER TABLE&#8221; to add the constraints afterward is still not supported so I run the same manually with the FOREIGN KEY declaration in the CREATE TABLE:</p>
+<pre><code>
+ysqlsh franck
+ drop table if exists pgbench_history;
+ drop table if exists pgbench_tellers;
+ drop table if exists pgbench_accounts;
+ drop table if exists pgbench_branches;
+CREATE TABLE pgbench_branches (
+    bid integer NOT NULL
+   ,bbalance integer
+   ,filler character(88)
+   ,CONSTRAINT pgbench_branches_pkey PRIMARY KEY (bid)
+ );
+CREATE TABLE pgbench_accounts (
+    aid integer NOT NULL
+   ,bid integer references pgbench_branches
+   ,abalance integer
+   ,filler character(84)
+   ,CONSTRAINT pgbench_accounts_pkey PRIMARY KEY (aid)
+ );
+CREATE TABLE pgbench_tellers (
+    tid integer NOT NULL
+   ,bid integer references pgbench_branches
+   ,tbalance integer
+   ,filler character(84)
+   ,CONSTRAINT pgbench_tellers_pkey PRIMARY KEY (tid)
+ );
+CREATE TABLE pgbench_history (
+    tid integer references pgbench_tellers
+   ,bid integer references pgbench_branches
+   ,aid integer references pgbench_accounts
+   ,delta integer
+   ,mtime timestamp without time zone
+   ,filler character(22)
+ );
+\q
+</code></pre>
+<p>Now remains to insert the rows there. This was very long (about an hour) in 1.3:</p>
+<pre><code>
+time pgbench --initialize --init-steps=g -h localhost -p 5433 -U postgres franck
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-07-184013.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-07-184013.jpg" alt="" width="1024" height="183" class="aligncenter size-large wp-image-38054" /></a></p>
+<p>No foreign key error and 6 seconds only!</p>
+<p>Do you remember that I had to switch to SERIALIZABLE isolation level? I don&#8217;t have to here:</p>
+<p><a href="../../assets/Annotation-2020-03-07-185958.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-07-185958.jpg" alt="" width="1024" height="355" class="aligncenter size-large wp-image-38056" /></a></p>
+<p>This has been fixed with the support of SELECT locks, so no need to go to optimistic locking with SERIALIZABLE (which requires that the application implements a &#8216;retry&#8217; logic).</p>
+<h3>Simple Update in 1 thread</h3>
+<p>Then, as I did before, I run a Simple Update workload from one session during 30 seconds:</p>
+<pre><code>
+pgbench --no-vacuum --builtin=simple-update --protocol=prepared --time 30 -h localhost -p 5433 -U postgres franck
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-07-191625.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-07-191625.jpg" alt="" width="1024" height="218" class="aligncenter size-large wp-image-38059" /></a></p>
+<p>When compared with the <a href="https://miro.medium.com/max/3736/1*I4Ypc0PUFUCLEB-9NK_mSA.png" rel="noopener noreferrer" target="_blank">previous run</a> on 1.3 I&#8217;ve updated 9x more transactions. Yes, that&#8217;s exactly what has been announced for this version: huge performance imprevements:</p>
+<blockquote class="twitter-tweet" data-width="500" data-dnt="true">
+<p lang="en" dir="ltr">What we&#39;ve been up to over the last few month &#8211; YugabyteDB 2.1 has a ton of perf improvements and a lot of other goodies! <a href="https://t.co/wwwhVG7bPd">https://t.co/wwwhVG7bPd</a></p>
+<p>PS: Please do give it a spin, would love your feedback.</p>
+<p>&mdash; Karthik Ranganathan (@karthikr) <a href="https://twitter.com/karthikr/status/1232356784343400449?ref_src=twsrc%5Etfw">February 25, 2020</a></p></blockquote>
+<p><script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script></p>
+<h3>Simple Update in 10 threads</h3>
+<p>Then, as I did before I&#8217;m running with 10 concurrent threads</p>
+<pre><code>
+pgbench --no-vacuum --protocol=prepared --builtin=simple-update --time 30 --jobs=10 --client=10 -h localhost -p 5433 -U postgres franck
+</code></pre>
+<p><a href="../../assets/Annotation-2020-03-07-195106.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-07-195106.jpg" alt="" width="1024" height="150" class="aligncenter size-large wp-image-38065" /></a></p>
+<p>Again, that 7x better than my test on 1.3 and still in read commited isolation level.</p>
+<p>Note that I was lucky here but it can happen that we get a serialization error even in read commited like in this second run of the same:<br />
+<a href="../../assets/Annotation-2020-03-07-195420.jpg"><img loading="lazy" decoding="async" src="../../assets/Annotation-2020-03-07-195420.jpg" alt="" width="1024" height="200" class="aligncenter size-large wp-image-38067" /></a></p>
+<p>The community implementation of pgbench has no retry logic. Once an error is enountered the thead finishes, and that&#8217;s unusable for a benchmark. The patch proposed many times was, unfortunately, always rejected: <a href="https://commitfest.postgresql.org/18/1645/" rel="noopener noreferrer" target="_blank">https://commitfest.postgresql.org/18/1645/</a>.</p>
+<p>But YugaByteDB has a solution for that, which I&#8217;ll show in the next post: <a href="https://www.dbi-services.com/blog/ysql_bench/" rel="noopener noreferrer" target="_blank">https://www.dbi-services.com/blog/ysql_bench/</a></p>
+
+</div>
+</body>
+</html>
