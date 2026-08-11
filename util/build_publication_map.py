@@ -601,6 +601,11 @@ def write_sitemap(path: Path, catalog: dict[str, Any], root: Path) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    parser.add_argument(
+        "--skip-google-analytics",
+        action="store_true",
+        help="Do not add Google Analytics tags to archived HTML pages",
+    )
     args = parser.parse_args()
     root = args.root.resolve()
     output = root / "home" / "publications.js"
@@ -610,13 +615,14 @@ def main() -> None:
     write_social_preview(root, catalog)
     write_sitemap(root / "sitemap.xml", catalog, root)
     write_sitemap(root / "home" / "sitemap.xml", catalog, root)
-    analytics_changed, analytics_tagged = install_google_tags(root)
     print(
         f"Wrote {output} with {catalog['publication_count']} publications, "
         f"{len(catalog['database_counts'])} database facets, and "
         f"{len(catalog['category_counts'])} categories"
     )
-    print(f"Google tag: updated {analytics_changed} pages; {analytics_tagged} pages tagged")
+    if not args.skip_google_analytics:
+        analytics_changed, analytics_tagged = install_google_tags(root)
+        print(f"Google tag: updated {analytics_changed} pages; {analytics_tagged} pages tagged")
 
 
 if __name__ == "__main__":

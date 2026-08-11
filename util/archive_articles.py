@@ -816,6 +816,11 @@ def main() -> None:
     parser.add_argument("--techcommunity-profile-id", default="3595257")
     parser.add_argument("--cern-author", default="fpachot")
     parser.add_argument("--offline", action="store_true", help="Rebuild from local snapshots only")
+    parser.add_argument(
+        "--skip-google-analytics",
+        action="store_true",
+        help="Do not add Google Analytics tags to archived HTML pages",
+    )
     args = parser.parse_args()
 
     if args.offline:
@@ -879,9 +884,10 @@ def main() -> None:
     }
     manifest_path = root / "archive-manifest.json"
     write_json_atomic(manifest_path, manifest)
-    analytics_changed, analytics_tagged = install_google_tags(root)
     print(f"Wrote {manifest_path} with {len(articles)} articles")
-    print(f"Google tag: updated {analytics_changed} pages; {analytics_tagged} pages tagged")
+    if not args.skip_google_analytics:
+        analytics_changed, analytics_tagged = install_google_tags(root)
+        print(f"Google tag: updated {analytics_changed} pages; {analytics_tagged} pages tagged")
 
 
 if __name__ == "__main__":

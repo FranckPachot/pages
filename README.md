@@ -38,6 +38,12 @@ python util/build_publication_map.py
 
 Then open `index.html` directly or serve the repository with any static HTTP server.
 
+## Daily publication discovery
+
+The `Daily publication refresh` GitHub Actions workflow runs every day at 06:17 UTC and can also be started manually. It checks the public APIs and feeds supported by `util/archive_articles.py`, rebuilds the publication index without retagging unrelated HTML pages, and opens or updates a single review pull request only when files change. It never posts, replies, reacts, follows, or changes anything on a social platform.
+
+The workflow discovers publications from DBI Services, Dev.to, Yugabyte, Microsoft Tech Community, CERN, and Developpez. Medium and LinkedIn remain local or authenticated imports, so they are inventoried but cannot be discovered by the unattended job. Review the pull request before merging, especially when a new article needs a curated description.
+
 ## Build the agent knowledge base
 
 `db-skills.md` combines the curated database field manuals with an exhaustive, deduplicated registry of archived publications. The workspace skill at `.github/skills/database-experience/SKILL.md` tells agents when and how to consult it.
