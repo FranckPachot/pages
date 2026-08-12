@@ -14,8 +14,10 @@
     sort: "newest",
     visible: pageSize,
   };
+  let searchDraft = "";
 
   const elements = {
+    filters: document.querySelector("#filters"),
     search: document.querySelector("#search"),
     database: document.querySelector("#database"),
     version: document.querySelector("#version"),
@@ -175,8 +177,16 @@
     );
   }
 
+  function queryTerms(value) {
+    return value.trim().split(/\s+/).filter(Boolean);
+  }
+
+  function effectiveQueryTerms() {
+    return queryTerms(`${state.query} ${searchDraft}`);
+  }
+
   function matches(publication) {
-    const terms = state.query.toLocaleLowerCase().trim().split(/\s+/).filter(Boolean);
+    const terms = effectiveQueryTerms().map((term) => term.toLocaleLowerCase());
     return terms.every((term) => publication.search_text.includes(term))
       && (!state.database || publication.databases.includes(state.database))
       && (!state.version || publication.versions.includes(state.version))
@@ -262,7 +272,7 @@
 
   function activeFilterEntries() {
     const entries = [];
-    if (state.query) entries.push(["query", `“${state.query}”`]);
+    queryTerms(state.query).forEach((term) => entries.push([`query:${term}`, `“${term}”`]));
     if (state.database) entries.push(["database", state.database]);
     if (state.version) entries.push(["version", state.version]);
     if (state.category) entries.push(["category", state.category]);
@@ -284,7 +294,10 @@
   }
 
   function clearFilter(key) {
-    if (key === "query") state.query = "";
+    if (key.startsWith("query:")) {
+      const term = key.slice("query:".length);
+      state.query = queryTerms(state.query).filter((value) => value !== term).join(" ");
+    }
     if (["database", "version", "category", "source"].includes(key)) state[key] = "";
     if (key === "years") {
       state.yearFrom = catalog.year_min;
@@ -295,7 +308,7 @@
   }
 
   function syncControls() {
-    elements.search.value = state.query;
+    elements.search.value = searchDraft;
     elements.database.value = state.database;
     elements.version.value = state.version;
     elements.category.value = state.category;
@@ -308,7 +321,8 @@
 
   function updateUrl() {
     const parameters = new URLSearchParams();
-    if (state.query) parameters.set("q", state.query);
+    const query = effectiveQueryTerms().join(" ");
+    if (query) parameters.set("q", query);
     ["database", "version", "category", "source"].forEach((key) => state[key] && parameters.set(key, state[key]));
     if (state.yearFrom !== catalog.year_min) parameters.set("from", state.yearFrom);
     if (state.yearTo !== catalog.year_max) parameters.set("to", state.yearTo);
@@ -343,10 +357,23 @@
     elements.search.addEventListener("input", () => {
       cancelAnimationFrame(searchFrame);
       searchFrame = requestAnimationFrame(() => {
-        state.query = elements.search.value;
+        searchDraft = elements.search.value;
         state.visible = pageSize;
         update();
       });
+    });
+    elements.filters.addEventListener("submit", (event) => {
+      event.preventDefault();
+      cancelAnimationFrame(searchFrame);
+      searchDraft = elements.search.value;
+      const terms = queryTerms(`${state.query} ${searchDraft}`);
+      state.query = terms.filter((term, index) => (
+        terms.findIndex((candidate) => candidate.toLocaleLowerCase() === term.toLocaleLowerCase()) === index
+      )).join(" ");
+      searchDraft = "";
+      elements.search.value = "";
+      state.visible = pageSize;
+      update();
     });
     ["database", "version", "category", "source", "sort"].forEach((key) => {
       elements[key].addEventListener("change", () => {
@@ -370,6 +397,7 @@
     elements.clearYear.addEventListener("click", () => clearFilter("years"));
     elements.reset.addEventListener("click", () => {
       Object.assign(state, { query: "", database: "", version: "", category: "", source: "", yearFrom: catalog.year_min, yearTo: catalog.year_max, sort: "newest", visible: pageSize });
+      searchDraft = "";
       syncControls();
       update();
     });
