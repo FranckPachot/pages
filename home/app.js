@@ -4,7 +4,7 @@
   const catalog = window.PUBLICATION_CATALOG;
   const pageSize = 80;
   const state = {
-    query: "",
+    query: [],
     database: "",
     version: "",
     category: "",
@@ -177,12 +177,25 @@
     );
   }
 
-  function queryTerms(value) {
-    return value.trim().split(/\s+/).filter(Boolean);
+  function parseQuery(value) {
+    const terms = [];
+    const pattern = /"((?:\\.|[^"])*)"|(\S+)/g;
+    let match;
+    while ((match = pattern.exec(value)) !== null) {
+      terms.push((match[1] ?? match[2]).replace(/\\([\\"])/g, "$1"));
+    }
+    return terms;
+  }
+
+  function serializeQuery(terms) {
+    return terms.map((term) => (
+      /\s/.test(term) ? `"${term.replace(/([\\"])/g, "\\$1")}"` : term
+    )).join(" ");
   }
 
   function effectiveQueryTerms() {
-    return queryTerms(`${state.query} ${searchDraft}`);
+    const draft = searchDraft.trim().replace(/\s+/g, " ");
+    return draft ? [...state.query, draft] : state.query;
   }
 
   function matches(publication) {
@@ -272,7 +285,7 @@
 
   function activeFilterEntries() {
     const entries = [];
-    queryTerms(state.query).forEach((term) => entries.push([`query:${term}`, `“${term}”`]));
+    state.query.forEach((term, index) => entries.push([`query:${index}`, `“${term}”`]));
     if (state.database) entries.push(["database", state.database]);
     if (state.version) entries.push(["version", state.version]);
     if (state.category) entries.push(["category", state.category]);
@@ -295,8 +308,7 @@
 
   function clearFilter(key) {
     if (key.startsWith("query:")) {
-      const term = key.slice("query:".length);
-      state.query = queryTerms(state.query).filter((value) => value !== term).join(" ");
+      state.query.splice(Number(key.slice("query:".length)), 1);
     }
     if (["database", "version", "category", "source"].includes(key)) state[key] = "";
     if (key === "years") {
@@ -321,7 +333,7 @@
 
   function updateUrl() {
     const parameters = new URLSearchParams();
-    const query = effectiveQueryTerms().join(" ");
+    const query = serializeQuery(effectiveQueryTerms());
     if (query) parameters.set("q", query);
     ["database", "version", "category", "source"].forEach((key) => state[key] && parameters.set(key, state[key]));
     if (state.yearFrom !== catalog.year_min) parameters.set("from", state.yearFrom);
@@ -345,7 +357,7 @@
 
   function readUrlState() {
     const parameters = new URLSearchParams(location.search);
-    state.query = parameters.get("q") || "";
+    state.query = parseQuery(parameters.get("q") || "");
     ["database", "version", "category", "source"].forEach((key) => state[key] = parameters.get(key) || "");
     state.yearFrom = Number(parameters.get("from")) || catalog.year_min;
     state.yearTo = Number(parameters.get("to")) || catalog.year_max;
@@ -365,11 +377,11 @@
     elements.filters.addEventListener("submit", (event) => {
       event.preventDefault();
       cancelAnimationFrame(searchFrame);
-      searchDraft = elements.search.value;
-      const terms = queryTerms(`${state.query} ${searchDraft}`);
+      const phrase = elements.search.value.trim().replace(/\s+/g, " ");
+      const terms = phrase ? [...state.query, phrase] : state.query;
       state.query = terms.filter((term, index) => (
         terms.findIndex((candidate) => candidate.toLocaleLowerCase() === term.toLocaleLowerCase()) === index
-      )).join(" ");
+      ));
       searchDraft = "";
       elements.search.value = "";
       state.visible = pageSize;
@@ -396,7 +408,7 @@
     });
     elements.clearYear.addEventListener("click", () => clearFilter("years"));
     elements.reset.addEventListener("click", () => {
-      Object.assign(state, { query: "", database: "", version: "", category: "", source: "", yearFrom: catalog.year_min, yearTo: catalog.year_max, sort: "newest", visible: pageSize });
+      Object.assign(state, { query: [], database: "", version: "", category: "", source: "", yearFrom: catalog.year_min, yearTo: catalog.year_max, sort: "newest", visible: pageSize });
       searchDraft = "";
       syncControls();
       update();
