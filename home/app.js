@@ -9,6 +9,7 @@
     version: "",
     category: "",
     source: "",
+    employment: "",
     yearFrom: catalog.year_min,
     yearTo: catalog.year_max,
     sort: "newest",
@@ -23,8 +24,7 @@
     version: document.querySelector("#version"),
     category: document.querySelector("#category"),
     source: document.querySelector("#source"),
-    yearFrom: document.querySelector("#year-from"),
-    yearTo: document.querySelector("#year-to"),
+    employment: document.querySelector("#employment"),
     sort: document.querySelector("#sort"),
     results: document.querySelector("#results"),
     resultCount: document.querySelector("#result-count"),
@@ -72,10 +72,9 @@
     Object.entries(catalog.source_counts)
       .sort((left, right) => sourceNames[left[0]].localeCompare(sourceNames[right[0]]))
       .forEach(([value, count]) => option(elements.source, value, `${sourceNames[value]} · ${count}`));
-    for (let year = catalog.year_min; year <= catalog.year_max; year += 1) {
-      option(elements.yearFrom, String(year), String(year));
-      option(elements.yearTo, String(year), String(year));
-    }
+    catalog.employment_periods.forEach((period) => (
+      option(elements.employment, period.key, `${period.company} · ${period.range} · ${period.count}`)
+    ));
   }
 
   function databaseLogo(value) {
@@ -205,6 +204,7 @@
       && (!state.version || publication.versions.includes(state.version))
       && (!state.category || publication.categories.includes(state.category))
       && (!state.source || publication.source_key === state.source)
+      && (!state.employment || publication.employment_period === state.employment)
       && publication.year >= state.yearFrom
       && publication.year <= state.yearTo;
   }
@@ -290,6 +290,10 @@
     if (state.version) entries.push(["version", state.version]);
     if (state.category) entries.push(["category", state.category]);
     if (state.source) entries.push(["source", sourceNames[state.source]]);
+    if (state.employment) {
+      const period = catalog.employment_periods.find((candidate) => candidate.key === state.employment);
+      entries.push(["employment", `${period.company} · ${period.range}`]);
+    }
     if (state.yearFrom !== catalog.year_min || state.yearTo !== catalog.year_max) entries.push(["years", `${state.yearFrom}–${state.yearTo}`]);
     return entries;
   }
@@ -310,7 +314,7 @@
     if (key.startsWith("query:")) {
       state.query.splice(Number(key.slice("query:".length)), 1);
     }
-    if (["database", "version", "category", "source"].includes(key)) state[key] = "";
+    if (["database", "version", "category", "source", "employment"].includes(key)) state[key] = "";
     if (key === "years") {
       state.yearFrom = catalog.year_min;
       state.yearTo = catalog.year_max;
@@ -325,8 +329,7 @@
     elements.version.value = state.version;
     elements.category.value = state.category;
     elements.source.value = state.source;
-    elements.yearFrom.value = String(state.yearFrom);
-    elements.yearTo.value = String(state.yearTo);
+    elements.employment.value = state.employment;
     elements.sort.value = state.sort;
     elements.clearYear.hidden = state.yearFrom === catalog.year_min && state.yearTo === catalog.year_max;
   }
@@ -335,7 +338,7 @@
     const parameters = new URLSearchParams();
     const query = serializeQuery(effectiveQueryTerms());
     if (query) parameters.set("q", query);
-    ["database", "version", "category", "source"].forEach((key) => state[key] && parameters.set(key, state[key]));
+    ["database", "version", "category", "source", "employment"].forEach((key) => state[key] && parameters.set(key, state[key]));
     if (state.yearFrom !== catalog.year_min) parameters.set("from", state.yearFrom);
     if (state.yearTo !== catalog.year_max) parameters.set("to", state.yearTo);
     if (state.sort !== "newest") parameters.set("sort", state.sort);
@@ -358,7 +361,7 @@
   function readUrlState() {
     const parameters = new URLSearchParams(location.search);
     state.query = parseQuery(parameters.get("q") || "");
-    ["database", "version", "category", "source"].forEach((key) => state[key] = parameters.get(key) || "");
+    ["database", "version", "category", "source", "employment"].forEach((key) => state[key] = parameters.get(key) || "");
     state.yearFrom = Number(parameters.get("from")) || catalog.year_min;
     state.yearTo = Number(parameters.get("to")) || catalog.year_max;
     state.sort = parameters.get("sort") || "newest";
@@ -387,28 +390,16 @@
       state.visible = pageSize;
       update();
     });
-    ["database", "version", "category", "source", "sort"].forEach((key) => {
+    ["database", "version", "category", "source", "employment", "sort"].forEach((key) => {
       elements[key].addEventListener("change", () => {
         state[key] = elements[key].value;
         state.visible = pageSize;
         update();
       });
     });
-    elements.yearFrom.addEventListener("change", () => {
-      state.yearFrom = Number(elements.yearFrom.value);
-      if (state.yearFrom > state.yearTo) state.yearTo = state.yearFrom;
-      syncControls();
-      update();
-    });
-    elements.yearTo.addEventListener("change", () => {
-      state.yearTo = Number(elements.yearTo.value);
-      if (state.yearTo < state.yearFrom) state.yearFrom = state.yearTo;
-      syncControls();
-      update();
-    });
     elements.clearYear.addEventListener("click", () => clearFilter("years"));
     elements.reset.addEventListener("click", () => {
-      Object.assign(state, { query: [], database: "", version: "", category: "", source: "", yearFrom: catalog.year_min, yearTo: catalog.year_max, sort: "newest", visible: pageSize });
+      Object.assign(state, { query: [], database: "", version: "", category: "", source: "", employment: "", yearFrom: catalog.year_min, yearTo: catalog.year_max, sort: "newest", visible: pageSize });
       searchDraft = "";
       syncControls();
       update();

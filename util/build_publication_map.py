@@ -38,6 +38,16 @@ SOURCE_NAMES = {
     "yugabyte": "Yugabyte",
 }
 
+EMPLOYMENT_PERIODS = [
+    {"key": "microsoft-2026", "company": "Microsoft", "range": "Jun 2026-Present", "start": "2026-06-01"},
+    {"key": "mongodb-2025", "company": "MongoDB", "range": "Feb 2025-May 2026", "start": "2025-02-06"},
+    {"key": "yugabyte-2021", "company": "Yugabyte", "range": "Jul 2021-Feb 2025", "start": "2021-07-01"},
+    {"key": "dbi-services-2020", "company": "dbi services", "range": "Feb 2020-Jun 2021", "start": "2020-02-01"},
+    {"key": "cern-2018", "company": "CERN", "range": "Sep 2018-Feb 2020", "start": "2018-09-01"},
+    {"key": "dbi-services-2014", "company": "dbi services", "range": "2014-Sep 2018", "start": "2014-01-01"},
+    {"key": "trivadis-2010", "company": "Trivadis AG", "range": "Dec 2010-Nov 2013", "start": "2010-12-01"},
+]
+
 DATABASE_RULES = {
     "Azure HorizonDB": r"\b(?:microsoft\s+)?(?:azure\s+)?horizondb\b",
     "Oracle Database": r"\boracle(?: database|text)?\b|\bora-\d{4,5}\b|\b(?:9i|10g|11g|12c|18c|19c|21c|23c|23ai|26ai)(?:r[12])?\b|\b(?:v|gv|x)\$[a-z0-9_$#]+\b|\b(?:dba|cdb)_[a-z0-9_$#]+\b|\b(?:dbms|utl|owa|ctx|sdo)_[a-z0-9_$#]+\b|\b(?:sql\*plus|sqlplus|sqlcl|rman|data\s*guard|golden\s*gate|exadata|awr|statspack|pl/sql|varchar2|sysdate|systimestamp|rownum|connect by|match_recognize|pluggable database|flashback table|asm iostats)\b|\basm_[a-z0-9_$#]+\b|\b(?:cdb|pdb)\$root\b",
@@ -215,6 +225,13 @@ def infer_categories(signal: str) -> list[str]:
     return categories or ["General Database"]
 
 
+def employment_period(date: str) -> dict[str, str]:
+    for period in EMPLOYMENT_PERIODS:
+        if date >= period["start"]:
+            return period
+    raise ValueError(f"No employment period configured for publication date {date}")
+
+
 def infer_versions(signal: str, databases: list[str]) -> list[str]:
     versions: list[str] = []
     oracle_aliases = {
@@ -294,6 +311,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         article_id = f"{article['source']}:{article['source_id']}"
         summary = ai_descriptions.get(article_id) or description or body[:320]
         date = article["published_at"][:10]
+        employment = employment_period(date)
         archive_url = article["archive_path"]
         read_url, snapshot_url = publication_urls(root, article)
         search_text = normalize_text(
@@ -305,6 +323,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
                 "title": title,
                 "date": date,
                 "year": int(date[:4]),
+                "employment_period": employment["key"],
                 "source": SOURCE_NAMES.get(article["source"], article["source"]),
                 "source_key": article["source"],
                 "read_url": read_url,
@@ -324,12 +343,18 @@ def build_catalog(root: Path) -> dict[str, Any]:
     category_counts = Counter(value for item in publications for value in item["categories"])
     version_counts = Counter(value for item in publications for value in item["versions"])
     tag_counts = Counter(value for item in publications for value in item["tags"])
+    employment_counts = Counter(item["employment_period"] for item in publications)
     return {
         "generated_from_schema": manifest["schema_version"],
         "publication_count": len(publications),
         "year_min": min(item["year"] for item in publications),
         "year_max": max(item["year"] for item in publications),
         "source_counts": dict(Counter(item["source_key"] for item in publications)),
+        "employment_periods": [
+            {**period, "count": employment_counts[period["key"]]}
+            for period in EMPLOYMENT_PERIODS
+            if employment_counts[period["key"]]
+        ],
         "database_counts": dict(database_counts.most_common()),
         "database_colors": DATABASE_COLORS,
         "category_counts": dict(category_counts.most_common()),
