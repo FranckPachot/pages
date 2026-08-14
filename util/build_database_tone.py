@@ -32,7 +32,8 @@ DATABASE_ALIASES = {
     "MySQL": r"\bmysql\b|\bmariadb\b",
     "Amazon Aurora": r"\b(?:amazon |aws )?aurora\b",
     "Amazon DynamoDB": r"\bdynamodb\b",
-    "DocumentDB": r"\bdocumentdb\b",
+    "Amazon DocumentDB": r"\b(?:amazon(?:'s|’s)?|aws)\s+documentdb\b",
+    "DocumentDB (PostgreSQL)": r"(?<!amazon )(?<!amazon's )(?<!amazon’s )(?<!aws )\bdocumentdb\b",
     "CockroachDB": r"\bcockroachdb\b",
     "Cassandra": r"\bcassandra\b",
     "SQLite": r"\bsqlite\b",
@@ -68,14 +69,12 @@ POSITIVE_SIGNALS = {
 CRITICAL_SIGNALS = {
     "bad": 1,
     "bug": 2,
-    "complex": 1,
     "dangerous": 2,
     "drawback": 1,
     "expensive": 1,
     "inefficient": 2,
     "lack": 1,
     "limitation": 1,
-    "problem": 1,
     "regression": 2,
     "slow": 1,
     "slower": 1,
@@ -154,9 +153,14 @@ def signal_hits(
                 )
                 if other_distance < target_distance:
                     continue
-            prefix = folded[max(0, match.start() - 18):match.start()]
-            surroundings = folded[max(0, match.start() - 30):match.end() + 30]
-            if re.search(r"\b(?:not|no|isn't|wasn't|without)\s+$", prefix):
+            prefix = folded[max(0, match.start() - 70):match.start()]
+            surroundings = folded[max(0, match.start() - 180):match.end() + 180]
+            if re.search(r"\b(?:not|no|isn't|wasn't|without)(?:\s+\w+){0,4}\s+$", prefix):
+                continue
+            if phrase in {"fast", "faster", "slow", "slower"} and re.search(
+                r"\b(?:fast(?:er)?|slow(?:er)?)(?:\s+\w+){0,3}\s+than\b",
+                folded[max(0, match.start() - 25):match.end() + 45],
+            ):
                 continue
             if signals is POSITIVE_SIGNALS and re.search(
                 rf"\b(?:claim|market|say|state|tout)\w*\b.{{0,36}}\b{re.escape(phrase)}\b",
@@ -170,7 +174,7 @@ def signal_hits(
             ):
                 continue
             if signals is CRITICAL_SIGNALS and re.search(
-                rf"\b(?:myth|supposed(?:ly)?|minimal risks? of)\b.*\b{re.escape(phrase)}\b|"
+                rf"\b(?:myth|fear|claim|say|state|assert|supposed(?:ly)?|minimal risks? of)\w*\b.*\b{re.escape(phrase)}\b|"
                 rf"\b{re.escape(phrase)}\b.*\b(?:myth|is fixed|was fixed|has been fixed)\b",
                 surroundings,
             ):
@@ -210,6 +214,11 @@ def mention_contexts(text: str, alias_pattern: str) -> list[str]:
     return list(dict.fromkeys(contexts))
 
 
+def prose_without_link_targets(text: str) -> str:
+    text = re.sub(r"\[([^\]]+)\]\(https?://[^)]+\)", r"\1", text, flags=re.IGNORECASE)
+    return re.sub(r"https?://\S+", "", text, flags=re.IGNORECASE)
+
+
 def database_mentions(text: str) -> list[tuple[str, int, int]]:
     mentions = []
     for database, alias in DATABASE_ALIASES.items():
@@ -218,6 +227,7 @@ def database_mentions(text: str) -> list[tuple[str, int, int]]:
 
 
 def evaluative_sentences(text: str) -> list[str]:
+    text = prose_without_link_targets(text)
     sentences = [normalize_text(sentence) for sentence in SENTENCE_PATTERN.split(text)]
     result = []
     for sentence in sentences:
@@ -248,7 +258,10 @@ def relation_hits(text: str, target_database: str) -> tuple[list[dict[str, Any]]
 
             if re.search(rf"\b(?:{POSITIVE_RELATION_NOUN})\b(?:\s+\w+){{0,4}}\s+of\s+(?:\w+\s+){{0,4}}$", before):
                 add(positive, "named source of advantages")
-            if re.search(rf"\b(?:{CRITICAL_RELATION_NOUN})\b(?:\s+\w+){{0,4}}\s+of\s+(?:\w+\s+){{0,4}}$", before):
+            if re.search(rf"\b(?:{CRITICAL_RELATION_NOUN})\b(?:\s+\w+){{0,4}}\s+of\s+(?:\w+\s+){{0,4}}$", before) and not re.search(
+                rf"\b(?:not|no|isn't|wasn't|without)(?:\s+\w+){{0,4}}\s+(?:{CRITICAL_RELATION_NOUN})\b",
+                before,
+            ):
                 add(critical, "named source of disadvantages")
             if re.match(rf"(?:'s|’s)?(?:\s+\w+){{0,4}}\s+\b(?:{POSITIVE_RELATION_NOUN})\b", possessive_after):
                 add(positive, "possesses stated advantages")
@@ -259,6 +272,10 @@ def relation_hits(text: str, target_database: str) -> tuple[list[dict[str, Any]]
             better_before = re.search(r"\bbetter\s+than(?:\s+\w+){0,5}\s*$", before)
             worse_after = re.search(r"\bworse\s+than\b", after)
             worse_before = re.search(r"\bworse\s+than(?:\s+\w+){0,5}\s*$", before)
+            faster_after = re.search(r"\b(?:\d+\s+times\s+)?faster\s+than\b", after)
+            faster_before = re.search(r"\bfaster\s+than(?:\s+\w+){0,5}\s*$", before)
+            slower_after = re.search(r"\b(?:\d+\s+times\s+)?slower\s+than\b", after)
+            slower_before = re.search(r"\bslower\s+than(?:\s+\w+){0,5}\s*$", before)
             reported_comparison = bool(re.search(r"\b(?:claim|market|say|state|tout)\w*\b", before[-45:] + after[:45]))
             if better_after and not reported_comparison:
                 add(positive, "better side of comparison")
@@ -268,6 +285,14 @@ def relation_hits(text: str, target_database: str) -> tuple[list[dict[str, Any]]
                 add(critical, "worse side of comparison")
             if worse_before and not reported_comparison:
                 add(positive, "better side of comparison")
+            if faster_after and not reported_comparison:
+                add(positive, "faster side of comparison")
+            if faster_before and not reported_comparison:
+                add(critical, "slower side of comparison")
+            if slower_after and not reported_comparison:
+                add(critical, "slower side of comparison")
+            if slower_before and not reported_comparison:
+                add(positive, "faster side of comparison")
 
             if re.search(r"\b(?:combine|bring|deliver|offer|provide|retain|inherit)\w*\b", after[:45]) and re.search(
                 rf"\b(?:{POSITIVE_RELATION_NOUN})\b", after
@@ -326,7 +351,7 @@ def classify_mention(
     alias_pattern = DATABASE_ALIASES.get(database)
     if not alias_pattern:
         return None
-    title_summary = normalize_text(f"{publication['title']}. {curated_summary}")
+    title_summary = normalize_text(prose_without_link_targets(f"{publication['title']}. {curated_summary}"))
     contexts = mention_contexts(title_summary, alias_pattern)
     explicit_mentions = len(re.findall(alias_pattern, title_summary, re.IGNORECASE))
     if not explicit_mentions:
@@ -453,7 +478,7 @@ def build_analysis(root: Path) -> dict[str, Any]:
         aggregates[database] = {"count": len(database_records), "periods": periods}
     return {
         "schema_version": 1,
-        "method": "conservative-relation-aware-sentiment-v3",
+        "method": "conservative-relation-aware-sentiment-v4",
         "publication_count": catalog["publication_count"],
         "mention_count": len(records),
         "database_counts": dict(database_counts.most_common()),

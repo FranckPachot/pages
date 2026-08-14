@@ -1,7 +1,15 @@
 #!/usr/bin/env python3
 """Regression checks for product-agnostic comparison sentiment attribution."""
 
-from build_database_tone import preferred_publication_url, relation_hits
+from build_database_tone import (
+    CRITICAL_SIGNALS,
+    DATABASE_ALIASES,
+    database_mentions,
+    preferred_publication_url,
+    prose_without_link_targets,
+    relation_hits,
+    signal_hits,
+)
 
 
 def polarity(sentence: str, database: str) -> int:
@@ -27,6 +35,44 @@ def main() -> None:
         {"canonical_url": "", "read_url": "archive/article.html"}
     ) == "archive/article.html"
     products = ["YugabyteDB", "Oracle Database", "PostgreSQL"]
+    assert not signal_hits("The operation completed without any problem.", CRITICAL_SIGNALS)
+    assert not signal_hits(
+        "The need to retry is not a limitation of MongoDB.",
+        CRITICAL_SIGNALS,
+        DATABASE_ALIASES["MongoDB"],
+    )
+    assert not signal_hits(
+        "This counters the myth that MongoDB transactions are slow.",
+        CRITICAL_SIGNALS,
+        DATABASE_ALIASES["MongoDB"],
+    )
+    assert not signal_hits(
+        "It says that 'As the size of your tables grow, these operations will get slower and slower.' "
+        "I will build those tables in PostgreSQL and show that performance is not a black box.",
+        CRITICAL_SIGNALS,
+        DATABASE_ALIASES["PostgreSQL"],
+    )
+    assert not signal_hits(
+        "The fear of joins being expensive was already there in Oracle Database.",
+        CRITICAL_SIGNALS,
+        DATABASE_ALIASES["Oracle Database"],
+    )
+    assert "MongoDB" not in prose_without_link_targets(
+        "A [previous post](https://dev.to/mongodb/example) describes a PostgreSQL limitation."
+    )
+    assert {database for database, _, _ in database_mentions("Amazon DocumentDB adds an index.")} == {
+        "Amazon DocumentDB"
+    }
+    assert {
+        database
+        for database, _, _ in database_mentions("The DocumentDB extension runs on PostgreSQL.")
+    } == {"DocumentDB (PostgreSQL)", "PostgreSQL"}
+    assert {
+        database
+        for database, _, _ in database_mentions(
+            "Amazon DocumentDB is unrelated to Microsoft's DocumentDB extension for PostgreSQL."
+        )
+    } == {"Amazon DocumentDB", "DocumentDB (PostgreSQL)", "PostgreSQL"}
     for offset in range(len(products)):
         subject, advantage, disadvantage = products[offset:] + products[:offset]
         assert_roles(
@@ -64,6 +110,14 @@ def main() -> None:
         assert_roles(
             f"{improving}'s new index matches the capabilities of {benchmark}.",
             {improving: 1, benchmark: 1},
+        )
+        assert_roles(
+            f"{improving} is 40 times slower than {benchmark}.",
+            {improving: -1, benchmark: 1},
+        )
+        assert_roles(
+            f"Retry logic is not a limitation of {benchmark}.",
+            {benchmark: 0},
         )
     print("Relation sentiment checks passed")
 
