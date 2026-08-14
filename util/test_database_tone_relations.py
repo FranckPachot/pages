@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regression checks for product-agnostic comparison sentiment attribution."""
 
-from build_database_tone import relation_hits
+from build_database_tone import preferred_publication_url, relation_hits
 
 
 def polarity(sentence: str, database: str) -> int:
@@ -20,6 +20,12 @@ def assert_roles(sentence: str, expected: dict[str, int]) -> None:
 
 
 def main() -> None:
+    assert preferred_publication_url(
+        {"canonical_url": "https://example.com/live", "read_url": "archive/article.html"}
+    ) == "https://example.com/live"
+    assert preferred_publication_url(
+        {"canonical_url": "", "read_url": "archive/article.html"}
+    ) == "archive/article.html"
     products = ["YugabyteDB", "Oracle Database", "PostgreSQL"]
     for offset in range(len(products)):
         subject, advantage, disadvantage = products[offset:] + products[:offset]

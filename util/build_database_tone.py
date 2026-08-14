@@ -316,6 +316,10 @@ def relation_hits(text: str, target_database: str) -> tuple[list[dict[str, Any]]
     return positive, critical
 
 
+def preferred_publication_url(publication: dict[str, Any]) -> str:
+    return publication.get("canonical_url") or publication["read_url"]
+
+
 def classify_mention(
     publication: dict[str, Any], database: str, curated_summary: str
 ) -> dict[str, Any] | None:
@@ -378,7 +382,7 @@ def classify_mention(
         "date": publication["date"],
         "employment_period": publication["employment_period"],
         "title": publication["title"],
-        "url": publication["read_url"],
+        "url": preferred_publication_url(publication),
         "source": publication["source_key"],
         "evaluation": evaluation,
         "positive_weight": positive_weight,
