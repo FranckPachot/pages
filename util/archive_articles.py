@@ -448,6 +448,94 @@ def techcommunity_metadata(document: str) -> dict[str, Any] | None:
     return None
 
 
+def prepare_techcommunity_snapshot(document: str, profile_id: str) -> str:
+    if 'name="techcommunity-static-archive"' in document:
+        if profile_id in document:
+            return document
+        return document.replace(
+            '<meta name="techcommunity-static-archive" content="1">',
+            '<meta name="techcommunity-static-archive" content="1">\n'
+            f'<meta name="techcommunity-profile-id" content="{html.escape(profile_id, quote=True)}">',
+        )
+    next_data_match = re.search(
+        r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>',
+        document,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    metadata = techcommunity_metadata(document)
+    if not next_data_match or not metadata:
+        return document
+    try:
+        next_data = json.loads(next_data_match.group(1))
+    except json.JSONDecodeError:
+        return document
+    apollo_state = next_data.get("props", {}).get("pageProps", {}).get("apolloState", {})
+    article = next(
+        (
+            value
+            for key, value in apollo_state.items()
+            if key.startswith("BlogTopicMessage:message:") and isinstance(value, dict)
+        ),
+        None,
+    )
+    if not article or not article.get("body"):
+        return document
+    authors = metadata.get("author", [])
+    if isinstance(authors, dict):
+        authors = [authors]
+    author = authors[0] if authors and isinstance(authors[0], dict) else {}
+    main_entity = metadata.get("mainEntityOfPage", "")
+    canonical = main_entity.get("@id", "") if isinstance(main_entity, dict) else main_entity
+    title = clean_text(article.get("subject", "") or metadata.get("headline", ""))
+    published = article.get("postTime", "") or metadata.get("datePublished", "")
+    cover_image = article.get("coverImage", {})
+    cover_url = cover_image.get("url", "") if isinstance(cover_image, dict) else ""
+    cover = (
+        f'<img class="cover" src="{html.escape(cover_url, quote=True)}" alt="">'
+        if cover_url
+        else ""
+    )
+    static_document = f'''<!DOCTYPE html>
+<html lang="en"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="techcommunity-static-archive" content="1">
+<meta name="techcommunity-profile-id" content="{html.escape(profile_id, quote=True)}">
+<title>{html.escape(title)} | Microsoft Tech Community archive</title>
+<link rel="canonical" href="{html.escape(str(canonical), quote=True)}">
+<script type="application/ld+json">{json.dumps(metadata, ensure_ascii=False).replace("</", "<\\/")}</script>
+<style>
+:root {{ color-scheme: light; font-family: "Segoe UI", sans-serif; color: #242424; }}
+body {{ margin: 0; background: #f5f5f5; line-height: 1.6; }}
+header, main, footer {{ box-sizing: border-box; max-width: 920px; margin: auto; padding: 24px clamp(20px, 5vw, 64px); }}
+header {{ padding-top: 48px; padding-bottom: 32px; }}
+main {{ background: white; }}
+h1 {{ margin: 12px 0; font-size: clamp(2rem, 5vw, 3.5rem); line-height: 1.08; }}
+h2, h3 {{ line-height: 1.25; margin-top: 1.6em; }}
+.source, footer {{ color: #616161; }}
+.source a, main a, footer a {{ color: #0067b8; }}
+.cover {{ display: block; width: 100%; max-height: 520px; object-fit: cover; }}
+img {{ max-width: 100%; height: auto; }}
+pre {{ overflow-x: auto; padding: 16px; background: #f5f5f5; border-left: 4px solid #0078d4; }}
+code {{ font-family: Consolas, monospace; }}
+table {{ display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }}
+th, td {{ padding: 8px; border: 1px solid #d1d1d1; }}
+blockquote {{ margin-left: 0; padding-left: 20px; border-left: 4px solid #d1d1d1; }}
+</style></head><body>
+<header><div class="source">Archived from <a href="{html.escape(str(canonical), quote=True)}">Microsoft Tech Community</a></div>
+<h1>{html.escape(title)}</h1>
+<div class="source">{html.escape(str(author.get("name", "")))} · <time datetime="{html.escape(str(published), quote=True)}">{html.escape(str(published)[:10])}</time></div></header>
+{cover}<main>{article["body"]}</main>
+<footer>This is a static archived copy. <a href="{html.escape(str(canonical), quote=True)}">View the original article</a>.</footer>
+</body></html>'''
+    return re.sub(
+        r'(?P<attribute>\b(?:href|src)=["\'])/(?!/)',
+        rf'\g<attribute>{TECHCOMMUNITY_BASE}/',
+        static_document,
+        flags=re.IGNORECASE,
+    )
+
+
 def techcommunity_manifest_entry(
     root: Path, path: Path, document: str, author_name: str, profile_id: str
 ) -> dict[str, Any]:
@@ -556,8 +644,9 @@ def archive_techcommunity(
             except ValueError:
                 continue
             replace_snapshot = True
-        if replace_snapshot:
-            write_text_atomic(path, document)
+        prepared_document = prepare_techcommunity_snapshot(document, profile_id)
+        if replace_snapshot or prepared_document != document:
+            write_text_atomic(path, prepared_document)
         archived += 1
         print(f"Microsoft Tech Community {archived}: {entry['title']}")
     return inventory_techcommunity(root, author_name, profile_id)
