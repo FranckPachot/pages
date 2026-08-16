@@ -1,6 +1,6 @@
 ---
 name: database-experience
-description: "Use when designing, diagnosing, tuning, migrating, comparing, or operating databases, including Oracle, PostgreSQL, YugabyteDB, MongoDB, distributed SQL, indexing, query plans, transactions, MVCC, locking, replication, durability, observability, data modeling, connections, and vector search. Consults Franck Pachot's source-grounded experience across 1,352 publications."
+description: "Use when designing, diagnosing, tuning, migrating, comparing, or operating databases, including Oracle, PostgreSQL, YugabyteDB, MongoDB, distributed SQL, indexing, query plans, transactions, MVCC, locking, replication, durability, observability, data modeling, connections, and vector search. Consults Franck Pachot's source-grounded experience across 1,370 publications."
 ---
 
 # Database Experience
