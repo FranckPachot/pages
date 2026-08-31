@@ -235,6 +235,7 @@ def employment_period(date: str) -> dict[str, str]:
 def infer_versions(signal: str, databases: list[str]) -> list[str]:
     versions: list[str] = []
     oracle_aliases = {
+        "8i": "8i",
         "9i": "9i",
         "10g": "10g",
         "11g": "11g",
@@ -247,13 +248,32 @@ def infer_versions(signal: str, databases: list[str]) -> list[str]:
         "26ai": "26ai",
     }
     if "Oracle Database" in databases:
-        for match in re.findall(r"\b(9i|10g|11g|12c|18c|19c|21c|23c|23ai|26ai)\b", signal, re.I):
-            versions.append(f"Oracle {oracle_aliases[match.casefold()]}")
-        for match in re.findall(r"\b(?:Oracle(?: Database)?\s+)?((?:9|10|11|12|18|19|21|23|26)\.\d+(?:\.\d+){0,2})\b", signal, re.I):
+        for match in re.findall(
+            r"\b(8\s*i|9\s*i|10\s*g|11\s*g|12\s*c|18\s*c|19\s*c|21\s*c|23\s*c|23\s*ai|26\s*ai)\b",
+            signal,
+            re.I,
+        ):
+            alias = re.sub(r"\s+", "", match).casefold()
+            versions.append(f"Oracle {oracle_aliases[alias]}")
+        for match in re.findall(r"\bOracle(?: Database)?\s+((?:8|9|10|11|12|18|19|21|23|26)\.\d+(?:\.\d+){0,2})\b", signal, re.I):
             versions.append(f"Oracle {match}")
 
+    if "PostgreSQL" in databases:
+        database_boundary = re.compile(
+            r"\b(?:Oracle(?: Database)?|PostgreSQL|Postgres|PG|YugabyteDB|YB|MongoDB|MySQL|SQL Server|SQLite|Db2)\b",
+            re.I,
+        )
+        for mention in re.finditer(r"\b(?:PostgreSQL|Postgres|PG)\b", signal, re.I):
+            nearby = signal[mention.end() : mention.end() + 320]
+            next_database = database_boundary.search(nearby)
+            if next_database:
+                nearby = nearby[: next_database.start()]
+            for match in re.findall(r"\b(\d{1,2}(?:\.\d+){0,2})\b", nearby):
+                major = int(match.split(".", 1)[0])
+                if 6 <= major <= 19:
+                    versions.append(f"PostgreSQL {match}")
+
     version_patterns = {
-        "PostgreSQL": r"\b(?:PostgreSQL|Postgres|PG)\s+(?:version\s+|v)?(\d{1,2}(?:\.\d+)?)\b",
         "YugabyteDB": r"\b(?:YugabyteDB|YB)\s+(?:version\s+|v)?(\d+\.\d+(?:\.\d+)?)\b",
         "MongoDB": r"\bMongoDB\s+(?:version\s+|v)?(\d+\.\d+(?:\.\d+)?)\b",
         "MySQL": r"\bMySQL\s+(?:version\s+|v)?(\d+\.\d+(?:\.\d+)?)\b",

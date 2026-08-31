@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="en"><head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-LFQ153SCQM"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-LFQ153SCQM');
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="techcommunity-static-archive" content="1">
+<meta name="techcommunity-profile-id" content="3595257">
+<title>Connecting Azure PostgreSQL to Oracle Autonomous with ORACLE_FDW | Microsoft Tech Community archive</title>
+<link rel="canonical" href="https://techcommunity.microsoft.com/blog/adforpostgresql/connecting-azure-postgresql-to-oracle-autonomous-with-oracle-fdw/4547941">
+<script type="application/ld+json">{"@context": "https://schema.org", "@type": "BlogPosting", "datePublished": "8/31/2026, 6:59:43 AM", "description": "When migrating databases to PostgreSQL, not all data transitions happen immediately. Applications often need to keep accessing legacy databases for reading or writing, whether during a phased migration, for reporting, or because certain data still lives in another system. PostgreSQL implements parts of the SQL/MED standard via Foreign Data Wrappers (FDW), enabling queries against tables stored in external systems as if they were local. Instead of building ETL pipelines or copying data periodically, PostgreSQL can access remote data directly and let the query planner decide what to execute remotely.\nIn this article, I&apos;ll connect Azure Database for PostgreSQL Flexible Server to an Oracle Autonomous Database using oracle_fdw, a Foreign Data Wrapper maintained by Laurenz Albe. I&apos;ll show how to:\n\nconnect PostgreSQL to Oracle over TLS (Transport Layer Security)\ndiscover the outbound IP address used by Azure Database for PostgreSQL\nimport Oracle tables as PostgreSQL foreign tables\nexamine how filters and join operations are pushed down to Oracle\nperform INSERT, UPDATE, and DELETE operations on Oracle tables from PostgreSQL\nmigrate from Oracle to PostgreSQL with a Create Table As Select over FDW\nrun hybrid queries to compare remote and local tables after migration\n\nThe goal is not to build a distributed database or a distributed transaction system. The goal is to access Oracle data from PostgreSQL with minimal setup while letting each database do the work it can do most efficiently.\nEnable the Foreign Data Wrapper\nTo enable ORACLE_FDW, I selected it in the server parameters allowed extensions:\n\nAnother option is to include it in the ServerParameter entry of an ARM template. In both cases, it is easy to check:\npostgres=&amp;gt; \\dconfig azure.extensions\n\n                      List of configuration parameters\n\n    Parameter     |             Value\n------------------+-------------------------------------------------\n azure.extensions | ORACLE_FDW\n \n(1 row)\n\nOpen the firewall and get the connection string\nI will connect to the Oracle Autonomous Database over the public internet. The security measures include user-password authentication, an encryption certificate, and a firewall with an IP whitelist. Since I am unsure which IP address Azure Database for PostgreSQL will use when connecting, I currently permit connections from any IP to my Oracle Autonomous Database:\n\nI didn’t select “Secure access from everywhere” because it requires mutual TLS (mTLS) with client certificates stored in a wallet on the client device. Since the client is an Azure PostgreSQL managed service and I can’t install a custom wallet, I chose one-way TLS (encryption without a client wallet), which is a practical option in this setup, as Oracle server certificates chain to public CAs trusted by Azure/PostgreSQL trust stores. This approach requires whitelisting IP addresses or a CIDR range. For testing, I temporarily allowed 0.0.0.0/0 to connect and capture the real source IP address for future adjustments. I did this only to identify the source IP used by Azure Database for PostgreSQL. In sensitive database environments, avoid allowing 0.0.0.0/0 even for a short time. Instead, use an ephemeral Oracle Autonomous test instance to identify the PostgreSQL server’s source IP address.\nYou will need a username and password to connect, along with the connection string shown in the database connection details:\n\nI recommend using the TP or LOW services because MEDIUM and HIGH are intended for data warehouse workloads, which can cause unexpected locking behavior or resource usage.\nIn my case, the connection string is:\n(description=(retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-madrid-1.oraclecloud.com))(connect_data=(service_name=g230b6bb64a62e6_mad_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))\n\nThat&apos;s everything I need on the Oracle side. I have all the information needed to connect from PostgreSQL.\nDeclare the Foreign Data Wrapper server\nI connect to the Azure PostgreSQL server with psql and enable the ORACLE_FDW extension:\npostgres=&amp;gt; create extension oracle_fdw;\n\nCREATE EXTENSION\n\nI declare the connection string for the foreign data wrapper server:\npostgres=&amp;gt; create server oracle_autonomous\n  foreign data wrapper oracle_fdw\n  options (dbserver &apos;(description=(retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-madrid-1.oraclecloud.com))(connect_data=(service_name=g230b6bb64a62e6_mad_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))&apos;);\n\nCREATE SERVER\n\nI declare the Oracle username and password to be used by my current user:\npostgres=&amp;gt; create user mapping for current_user\n  server oracle_autonomous\n  options (user &apos;ADMIN&apos;, password &apos;&amp;lt;password on Oracle Autonomous&amp;gt;&apos;);\n\nCREATE USER MAPPING\n\nTo check if the connection is correct, I call oracle_diag(), which shows the client-side versions as well as the major version of the server:\npostgres=&amp;gt; select oracle_diag(&apos;oracle_autonomous&apos;)\n;\n                                      oracle_diag\n----------------------------------------------------------------------------------------\n oracle_fdw 2.8.0, PostgreSQL 18.4, Oracle client 23.26.0.0.0, Oracle server 23.0.0.0.0\n\n(1 row)\n\nAs the server version is returned, I know that I&apos;m connected.\nIf it cannot connect, you must verify the connection string, the IP allow list, and the credentials.\nDiscover the public outbound IP address\nSince I don&apos;t want to keep the firewall open to 0.0.0.0/0 indefinitely, and rely solely on password-based protection, I first identify the IP address I&apos;m connected from to narrow down the allowed IP list:\npostgres=&amp;gt; select oracle_execute(&apos;oracle_autonomous&apos;,$$\n begin -- PL/SQL block to raise an exception that carries the IP address information\n  raise_application_error(\n   -20999,\n   &apos;Hello &apos; || user||&apos;@&apos;||sys_context(&apos;userenv&apos;,&apos;ip_address&apos;)\n  );\n end;\n$$);\n\nERROR:  error executing statement: OCIStmtExecute failed to execute query\nDETAIL:  ORA-20999: Hello ADMIN@4.203.152.223\nORA-06512: at line 3\n\nThe error message is expected because I used raise_application_error() to return a message to oracle_execute(), which does not accept statements that return a result.\nNow I can replace CIDR 0.0.0.0/0 with the IP address of the Azure PostgreSQL server I&apos;m connecting from:\n\nNote that Azure does not guarantee that this public address remains static, so this rule may need updating after maintenance or failover. For production where such FDW access is long-term and highly available, use an architecture that provides controlled egress IPs (for example via NAT) that you can allowlist, or private connectivity where available.\nSince ORACLE_FDW allows me to connect and perform DML on the Oracle side, I have no other tasks on the Oracle side. PostgreSQL is my Oracle client.\nImport Oracle table metadata\nBack at my psql prompt, I can import the metadata for the Oracle schema &quot;SH&quot; into the PostgreSQL schema &quot;fdw_sh&quot;:\npostgres=&amp;gt; create schema fdw_sh\n;\n\nCREATE SCHEMA\n\npostgres=&amp;gt; import foreign schema &quot;SH&quot; \n           from server oracle_autonomous into fdw_sh\n;\n\nIMPORT FOREIGN SCHEMA\n\nI can describe what is imported:\npostgres=&amp;gt; set search_path TO fdw_sh, public\n;\n\npostgres=&amp;gt; \\d\n                      List of relations\n Schema |            Name            |     Type      | Owner\n--------+----------------------------+---------------+--------\n fdw_sh | channels                   | foreign table | franck\n fdw_sh | costs                      | foreign table | franck\n fdw_sh | countries                  | foreign table | franck\n fdw_sh | customers                  | foreign table | franck\n fdw_sh | products                   | foreign table | franck\n fdw_sh | promotions                 | foreign table | franck\n fdw_sh | sales                      | foreign table | franck\n fdw_sh | supplementary_demographics | foreign table | franck\n fdw_sh | times                      | foreign table | franck\n(9 rows)\n\nThose are the tables imported from the &quot;SH&quot; schema of the Oracle database.\nORACLE_FDW has automatically mapped the data types to PostgreSQL data types:\npostgres=&amp;gt; \\d fdw_sh.countries\n\n                               Foreign table &quot;fdw_sh.countries&quot;\n                               \n        Column        |         Type          | Collation | Nullable | Default | FDW options\n----------------------+-----------------------+-----------+----------+---------+--------------\n country_id           | numeric               |           | not null |         | (key &apos;true&apos;)\n country_iso_code     | character(2)          |           | not null |         |\n country_name         | character varying(40) |           | not null |         |\n country_subregion    | character varying(30) |           | not null |         |\n country_subregion_id | numeric               |           | not null |         |\n country_region       | character varying(20) |           | not null |         |\n country_region_id    | numeric               |           | not null |         |\n country_total        | character varying(11) |           | not null |         |\n country_total_id     | numeric               |           | not null |         |\n country_name_hist    | character varying(40) |           |          |         |\nServer: oracle_autonomous\nFDW options: (schema &apos;SH&apos;, &quot;table&quot; &apos;COUNTRIES&apos;)\n\nIt is recommended to run ANALYZE to ensure the PostgreSQL query planner knows the cardinalities. Note that foreign tables are not automatically analyzed by auto-analyze.\npostgres=&amp;gt;  select format(&apos;analyze verbose %I.%I;&apos;, table_schema, table_name)\n            from information_schema.tables\n            where table_schema = &apos;fdw_sh&apos;\n\\gexec\n\nPostgreSQL doesn&apos;t automatically collect statistics on foreign tables. Without running ANALYZE, the optimizer might misjudge row counts, resulting in suboptimal join plans and fewer pushdown opportunities. By default, ANALYZE reads 100% of the table but it can be lowered for large table by setting the sample percentage beforehand:\npostgres=&amp;gt; alter foreign table fdw_sh.sales options (set sample_percent &apos;5&apos;)\n;\nALTER FOREIGN TABLE\n\nQuery the foreign tables\nI can query foreign tables just like local ones. For example, to find the total customer credit exposure by country for certain regions, I run the following:\npostgres=&amp;gt; -- explain (analyze, verbose, buffers) \n           select\n            co.country_name,\n            sum(cu.cust_credit_limit) as total_credit\n           from fdw_sh.customers cu\n           join fdw_sh.countries co on co.country_id = cu.country_id\n           where co.country_region in (&apos;Europe&apos;)\n           group by co.country_name\n           having sum(cu.cust_credit_limit) &amp;gt; 1e7\n           order by total_credit desc\n;\n\n  country_name  | total_credit\n----------------+--------------\n Germany        |     49579000\n United Kingdom |     45205500\n Italy          |     44844500\n France         |     23987000\n Spain          |     12170000\n \n(5 rows)\n\nThe execution plan indicates the operations that have been delegated to the foreign database:\n Sort  (cost=253237.64..253237.64 rows=3 width=41) (actual time=10348.498..10348.500 rows=5.00 loops=1)\n   Output: co.country_name, (sum(cu.cust_credit_limit))\n   Sort Key: (sum(cu.cust_credit_limit)) DESC\n   Sort Method: quicksort  Memory: 25kB\n   -&amp;gt;  GroupAggregate  (cost=253056.49..253237.61 rows=3 width=41) (actual time=10343.320..10348.489 rows=5.00 loops=1)\n         Output: co.country_name, sum(cu.cust_credit_limit)\n         Group Key: co.country_name\n         Filter: (sum(cu.cust_credit_limit) &amp;gt; &apos;10000000&apos;::numeric)\n         Rows Removed by Filter: 3\n         -&amp;gt;  Sort  (cost=253056.49..253116.81 rows=24130 width=14) (actual time=10342.473..10343.918 rows=30564.00 loops=1)\n               Output: co.country_name, cu.cust_credit_limit\n               Sort Key: co.country_name\n               Sort Method: quicksort  Memory: 1783kB\n               -&amp;gt;  Foreign Scan  (cost=10000.00..251300.00 rows=24130 width=14) (actual time=51.461..10333.852 rows=30564.00 loops=1)\n                     Output: co.country_name, cu.cust_credit_limit\n                     Oracle query: SELECT /*47caada6fd16dcb0*/ r2.&quot;COUNTRY_NAME&quot;, r1.&quot;CUST_CREDIT_LIMIT&quot; FROM (&quot;SH&quot;.&quot;CUSTOMERS&quot; r1 INNER JOIN &quot;SH&quot;.&quot;COUNTRIES&quot; r2 ON (r1.&quot;COUNTRY_ID&quot; = r2.&quot;COUNTRY_ID&quot;) AND (r2.&quot;COUNTRY_REGION&quot; = &apos;Europe&apos;))\n                     Oracle plan: SELECT STATEMENT\n                     Oracle plan:   HASH JOIN   (condition &quot;R1&quot;.&quot;COUNTRY_ID&quot;=&quot;R2&quot;.&quot;COUNTRY_ID&quot;)\n                     Oracle plan:     TABLE ACCESS FULL COUNTRIES  (filter &quot;R2&quot;.&quot;COUNTRY_REGION&quot;=&apos;Europe&apos;)\n                     Oracle plan:     TABLE ACCESS FULL CUSTOMERS\n Query Identifier: -2654414372183047898\n Planning Time: 152.202 ms\n Execution Time: 10348.595 ms\n\nThe most important line in the execution plan is the generated Oracle query. It shows exactly which operations PostgreSQL delegated to Oracle and how many rows were returned across the network. In this example, the join and filter were pushed down: it executed a hash join with the COUNTRIES table as the build table and the CUSTOMERS table as the probe table, returning 30564 rows. The aggregation happened in PostgreSQL.\nHere is the visualization in the VS Code extension for PostgreSQL:\n\nChecking the execution plan is essential because remote calls introduce latency. We should minimize roundtrips and avoid reading excessive rows that will be discarded later.\nExecute DML (read and write)\nUnlike many federation technologies, oracle_fdw supports direct INSERT, UPDATE, and DELETE operations on Oracle tables from PostgreSQL. I use oracle_execute() to create a new table on the remote Oracle Database:\npostgres=&amp;gt; select oracle_execute(\n  &apos;oracle_autonomous&apos;,\n  $$\n    create table &quot;REGIONS&quot; (\n      ID   number primary key,\n      NAME varchar2(100) unique\n    )\n  $$\n);\n\n oracle_execute\n----------------\n\n(1 row)\n\n\npostgres=&amp;gt; select oracle_close_connections()\n;\n\n oracle_close_connections\n--------------------------\n\n(1 row)\n\nAfter executing DDL through oracle_execute(), I close the cached Oracle connection because, in my tests, Oracle’s implicit DDL commit left oracle_fdw’s transaction state out of sync, causing subsequent queries on the same remote session to fail with ORA-08177 (&quot;can&apos;t serialize access for this transaction&quot;).\nI am able to declare the foreign table and insert rows through it:\npostgres=&amp;gt; create foreign table regions (\n  id numeric options (key &apos;true&apos;),\n  name text\n)\nserver oracle_autonomous\noptions (schema &apos;ADMIN&apos;, table &apos;REGIONS&apos;)\n;\n\nCREATE FOREIGN TABLE\n\npostgres=&amp;gt; insert into regions (name, id)\n           select distinct country_region, country_region_id\n           from fdw_sh.countries\n;\n\nINSERT 0 6\n\nTo demonstrate that DML occurs on the Oracle Database, I attempt to insert a duplicate, which results in an Oracle error:\npostgres=&amp;gt; insert into regions values (1,&apos;Europe&apos;)\n;\n\nERROR:  error executing query: OCIStmtExecute failed to execute remote query\nDETAIL:  ORA-00001: unique constraint (ADMIN.SYS_C0035974) violated on table ADMIN.REGIONS columns (NAME)\nORA-03301: (ORA-00001 details) row with column values (NAME:&apos;Europe&apos;) already exists\nHelp: https://docs.oracle.com/error-help/db/ora-0000\n\nRemote queries are supported for transactions:\npostgres=&amp;gt; begin;\n\nBEGIN\n\npostgres=*&amp;gt; delete from regions;\n\nDELETE 6\n\npostgres=*&amp;gt; select * from regions;\n\n id | name\n----+------\n(0 rows)\n\npostgres=*&amp;gt; rollback;\n\nROLLBACK\n\npostgres=&amp;gt; select * from regions;\n\n  id   |    name\n-------+-------------\n 52800 | Africa\n 52801 | Americas\n 52802 | Asia\n 52803 | Europe\n 52804 | Middle East\n 52805 | Oceania\n(6 rows)\n\nThe remote delete was executed but later reversed through a rollback in the local transaction. You can check when the remote transaction starts and ends by setting client_min_messages to debug. You can query both local and remote tables within a single local transaction (without two-phase commit or distributed transaction guarantees). However, this does not provide consistent guarantees for distributed transactions.\nHybrid queries\nAn SQL statement can involve local and remote tables. Here is an easy way to import data from Oracle to PostgreSQL:\npostgres=&amp;gt; create table local_customers as\n            select * from fdw_sh.customers\n;\n\nCREATE TABLE\n\npostgres=&amp;gt; alter table local_customers\n             add primary key (cust_id)\n;\n\nALTER TABLE\n\npostgres=&amp;gt; vacuum analyze local_customers\n;\n\nVACUUM\n\nA SQL statement can join local and remote tables. Here is an easy way to compare two tables:\npostgres=&amp;gt; select l.cust_id, r.cust_id\n            -- full outer join to read all rows from both tables\n            from local_customers l\n            -- push down order by to favor merge join\n            full outer join (\n               select * from fdw_sh.customers order by cust_id\n               ) r using (cust_id)\n            -- eliminate the same rows\n            where \n                -- one cust_id row doesn&apos;t exist in the other\n                l.cust_id is null or r.cust_id is null \n                -- or it exists in both but with difference values\n                or l is distinct from r\n;\n\nTo compare them, all rows must be read, but this execution plan is efficient, using a sort-merge join that compares rows without buffering them into a temporary table.\n\nThis comparison is long and may produce false positives if concurrent DML operations occur while logical replication runs during the migration. Nevertheless, since both databases utilize multi-version concurrency control snapshots and their transactions started nearly simultaneously when using autocommit or serializable transactions, the likelihood of false positives is low. To deal with transient differences, you can quiesce writes, compare only a known past time window, or recheck reported rows after replication catches up.\nLimitations\nThe foreign data wrapper is not a distributed query engine. It pushes only certain operations when it improves performance. For example, in the previous case, Oracle performed the join and filter, but PostgreSQL executed the GROUP BY.\nOperationPushdownWHERE✅ Yes (only expressions that can be safely translated)JOIN✔️ Yes, between two foreign tables on the same foreign server when the join conditions and filters can be translatedORDER BY✔️ Yes, except for string-based sort and when a join is pushed downGROUP BY❌ (no aggregation pushdown in oracle_fdw 2.8.0)INSERT/UPDATE/DELETE✅Joins over 3 foreign tables❌ NoPostgreSQL functions❌ No, except now(), transaction_timestamp(), current_timestamp, current_date, localtimestamp which are translated and pushed down\nQueries continue to be transmitted over the network. If pushdown isn&apos;t feasible, large result sets can slow down performance. Foreign tables are not automatically analyzed. Cross-database transactions are not managed as distributed transactions. oracle_fdw is ideal for access, reporting, and migration, but it does not substitute for physically transferring heavily used data into PostgreSQL.\nConclusion\nORACLE_FDW is simple to enable on Azure Database for PostgreSQL Flexible Server and provides a simple way to access Oracle data from PostgreSQL without introducing a separate replication or ETL layer. Oracle tables appear as PostgreSQL foreign tables, can join with local tables, and support read-write operations.\nThe key feature is visibility. PostgreSQL&apos;s execution plan shows not only local operations but also the SQL sent to Oracle, along with the Oracle execution plan. This helps users easily see which parts are executed remotely and which stay on PostgreSQL.\nAs with all Foreign Data Wrappers, performance depends on how much work you delegate to the remote database. Pushdown candidates typically include filters, joins, and sorting. PostgreSQL executes aggregation locally rather than delegating it to Oracle. Network latency and data transfer costs also play a significant role.\nFor migrations, reporting, data validation, or gradual application modernization, oracle_fdw provides an effective solution to connect PostgreSQL and Oracle while using standard SQL on both platforms. It does not try to treat multiple databases as a single distributed system.\nIf you used the Oracle Foreign Data Wrapper, please share your questions, comments, and feedback in the PostgreSQL Hub Developer Forum.", "mainEntityOfPage": {"@type": "WebPage", "@id": "https://techcommunity.microsoft.com/blog/adforpostgresql/connecting-azure-postgresql-to-oracle-autonomous-with-oracle-fdw/4547941"}, "headline": "Connecting Azure PostgreSQL to Oracle Autonomous with ORACLE_FDW", "image": ["https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLWo4a0NPNQ?revision=5"], "dateModified": "8/31/2026, 6:59:43 AM", "author": {"@type": "Person", "name": "FranckPachot", "url": "https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/dS0zNTk1MjU3LWRGM2FHTg?image-coordinates=0%2C0%2C400%2C400"}, "publisher": {"@type": "Organization", "name": "TECHCOMMUNITY.MICROSOFT.COM"}}</script>
+<style>
+:root { color-scheme: light; font-family: "Segoe UI", sans-serif; color: #242424; }
+body { margin: 0; background: #f5f5f5; line-height: 1.6; }
+header, main, footer { box-sizing: border-box; max-width: 920px; margin: auto; padding: 24px clamp(20px, 5vw, 64px); }
+header { padding-top: 48px; padding-bottom: 32px; }
+main { background: white; }
+h1 { margin: 12px 0; font-size: clamp(2rem, 5vw, 3.5rem); line-height: 1.08; }
+h2, h3 { line-height: 1.25; margin-top: 1.6em; }
+.source, footer { color: #616161; }
+.source a, main a, footer a { color: #0067b8; }
+.cover { display: block; width: 100%; max-height: 520px; object-fit: cover; }
+img { max-width: 100%; height: auto; }
+pre { overflow-x: auto; padding: 16px; background: #f5f5f5; border-left: 4px solid #0078d4; }
+code { font-family: Consolas, monospace; }
+table { display: block; max-width: 100%; overflow-x: auto; border-collapse: collapse; }
+th, td { padding: 8px; border: 1px solid #d1d1d1; }
+blockquote { margin-left: 0; padding-left: 20px; border-left: 4px solid #d1d1d1; }
+</style></head><body>
+<header><div class="source">Archived from <a href="https://techcommunity.microsoft.com/blog/adforpostgresql/connecting-azure-postgresql-to-oracle-autonomous-with-oracle-fdw/4547941">Microsoft Tech Community</a></div>
+<h1>Connecting Azure PostgreSQL to Oracle Autonomous with ORACLE_FDW</h1>
+<div class="source">FranckPachot · <time datetime="2026-08-30T23:59:43.274-07:00">2026-08-30</time></div></header>
+<img class="cover" src="https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLWo4a0NPNQ?revision=5" alt=""><main><P>When migrating databases to PostgreSQL, not all data transitions happen immediately. Applications often need to keep accessing legacy databases for reading or writing, whether during a phased migration, for reporting, or because certain data still lives in another system. PostgreSQL implements parts of the <A href="https://en.wikipedia.org/wiki/SQL/MED" target="_blank" rel="noopener nofollow noreferrer">SQL/MED</A> standard via Foreign Data Wrappers (FDW), enabling queries against tables stored in external systems as if they were local. Instead of building ETL pipelines or copying data periodically, PostgreSQL can access remote data directly and let the query planner decide what to execute remotely.</P>
+<P>In this article, I'll connect <A href="https://learn.microsoft.com/en-us/azure/postgresql/overview" target="_blank" rel="noopener noreferrer">Azure Database for PostgreSQL Flexible Server</A> to an Oracle Autonomous Database using <A href="https://github.com/laurenz/oracle_fdw" target="_blank" rel="noopener noreferrer">oracle_fdw</A>, a Foreign Data Wrapper maintained by Laurenz Albe. I'll show how to:</P>
+<UL>
+<LI>connect PostgreSQL to Oracle over TLS (Transport Layer Security)</LI>
+<LI>discover the outbound IP address used by Azure Database for PostgreSQL</LI>
+<LI>import Oracle tables as PostgreSQL foreign tables</LI>
+<LI>examine how filters and join operations are pushed down to Oracle</LI>
+<LI>perform INSERT, UPDATE, and DELETE operations on Oracle tables from PostgreSQL</LI>
+<LI>migrate from Oracle to PostgreSQL with a Create Table As Select over FDW</LI>
+<LI>run hybrid queries to compare remote and local tables after migration</LI>
+</UL>
+<P>The goal is not to build a distributed database or a distributed transaction system. The goal is to access Oracle data from PostgreSQL with minimal setup while letting each database do the work it can do most efficiently.</P>
+<H2 id="community-4547941-toc-hId-1364472658">Enable the Foreign Data Wrapper</H2>
+<P>To enable ORACLE_FDW, I selected it in the server parameters allowed extensions:</P>
+<span class="lia-media-object lia-media-is-center lia-media-size-default" data-image-alt=""><button class="lia-media-unstyled-btn" type="button" aria-haspopup="true" aria-label="Enlarge Image"><img src="https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLXl3T3BEdg?image-dimensions=999x528&amp;revision=5" width="999" height="528" alt="" /></button></span>
+<P>Another option is to include it in the ServerParameter entry of an ARM template. In both cases, it is easy to check:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; \dconfig azure.extensions
+
+                      List of configuration parameters
+
+    Parameter     |             Value
+------------------+-------------------------------------------------
+ azure.extensions | ORACLE_FDW
+ 
+(1 row)
+</code></pre>
+<H2 id="community-4547941-toc-hId--442981805">Open the firewall and get the connection string</H2>
+<P>I will connect to the Oracle Autonomous Database over the public internet. The security measures include user-password authentication, an encryption certificate, and a firewall with an IP whitelist. Since I am unsure which IP address Azure Database for PostgreSQL will use when connecting, I currently permit connections from any IP to my Oracle Autonomous Database:</P>
+<span class="lia-media-object lia-media-is-center lia-media-size-default" data-image-alt=""><button class="lia-media-unstyled-btn" type="button" aria-haspopup="true" aria-label="Enlarge Image"><img src="https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLXFQdFJyVQ?image-dimensions=999x538&amp;revision=5" width="999" height="538" alt="" /></button></span>
+<P>I didn’t select “Secure access from everywhere” because it requires mutual TLS (mTLS) with client certificates stored in a wallet on the client device. Since the client is an Azure PostgreSQL managed service and I can’t install a custom wallet, I chose one-way TLS (encryption without a client wallet), which is a practical option in this setup, as Oracle server certificates chain to public CAs trusted by Azure/PostgreSQL trust stores. This approach requires whitelisting IP addresses or a CIDR range. For testing, I temporarily allowed 0.0.0.0/0 to connect and capture the real source IP address for future adjustments. I did this only to identify the source IP used by Azure Database for PostgreSQL. In sensitive database environments, avoid allowing 0.0.0.0/0 even for a short time. Instead, use an ephemeral Oracle Autonomous test instance to identify the PostgreSQL server’s source IP address.</P>
+<P>You will need a username and password to connect, along with the connection string shown in the database connection details:</P>
+<span class="lia-media-object lia-media-is-center lia-media-size-default" data-image-alt=""><button class="lia-media-unstyled-btn" type="button" aria-haspopup="true" aria-label="Enlarge Image"><img src="https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLTFZdUw1UA?image-dimensions=999x694&amp;revision=5" width="999" height="694" alt="" /></button></span>
+<P>I recommend using the TP or LOW services because MEDIUM and HIGH are intended for data warehouse workloads, which can cause unexpected locking behavior or resource usage.</P>
+<P>In my case, the connection string is:</P>
+<pre class="lia-code-sample language-javascript"><code>(description=(retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-madrid-1.oraclecloud.com))(connect_data=(service_name=g230b6bb64a62e6_mad_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))
+</code></pre>
+<P>That's everything I need on the Oracle side. I have all the information needed to connect from PostgreSQL.</P>
+<H2 id="community-4547941-toc-hId-2044531028">Declare the Foreign Data Wrapper server</H2>
+<P>I connect to the Azure PostgreSQL server with psql and enable the ORACLE_FDW extension:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; create extension oracle_fdw;
+
+CREATE EXTENSION
+</code></pre>
+<P>I declare the connection string for the foreign data wrapper server:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; create server oracle_autonomous
+  foreign data wrapper oracle_fdw
+  options (dbserver '(description=(retry_count=20)(retry_delay=3)(address=(protocol=tcps)(port=1521)(host=adb.eu-madrid-1.oraclecloud.com))(connect_data=(service_name=g230b6bb64a62e6_mad_tp.adb.oraclecloud.com))(security=(ssl_server_dn_match=yes)))');
+
+CREATE SERVER
+</code></pre>
+<P>I declare the Oracle username and password to be used by my current user:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; create user mapping for current_user
+  server oracle_autonomous
+  options (user 'ADMIN', password '&lt;password on Oracle Autonomous&gt;');
+
+CREATE USER MAPPING
+</code></pre>
+<P>To check if the connection is correct, I call oracle_diag(), which shows the client-side versions as well as the major version of the server:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; select oracle_diag('oracle_autonomous')
+;
+                                      oracle_diag
+----------------------------------------------------------------------------------------
+ oracle_fdw 2.8.0, PostgreSQL 18.4, Oracle client 23.26.0.0.0, Oracle server 23.0.0.0.0
+
+(1 row)
+</code></pre>
+<P>As the server version is returned, I know that I'm connected.</P>
+<P>If it cannot connect, you must verify the connection string, the IP allow list, and the credentials.</P>
+<H2 id="community-4547941-toc-hId-237076565">Discover the public outbound IP address</H2>
+<P>Since I don't want to keep the firewall open to 0.0.0.0/0 indefinitely, and rely solely on password-based protection, I first identify the IP address I'm connected from to narrow down the allowed IP list:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; select oracle_execute('oracle_autonomous',$$
+ begin -- PL/SQL block to raise an exception that carries the IP address information
+  raise_application_error(
+   -20999,
+   'Hello ' || user||'@'||sys_context('userenv','ip_address')
+  );
+ end;
+$$);
+
+ERROR:  error executing statement: OCIStmtExecute failed to execute query
+DETAIL:  ORA-20999: Hello ADMIN@4.203.152.223
+ORA-06512: at line 3
+</code></pre>
+<P>The error message is expected because I used raise_application_error() to return a message to oracle_execute(), which does not accept statements that return a result.</P>
+<P>Now I can replace CIDR 0.0.0.0/0 with the IP address of the Azure PostgreSQL server I'm connecting from:</P>
+<span class="lia-media-object lia-media-is-center lia-media-size-default" data-image-alt=""><button class="lia-media-unstyled-btn" type="button" aria-haspopup="true" aria-label="Enlarge Image"><img src="https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLXkxWUZvcw?image-dimensions=999x186&amp;revision=5" width="999" height="186" alt="" /></button></span>
+<P>Note that Azure does not guarantee that this public address remains static, so this rule may need updating after maintenance or failover. For production where such FDW access is long-term and highly available, use an architecture that provides controlled egress IPs (for example via NAT) that you can allowlist, or private connectivity where available.</P>
+<P>Since ORACLE_FDW allows me to connect and perform DML on the Oracle side, I have no other tasks on the Oracle side. PostgreSQL is my Oracle client.</P>
+<H2 id="community-4547941-toc-hId--1570377898">Import Oracle table metadata</H2>
+<P>Back at my psql prompt, I can import the metadata for the Oracle schema "SH" into the PostgreSQL schema "fdw_sh":</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; create schema fdw_sh
+;
+
+CREATE SCHEMA
+
+postgres=&gt; import foreign schema "SH" 
+           from server oracle_autonomous into fdw_sh
+;
+
+IMPORT FOREIGN SCHEMA
+</code></pre>
+<P>I can describe what is imported:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; set search_path TO fdw_sh, public
+;
+
+postgres=&gt; \d
+                      List of relations
+ Schema |            Name            |     Type      | Owner
+--------+----------------------------+---------------+--------
+ fdw_sh | channels                   | foreign table | franck
+ fdw_sh | costs                      | foreign table | franck
+ fdw_sh | countries                  | foreign table | franck
+ fdw_sh | customers                  | foreign table | franck
+ fdw_sh | products                   | foreign table | franck
+ fdw_sh | promotions                 | foreign table | franck
+ fdw_sh | sales                      | foreign table | franck
+ fdw_sh | supplementary_demographics | foreign table | franck
+ fdw_sh | times                      | foreign table | franck
+(9 rows)
+</code></pre>
+<P>Those are the tables imported from the "SH" schema of the Oracle database.</P>
+<P>ORACLE_FDW has automatically mapped the data types to PostgreSQL data types:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; \d fdw_sh.countries
+
+                               Foreign table "fdw_sh.countries"
+                               
+        Column        |         Type          | Collation | Nullable | Default | FDW options
+----------------------+-----------------------+-----------+----------+---------+--------------
+ country_id           | numeric               |           | not null |         | (key 'true')
+ country_iso_code     | character(2)          |           | not null |         |
+ country_name         | character varying(40) |           | not null |         |
+ country_subregion    | character varying(30) |           | not null |         |
+ country_subregion_id | numeric               |           | not null |         |
+ country_region       | character varying(20) |           | not null |         |
+ country_region_id    | numeric               |           | not null |         |
+ country_total        | character varying(11) |           | not null |         |
+ country_total_id     | numeric               |           | not null |         |
+ country_name_hist    | character varying(40) |           |          |         |
+Server: oracle_autonomous
+FDW options: (schema 'SH', "table" 'COUNTRIES')
+</code></pre>
+<P>It is recommended to run ANALYZE to ensure the PostgreSQL query planner knows the cardinalities. Note that foreign tables are not automatically analyzed by auto-analyze.</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt;  select format('analyze verbose %I.%I;', table_schema, table_name)
+            from information_schema.tables
+            where table_schema = 'fdw_sh'
+\gexec
+</code></pre>
+<P>PostgreSQL doesn't automatically collect statistics on foreign tables. Without running ANALYZE, the optimizer might misjudge row counts, resulting in suboptimal join plans and fewer pushdown opportunities. By default, ANALYZE reads 100% of the table but it can be lowered for large table by setting the sample percentage beforehand:</P>
+<pre class="lia-code-sample language-sql"><code>postgres=&gt; alter foreign table fdw_sh.sales options (set sample_percent '5')
+;
+ALTER FOREIGN TABLE
+</code></pre>
+<H2 id="community-4547941-toc-hId-917134935">Query the foreign tables</H2>
+<P>I can query foreign tables just like local ones. For example, to find the total customer credit exposure by country for certain regions, I run the following:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; -- explain (analyze, verbose, buffers) 
+           select
+            co.country_name,
+            sum(cu.cust_credit_limit) as total_credit
+           from fdw_sh.customers cu
+           join fdw_sh.countries co on co.country_id = cu.country_id
+           where co.country_region in ('Europe')
+           group by co.country_name
+           having sum(cu.cust_credit_limit) &gt; 1e7
+           order by total_credit desc
+;
+
+  country_name  | total_credit
+----------------+--------------
+ Germany        |     49579000
+ United Kingdom |     45205500
+ Italy          |     44844500
+ France         |     23987000
+ Spain          |     12170000
+ 
+(5 rows)
+</code></pre>
+<P>The execution plan indicates the operations that have been delegated to the foreign database:</P>
+<pre class="lia-code-sample language-javascript"><code> Sort  (cost=253237.64..253237.64 rows=3 width=41) (actual time=10348.498..10348.500 rows=5.00 loops=1)
+   Output: co.country_name, (sum(cu.cust_credit_limit))
+   Sort Key: (sum(cu.cust_credit_limit)) DESC
+   Sort Method: quicksort  Memory: 25kB
+   -&gt;  GroupAggregate  (cost=253056.49..253237.61 rows=3 width=41) (actual time=10343.320..10348.489 rows=5.00 loops=1)
+         Output: co.country_name, sum(cu.cust_credit_limit)
+         Group Key: co.country_name
+         Filter: (sum(cu.cust_credit_limit) &gt; '10000000'::numeric)
+         Rows Removed by Filter: 3
+         -&gt;  Sort  (cost=253056.49..253116.81 rows=24130 width=14) (actual time=10342.473..10343.918 rows=30564.00 loops=1)
+               Output: co.country_name, cu.cust_credit_limit
+               Sort Key: co.country_name
+               Sort Method: quicksort  Memory: 1783kB
+               -&gt;  Foreign Scan  (cost=10000.00..251300.00 rows=24130 width=14) (actual time=51.461..10333.852 rows=30564.00 loops=1)
+                     Output: co.country_name, cu.cust_credit_limit
+                     Oracle query: SELECT /*47caada6fd16dcb0*/ r2."COUNTRY_NAME", r1."CUST_CREDIT_LIMIT" FROM ("SH"."CUSTOMERS" r1 INNER JOIN "SH"."COUNTRIES" r2 ON (r1."COUNTRY_ID" = r2."COUNTRY_ID") AND (r2."COUNTRY_REGION" = 'Europe'))
+                     Oracle plan: SELECT STATEMENT
+                     Oracle plan:   HASH JOIN   (condition "R1"."COUNTRY_ID"="R2"."COUNTRY_ID")
+                     Oracle plan:     TABLE ACCESS FULL COUNTRIES  (filter "R2"."COUNTRY_REGION"='Europe')
+                     Oracle plan:     TABLE ACCESS FULL CUSTOMERS
+ Query Identifier: -2654414372183047898
+ Planning Time: 152.202 ms
+ Execution Time: 10348.595 ms
+</code></pre>
+<P>The most important line in the execution plan is the generated Oracle query. It shows exactly which operations PostgreSQL delegated to Oracle and how many rows were returned across the network. In this example, the join and filter were pushed down: it executed a hash join with the COUNTRIES table as the build table and the CUSTOMERS table as the probe table, returning 30564 rows. The aggregation happened in PostgreSQL.</P>
+<P>Here is the visualization in the <A href="https://learn.microsoft.com/en-us/azure/postgresql/development/vs-code-extension/postgresql-extension-overview" target="_blank" rel="noopener noreferrer">VS Code extension for PostgreSQL</A>:</P>
+<span class="lia-media-object lia-media-is-center lia-media-size-default" data-image-alt=""><button class="lia-media-unstyled-btn" type="button" aria-haspopup="true" aria-label="Enlarge Image"><img src="https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLU1YTU9TVg?image-dimensions=999x123&amp;revision=5" width="999" height="123" alt="" /></button></span>
+<P>Checking the execution plan is essential because remote calls introduce latency. We should minimize roundtrips and avoid reading excessive rows that will be discarded later.</P>
+<H2 id="community-4547941-toc-hId--890319528">Execute DML (read and write)</H2>
+<P>Unlike many federation technologies, oracle_fdw supports direct INSERT, UPDATE, and DELETE operations on Oracle tables from PostgreSQL. I use oracle_execute() to create a new table on the remote Oracle Database:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; select oracle_execute(
+  'oracle_autonomous',
+  $$
+    create table "REGIONS" (
+      ID   number primary key,
+      NAME varchar2(100) unique
+    )
+  $$
+);
+
+ oracle_execute
+----------------
+
+(1 row)
+
+
+postgres=&gt; select oracle_close_connections()
+;
+
+ oracle_close_connections
+--------------------------
+
+(1 row)
+</code></pre>
+<P>After executing DDL through oracle_execute(), I close the cached Oracle connection because, in my tests, Oracle’s implicit DDL commit left oracle_fdw’s transaction state out of sync, causing subsequent queries on the same remote session to fail with <SPAN style="color: rgb(30, 30, 30);">ORA-08177 ("can't serialize access for this transaction").</SPAN></P>
+<P>I am able to declare the foreign table and insert rows through it:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; create foreign table regions (
+  id numeric options (key 'true'),
+  name text
+)
+server oracle_autonomous
+options (schema 'ADMIN', table 'REGIONS')
+;
+
+CREATE FOREIGN TABLE
+
+postgres=&gt; insert into regions (name, id)
+           select distinct country_region, country_region_id
+           from fdw_sh.countries
+;
+
+INSERT 0 6
+</code></pre>
+<P>To demonstrate that DML occurs on the Oracle Database, I attempt to insert a duplicate, which results in an Oracle error:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; insert into regions values (1,'Europe')
+;
+
+ERROR:  error executing query: OCIStmtExecute failed to execute remote query
+DETAIL:  ORA-00001: unique constraint (ADMIN.SYS_C0035974) violated on table ADMIN.REGIONS columns (NAME)
+ORA-03301: (ORA-00001 details) row with column values (NAME:'Europe') already exists
+Help: https://docs.oracle.com/error-help/db/ora-0000
+</code></pre>
+<P>Remote queries are supported for transactions:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; begin;
+
+BEGIN
+
+postgres=*&gt; delete from regions;
+
+DELETE 6
+
+postgres=*&gt; select * from regions;
+
+ id | name
+----+------
+(0 rows)
+
+postgres=*&gt; rollback;
+
+ROLLBACK
+
+postgres=&gt; select * from regions;
+
+  id   |    name
+-------+-------------
+ 52800 | Africa
+ 52801 | Americas
+ 52802 | Asia
+ 52803 | Europe
+ 52804 | Middle East
+ 52805 | Oceania
+(6 rows)
+</code></pre>
+<P>The remote delete was executed but later reversed through a rollback in the local transaction. You can check when the remote transaction starts and ends by setting client_min_messages to debug. You can query both local and remote tables within a single local transaction (without two-phase commit or distributed transaction guarantees). However, this does not provide consistent guarantees for distributed transactions.</P>
+<H2 id="community-4547941-toc-hId-1597193305">Hybrid queries</H2>
+<P>An SQL statement can involve local and remote tables. Here is an easy way to import data from Oracle to PostgreSQL:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; create table local_customers as
+            select * from fdw_sh.customers
+;
+
+CREATE TABLE
+
+postgres=&gt; alter table local_customers
+             add primary key (cust_id)
+;
+
+ALTER TABLE
+
+postgres=&gt; vacuum analyze local_customers
+;
+
+VACUUM
+</code></pre>
+<P>A SQL statement can join local and remote tables. Here is an easy way to compare two tables:</P>
+<pre class="lia-code-sample language-javascript"><code>postgres=&gt; select l.cust_id, r.cust_id
+            -- full outer join to read all rows from both tables
+            from local_customers l
+            -- push down order by to favor merge join
+            full outer join (
+               select * from fdw_sh.customers order by cust_id
+               ) r using (cust_id)
+            -- eliminate the same rows
+            where 
+                -- one cust_id row doesn't exist in the other
+                l.cust_id is null or r.cust_id is null 
+                -- or it exists in both but with difference values
+                or l is distinct from r
+;
+</code></pre>
+<P>To compare them, all rows must be read, but this execution plan is efficient, using a sort-merge join that compares rows without buffering them into a temporary table.</P>
+<span class="lia-media-object lia-media-is-center lia-media-size-default" data-image-alt=""><button class="lia-media-unstyled-btn" type="button" aria-haspopup="true" aria-label="Enlarge Image"><img src="https://techcommunity.microsoft.com/t5/s/gxcuf89792/images/bS00NTQ3OTQxLTRSOEl1NQ?image-dimensions=999x243&amp;revision=5" width="999" height="243" alt="" /></button></span>
+<P>This comparison is long and may produce false positives if concurrent DML operations occur while logical replication runs during the migration. Nevertheless, since both databases utilize multi-version concurrency control snapshots and their transactions started nearly simultaneously when using autocommit or serializable transactions, the likelihood of false positives is low. To deal with transient differences, you can quiesce writes, compare only a known past time window, or recheck reported rows after replication catches up.</P>
+<H2 id="community-4547941-toc-hId--210261158">Limitations</H2>
+<P>The foreign data wrapper is not a distributed query engine. It pushes only certain operations when it improves performance. For example, in the previous case, Oracle performed the join and filter, but PostgreSQL executed the GROUP BY.</P>
+<DIV class="styles_lia-table-wrapper__h6Xo9 styles_table-responsive__MW0lN"><table border="1" style="width: 100%; border-width: 1px;"><thead><tr><th>Operation</th><th>Pushdown</th></tr></thead><tbody><tr><td>WHERE</td><td>✅ Yes (only expressions that can be safely translated)</td></tr><tr><td>JOIN</td><td>✔️ Yes, between two foreign tables on the same foreign server when the join conditions and filters can be translated</td></tr><tr><td>ORDER BY</td><td>✔️ Yes, except for string-based sort and when a join is pushed down</td></tr><tr><td>GROUP BY</td><td>❌ (no aggregation pushdown in oracle_fdw 2.8.0)</td></tr><tr><td>INSERT/UPDATE/DELETE</td><td>✅</td></tr><tr><td>Joins over 3 foreign tables</td><td>❌ No</td></tr><tr><td>PostgreSQL functions</td><td>❌ No, except now(), transaction_timestamp(), current_timestamp, current_date, localtimestamp which are translated and pushed down</td></tr></tbody><colgroup><col style="width: 50.00%" /><col style="width: 50.00%" /></colgroup></table></DIV>
+<P>Queries continue to be transmitted over the network. If pushdown isn't feasible, large result sets can slow down performance. Foreign tables are not automatically analyzed. Cross-database transactions are not managed as distributed transactions. oracle_fdw is ideal for access, reporting, and migration, but it does not substitute for physically transferring heavily used data into PostgreSQL.</P>
+<H2 id="community-4547941-toc-hId--2017715621">Conclusion</H2>
+<P>ORACLE_FDW is simple to enable on <A href="https://learn.microsoft.com/en-us/azure/postgresql/overview" target="_blank" rel="noopener noreferrer">Azure Database for PostgreSQL Flexible Server</A> and provides a simple way to access Oracle data from PostgreSQL without introducing a separate replication or ETL layer. Oracle tables appear as PostgreSQL foreign tables, can join with local tables, and support read-write operations.</P>
+<P>The key feature is visibility. PostgreSQL's execution plan shows not only local operations but also the SQL sent to Oracle, along with the Oracle execution plan. This helps users easily see which parts are executed remotely and which stay on PostgreSQL.</P>
+<P>As with all Foreign Data Wrappers, performance depends on how much work you delegate to the remote database. Pushdown candidates typically include filters, joins, and sorting. PostgreSQL executes aggregation locally rather than delegating it to Oracle. Network latency and data transfer costs also play a significant role.</P>
+<P>For migrations, reporting, data validation, or gradual application modernization, oracle_fdw provides an effective solution to connect PostgreSQL and Oracle while using standard SQL on both platforms. It does not try to treat multiple databases as a single distributed system.</P>
+<P>If you used the Oracle Foreign Data Wrapper, please share your questions, comments, and feedback in the <A href="https://github.com/Azure-Samples/postgres-hub/discussions" target="_blank" rel="noopener noreferrer">PostgreSQL Hub Developer Forum.</A></P></main>
+<footer>This is a static archived copy. <a href="https://techcommunity.microsoft.com/blog/adforpostgresql/connecting-azure-postgresql-to-oracle-autonomous-with-oracle-fdw/4547941">View the original article</a>.</footer>
+</body></html>
