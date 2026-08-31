@@ -36,7 +36,17 @@ Regenerate its browser catalog after refreshing the archive:
 python util/build_publication_map.py
 ```
 
-Then open `index.html` directly or serve the repository with any static HTTP server.
+This also rebuilds `impact.html` from the latest dated observation for each publication under `impact/<source>/`. Platform metrics remain separate: article views are not inferred from impressions, reactions, or public counters.
+
+Authenticated DEV metrics can be refreshed without putting an API key in the repository or command history. Set `BLOG_ARCHIVE_DEVTO_API_KEY` directly in the process environment, then run:
+
+```shell
+python util/collect_publication_impact.py --all-devto
+```
+
+LinkedIn metrics require an authenticated author browser session and are stored as dated snapshots under `impact/linkedin/`. The unattended daily workflow rebuilds the impact page from available observations but does not access authenticated analytics.
+
+Then open `index.html` or `impact.html` directly, or serve the repository with any static HTTP server.
 
 ## Daily publication discovery
 

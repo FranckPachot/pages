@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
+from build_impact_page import write_impact_page
 from google_analytics import install_google_tags
 
 
@@ -634,7 +635,7 @@ def write_sitemap(path: Path, catalog: dict[str, Any], root: Path) -> None:
         f"{index_path.parent.relative_to(root).as_posix()}/"
         for index_path in sorted((root / "minibook").glob("*/index.html"))
     ]
-    static_pages = ["", "minibook/", *minibook_pages]
+    static_pages = ["", "impact.html", "minibook/", *minibook_pages]
     entries = [f"  <url><loc>{SITE_URL}{page}</loc></url>" for page in static_pages]
     for publication in local_pages:
         url = SITE_URL + quote(publication["archive_url"], safe="/-._~")
@@ -657,13 +658,15 @@ def main() -> None:
     catalog = build_catalog(root)
     catalog_version = write_catalog(output, catalog)
     write_root_index(root / "index.html", catalog, catalog_version)
+    impact_count = write_impact_page(root)
     write_social_preview(root, catalog)
     write_sitemap(root / "sitemap.xml", catalog, root)
     write_sitemap(root / "home" / "sitemap.xml", catalog, root)
     print(
         f"Wrote {output} with {catalog['publication_count']} publications, "
         f"{len(catalog['database_counts'])} database facets, and "
-        f"{len(catalog['category_counts'])} categories"
+        f"{len(catalog['category_counts'])} categories; "
+        f"impact.html has {impact_count} measured publications"
     )
     if not args.skip_google_analytics:
         analytics_changed, analytics_tagged = install_google_tags(root)
