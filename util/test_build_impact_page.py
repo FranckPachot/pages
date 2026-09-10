@@ -69,6 +69,10 @@ def main() -> None:
         assert "15</strong>" in document
         assert "1,015</strong>" not in document
         assert 'data-views="3"' in document
+        assert 'data-year="2026"' in document
+        assert '<select id="impact-year">' in document
+        assert '<option value="2026">2026</option>' in document
+        assert "row.dataset.year === year.value" in document
         assert "Article views measure opened articles" in document
 
 

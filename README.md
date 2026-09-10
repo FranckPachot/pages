@@ -28,7 +28,7 @@ Use `--refresh-dbi`, `--refresh-devto`, `--refresh-yugabyte`, `--refresh-techcom
 
 ## Browse the publication index
 
-The searchable index at the [site root](index.html) groups all publications by year, source, database, version, category, and tag. It also provides full-text search across titles, summaries, tags, and archived article text. The generated root page includes crawlable recent article links and structured data; `sitemap.xml` and `robots.txt` support search-engine discovery.
+The searchable index at the [site root](index.html) groups all publications by year, source, database, version, category, and tag. It also provides full-text search across titles, summaries, tags, and archived article text. The generated root page includes crawlable recent article links and structured data; `rss.xml`, `sitemap.xml`, and `robots.txt` support subscription and search-engine discovery.
 
 Regenerate its browser catalog after refreshing the archive:
 
@@ -36,7 +36,7 @@ Regenerate its browser catalog after refreshing the archive:
 python util/build_publication_map.py
 ```
 
-This also rebuilds `impact.html` from the latest dated observation for each publication under `impact/<source>/`. Platform metrics remain separate: article views are not inferred from impressions, reactions, or public counters.
+This also rebuilds `rss.xml` with the 50 newest deduplicated publications and `impact.html` from the latest dated observation for each publication under `impact/<source>/`. Platform metrics remain separate: article views are not inferred from impressions, reactions, or public counters.
 
 Authenticated DEV metrics can be refreshed without putting an API key in the repository or command history. Set `BLOG_ARCHIVE_DEVTO_API_KEY` directly in the process environment, then run:
 

@@ -100,9 +100,10 @@ def publication_row(publication: dict[str, Any]) -> str:
     canonical_url = html.escape(publication.get("canonical_url", ""), quote=True)
     title = html.escape(publication.get("title", ""))
     published_at = html.escape(publication.get("published_at", ""))
+    published_year = published_at[:4]
     collected_at = html.escape(publication.get("collected_at", ""))
     searchable = html.escape(f"{publication.get('title', '')} {source_label}".lower(), quote=True)
-    return f'''      <tr data-source="{html.escape(source, quote=True)}" data-search="{searchable}" data-views="{views if views is not None else -1}" data-date="{published_at}">
+    return f'''      <tr data-source="{html.escape(source, quote=True)}" data-year="{published_year}" data-search="{searchable}" data-views="{views if views is not None else -1}" data-date="{published_at}">
         <td><time datetime="{published_at}">{published_at[:10]}</time></td>
         <td><a href="{canonical_url}" target="_blank" rel="noopener">{title}</a><small>Measured {collected_at[:10]}</small></td>
         <td><span class="impact-source impact-source--{html.escape(source, quote=True)}">{html.escape(source_label)}</span></td>
@@ -144,6 +145,15 @@ def build_document(
         f'            <option value="{html.escape(source, quote=True)}">{html.escape(SOURCE_LABELS.get(source, source))}</option>'
         for source in sources
     )
+    years = sorted(
+        {publication.get("published_at", "")[:4] for publication in publications},
+        reverse=True,
+    )
+    year_options = "\n".join(
+        f'            <option value="{html.escape(year, quote=True)}">{html.escape(year)}</option>'
+        for year in years
+        if year
+    )
     rows = "\n".join(publication_row(publication) for publication in publications)
     return f'''<!doctype html>
 <html lang="en">
@@ -174,7 +184,7 @@ def build_document(
     .impact-summary__row {{ display: grid; grid-template-columns: minmax(180px, 1fr) 90px 170px 160px; gap: 16px; padding: 13px 0; border-bottom: 1px solid var(--line); align-items: baseline; }}
     .impact-summary__row span:not(:first-child) {{ color: var(--muted); font-size: 13px; }}
     .impact-explorer {{ padding: 40px 0; }}
-    .impact-controls {{ display: grid; grid-template-columns: minmax(260px, 1fr) 220px 190px; gap: 10px; padding: 16px; background: var(--ink); border-radius: var(--radius); margin: 20px 0 0; }}
+    .impact-controls {{ display: grid; grid-template-columns: minmax(240px, 1fr) 200px 130px 170px; gap: 10px; padding: 16px; background: var(--ink); border-radius: var(--radius); margin: 20px 0 0; }}
     .impact-controls label {{ color: #b9c3c9; display: grid; font: 10px "IBM Plex Mono", monospace; gap: 6px; text-transform: uppercase; }}
     .impact-controls input, .impact-controls select {{ background: #22313b; border: 1px solid #42505b; border-radius: 4px; color: white; height: 40px; padding: 0 10px; width: 100%; }}
     .impact-table-wrap {{ overflow-x: auto; }}
@@ -235,6 +245,9 @@ def build_document(
         <label>Platform<select id="impact-source"><option value="">All measured platforms</option>
 {source_options}
         </select></label>
+        <label>Year<select id="impact-year"><option value="">All years</option>
+      {year_options}
+        </select></label>
         <label>Sort<select id="impact-sort"><option value="views">Most viewed</option><option value="newest">Newest</option><option value="oldest">Oldest</option></select></label>
       </form>
       <div class="impact-table-wrap">
@@ -255,12 +268,13 @@ def build_document(
       const rows = [...body.querySelectorAll('tr')];
       const search = document.getElementById('impact-search');
       const source = document.getElementById('impact-source');
+      const year = document.getElementById('impact-year');
       const sort = document.getElementById('impact-sort');
       const count = document.getElementById('impact-count');
       const empty = document.getElementById('impact-empty');
       function render() {{
         const query = search.value.trim().toLowerCase();
-        const visible = rows.filter(row => (!query || row.dataset.search.includes(query)) && (!source.value || row.dataset.source === source.value));
+        const visible = rows.filter(row => (!query || row.dataset.search.includes(query)) && (!source.value || row.dataset.source === source.value) && (!year.value || row.dataset.year === year.value));
         visible.sort((left, right) => sort.value === 'views' ? Number(right.dataset.views) - Number(left.dataset.views) : sort.value === 'oldest' ? left.dataset.date.localeCompare(right.dataset.date) : right.dataset.date.localeCompare(left.dataset.date));
         rows.forEach(row => row.hidden = true);
         visible.forEach(row => {{ row.hidden = false; body.appendChild(row); }});
@@ -269,6 +283,7 @@ def build_document(
       }}
       search.addEventListener('input', render);
       source.addEventListener('change', render);
+      year.addEventListener('change', render);
       sort.addEventListener('change', render);
       render();
     }})();

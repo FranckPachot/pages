@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import argparse
+import datetime
+import email.utils
 import hashlib
 import html
 import json
@@ -12,6 +14,7 @@ import os
 import re
 import shutil
 import subprocess
+import xml.etree.ElementTree as ET
 from collections import Counter
 from html.parser import HTMLParser
 from pathlib import Path
@@ -23,6 +26,8 @@ from google_analytics import install_google_tags
 
 
 SITE_URL = "https://franckpachot.github.io/pages/"
+RSS_ITEM_LIMIT = 50
+ATOM_NAMESPACE = "http://www.w3.org/2005/Atom"
 
 
 SOURCE_NAMES = {
@@ -635,13 +640,71 @@ def write_sitemap(path: Path, catalog: dict[str, Any], root: Path) -> None:
         f"{index_path.parent.relative_to(root).as_posix()}/"
         for index_path in sorted((root / "minibook").glob("*/index.html"))
     ]
-    static_pages = ["", "impact.html", "minibook/", *minibook_pages]
+    static_pages = [
+        "",
+        "analysis/database-tone/",
+        "impact.html",
+        "minibook/",
+        *minibook_pages,
+    ]
     entries = [f"  <url><loc>{SITE_URL}{page}</loc></url>" for page in static_pages]
     for publication in local_pages:
         url = SITE_URL + quote(publication["archive_url"], safe="/-._~")
         entries.append(f"  <url><loc>{html.escape(url)}</loc><lastmod>{publication['date']}</lastmod></url>")
     sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + "\n".join(entries) + "\n</urlset>\n"
     path.write_text(sitemap, encoding="utf-8")
+
+
+def write_rss(path: Path, catalog: dict[str, Any]) -> None:
+    ET.register_namespace("atom", ATOM_NAMESPACE)
+    publications = sorted(
+        catalog["publications"],
+        key=lambda publication: (publication["date"], publication["id"]),
+        reverse=True,
+    )[:RSS_ITEM_LIMIT]
+
+    rss = ET.Element("rss", {"version": "2.0"})
+    channel = ET.SubElement(rss, "channel")
+    ET.SubElement(channel, "title").text = "Database Articles by Franck Pachot"
+    ET.SubElement(channel, "link").text = SITE_URL
+    ET.SubElement(channel, "description").text = (
+        "Recent database articles by Franck Pachot about PostgreSQL, Oracle Database, "
+        "MongoDB, YugabyteDB, performance, and distributed systems."
+    )
+    ET.SubElement(channel, "language").text = "en"
+    ET.SubElement(
+        channel,
+        f"{{{ATOM_NAMESPACE}}}link",
+        {
+            "href": f"{SITE_URL}rss.xml",
+            "rel": "self",
+            "type": "application/rss+xml",
+        },
+    )
+    if publications:
+        latest = datetime.datetime.fromisoformat(publications[0]["date"]).replace(
+            tzinfo=datetime.timezone.utc
+        )
+        ET.SubElement(channel, "lastBuildDate").text = email.utils.format_datetime(latest)
+
+    for publication in publications:
+        item = ET.SubElement(channel, "item")
+        ET.SubElement(item, "title").text = publication["title"]
+        ET.SubElement(item, "link").text = publication["canonical_url"]
+        ET.SubElement(item, "guid", {"isPermaLink": "true"}).text = publication[
+            "canonical_url"
+        ]
+        published = datetime.datetime.fromisoformat(publication["date"]).replace(
+            tzinfo=datetime.timezone.utc
+        )
+        ET.SubElement(item, "pubDate").text = email.utils.format_datetime(published)
+        ET.SubElement(item, "description").text = publication["summary"]
+        ET.SubElement(item, "category").text = publication["source"]
+        for tag in publication["tags"]:
+            ET.SubElement(item, "category").text = tag
+
+    ET.indent(rss, space="  ")
+    ET.ElementTree(rss).write(path, encoding="utf-8", xml_declaration=True)
 
 
 def main() -> None:
@@ -662,6 +725,7 @@ def main() -> None:
     write_social_preview(root, catalog)
     write_sitemap(root / "sitemap.xml", catalog, root)
     write_sitemap(root / "home" / "sitemap.xml", catalog, root)
+    write_rss(root / "rss.xml", catalog)
     print(
         f"Wrote {output} with {catalog['publication_count']} publications, "
         f"{len(catalog['database_counts'])} database facets, and "
