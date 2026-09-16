@@ -12,6 +12,9 @@ This repository preserves articles published across several platforms:
 
 `archive-manifest.json` is the unified, machine-readable inventory. Each entry records its source, stable source ID, title, publication date, canonical URL, local archive path, and tags when available. The original exports remain unchanged.
 
+Version-sensitive follow-up notes live in [reviews](reviews/README.md). They link
+back to the published articles without modifying archived or published content.
+
 ## Refresh the archive
 
 Python 3 is the only prerequisite. From the repository root, run:
