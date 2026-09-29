@@ -47,6 +47,16 @@ Authenticated DEV metrics can be refreshed without putting an API key in the rep
 python util/collect_publication_impact.py --all-devto
 ```
 
+Without authentication, refresh the public DEV reaction and comment counters for every
+article with:
+
+```shell
+python util/collect_publication_impact.py --all-devto-public
+```
+
+The impact builder merges observations metric by metric, so newer public counters do not
+replace older authenticated page-view totals.
+
 LinkedIn metrics require an authenticated author browser session and are stored as dated snapshots under `impact/linkedin/`. The unattended daily workflow rebuilds the impact page from available observations but does not access authenticated analytics.
 
 Then open `index.html` or `impact.html` directly, or serve the repository with any static HTTP server.

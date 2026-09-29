@@ -41,8 +41,26 @@ def latest_observations(root: Path) -> list[dict[str, Any]]:
                 continue
             candidate = {**publication, "collected_at": collected_at}
             current = latest.get(publication_id)
-            if current is None or collected_at > current.get("collected_at", ""):
+            if current is None:
                 latest[publication_id] = candidate
+                continue
+            older, newer = (
+                (current, candidate)
+                if current.get("collected_at", "") <= collected_at
+                else (candidate, current)
+            )
+            latest[publication_id] = {
+                **older,
+                **newer,
+                "metrics": {
+                    **older.get("metrics", {}),
+                    **newer.get("metrics", {}),
+                },
+                "public_counters": {
+                    **older.get("public_counters", {}),
+                    **newer.get("public_counters", {}),
+                },
+            }
     return sorted(
         latest.values(),
         key=lambda publication: (
@@ -55,6 +73,8 @@ def latest_observations(root: Path) -> list[dict[str, Any]]:
 
 def metric(publication: dict[str, Any], name: str) -> int | None:
     value = publication.get("metrics", {}).get(name)
+    if not isinstance(value, int) and name in ("reactions", "comments"):
+        value = publication.get("public_counters", {}).get(name)
     return value if isinstance(value, int) else None
 
 

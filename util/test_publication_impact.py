@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Regression checks for publication impact normalization."""
 
-from collect_publication_impact import merge_publications, normalize_devto_totals
+from collect_publication_impact import (
+    merge_publications,
+    normalize_devto_public,
+    normalize_devto_totals,
+)
 
 
 def main() -> None:
@@ -37,6 +41,11 @@ def main() -> None:
     assert impact["public_counters"] == {"reactions": 2, "comments": 0}
     assert "follows" not in impact["metrics"]
     assert impact["provenance"]["measurement_type"] == "exact"
+
+    public = normalize_devto_public(article, "2026-09-29T07:00:00Z")
+    assert public["metrics"] == {}
+    assert public["public_counters"] == {"reactions": 2, "comments": 0}
+    assert public["provenance"]["measurement_type"] == "public_counter"
 
     older = {**impact, "collected_at": "2026-08-31T15:00:00Z"}
     other = {**impact, "publication_id": "dev.to:123", "source_id": "123"}

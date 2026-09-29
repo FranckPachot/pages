@@ -79,6 +79,36 @@ def normalize_devto_totals(
     }
 
 
+def normalize_devto_public(article: dict[str, Any], collected_at: str) -> dict[str, Any]:
+    article_id = article.get("id")
+    reactions = article.get("public_reactions_count")
+    comments = article.get("comments_count")
+    if not isinstance(article_id, int) or article_id <= 0:
+        raise ValueError("Invalid Dev.to article ID")
+    if not isinstance(reactions, int) or not isinstance(comments, int):
+        raise ValueError("Incomplete Dev.to public counters")
+    return {
+        "publication_id": f"dev.to:{article_id}",
+        "source": "dev.to",
+        "source_id": str(article_id),
+        "title": article.get("title", ""),
+        "canonical_url": article.get("canonical_url") or article.get("url", ""),
+        "published_at": article.get("published_at", ""),
+        "collected_at": collected_at,
+        "metrics": {},
+        "public_counters": {
+            "reactions": reactions,
+            "comments": comments,
+        },
+        "provenance": {
+            "measurement_type": "public_counter",
+            "provider": "DEV Community public articles API",
+            "endpoint": "/api/articles?username=franckpachot",
+            "notes": "Public reactions and comments only; article views require authenticated analytics.",
+        },
+    }
+
+
 def merge_publications(
     existing: list[dict[str, Any]], collected: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
@@ -107,6 +137,47 @@ def devto_get(path: str, api_key: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Unexpected Dev.to response for {path}")
     return value
+
+
+def devto_get_public(path: str) -> Any:
+    request = urllib.request.Request(
+        f"{DEVTO_API}{path}",
+        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.load(response)
+
+
+def collect_devto_public(root: Path, username: str) -> Path:
+    collected_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+    publications = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode(
+            {"username": username, "per_page": 100, "page": page}
+        )
+        batch = devto_get_public(f"/articles?{query}")
+        if not isinstance(batch, list):
+            raise ValueError(f"Unexpected Dev.to article list response on page {page}")
+        if not batch:
+            break
+        publications.extend(
+            normalize_devto_public(article, collected_at) for article in batch
+        )
+        print(f"Dev.to public impact page {page}: {len(batch)} articles")
+        page += 1
+
+    if not publications:
+        raise ValueError(f"No public Dev.to articles found for {username}")
+    snapshot = {
+        "schema_version": 1,
+        "collected_at": collected_at,
+        "publication_count": len(publications),
+        "publications": publications,
+    }
+    output_path = root / "impact" / "devto-public" / f"{collected_at[:10]}.json"
+    write_json_atomic(output_path, snapshot)
+    return output_path
 
 
 def local_devto_articles(root: Path, article_ids: list[int], collect_all: bool) -> list[dict[str, Any]]:
@@ -171,6 +242,12 @@ def main() -> None:
     parser.add_argument("--article-id", type=int, action="append", default=[])
     parser.add_argument("--all-devto", action="store_true")
     parser.add_argument(
+        "--all-devto-public",
+        action="store_true",
+        help="Collect public reaction and comment counters without authentication",
+    )
+    parser.add_argument("--username", default="franckpachot")
+    parser.add_argument(
         "--request-interval",
         type=float,
         default=2.1,
@@ -179,9 +256,14 @@ def main() -> None:
     args = parser.parse_args()
     if args.request_interval < 2:
         parser.error("--request-interval must be at least 2 seconds")
-    output_path = collect_devto(
-        args.root.resolve(), args.article_id, args.all_devto, args.request_interval
-    )
+    if args.all_devto_public:
+        if args.article_id or args.all_devto:
+            parser.error("--all-devto-public cannot be combined with authenticated options")
+        output_path = collect_devto_public(args.root.resolve(), args.username)
+    else:
+        output_path = collect_devto(
+            args.root.resolve(), args.article_id, args.all_devto, args.request_interval
+        )
     print(f"Wrote {output_path}")
 
 

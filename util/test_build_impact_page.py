@@ -51,6 +51,17 @@ def main() -> None:
         )
         write_snapshot(
             root,
+            "devto-public",
+            "2026-01-03",
+            [{
+                **devto,
+                "collected_at": "2026-01-03T12:00:00Z",
+                "metrics": {},
+                "public_counters": {"reactions": 7, "comments": 2},
+            }],
+        )
+        write_snapshot(
+            root,
             "linkedin",
             "2026-01-02",
             [{**linkedin, "collected_at": "2026-01-02T12:00:00Z"}],
@@ -58,7 +69,9 @@ def main() -> None:
 
         publications = latest_observations(root)
         assert len(publications) == 2
-        assert next(item for item in publications if item["source"] == "dev.to")["metrics"]["page_views"] == 12
+        merged_devto = next(item for item in publications if item["source"] == "dev.to")
+        assert merged_devto["metrics"]["page_views"] == 12
+        assert merged_devto["public_counters"] == {"reactions": 7, "comments": 2}
         assert article_views(linkedin) == 3
 
         document = build_document(publications, {"dev.to": 20, "linkedin": 5})
