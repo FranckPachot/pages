@@ -35,6 +35,7 @@ SOURCE_NAMES = {
     "dbi-services": "dbi services",
     "developpez": "Developpez.com",
     "dev.to": "Dev.to",
+    "javapro": "JAVAPRO",
     "linkedin": "LinkedIn",
     "medium": "Medium",
     "microsoft-techcommunity": "Microsoft Tech Community",
@@ -196,6 +197,10 @@ def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
         body = html_text(value.get("content", {}).get("rendered", ""))
         description = value.get("yoast_head_json", {}).get("description", "")
         return body, normalize_text(description)
+    if source == "javapro":
+        body = html_text(value.get("content", {}).get("rendered", ""))
+        description = html_text(value.get("excerpt", {}).get("rendered", ""))
+        return body, description
     if source == "cern":
         body = html_text(value.get("attributes", {}).get("body", {}).get("processed", ""))
         return body, ""

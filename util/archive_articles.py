@@ -23,6 +23,7 @@ from google_analytics import install_google_tags
 DEVTO_API = "https://dev.to/api"
 DBI_API = "https://www.dbi-services.com/blog/wp-json/wp/v2"
 YUGABYTE_API = "https://www.yugabyte.com/wp-json/wp/v2"
+JAVAPRO_API = "https://javapro.io/wp-json/wp/v2"
 TECHCOMMUNITY_BASE = "https://techcommunity.microsoft.com"
 CERN_API = "https://db-blog.web.cern.ch/jsonapi/node/blog_post"
 CERN_BASE = "https://db-blog.web.cern.ch"
@@ -418,6 +419,75 @@ def archive_yugabyte(root: Path, author_slug: str, refresh: bool) -> list[dict[s
             write_json_atomic(path, detail)
         print(f"Yugabyte {position}/{len(summaries)}: {clean_text(detail['title']['rendered'])}")
     return inventory_yugabyte(root)
+
+
+def javapro_manifest_entry(
+    root: Path, path: Path, detail: dict[str, Any], author_id: int
+) -> dict[str, Any]:
+    article_id = detail.get("id")
+    if not isinstance(article_id, int) or article_id <= 0 or path.stem != str(article_id):
+        raise ValueError(f"Invalid JAVAPRO article ID in {path}")
+    if detail.get("author") != author_id:
+        raise ValueError(f"JAVAPRO article is not authored by user {author_id}")
+    if not detail.get("date") or not detail.get("link") or not detail.get("title", {}).get("rendered"):
+        raise ValueError(f"Incomplete JAVAPRO article metadata in {path}")
+    return {
+        "source": "javapro",
+        "source_id": str(article_id),
+        "title": clean_text(detail["title"]["rendered"]),
+        "published_at": detail["date"],
+        "canonical_url": detail["link"],
+        "archive_path": path.relative_to(root).as_posix(),
+        "tags": [],
+    }
+
+
+def inventory_javapro(root: Path, author_id: int) -> list[dict[str, Any]]:
+    articles = []
+    for path in sorted((root / "javapro" / "articles").glob("*.json")):
+        try:
+            detail = json.loads(read_text(path))
+            articles.append(javapro_manifest_entry(root, path, detail, author_id))
+        except (json.JSONDecodeError, ValueError) as error:
+            print(f"Skipping invalid JAVAPRO snapshot {path.relative_to(root)}: {error}")
+    return articles
+
+
+def list_javapro_articles(author_id: int) -> list[dict[str, Any]]:
+    articles = []
+    page = 1
+    while True:
+        query = urllib.parse.urlencode(
+            {
+                "author": author_id,
+                "per_page": 100,
+                "page": page,
+                "_fields": "id,author,slug,link,date,title,content,excerpt,categories,tags",
+            }
+        )
+        batch = web_get_json(f"{JAVAPRO_API}/posts?{query}")
+        if not isinstance(batch, list):
+            raise ValueError(f"Unexpected JAVAPRO article list response on page {page}")
+        articles.extend(batch)
+        if len(batch) < 100:
+            return articles
+        page += 1
+
+
+def archive_javapro(root: Path, author_id: int, refresh: bool) -> list[dict[str, Any]]:
+    archive_dir = root / "javapro" / "articles"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    articles = list_javapro_articles(author_id)
+    for position, detail in enumerate(articles, start=1):
+        article_id = detail.get("id")
+        if not isinstance(article_id, int) or article_id <= 0:
+            raise ValueError("Invalid JAVAPRO article response")
+        path = archive_dir / f"{article_id}.json"
+        entry = javapro_manifest_entry(root, path, detail, author_id)
+        if refresh or not path.exists():
+            write_json_atomic(path, detail)
+        print(f"JAVAPRO {position}/{len(articles)}: {entry['title']}")
+    return inventory_javapro(root, author_id)
 
 
 def jsonld_values(value: Any) -> list[dict[str, Any]]:
@@ -894,6 +964,8 @@ def main() -> None:
     parser.add_argument("--devto-id", type=int, help="Archive one Dev.to article by ID")
     parser.add_argument("--skip-yugabyte", action="store_true")
     parser.add_argument("--refresh-yugabyte", action="store_true")
+    parser.add_argument("--skip-javapro", action="store_true")
+    parser.add_argument("--refresh-javapro", action="store_true")
     parser.add_argument("--skip-techcommunity", action="store_true")
     parser.add_argument("--refresh-techcommunity", action="store_true")
     parser.add_argument("--skip-cern", action="store_true")
@@ -901,6 +973,7 @@ def main() -> None:
     parser.add_argument("--skip-developpez", action="store_true")
     parser.add_argument("--refresh-developpez", action="store_true")
     parser.add_argument("--yugabyte-author", default="fpachot")
+    parser.add_argument("--javapro-author-id", type=int, default=117)
     parser.add_argument("--techcommunity-author", default="FranckPachot")
     parser.add_argument("--techcommunity-profile-id", default="3595257")
     parser.add_argument("--cern-author", default="fpachot")
@@ -916,6 +989,7 @@ def main() -> None:
         args.skip_dbi = True
         args.skip_devto = True
         args.skip_yugabyte = True
+        args.skip_javapro = True
         args.skip_techcommunity = True
         args.skip_cern = True
         args.skip_developpez = True
@@ -937,6 +1011,10 @@ def main() -> None:
         articles += archive_yugabyte(root, args.yugabyte_author, args.refresh_yugabyte)
     else:
         articles += inventory_yugabyte(root)
+    if not args.skip_javapro:
+        articles += archive_javapro(root, args.javapro_author_id, args.refresh_javapro)
+    else:
+        articles += inventory_javapro(root, args.javapro_author_id)
     if not args.skip_techcommunity:
         articles += archive_techcommunity(
             root,
