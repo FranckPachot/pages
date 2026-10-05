@@ -305,6 +305,20 @@ def inventory_devto(root: Path) -> list[dict[str, Any]]:
     return articles
 
 
+def get_devto_article_detail(summary: dict[str, Any]) -> dict[str, Any]:
+    article_id = summary["id"]
+    try:
+        detail = api_get(f"/articles/{article_id}")
+    except urllib.error.HTTPError as error:
+        path = summary.get("path", "")
+        if error.code != 404 or not re.fullmatch(r"/[A-Za-z0-9_-]+/[A-Za-z0-9_-]+", path):
+            raise
+        detail = api_get(f"/articles{path}")
+    if not isinstance(detail, dict) or detail.get("id") != article_id:
+        raise ValueError(f"Unexpected Dev.to detail response for article {article_id}")
+    return detail
+
+
 def archive_devto(
     root: Path, username: str, refresh: bool, max_articles: int | None
 ) -> list[dict[str, Any]]:
@@ -319,9 +333,7 @@ def archive_devto(
         article_id = str(summary["id"])
         path = archive_dir / f"{article_id}.json"
         if refresh or not path.exists():
-            detail = api_get(f"/articles/{article_id}")
-            if not isinstance(detail, dict) or detail.get("id") != summary["id"]:
-                raise ValueError(f"Unexpected Dev.to detail response for article {article_id}")
+            detail = get_devto_article_detail(summary)
             write_json_atomic(path, detail)
         else:
             try:
@@ -337,9 +349,11 @@ def archive_devto(
 def archive_devto_id(root: Path, article_id: int) -> list[dict[str, Any]]:
     archive_dir = root / "devto" / "articles"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    detail = api_get(f"/articles/{article_id}")
-    if not isinstance(detail, dict) or detail.get("id") != article_id:
-        raise ValueError(f"Unexpected Dev.to detail response for article {article_id}")
+    summary = next(
+        (article for article in list_devto_articles("franckpachot") if article["id"] == article_id),
+        {"id": article_id},
+    )
+    detail = get_devto_article_detail(summary)
     path = archive_dir / f"{article_id}.json"
     write_json_atomic(path, detail)
     print(f"Dev.to: {detail.get('title', article_id)}")
