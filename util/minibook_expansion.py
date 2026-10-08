@@ -514,6 +514,24 @@ EXTRA_BOOKS = [
         ],
         "sources": ["Postgres vs. Oracle access paths II – Index Only Scan", "Skip Scan vs. Loose Index Scan", "SELECT DISTINCT pushdown to do a loose index scan (skip scan)", "YugabyteDB Skip Scan aka Loose Index Scan on compound index", "Covering Index nuances: which columns to cover (WHERE, ORDER BY, LIMIT, SELECT)?", "Index Filtering in PostgreSQL and YugabyteDB (Index Scan instead of Index Only Scan)", "Boost Secondary Index Queries with Index Only Scan"],
     },
+    {
+        "slug": "postgresql-analytics-federation",
+        "number": "40",
+        "title": "PostgreSQL Analytics Federation",
+        "subtitle": "DuckDB, foreign data, Parquet, and pushdown",
+        "description": "Design and verify analytical queries that cross PostgreSQL, embedded DuckDB, foreign servers, and object-storage files without hiding data movement.",
+        "accent": "#d0aa00",
+        "topics": "PostgreSQL · DuckDB · FDW · Parquet · pushdown",
+        "chapters": [
+            chapter("Federation moves work or data", "A query spanning engines can ship predicates and aggregates to the data, pull rows into the coordinator, or combine both. The SQL text alone does not reveal which boundary was crossed.", "Draw every engine and storage boundary.", "Count rows and bytes crossing each boundary.", "Treat network and object-store requests as plan work."),
+            chapter("Embedded analytics changes the executor", "An extension such as pg_duckdb can run analytical operators through DuckDB inside a PostgreSQL deployment while preserving a PostgreSQL entry point. That adds capability and also a versioned executable dependency.", "Confirm which operators run in each engine.", "Retain PostgreSQL, extension, and DuckDB versions.", "Include extension loading and restart requirements in operations."),
+            chapter("Files need schemas and credentials", "Parquet and Iceberg carry useful metadata, but access still depends on URI handling, credentials, network paths, type mapping, and catalog behavior. Managed services expose only an approved subset of those controls.", "Test representative nested and temporal types.", "Use least-privilege object access.", "Keep secrets outside SQL history and generated pages."),
+            chapter("Pushdown is the decisive optimization", "Filtering, projection, aggregation, ordering, and limiting near the source can avoid transferring irrelevant rows. Support is shape- and version-specific, so a remote-looking scan is not proof that useful work moved.", "Inspect both coordinator and remote plans.", "Compare source rows read with rows returned.", "Test unsupported expressions and parameterized predicates."),
+            chapter("Federation does not create one transaction", "A local statement can read several systems without giving them one MVCC snapshot, commit protocol, or failure boundary. Reproducible analytics must state the consistency point of every source.", "Record source snapshot or file version.", "Separate read consistency from query syntax.", "Define retry behavior for partial remote failures."),
+            chapter("Compare complete data paths", "Embedded DuckDB, a foreign data wrapper, a native managed-service extension, and extract-then-query pipelines optimize different constraints. Compare setup, pushdown, transfer, cache state, concurrency, and governance rather than one warm runtime.", "Use the same data and result invariant.", "Report planning and startup separately.", "Include upgrade, recovery, and observability costs."),
+        ],
+        "sources": ["Full pg_duckdb on Azure Database for PostgreSQL", "Amazon Aurora's analytics is gated DuckDB: comparison with pg_duckdb", "DuckDB on YugabyteDB", "DuckDB to query MongoDB", "Oracle FDW on Azure Database for PostgreSQL", "Query Amazon Redshift from YugabyteDB though PostgreSQL Foreign Data Wrapper and VPC peering"],
+    },
 ]
 
 
@@ -685,5 +703,11 @@ EXTRA_TECHNICAL_GUIDES = {
         guide("Measure visibility coverage", "The visibility map reports all-visible pages that can support heap-free index-only execution. Extension installation should follow normal governance.", "CREATE EXTENSION IF NOT EXISTS pg_visibility;\nSELECT * FROM pg_visibility_map_summary('public.event');"),
         guide("Express a loose scan recursively", "Where native skip scan is unavailable, a recursive next-key probe demonstrates the physical idea. It needs careful null handling and is not automatically the best production query.", "WITH RECURSIVE keys(k) AS (\n  (SELECT min(category) FROM item)\n  UNION ALL\n  SELECT (SELECT min(category) FROM item WHERE category > keys.k)\n  FROM keys WHERE k IS NOT NULL\n)\nSELECT k FROM keys WHERE k IS NOT NULL;"),
         guide("Compare entries examined per group", "A useful distinct-scan test records groups returned, index entries read, heap fetches, storage rows, and RPCs. Runtime alone cannot show where duplicates were eliminated.", "EXPLAIN (ANALYZE, BUFFERS, DIST, COSTS OFF)\nSELECT DISTINCT category FROM item ORDER BY category;\n-- Compare groups returned with index/storage rows read."),
+    ],
+    "postgresql-analytics-federation": [
+        guide("Capture the execution boundary", "Use each engine's plan output and retain the remote SQL or file scan details. A local Foreign Scan or Custom Scan node is only the start of the evidence.", "EXPLAIN (ANALYZE, VERBOSE, BUFFERS, SETTINGS)\nSELECT key, count(*)\nFROM federated_source\nWHERE event_time >= $1\nGROUP BY key;"),
+        guide("Measure pushdown by removing it", "Compare equivalent queries with a pushdown-compatible predicate and a deliberately unsupported expression. Record source rows, transferred rows, bytes, requests, and elapsed time.", "pushdown_ratio = rows_returned_by_source / rows_examined_at_source\ntransfer_ratio = rows_received_locally / rows_examined_at_source\n# Keep plans and remote statements for both query shapes."),
+        guide("Inventory analytical extension state", "Managed services may require allow-listing and a restart before CREATE EXTENSION. Capture the installed version and preload state rather than assuming another server has the same capability.", "SELECT extname, extversion FROM pg_extension\nWHERE extname IN ('pg_duckdb', 'postgres_fdw', 'oracle_fdw');\nSHOW shared_preload_libraries;\nSELECT name, setting, pending_restart FROM pg_settings\nWHERE name = 'shared_preload_libraries';"),
+        guide("Pin a reproducible file input", "Object paths can be overwritten while a query remains syntactically identical. Record immutable object versions, file hashes, schemas, row counts, and the credentials scope used by the test.", "input = {\n  'uri': 'object://bucket/path/data.parquet',\n  'version': '<immutable-version>',\n  'sha256': '<digest>',\n  'rows': '<count>',\n  'schema': '<captured-schema>'\n}"),
     ],
 }

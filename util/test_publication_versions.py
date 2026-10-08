@@ -43,6 +43,12 @@ def main() -> None:
     publications = {
         publication["id"]: publication for publication in build_catalog(ROOT)["publications"]
     }
+    assert {"Amazon Aurora", "DuckDB", "PostgreSQL"}.issubset(
+        publications["dev.to:4803170"]["databases"]
+    )
+    assert {"DuckDB", "PostgreSQL"}.issubset(
+        publications["dev.to:4812637"]["databases"]
+    )
     include_versions = publications["dev.to:4528531"]["versions"]
     assert include_versions == [
         "PostgreSQL 11",

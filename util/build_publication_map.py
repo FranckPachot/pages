@@ -68,6 +68,7 @@ DATABASE_RULES = {
     "DocumentDB": r"\bdocumentdb\b",
     "CockroachDB": r"\bcockroachdb\b",
     "Cassandra": r"\bcassandra\b|\bcql\b",
+    "DuckDB": r"\bduckdb\b|\bpg_duckdb\b",
     "SQLite": r"\bsqlite\b",
     "Db2": r"\bdb2\b",
     "SAP HANA": r"\bsap hana\b|\bhana database\b",
@@ -85,6 +86,7 @@ DATABASE_COLORS = {
     "CockroachDB": "#6933ff",
     "Db2": "#009a2b",
     "Cassandra": "#1287b1",
+    "DuckDB": "#fff000",
     "Azure HorizonDB": "#0078d4",
     "SQLite": "#003b57",
     "Database agnostic": "#aeb8b4",
@@ -521,6 +523,7 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         "CockroachDB": "cockroachdb.svg",
         "Db2": "db2.png",
         "Cassandra": "cassandra.svg",
+        "DuckDB": "generic-database.svg",
         "Azure HorizonDB": "azure.svg",
         "SQLite": "sqlite.svg",
     }
@@ -528,7 +531,7 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         "Oracle Database": "O", "PostgreSQL": "PG", "YugabyteDB": "YB", "MongoDB": "M",
         "Amazon Aurora": "A", "Amazon DynamoDB": "D", "MySQL": "MY", "Microsoft SQL Server": "MS",
         "DocumentDB": "D", "CockroachDB": "CR", "Db2": "2", "Cassandra": "C",
-        "Azure HorizonDB": "H", "SQLite": "SQ",
+        "DuckDB": "DU", "Azure HorizonDB": "H", "SQLite": "SQ",
     }
     circumference = 2 * math.pi * 126
     offset = 0.0

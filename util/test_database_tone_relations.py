@@ -69,6 +69,10 @@ def main() -> None:
     } == {"DocumentDB (PostgreSQL)", "PostgreSQL"}
     assert {
         database
+        for database, _, _ in database_mentions("pg_duckdb embeds DuckDB in PostgreSQL.")
+    } == {"DuckDB", "PostgreSQL"}
+    assert {
+        database
         for database, _, _ in database_mentions(
             "Amazon DocumentDB is unrelated to Microsoft's DocumentDB extension for PostgreSQL."
         )

@@ -36,6 +36,7 @@ DATABASE_ALIASES = {
     "DocumentDB (PostgreSQL)": r"(?<!amazon )(?<!amazon's )(?<!amazon’s )(?<!aws )\bdocumentdb\b",
     "CockroachDB": r"\bcockroachdb\b",
     "Cassandra": r"\bcassandra\b",
+    "DuckDB": r"\bduckdb\b|\bpg_duckdb\b",
     "SQLite": r"\bsqlite\b",
     "Db2": r"\bdb2\b",
     "SAP HANA": r"\bsap hana\b|\bhana database\b",

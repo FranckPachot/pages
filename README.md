@@ -75,7 +75,12 @@ The workflow discovers publications from DBI Services, Dev.to, Yugabyte, JAVAPRO
 Regenerate it after refreshing publications or changing a minibook:
 
 ```shell
+python3.13 util/build_minibooks.py
 python3.13 util/generate_db_skills.py
 ```
+
+The unattended refresh performs both steps after publication discovery. It also
+collects public DEV counters before rebuilding the publication index so
+`impact.html` includes the newest observation in the same run.
 
 The companion [database lab guide](how-to-build-a-db-lab.md) turns the publication method into reproducible PostgreSQL, Oracle Database, YugabyteDB, and MongoDB experiments with shared fixtures and source links.
