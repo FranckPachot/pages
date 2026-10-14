@@ -57,6 +57,7 @@ EMPLOYMENT_PERIODS = [
 
 DATABASE_RULES = {
     "Azure HorizonDB": r"\b(?:microsoft\s+)?(?:azure\s+)?horizondb\b",
+    "Azure Database for PostgreSQL": r"\bazure\s+database\s+for\s+postgresql\b|\bazure\s+postgres(?:ql)?\b|\bazure\s+(?:postgres(?:ql)?\s+)?flex(?:ible)?\s+server\b|\bpostgres(?:ql)?\s+flex(?:ible)?\s+server\b|\baz\s+postgres\s+flexible-server\b",
     "Oracle Database": r"\boracle(?: database|text)?\b|\bora-\d{4,5}\b|\b(?:9i|10g|11g|12c|18c|19c|21c|23c|23ai|26ai)(?:r[12])?\b|\b(?:v|gv|x)\$[a-z0-9_$#]+\b|\b(?:dba|cdb)_[a-z0-9_$#]+\b|\b(?:dbms|utl|owa|ctx|sdo)_[a-z0-9_$#]+\b|\b(?:sql\*plus|sqlplus|sqlcl|rman|data\s*guard|golden\s*gate|exadata|awr|statspack|pl/sql|varchar2|sysdate|systimestamp|rownum|connect by|match_recognize|pluggable database|flashback table|asm iostats)\b|\basm_[a-z0-9_$#]+\b|\b(?:cdb|pdb)\$root\b",
     "PostgreSQL": r"\bpostgres(?:ql)?\b|\bpg_[a-z0-9_]+\b|\bpsql\b",
     "YugabyteDB": r"\byugabyte(?:db|d)?\b|\byb-[a-z0-9_-]+\b|\bycql\b|\bysql\b",
@@ -88,6 +89,7 @@ DATABASE_COLORS = {
     "Cassandra": "#1287b1",
     "DuckDB": "#fff000",
     "Azure HorizonDB": "#0078d4",
+    "Azure Database for PostgreSQL": "#0078d4",
     "SQLite": "#003b57",
     "Database agnostic": "#aeb8b4",
 }
@@ -228,7 +230,13 @@ def unique_strings(values: list[str]) -> list[str]:
 
 
 def infer_databases(signal: str) -> list[str]:
-    return [name for name, pattern in DATABASE_RULES.items() if re.search(pattern, signal, re.IGNORECASE)]
+    databases = [
+        name for name, pattern in DATABASE_RULES.items() if re.search(pattern, signal, re.IGNORECASE)
+    ]
+    azure_postgresql_products = {"Azure HorizonDB", "Azure Database for PostgreSQL"}
+    if azure_postgresql_products.intersection(databases) and "PostgreSQL" not in databases:
+        databases.append("PostgreSQL")
+    return databases
 
 
 def infer_categories(signal: str) -> list[str]:
@@ -336,7 +344,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         title = normalize_text(article["title"])
         signal = " ".join([title, " ".join(tags), body[:1800]])
         databases = infer_databases(signal)
-        horizon_signal = " ".join([title, " ".join(tags), description])
+        horizon_signal = " ".join([title, " ".join(tags), description, body[:1800]])
         if "Azure HorizonDB" in databases and not re.search(DATABASE_RULES["Azure HorizonDB"], horizon_signal, re.IGNORECASE):
             databases.remove("Azure HorizonDB")
         versions = infer_versions(signal, databases)
@@ -523,15 +531,17 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
         "CockroachDB": "cockroachdb.svg",
         "Db2": "db2.png",
         "Cassandra": "cassandra.svg",
-        "DuckDB": "generic-database.svg",
-        "Azure HorizonDB": "azure.svg",
+        "DuckDB": "duckdb.png",
+        "Azure HorizonDB": "azure-horizondb.png",
+        "Azure Database for PostgreSQL": "azure-database-for-postgresql.png",
         "SQLite": "sqlite.svg",
     }
     initials = {
         "Oracle Database": "O", "PostgreSQL": "PG", "YugabyteDB": "YB", "MongoDB": "M",
         "Amazon Aurora": "A", "Amazon DynamoDB": "D", "MySQL": "MY", "Microsoft SQL Server": "MS",
         "DocumentDB": "D", "CockroachDB": "CR", "Db2": "2", "Cassandra": "C",
-        "DuckDB": "DU", "Azure HorizonDB": "H", "SQLite": "SQ",
+        "DuckDB": "DU", "Azure HorizonDB": "H", "Azure Database for PostgreSQL": "AP",
+        "SQLite": "SQ",
     }
     circumference = 2 * math.pi * 126
     offset = 0.0

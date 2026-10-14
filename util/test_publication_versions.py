@@ -3,7 +3,7 @@
 
 from pathlib import Path
 
-from build_publication_map import build_catalog, infer_versions
+from build_publication_map import build_catalog, infer_databases, infer_versions
 
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +33,18 @@ def main() -> None:
         "Oracle 11g, MySQL 5.6, Postgres 9.6 and 9.3, SQLite.",
         ["Oracle Database", "MySQL", "PostgreSQL", "SQLite"],
     ) == ["Oracle 11g", "PostgreSQL 9.6", "PostgreSQL 9.3", "MySQL 5.6"]
+    for signal in (
+        "Azure Database for PostgreSQL Flexible Server",
+        "Azure PostgreSQL",
+        "Azure Flexible Server",
+        "az postgres flexible-server parameter set",
+    ):
+        assert {"Azure Database for PostgreSQL", "PostgreSQL"}.issubset(
+            infer_databases(signal)
+        )
+    assert {"Azure HorizonDB", "PostgreSQL"}.issubset(
+        infer_databases("Azure HorizonDB")
+    )
 
     oracle_versions = infer_versions(
         "Oracle 8.1.7 preceded 8i, while Oracle Database 19.3 belongs to the 19c family.",
@@ -46,9 +58,23 @@ def main() -> None:
     assert {"Amazon Aurora", "DuckDB", "PostgreSQL"}.issubset(
         publications["dev.to:4803170"]["databases"]
     )
-    assert {"DuckDB", "PostgreSQL"}.issubset(
+    assert {"Azure Database for PostgreSQL", "DuckDB", "PostgreSQL"}.issubset(
         publications["dev.to:4812637"]["databases"]
     )
+    assert {"Azure HorizonDB", "PostgreSQL"}.issubset(
+        publications["microsoft-techcommunity:4540160"]["databases"]
+    )
+    assert {"Azure HorizonDB", "PostgreSQL"}.issubset(
+        publications["microsoft-techcommunity:4544728"]["databases"]
+    )
+    assert {"Azure HorizonDB", "PostgreSQL"}.issubset(
+        publications["dev.to:4190390"]["databases"]
+    )
+    assert {
+        "Azure Database for PostgreSQL",
+        "Azure HorizonDB",
+        "PostgreSQL",
+    }.issubset(publications["linkedin:q4ede"]["databases"])
     include_versions = publications["dev.to:4528531"]["versions"]
     assert include_versions == [
         "PostgreSQL 11",

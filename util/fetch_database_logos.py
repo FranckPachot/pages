@@ -14,6 +14,9 @@ DIRECT_LOGOS = {
 }
 CURATED_LOGOS = {
     "db2.png": "https://www.ibm.com/content/adobe-cms/us/en/products/instana/supported-technologies/db2-monitoring/jcr:content/root/table_of_contents/body/content_section_styled/content-section-body/complex_narrative/logoimage.coreimg.png/1773950316806/ibm-db2.png",
+    "duckdb.png": "DuckDB product mark (curated)",
+    "azure-horizondb.png": "Azure HorizonDB product mark (curated)",
+    "azure-database-for-postgresql.png": "Azure Database for PostgreSQL product mark (curated)",
 }
 LOGOS = {
     "postgresql.svg": [("logos", "postgresql")],
