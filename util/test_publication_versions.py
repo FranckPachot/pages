@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Regression checks for database-version attribution in the publication map."""
 
+import json
+import tempfile
 from pathlib import Path
 
 from build_publication_map import build_catalog, infer_databases, infer_versions
@@ -46,6 +48,63 @@ def main() -> None:
         infer_databases("Azure HorizonDB")
     )
 
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        root = Path(temporary_directory)
+        prefix = "SQL walkthrough. " * 180
+        articles = []
+        for source_id, title, tags, body in (
+            (
+                "late-azure-postgresql",
+                "PostgreSQL and DuckDB data lake",
+                ["azure"],
+                prefix + "This plan runs on Azure Database for PostgreSQL.",
+            ),
+            (
+                "azure-blob-only",
+                "PostgreSQL and DuckDB data lake",
+                ["azure"],
+                prefix + "Azure Blob Storage is read from PostgreSQL.",
+            ),
+            (
+                "horizondb-comparison",
+                "Azure HorizonDB and DuckDB",
+                ["azure"],
+                prefix + "This feature is not available in Azure Database for PostgreSQL.",
+            ),
+            (
+                "untagged-postgresql",
+                "PostgreSQL query planning",
+                [],
+                prefix + "Microsoft supports Azure Database for PostgreSQL migrations.",
+            ),
+        ):
+            snapshot = root / f"{source_id}.json"
+            snapshot.write_text(json.dumps({"body_markdown": body}), encoding="utf-8")
+            articles.append(
+                {
+                    "source": "dev.to",
+                    "source_id": source_id,
+                    "title": title,
+                    "published_at": "2026-10-15T07:59:08Z",
+                    "canonical_url": f"https://dev.to/example/{source_id}",
+                    "archive_path": snapshot.name,
+                    "tags": tags,
+                }
+            )
+        (root / "archive-manifest.json").write_text(
+            json.dumps({"schema_version": 1, "articles": articles}), encoding="utf-8"
+        )
+        fixtures = {
+            publication["id"]: publication for publication in build_catalog(root)["publications"]
+        }
+        assert fixtures["dev.to:late-azure-postgresql"]["databases"] == [
+            "Azure Database for PostgreSQL",
+            "PostgreSQL",
+            "DuckDB",
+        ]
+        for source_id in ("azure-blob-only", "horizondb-comparison", "untagged-postgresql"):
+            assert "Azure Database for PostgreSQL" not in fixtures[f"dev.to:{source_id}"]["databases"]
+
     oracle_versions = infer_versions(
         "Oracle 8.1.7 preceded 8i, while Oracle Database 19.3 belongs to the 19c family.",
         ["Oracle Database"],
@@ -61,6 +120,10 @@ def main() -> None:
     assert {"Azure Database for PostgreSQL", "DuckDB", "PostgreSQL"}.issubset(
         publications["dev.to:4812637"]["databases"]
     )
+    assert {"Azure Database for PostgreSQL", "DuckDB", "PostgreSQL"}.issubset(
+        publications["dev.to:4820013"]["databases"]
+    )
+    assert "Azure Database for PostgreSQL" not in publications["dev.to:3999543"]["databases"]
     assert {"Azure HorizonDB", "PostgreSQL"}.issubset(
         publications["microsoft-techcommunity:4540160"]["databases"]
     )

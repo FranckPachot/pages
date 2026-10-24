@@ -347,6 +347,13 @@ def build_catalog(root: Path) -> dict[str, Any]:
         horizon_signal = " ".join([title, " ".join(tags), description, body[:1800]])
         if "Azure HorizonDB" in databases and not re.search(DATABASE_RULES["Azure HorizonDB"], horizon_signal, re.IGNORECASE):
             databases.remove("Azure HorizonDB")
+        azure_postgresql = "Azure Database for PostgreSQL"
+        if (
+            "azure" in {tag.casefold() for tag in tags}
+            and not {"Azure HorizonDB", azure_postgresql}.intersection(databases)
+            and re.search(DATABASE_RULES[azure_postgresql], body, re.IGNORECASE)
+        ):
+            databases = infer_databases(f"{azure_postgresql} {signal}")
         versions = infer_versions(signal, databases)
         categories = infer_categories(signal)
         article_id = f"{article['source']}:{article['source_id']}"

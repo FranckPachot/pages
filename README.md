@@ -34,6 +34,11 @@ Use `--refresh-dbi`, `--refresh-devto`, `--refresh-yugabyte`, `--refresh-javapro
 
 The searchable index at the [site root](index.html) groups all publications by year, source, database, version, category, and tag. It also provides full-text search across titles, summaries, tags, and archived article text. The generated root page includes crawlable recent article links and structured data; `rss.xml`, `sitemap.xml`, and `robots.txt` support subscription and search-engine discovery.
 
+For Azure-tagged articles without an identified Azure database product, the catalog
+also checks the full article for an explicit Azure Database for PostgreSQL mention.
+Azure Blob references alone do not add that database badge, and this fallback does
+not relabel HorizonDB articles based on later comparisons.
+
 Regenerate its browser catalog after refreshing the archive:
 
 ```shell
