@@ -61,7 +61,8 @@ python util/collect_publication_impact.py --all-devto-public
 ```
 
 The impact builder merges observations metric by metric, so newer public counters do not
-replace older authenticated page-view totals.
+replace older authenticated page-view totals. Newer reaction and comment observations
+replace older totals, including authenticated ones.
 
 LinkedIn metrics require an authenticated author browser session and are stored as dated snapshots under `impact/linkedin/`. The unattended daily workflow rebuilds the impact page from available observations but does not access authenticated analytics.
 

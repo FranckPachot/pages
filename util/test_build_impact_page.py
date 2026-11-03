@@ -24,7 +24,7 @@ def main() -> None:
         "title": "DEV article",
         "canonical_url": "https://dev.to/example",
         "published_at": "2026-01-01",
-        "metrics": {"page_views": 10},
+        "metrics": {"page_views": 10, "reactions": 2, "comments": 0},
     }
     linkedin = {
         "publication_id": "linkedin:1",
@@ -47,7 +47,11 @@ def main() -> None:
             root,
             "devto",
             "2026-01-02",
-            [{**devto, "collected_at": "2026-01-02T12:00:00Z", "metrics": {"page_views": 12}}],
+            [{
+                **devto,
+                "collected_at": "2026-01-02T12:00:00Z",
+                "metrics": {"page_views": 12, "reactions": 4, "comments": 1},
+            }],
         )
         write_snapshot(
             root,
@@ -70,7 +74,7 @@ def main() -> None:
         publications = latest_observations(root)
         assert len(publications) == 2
         merged_devto = next(item for item in publications if item["source"] == "dev.to")
-        assert merged_devto["metrics"]["page_views"] == 12
+        assert merged_devto["metrics"] == {"page_views": 12, "reactions": 7, "comments": 2}
         assert merged_devto["public_counters"] == {"reactions": 7, "comments": 2}
         assert article_views(linkedin) == 3
 
@@ -87,6 +91,22 @@ def main() -> None:
         assert '<option value="2026">2026</option>' in document
         assert "row.dataset.year === year.value" in document
         assert "Article views measure opened articles" in document
+
+        write_snapshot(
+            root,
+            "devto",
+            "2026-01-04",
+            [{
+                **devto,
+                "collected_at": "2026-01-04T12:00:00Z",
+                "metrics": {"page_views": 20, "reactions": 9, "comments": 3},
+                "public_counters": {"reactions": 7, "comments": 2},
+            }],
+        )
+        refreshed_devto = next(
+            item for item in latest_observations(root) if item["source"] == "dev.to"
+        )
+        assert refreshed_devto["metrics"] == {"page_views": 20, "reactions": 9, "comments": 3}
 
 
 if __name__ == "__main__":

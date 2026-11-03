@@ -39,7 +39,18 @@ def latest_observations(root: Path) -> list[dict[str, Any]]:
             collected_at = publication.get("collected_at", snapshot.get("collected_at", ""))
             if not isinstance(publication_id, str) or not isinstance(collected_at, str):
                 continue
-            candidate = {**publication, "collected_at": collected_at}
+            candidate = {
+                **publication,
+                "collected_at": collected_at,
+                "metrics": {
+                    **{
+                        name: value
+                        for name, value in publication.get("public_counters", {}).items()
+                        if name in ("reactions", "comments") and isinstance(value, int)
+                    },
+                    **publication.get("metrics", {}),
+                },
+            }
             current = latest.get(publication_id)
             if current is None:
                 latest[publication_id] = candidate
