@@ -70,9 +70,11 @@ Then open `index.html` or `impact.html` directly, or serve the repository with a
 
 ## Daily publication discovery
 
-The `Daily publication refresh` GitHub Actions workflow runs every day at 06:17 UTC and can also be started manually. It checks the public APIs and feeds supported by `util/archive_articles.py`, rebuilds the publication index without retagging unrelated HTML pages, and opens or updates a single review pull request only when files change. It never posts, replies, reacts, follows, or changes anything on a social platform.
+The `Daily publication refresh` GitHub Actions workflow runs every day at 06:17 UTC and can also be started manually. It checks the public APIs and feeds supported by `util/archive_articles.py`, rebuilds the publication index without retagging unrelated HTML pages, runs the regression checks, and commits updates directly to the repository's default branch (`master`) only when files change. It never posts, replies, reacts, follows, or changes anything on a social platform.
 
-The workflow discovers publications from DBI Services, Dev.to, Yugabyte, JAVAPRO, and Microsoft Tech Community. The historical CERN and Developpez archives are inventoried from their local snapshots because their former public discovery endpoints are no longer available or reliable enough for unattended refreshes. Medium and LinkedIn remain local or authenticated imports, so they are inventoried but cannot be discovered by the unattended job. Review the pull request before merging, especially when a new article needs a curated description.
+After pushing updates, the workflow explicitly requests a GitHub Pages build using its repository-scoped token. This is necessary because pushes made with `GITHUB_TOKEN` do not automatically trigger Pages builds. No personal access token or local computer is required.
+
+The workflow discovers publications from DBI Services, Dev.to, Yugabyte, JAVAPRO, and Microsoft Tech Community. The historical CERN and Developpez archives are inventoried from their local snapshots because their former public discovery endpoints are no longer available or reliable enough for unattended refreshes. Medium and LinkedIn remain local or authenticated imports, so they are inventoried but cannot be discovered by the unattended job. New entries use the available article descriptions; curated summaries can be added later under `util/publication_descriptions/`.
 
 ## Build the agent knowledge base
 

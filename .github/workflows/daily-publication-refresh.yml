@@ -7,7 +7,7 @@ on:
 
 permissions:
   contents: write
-  pull-requests: write
+  pages: write
 
 env:
   PYTHONDONTWRITEBYTECODE: "1"
@@ -19,9 +19,12 @@ concurrency:
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -46,17 +49,34 @@ jobs:
       - name: Rebuild agent knowledge base
         run: python util/generate_db_skills.py
 
-      - name: Open publication review pull request
-        uses: peter-evans/create-pull-request@v7
-        with:
-          branch: automation/daily-publication-refresh
-          delete-branch: true
-          commit-message: Archive newly discovered publications
-          title: Review newly discovered publications
-          body: |
-            Automated daily refresh of the public publication archive.
+      - name: Validate publication updates
+        run: |
+          for test in util/test_*.py; do
+            python "$test"
+          done
+          git diff --check
 
-            This job reads public publication feeds and APIs, archives newly discovered articles,
-            and rebuilds the publication index. It does not post to or modify any social account.
+      - name: Commit and push publication updates
+        id: commit
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          git add -- archive-manifest.json db-skills.md index.html impact.html \
+            rss.xml sitemap.xml home dbi-services devto yugabyte javapro \
+            microsoft-techcommunity impact minibook analysis/database-tone
+          if git diff --cached --quiet; then
+            echo "No publication updates to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Refresh publications and impact metrics" \
+            -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
+          git push origin "HEAD:$DEFAULT_BRANCH"
+          echo "changed=true" >> "$GITHUB_OUTPUT"
 
-            LinkedIn publications still require the documented authenticated, localhost-only capture.
+      - name: Request GitHub Pages build
+        if: steps.commit.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api --method POST "repos/$GITHUB_REPOSITORY/pages/builds"
