@@ -70,11 +70,13 @@ Then open `index.html` or `impact.html` directly, or serve the repository with a
 
 ## Daily publication discovery
 
-The `Daily publication refresh` GitHub Actions workflow runs every day at 06:17 UTC and can also be started manually. It checks the public APIs and feeds supported by `util/archive_articles.py`, rebuilds the publication index without retagging unrelated HTML pages, runs the regression checks, and commits updates directly to the repository's default branch (`master`) only when files change. It never posts, replies, reacts, follows, or changes anything on a social platform.
+The local Copilot automation `Daily publication archive refresh` runs every day at 09:00 local time. It is configured in VS Code's Automations, not stored as a repository schedule. This computer and the local agent host must be running for scheduled execution. Each run uses an isolated worktree based on `master`, checks the supported public sources, adds source-grounded descriptions for new articles, rebuilds generated pages, and runs the regression checks before committing and pushing updates directly to `master`. It never posts, replies, reacts, follows, or changes anything on a social platform.
 
-After pushing updates, the workflow explicitly requests a GitHub Pages build using its repository-scoped token. This is necessary because pushes made with `GITHUB_TOKEN` do not automatically trigger Pages builds. No personal access token or local computer is required.
+Local pushes use the computer's existing GitHub authentication and trigger the normal GitHub Pages deployment. Missing credentials, unavailable publication sources, failed validation, or push conflicts are reported rather than treated as successful refreshes.
 
-The workflow discovers publications from DBI Services, Dev.to, Yugabyte, JAVAPRO, and Microsoft Tech Community. The historical CERN and Developpez archives are inventoried from their local snapshots because their former public discovery endpoints are no longer available or reliable enough for unattended refreshes. Medium and LinkedIn remain local or authenticated imports, so they are inventoried but cannot be discovered by the unattended job. New entries use the available article descriptions; curated summaries can be added later under `util/publication_descriptions/`.
+The automation discovers publications from DBI Services, Dev.to, Yugabyte, JAVAPRO, and Microsoft Tech Community. The historical CERN and Developpez archives are inventoried from their local snapshots because their former public discovery endpoints are no longer available or reliable enough for unattended refreshes. Medium and LinkedIn remain local or authenticated imports, so they are inventoried but cannot be discovered by the unattended job. Curated summaries live under `util/publication_descriptions/`.
+
+The GitHub Actions `Manual publication refresh` workflow is disabled and has no daily schedule, preventing duplicate refreshes. Microsoft Tech Community returned HTTP 403 from a GitHub-hosted runner during verification, so the local automation is the daily execution path. If the manual workflow is enabled and run separately, it requests a Pages build explicitly because pushes made with `GITHUB_TOKEN` do not trigger one automatically.
 
 ## Build the agent knowledge base
 
@@ -87,7 +89,7 @@ python3.13 util/build_minibooks.py
 python3.13 util/generate_db_skills.py
 ```
 
-The unattended refresh performs both steps after publication discovery. It also
+The daily automation performs both steps after publication discovery. It also
 collects public DEV counters before rebuilding the publication index so
 `impact.html` includes the newest observation in the same run.
 
