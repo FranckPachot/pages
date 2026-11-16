@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-LFQ153SCQM"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-LFQ153SCQM');
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-10-odc-appreciation-day-reduce-cpu-usage-running-business-logic-oracle">
+<title>ODC Appreciation Day : Reduce CPU usage by running the business logic in the Oracle Database</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<nav><a href="../../../index.html">Publication index</a></nav>
+<p class="firstpub">Archived from Databases at CERN, published 2018-10-11.
+<a href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-10-odc-appreciation-day-reduce-cpu-usage-running-business-logic-oracle">Original article URL</a>.
+The content describes the versions available at the publication date.</p>
+<h1>ODC Appreciation Day : Reduce CPU usage by running the business logic in the Oracle Database</h1>
+<main>
+<p>Here is my <a href="https://oracle-base.com/blog/2018/09/27/oracle-developer-community-odc-appreciation-day-2018-thanksodc/" target="blank">#ThanksODC</a> post. A long one... There's a point that should always be a major topic for database developer community discussions: where to run the procedural code. The access to data is in the database, for sure, and the language for it is SQL. But very often, the business logic of a transaction cannot be executed in one single SQL statement. Either because it is too complex and requires a procedural language. Or simply because the procedural language is easier to read and maintain. More self-documented when it comes with relevant function and variable names. And then there are two different decisions to make, but they are not completely independent because not all combinations are possible:</p>
+<ul>
+<li>Which language is used to code the business logic?</li>
+<li>In which engine to run the compiled, or interpreted, code?</li>
+</ul>
+<p>You choose the language depending on the developers skills, and usually the management prefers cheaper developers. Then you choose the engine that can run the executable component built&nbsp;from that language. And here again, the cost is the first criteria, and often the only one. The goal of this post is to show that, for performance and scalability reasons, you should run the engine close to where the SQL will run. For sure on the same data center. At least on the same server. And preferably within the same process. And that's why I'll start with a PL/SQL procedure. It runs in the database, and is a powerful language, easy to learn and read, with features that you can't find elsewhere. However, this does not pass the cost decisions. Rare and expensive developers to code PL/SQL, expensive license cost for the servers which run it, and vendor lock-in are the three reasons why lot of companies look at other choices. The cheap criteria, combined with laziness, favors weak type interpreted languages that can run everywhere. And for this reason I'll show the same business logic run from JavaScript in the client side of the database. But I'll also run the same JavaScript in the database, with the Multi-Lingual Engine which is currently in beta, in order to show that, maybe, in the future we will have this possibility.</p>
+<p>Those languages are just examples. The point is about where it runs.</p>
+<h2>CPU usage when running business logic in client vs. database</h2>
+<p>Actually I've built&nbsp;those simple examples when preparing <a href="https://oracle.rainfocus.com/widget/oracle/oow18/catalogcodeone18?search=pachot" target="_blank">my Oracle Code One session for OOW18</a>. I'll run 'top' to show the CPU usage in the database server process and in the client process. Here is a simple script that gets the CPU time used between the call with the 'init' argument and the 'diff' argument:</p>
+<pre>
+
+-bash-4.2$ cat &gt; show-cpu-seconds-from-ps.sh &lt;&lt;'CAT'
+
+ [ "$1" == "init" ] &amp;&amp; { rm -f /tmp/show-cpu-seconds-from-ps.txt ; }
+ ps h -eo cputime,pid,etime,args | sort &gt;&gt; /tmp/show-cpu-seconds-from-ps.txt ; awk '
+ {
+  process= $2 ; processes[process]=$4 " " $5 " " $6 " " $7 " " $8
+  split($1,a,/:/) ; cputime=a[3]+60*a[2]+60*60*a[1]
+  if ( last_cputime[process] == "" ) {
+   diff_cputime[process]=cputime
+  } else {
+   diff_cputime[process]=cputime-last_cputime[process]
+  }
+  last_cputime[process]=cputime
+ }
+ END{
+  if ( op !="init" ) for (i in diff_cputime) if (diff_cputime[i] &gt;2 ) printf "%10d cpu seconds in pid=%10d %-s\n",diff_cputime[i],i
+cesses[i]
+ }
+ ' op=$1 /tmp/show-cpu-seconds-from-ps.txt | sort -n | tail -5 | grep --color=auto -E "(^ *[0-9]+|^)"
+
+ TAC
+
+-bash-4.2$ chmod u+x show-cpu-seconds-from-ps.sh
+
+</pre><h2>The test case</h2>
+<p>My business logic will be very simple here: a transfer between two accounts. Decreasing or increasing the amount is not really 'business logic' but just maths and data logic, and this will be done with a SQL update. The business semantic comes when you combine the two updates to decrease an account and increase another one with the same amount, in the same transaction. And this is where a procedural language function will implement this transfer service. If the business requirements evolve with adding transfer fees, auditing security, checking account amounts,... this will be easy to add in the procedure.</p>
+<p>I create two tables, CUSTOMER and ACCOUNT:</p>
+<pre>
+
+-bash-4.2$ sqlcl sys/oracle@//localhost/PDB1 as sysdba
+SQLcl: Release 18.3 Production on Wed Oct 10 01:19:23 2018
+Copyright (c) 1982, 2018, Oracle.  All rights reserved.
+
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0_MLE - 64bit Beta
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+
+01:19:25 SQL&gt; grant dba to demo identified by demo;
+Grant succeeded.
+
+01:19:28 SQL&gt; alter user demo quota unlimited on USERS;
+User altered.
+
+01:19:30 SQL&gt; connect demo/demo@//localhost/PDB1
+Connected.
+01:19:32 SQL&gt; show user
+USER is "DEMO"
+01:19:35 SQL&gt; create table CUSTOMERS (
+  2   CUSTOMER_ID number generated always as identity constraint CUSTOMER_PK primary key,
+  3   CUSTOMER_NAME varchar2(42)
+  4  );
+Table created.
+
+01:19:40 SQL&gt; create table ACCOUNTS (
+  2   ACCOUNT_ID  varchar2(10) constraint ACCOUNT_PK primary key,
+  3   CUSTOMER_ID number,
+  4   AMOUNT      number default 0
+  5  );
+Table created.
+
+</pre><p>I insert 5000 customers and 500000 accounts:</p>
+<pre>
+
+01:19:43 SQL&gt; insert /*+ append */ into CUSTOMERS (CUSTOMER_NAME)
+  2   select x from (
+  3    select to_char( date'-4712-01-01'+rownum-1,'Jsp') x from xmltable('1 to 1000000')
+  4   ) where length(x)=42 and rownum&lt;=5000;
+
+5000 rows created.
+
+01:19:45 SQL&gt; commit;
+Commit complete.
+
+01:19:46 SQL&gt; select * from CUSTOMERS order by CUSTOMER_ID fetch first 10 rows only;
+
+  CUSTOMER_ID CUSTOMER_NAME
+  ----------- -------------
+            1 Three Thousand Three Hundred Seventy-Three
+            2 Three Thousand Three Hundred Seventy-Seven
+            3 Three Thousand Three Hundred Seventy-Eight
+            4 Three Thousand Seven Hundred Seventy-Three
+            5 Three Thousand Seven Hundred Seventy-Seven
+            6 Three Thousand Seven Hundred Seventy-Eight
+            7 Three Thousand Eight Hundred Seventy-Three
+            8 Three Thousand Eight Hundred Seventy-Seven
+            9 Three Thousand Eight Hundred Seventy-Eight
+           10 Seven Thousand Three Hundred Seventy-Three
+
+10 rows selected.
+
+01:19:50 SQL&gt; insert /*+ append */ into ACCOUNTS (ACCOUNT_ID,CUSTOMER_ID,AMOUNT)
+  2   select 'X'||to_char(rownum,'FM0999999'),CUSTOMER_ID,10000 from CUSTOMERS cross join xmltable('1 to 100')
+  3  ;
+
+500000 rows created.
+
+01:19:54 SQL&gt; commit;
+
+Commit complete.
+
+01:19:54 SQL&gt; select * from ACCOUNTS order by ACCOUNT_ID fetch first 10 rows only;
+
+ACCOUNT_ID     CUSTOMER_ID   AMOUNT
+----------     -----------   ------
+X0000001                 1    10000
+X0000002                 2    10000
+X0000003                 3    10000
+X0000004                 4    10000
+X0000005                 5    10000
+X0000006                 6    10000
+X0000007                 7    10000
+X0000008                 8    10000
+X0000009                 9    10000
+X0000010                10    10000
+
+
+10 rows selected.
+
+01:19:55 SQL&gt; set timing on
+01:19:56 SQL&gt; select /*+ full(ACCOUNTS) cache(ACCOUNTS) */ count(*),avg(amount) from ACCOUNTS;
+
+  COUNT(*)   AVG(AMOUNT)
+  --------   -----------
+    500000         10000
+
+Elapsed: 00:00:00.119
+
+</pre><p>&nbsp;</p>
+<p>Here I have 5000 customers and 100 accounts per customers. All is in buffer cache. All processing will be CPU usage.</p>
+<h2>The business logic described in procedural code</h2>
+<p>Here is the PL/SQL procedure that implements my service: it takes the two accounts to debit and credit, and the amount. I order to call it a service, I should commit the transaction. But this demo focuses only on the modifications.</p>
+<pre>
+
+01:19:58 SQL&gt; create or replace procedure transfer(acc1 varchar2, acc2 varchar2, amount number) as
+  2  begin
+  3   -- debit acc1
+  4   update ACCOUNTS set ACCOUNTS.AMOUNT = ACCOUNTS.AMOUNT - transfer.amount where ACCOUNT_ID=acc1;
+  5   if sql%rowcount &lt;&gt; 1 then raise_application_error(-20000,'Account '''||acc1||''' unknown'); end if;
+  6   -- credit acc2
+  7   update ACCOUNTS set ACCOUNTS.AMOUNT = ACCOUNTS.AMOUNT + transfer.amount where ACCOUNT_ID=acc2;
+  8   if sql%rowcount &lt;&gt; 1 then raise_application_error(-20000,'Account '''||acc2||''' unknown'); end if;
+  9  end;
+ 10  /
+
+Procedure created.
+
+Elapsed: 00:00:00.391
+
+</pre><p>Just testing by calling it to transfer $10&nbsp;between account X0000001 and X0000002:</p>
+<pre>
+
+01:20:05 SQL&gt; exec transfer('X0000001','X0000002',10);
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:00:00.177
+</pre><pre>
+01:20:06 SQL&gt; select * from ACCOUNTS order by ACCOUNT_ID fetch first 10 rows only;
+
+ACCOUNT_ID     CUSTOMER_ID   AMOUNT
+----------     -----------   ------
+X0000001                 1     9990
+X0000002                 2    10010
+X0000003                 3    10000
+X0000004                 4    10000
+X0000005                 5    10000
+X0000006                 6    10000
+X0000007                 7    10000
+X0000008                 8    10000
+X0000009                 9    10000
+X0000010                10    10000
+
+10 rows selected.
+
+Elapsed: 00:00:00.057
+</pre><p>&nbsp;</p>
+<p>I displayed the first 10 rows and finally I rollback to get back to the initial state where each account has $10000</p>
+<pre>
+
+01:20:08 SQL&gt; rollback;
+
+Rollback complete.
+
+Elapsed: 00:00:00.010
+01:20:09 SQL&gt; select * from ACCOUNTS order by ACCOUNT_ID fetch first 10 rows only;
+
+ACCOUNT_ID     CUSTOMER_ID   AMOUNT
+----------     -----------   ------
+X0000001                 1    10000
+X0000002                 2    10000
+X0000003                 3    10000
+X0000004                 4    10000
+X0000005                 5    10000
+X0000006                 6    10000
+X0000007                 7    10000
+X0000008                 8    10000
+X0000009                 9    10000
+X0000010                10    10000
+
+10 rows selected.
+
+Elapsed: 00:00:00.032
+
+</pre><h2>Implemented as SQL statements</h2>
+<p>Now it is time to do some tests and measure the CPU usage. Each of the other 499999 accounts will give $1 to the X0000001 account. I'll start without using my PL/SQL procedure. Just executing the relevant updates.</p>
+<p>I reset my CPU counters:</p>
+<pre>
+
+01:20:11 SQL&gt; set timing on
+01:20:13 SQL&gt; host ./show-cpu-seconds-from-ps.sh init
+
+</pre><p>I debit $1&nbsp;from each other account:</p>
+<pre>
+01:20:15 SQL&gt; update ACCOUNTS set AMOUNT=AMOUNT-1 where ACCOUNT_ID&lt;&gt;'X0000001';
+
+499999 rows updated.
+
+Elapsed: 00:00:17.150
+
+</pre><p>I credit the winner with the same amount:</p>
+<pre>
+
+01:20:33 SQL&gt; update ACCOUNTS set AMOUNT=AMOUNT+(select 1*count(*) from ACCOUNTS where ACCOUNT_ID&lt;&gt;'X0000001') where ACCOUNT_ID='X0000001';
+
+1 row updated.
+
+Elapsed: 00:00:00.105
+
+</pre><p>This took 17 seconds in total. I check the CPU time:</p>
+<pre>
+01:20:33 SQL&gt; host ./show-cpu-seconds-from-ps.sh diff
+
+        12 cpu seconds in pid=      6044 oracleDBML (LOCAL=NO)
+
+</pre><p>That's 12 seconds of CPU required to do those 499999 transfers. Here is the result:</p>
+<pre>
+
+01:20:33 SQL&gt; select * from ACCOUNTS order by ACCOUNT_ID fetch first 10 rows only;
+
+ACCOUNT_ID     CUSTOMER_ID   AMOUNT
+----------     -----------   ------
+X0000001                 1   509999
+X0000002                 2     9999
+X0000003                 3     9999
+X0000004                 4     9999
+X0000005                 5     9999
+X0000006                 6     9999
+X0000007                 7     9999
+X0000008                 8     9999
+X0000009                 9     9999
+X0000010                10     9999
+
+10 rows selected.
+
+</pre><p>I rollback to get back to the initial state:</p>
+<pre>
+
+Elapsed: 00:00:00.041
+01:20:41 SQL&gt; rollback;
+
+Rollback complete.
+
+Elapsed: 00:00:08.398
+
+</pre><p>The rollback took 8 seconds. It is basically the same work to do, updating the 500000 amounts beck to their previous value.</p>
+<h2>One SQL statement for the whole logic</h2>
+<p>I mentioned that a procedural language may be necessary to combine multiple SQL statements. Here I can do all my transfers with one SQL only, but the readability suffers:</p>
+<pre>
+01:20:51 SQL&gt; host ./show-cpu-seconds-from-ps.sh init
+
+01:20:53 SQL&gt; update ACCOUNTS set AMOUNT=
+  2          case
+  3           when ACCOUNT_ID='X0000001' then AMOUNT+(select 1*count(*) from ACCOUNTS where ACCOUNT_ID&lt;&gt;'X0000001')
+  4           else AMOUNT-1
+  5          end
+  6  /
+
+500000 rows updated.
+
+Elapsed: 00:00:10.571
+
+01:21:09 SQL&gt; host ./show-cpu-seconds-from-ps.sh diff
+
+        10 cpu seconds in pid=      6044 oracleDBML (LOCAL=NO)
+</pre><p>&nbsp;</p>
+<p>It is a bit faster, but more difficult to&nbsp;read or maintain. If the business rules evolves, it will be impossible to keep this approach.</p>
+<p>I check the result and rollback again. I'll show this for all tests because I didn't want to remove any line from my test case.</p>
+<pre>
+
+01:21:10 SQL&gt; select * from ACCOUNTS order by ACCOUNT_ID fetch first 10 rows only;
+
+ACCOUNT_ID     CUSTOMER_ID   AMOUNT
+----------     -----------   ------
+X0000001                 1   509999
+X0000002                 2     9999
+X0000003                 3     9999
+X0000004                 4     9999
+X0000005                 5     9999
+X0000006                 6     9999
+X0000007                 7     9999
+X0000008                 8     9999
+X0000009                 9     9999
+X0000010                10     9999
+
+10 rows selected.
+
+Elapsed: 00:00:00.024
+
+01:21:12 SQL&gt; rollback;
+
+Rollback complete.
+
+Elapsed: 00:00:07.994
+
+</pre><h2>PL/SQL procedure</h2>
+<p>So, you don't like SQL and prefer to code with a procedural language. Here is my PL/SQL procedure that I've created previously:</p>
+<pre>
+
+01:21:21 SQL&gt; desc transfer
+
+PROCEDURE transfer
+Argument Name   Type       In/Out   Default?
+ACC1            VARCHAR2   IN
+ACC2            VARCHAR2   IN
+AMOUNT          NUMBER     IN
+
+01:21:25 SQL&gt; ddl transfer
+
+  CREATE OR REPLACE EDITIONABLE PROCEDURE "DEMO"."TRANSFER" (acc1 varchar2, acc2 varchar2, amount number) as
+begin
+ -- debit acc1
+ update ACCOUNTS set ACCOUNTS.AMOUNT = ACCOUNTS.AMOUNT - transfer.amount where ACCOUNT_ID=acc1;
+ if sql%rowcount &lt;&gt; 1 then raise_application_error(-20000,'Account '''||acc1||''' unknown'); end if;
+ -- credit acc2
+ update ACCOUNTS set ACCOUNTS.AMOUNT = ACCOUNTS.AMOUNT + transfer.amount where ACCOUNT_ID=acc2;
+ if sql%rowcount &lt;&gt; 1 then raise_application_error(-20000,'Account '''||acc2||''' unknown'); end if;
+end;
+/
+
+</pre><p>&nbsp;</p>
+<p>Notice that my client here is SQLcl, the SQL Developer command line which has a 'ddl' command to call dbms_metadata.</p>
+<p>Ready to call this transfer procedure for my 499999 accounts. I need a loop here as my service implements only one transfer. Even if coded and deployed in the client side, the loop being a PL/SQL block&nbsp;will run in the database server as well as the stored procedure.</p>
+<pre>
+
+01:21:25 SQL&gt; host ./show-cpu-seconds-from-ps.sh init
+
+01:21:26 SQL&gt; exec for c in (select * from ACCOUNTS where ACCOUNT_ID&lt;&gt;'X0000001') loop transfer(c.ACCOUNT_ID,'X0000001',1); end loop;
+
+PL/SQL procedure successfully completed.
+
+Elapsed: 00:01:07.084
+
+01:22:34 SQL&gt; host ./show-cpu-seconds-from-ps.sh diff
+
+        66 cpu seconds in pid=      6044 oracleDBML (LOCAL=NO)
+
+</pre><p>This time the 499999 transfers took one minute of elapsed time, 01:07 exactly, and the CPU measure shows 66 seconds in the oracleDBML process, which is the database server process. The same process has run everything:</p>
+<ol>
+<li>the PL/SQL loop</li>
+<li>the PL/SQL stored procedure (499999 calls)</li>
+<li>the SQL statements (2x499999 updates)</li>
+</ol>
+<p>The 66 seconds are full CPU usage, no waits here, but has done nothing more than what was done in 10 seconds before. We had more updates because each transfer has updated the X0000001 account, but that's only 2x more work. The CPU usage goes way beyond that. This is because, even when running in the same process, SQL and PL/SQL are different engines and each call from one to the other involves a context switch. This takes CPU cycles. Those expensive CPU cycles were not consumed to process the business logic, but only to switch between two languages and execution environment.</p>
+<p>The rollback is still only 11 seconds, because this is all done by the SQL engine. No context switch here, the CPU is used only for the real work:</p>
+<pre>
+
+01:22:40 SQL&gt; select * from ACCOUNTS order by ACCOUNT_ID fetch first 10 rows only;
+
+ACCOUNT_ID     CUSTOMER_ID   AMOUNT
+----------     -----------   ------
+X0000001                 1   509999
+X0000002                 2     9999
+X0000003                 3     9999
+X0000004                 4     9999
+X0000005                 5     9999
+X0000006                 6     9999
+X0000007                 7     9999
+X0000008                 8     9999
+X0000009                 9     9999
+X0000010                10     9999
+
+10 rows selected.
+
+Elapsed: 00:00:00.035
+01:22:44 SQL&gt; rollback;
+
+Rollback complete.
+
+Elapsed: 00:00:11.399
+
+</pre><h2>Javascript function from client</h2>
+<p>The procedural approach require lot of CPU on the database server (where expensive licenses are paid per core). There are then two solutions: SQL only, or offload the procedural code to a server out of the database licensing, and with a language that was learned at school by the new generation of cheapest developers. Let's take JavaScript.</p>
+<p>You can run JavaScript anywhere. I'll stay with SQLcl because it can run JavaScript files with the 'script' command.</p>
+<p>I&nbsp;establish my JDBC connection:</p>
+<pre>
+
+01:22:57 SQL&gt; disconnect
+
+Disconnected from Oracle Database 12c Enterprise Edition Release 12.1.0.2.0_MLE - 64bit Beta
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+01:22:58 SQL&gt; script
+  2  var DriverManager = Java.type("java.sql.DriverManager");
+  3  if ( ! con === undefined ) { con.rollback(); con.close(); }
+  4  var con = DriverManager.getConnection("jdbc:oracle:oci8:@//localhost/PDB1","demo","demo");
+  5  con.setAutoCommit(false);
+  6  var sql = con.createStatement();
+  7  .
+
+01:23:06 SQL&gt; save script01-init.js replace
+Wrote file script01-init.js
+01:23:07 SQL&gt; @    script01-init.js
+Elapsed: 00:00:01.800
+
+</pre><p>Quickly check the 10 first customers to verify my connection and the data:</p>
+<pre>
+
+01:23:10 SQL&gt; script
+  2  print("First 10 accounts:");
+  3  var res=sql.executeQuery(" select ACCOUNT_ID,AMOUNT from ACCOUNTS order by 1 fetch first 10 rows only");
+  4  while(res.next()){print(" ACCOUNT_ID: "+res.getString(1)+" "+"AMOUNT: "+res.getString(2)); }
+  5  .
+
+01:23:13 SQL&gt; save script02-query.js replace
+Wrote file script02-query.js
+01:23:14 SQL&gt; @    script02-query.js
+First 10 accounts:
+ ACCOUNT_ID: X0000001 AMOUNT: 10000
+ ACCOUNT_ID: X0000002 AMOUNT: 10000
+ ACCOUNT_ID: X0000003 AMOUNT: 10000
+ ACCOUNT_ID: X0000004 AMOUNT: 10000
+ ACCOUNT_ID: X0000005 AMOUNT: 10000
+ ACCOUNT_ID: X0000006 AMOUNT: 10000
+ ACCOUNT_ID: X0000007 AMOUNT: 10000
+ ACCOUNT_ID: X0000008 AMOUNT: 10000
+ ACCOUNT_ID: X0000009 AMOUNT: 10000
+ ACCOUNT_ID: X0000010 AMOUNT: 10000
+Elapsed: 00:00:00.514
+
+</pre><p>Here is where I define my transfer() function and call it for the 499999 accounts:</p>
+<pre>
+
+01:23:15 SQL&gt; script
+  2  var pre1=con.prepareStatement(" update ACCOUNTS set AMOUNT=AMOUNT-? where ACCOUNT_ID=?");
+  3  var pre2=con.prepareStatement(" update ACCOUNTS set AMOUNT=AMOUNT+? where ACCOUNT_ID=?");
+  4  function transfer (acc1,acc2,amount) {
+  5   pre1.setInt(1,amount); pre1.setString(2,acc1); pre1.execute();
+  6   pre2.setInt(1,amount); pre2.setString(2,acc2); pre2.execute();
+  7  }
+  8  var res=sql.executeQuery(" select ACCOUNT_ID from ACCOUNTS where ACCOUNT_ID&lt;&gt;'X0000001'");
+  9  print("Calling transaction for each account...");var t0=new Date();var cnt=0;
+ 10  while(res.next()){ transfer(res.getString(1),'X0000001',1); cnt++ }
+ 11  print(cnt+" transactions executed in "+(new Date() - t0)/1000+" seconds");
+ 12  .
+
+01:23:24 SQL&gt; save script02-run.js replace
+Wrote file script02-run.js
+01:23:25 SQL&gt; host ./show-cpu-seconds-from-ps.sh init
+
+01:23:26 SQL&gt; @    script02-run.js
+Calling transaction for each account...
+499999 transactions executed in 232.235 seconds
+
+Elapsed: 00:03:52.434
+01:27:21 SQL&gt; host ./show-cpu-seconds-from-ps.sh diff
+
+        78 cpu seconds in pid=      5960 java -Djava.awt.headless=true -Dapple.awt.UIElement=true -Xss10M -client
+       148 cpu seconds in pid=      7490 oracleDBML (LOCAL=NO)
+
+</pre><p>&nbsp;</p>
+<p>Note the time: 3:52 elapsed minutes! 78 seconds on the client (java) and 148 seconds in the database.</p>
+<p>If you think that you have to offload the business logic from the database because the CPU cores of the database server are expensive, then you have an example of the opposite here. The job of updating the same accounts used less CPU when called from the database server itself. We do not split the work between two servers here. We just overload both of them. Each tier spends more time, either burning CPU for context switches, or waiting for the other to do so. Alternating between being busy (runnable) and idle (waiting on network) adds even more context switches, because they have to be scheduled in and out of the CPU. I've run this demo in the same server. You can imagine what happens when you add network latency. And when all this is run through a connection pool that adds a 'select 1 from dual' to each call...</p>
+<p>The time and resource consumption has exploded, but the work done is still the same, and the rollback is still quick:</p>
+<p>&nbsp;</p>
+<pre>
+
+01:27:21 SQL&gt; @    script02-query.js
+First 10 accounts:
+ ACCOUNT_ID: X0000001 AMOUNT: 509999
+ ACCOUNT_ID: X0000002 AMOUNT: 9999
+ ACCOUNT_ID: X0000003 AMOUNT: 9999
+ ACCOUNT_ID: X0000004 AMOUNT: 9999
+ ACCOUNT_ID: X0000005 AMOUNT: 9999
+ ACCOUNT_ID: X0000006 AMOUNT: 9999
+ ACCOUNT_ID: X0000007 AMOUNT: 9999
+ ACCOUNT_ID: X0000008 AMOUNT: 9999
+ ACCOUNT_ID: X0000009 AMOUNT: 9999
+ ACCOUNT_ID: X0000010 AMOUNT: 9999
+Elapsed: 00:00:00.038
+01:27:21 SQL&gt; script
+  2  con.rollback();
+  3  con.close();
+  4  .
+
+01:27:35 SQL&gt; save script02-close.js replace
+Wrote file script02-close.js
+01:27:36 SQL&gt; @    script02-close.js
+Elapsed: 00:00:09.722
+
+</pre><h2>Javascript from the database (MLE Beta)</h2>
+<p>From what we have seen, this service is faster, and less expensive, when run in the database. That's about where it runs. But there's still the problem of the language. My opinion is that a smaller team of good SQL and PL/SQL developers can deliver and maintain more and better code than an army of&nbsp;JavaScript developers with no experience in databases. But the trend is to push fast deliveries over the final software quality. Oracle may have an answer in the future for that. They are developing a Multi-Lingual Engine which may run code written in different languages (JavaScript, Python,...), in the database system itself (Oracle Database and MySQL). The beta is public (<a href="https://www.oracle.com/technetwork/database/multilingual-engine/overview/index.html" target="_blank">https://www.oracle.com/technetwork/database/multilingual-engine/overview/index.html</a>) and now you understand why my database server process was 'oracleDBML' - DBML is the name of the instance provided with the MLE Beta VM.</p>
+<p>I write my transfer() function in JavaScript. Here, the calls to SQL use a different API, but the idea of the MLE is that it can run anywhere transparently.</p>
+<pre>
+
+01:27:47 SQL&gt; quit
+-bash-4.2$ host cat &gt; demo.js &lt;&lt;EOF
+&gt; function transfer (acc1,acc2,amount) {
+&gt;  var sql = require('@oracle/sql');
+&gt;  sql.execute(" update ACCOUNTS set AMOUNT=AMOUNT-:amount where ACCOUNT_ID=:acc1",[amount,acc1]);
+&gt;  sql.execute(" update ACCOUNTS set AMOUNT=AMOUNT+:amount where ACCOUNT_ID=:acc2",[amount,acc1]);
+&gt; }
+&gt; module.exports.run = function () {
+&gt;  var sql = require('@oracle/sql');
+&gt;  var res=sql.execute(" select ACCOUNT_ID from ACCOUNTS where ACCOUNT_ID&lt;&gt;'X0000001'");
+&gt;  for (var row of res.rows) {
+&gt;   transfer(row[0],'X0000001',1);
+&gt;  }
+&gt; }
+&gt; EOF
+-bash-4.2$ cat &gt; demo.d.ts &lt;&lt;EOF
+&gt; export function run();
+&gt; EOF
+
+</pre><p>I deploy this demo.js into my database:</p>
+<pre>
+
+-bash-4.2$ dbjs deploy demo.js -u demo -p demo -c //localhost:1521/PDB1
+sqlcl demo/demo@//localhost:1521/PDB1
++ demo.js
+ run
+  SCALAR PROCEDURE DEMO.RUN
+
+</pre><p>I check that the package has been created:</p>
+<pre>
+
+-bash-4.2$ sqlcl demo/demo@//localhost:1521/PDB1
+
+SQLcl: Release 18.3 Production on Wed Oct 10 01:28:20 2018
+
+Copyright (c) 1982, 2018, Oracle.  All rights reserved.
+
+Last Successful login time: Wed Oct 10 2018 01:28:21 -04:00
+
+Connected to:
+Oracle Database 12c Enterprise Edition Release 12.1.0.2.0_MLE - 64bit Beta
+With the Partitioning, OLAP, Advanced Analytics and Real Application Testing options
+
+
+01:28:22 SQL&gt; set timing on
+01:28:26 SQL&gt; select library_name, file_spec FROM user_libraries;
+
+LIBRARY_NAME   FILE_SPEC
+------------   ---------
+demo.js        demo.js
+
+Elapsed: 00:00:01.996
+01:28:35 SQL&gt; select object_name,procedure_name,object_type from user_procedures;
+
+OBJECT_NAME   PROCEDURE_NAME   OBJECT_TYPE
+-----------   --------------   -----------
+TRANSFER                       PROCEDURE
+DEMO          RUN              PACKAGE
+DEMO                           PACKAGE
+
+Elapsed: 00:00:00.844
+
+</pre><p>And now ready to run:</p>
+<pre>
+
+01:28:36 SQL&gt; host ./show-cpu-seconds-from-ps.sh init
+
+01:28:38 SQL&gt; call demo.run();
+
+Call completed.
+
+Elapsed: 00:02:00.260
+
+01:30:40 SQL&gt; host ./show-cpu-seconds-from-ps.sh diff
+
+       120 cpu seconds in pid=      8507 oracleDBML (LOCAL=NO)
+
+</pre><p>&nbsp;</p>
+<p>Only one process is active here because MLE is running in the session process. The MLE engine is linked with the database instance. This is faster than the client-server roundtrips, but, in this example, not faster than PL/SQL. However, the goal is not to compare the time because one, PL/SQL, has been optimized during decades and the other, MLE, is just in beta here. Performance will evolve for sure. This example gives an idea of the future software architecture: the business logic may come back to the database, for performance and scalability reasons, carrying with it the agility of coding with different languages.</p>
+<p>Fortunately, whatever you choose, the rollback is still efficient and keeps the consistency of your transactions, whatever happens:</p>
+<pre>
+
+01:31:18 SQL&gt; select * from ACCOUNTS order by ACCOUNT_ID fetch first 10 rows only;
+
+ACCOUNT_ID     CUSTOMER_ID   AMOUNT
+----------     -----------   ------
+X0000001                 1    10000
+X0000002                 2    10000
+X0000003                 3    10000
+X0000004                 4    10000
+X0000005                 5    10000
+X0000006                 6    10000
+X0000007                 7    10000
+X0000008                 8    10000
+X0000009                 9    10000
+X0000010                10    10000
+
+
+10 rows selected.
+
+Elapsed: 00:00:00.065
+01:31:23 SQL&gt; rollback;
+
+Rollback complete.
+
+Elapsed: 00:00:09.668
+01:31:33 SQL&gt;
+
+</pre><p>We will see how the future evolves. For the moment, building scalable and efficient application requires coding data services and some business logic in the database. And the services must process data in bulk. This can mean different code for OLTP and batch processing. Unfortunately, today, this different code is in different languages, so it is not easy to share the libraries. In the past, with SQL*Forms applications, running PL/SQL on both sides was possible. Today, new application are developed with Java and Python. Even if there's a JVM in the database, there are many problems with it, such as the impossibility to apply rolling patches for the JVM, which is the more subject to security fixes. Today, PL/SQL is the only efficient procedural language that runs in the same process as your database session.</p>
+<p>That's about the future. For the moment, do not miss the phase in software design where a logical architecture, on whiteboard or powerpoint, has to be transformed to a physical architecture which takes into account where it runs. A service is not scalable if it involves latency, and context switches proportionally to the amount of data processed.</p>
+<p>&nbsp;</p>
+<p>&nbsp;</p>
+<hr>
+<p><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href="https://twitter.com/Franckpachot">@FranckPachot</a>)</strong></p>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,261 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-LFQ153SCQM"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-LFQ153SCQM');
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-11-oracle-index-compression-range-scan-file-names">
+<title>Oracle Index compression for range scan on file names</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<nav><a href="../../../index.html">Publication index</a></nav>
+<p class="firstpub">Archived from Databases at CERN, published 2018-11-30.
+<a href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-11-oracle-index-compression-range-scan-file-names">Original article URL</a>.
+The content describes the versions available at the publication date.</p>
+<h1>Oracle Index compression for range scan on file names</h1>
+<main>
+<p>Do you have tables with a column storing filenames? Long filenames with full path? If this is the case, then you probably realized how an index on this can be large. And when looking at the values sorted, you have seen the inefficiency of it: a big part of the full name is reapeated because it has the same prefix for files in the same (sub)directory. The 12<em>c</em>R2 Advanced Index Compression (COMPRESS ADVANCED LOW) does not help here because it only compresses identical values, like the basic compression of tables. With unique filenames, we cannot expect any benefit. But 12<em>c</em>R2 introduced a more complex algorithm (COMPRESS ADVANCED HIGH) which can compress values while keeping the order.</p>
+<p>You can read all details about it on Richard Foote blog:&nbsp;<a href="https://richardfoote.wordpress.com/category/advanced-index-compression/">https://richardfoote.wordpress.com/category/advanced-index-compression/</a></p>
+<p>My goal here is to see how it can benefit to this specific case: filenames all different but with repeated prefixes, and query on a range of it (such as all files under a subfolder)</p>
+<h2>Test case</h2>
+<p>As I'm running on the Autonomous Datawarehouse Cloud, I will disable parallel query (through parameter) and result cache(through hints)</p>
+<pre>
+SQL&gt; column index_name format a20
+SQL&gt; set echo on pagesize 1000 linesize 120
+SQL&gt; alter session disable parallel query;
+Session altered.
+
+SQL&gt; alter session set optimizer_ignore_hints=false;
+Session altered.
+
+</pre><p>I create a table for my test. The 3 columns SPELL_NONE, SPELL_LOW, SPELL_HIGH are all the same. I use 3 columns just to be able to create different indexes at the same time and compare them:</p>
+<pre>
+
+SQL&gt; create table DEMO_SPELL (num,spell_none,spell_low,spell_high) compress as
+    select n,s,s,s from (
+    with n as (
+    select to_char(date'-4712-01-01'+rownum-1,'JSP') s from xmltable('1 to 25')
+    ) select rownum n,'/'||n1.s||'/'||n2.s||'/'||n3.s||'/'||n4.s||'/'||n5.s||'/FILE'||mod(rownum,10000)||'.txt' s from n n1,n n2,n n3,n n4,n n5
+    );
+
+Table DEMO_SPELL created.</pre><p>&nbsp;</p>
+<p>This creates some filenames like the following, basically generating file names with a full path of 5 directories, each having 25 different values:</p>
+<pre>
+/ONE/EIGHTEEN/FOUR/EIGHTEEN/FOURTEEN/FILE7939.txt
+/TWO/SEVENTEEN/THIRTEEN/SEVEN/TWELVE/FILE8287.txt
+/FOUR/TWO/TWENTY-THREE/ONE/FOUR/FILE1254.txt  </pre><h2>Index size</h2>
+<p>I'm now creating the indexes, one with no compression, one with 'advanced low' compression and one with 'advanced high' compression.</p>
+<pre>
+SQL&gt; create index DEMO_SPELL_NONE on DEMO_SPELL(SPELL_NONE) pctfree 0;
+Index DEMO_SPELL_NONE created.
+
+SQL&gt; create index DEMO_SPELL_LOW on DEMO_SPELL(SPELL_LOW) pctfree 0 compress advanced low;
+Index DEMO_SPELL_LOW created.
+
+SQL&gt; create index DEMO_SPELL_HIGH on DEMO_SPELL(SPELL_HIGH) pctfree 0 compress advanced high;
+Index DEMO_SPELL_HIGH created.</pre><p>&nbsp;</p>
+<p>CREATE INDEX is supposed to gather statistics so I can look at the size</p>
+<pre>
+
+SQL&gt; select index_name,num_rows,compression,blevel,leaf_blocks,clustering_factor,visibility,pct_free from user_indexes where table_name='DEMO_SPELL';
+
+INDEX_NAME             NUM_ROWS COMPRESSION       BLEVEL LEAF_BLOCKS CLUSTERING_FACTOR VISIBILIT   PCT_FREE
+-------------------- ---------- ------------- ---------- ----------- ----------------- --------- ----------
+DEMO_SPELL_NONE         9765625 DISABLED               3       86183            963951 VISIBLE           10
+DEMO_SPELL_LOW          9765625 ADVANCED LOW           3       86232            963951 VISIBLE           10
+DEMO_SPELL_HIGH         9765625 ADVANCED HIGH          3           0            963951 VISIBLE           10</pre><p>&nbsp;</p>
+<p>There's obviously a bug here for high compression. I expect it smaller, but not with zero leaves. I'll gather statistics later, but want to see if this has bad consequences for the optimizer. I run an index range scan. My goal is to use the index to find files belonging to the same directory.</p>
+<h2>Execution plan</h2>
+<pre>
+
+SQL&gt; select /*+ gather_plan_statistics no_result_cache index(DEMO_SPELL) */ count(*) from DEMO_SPELL where SPELL_NONE like '/FOUR/TWO%';
+
+  COUNT(*)
+----------
+     15625
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'allstats last +cost');
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  58t8mncyzzz5f, child number 0
+-------------------------------------
+select /*+ gather_plan_statistics no_result_cache index(DEMO_SPELL) */
+count(*) from DEMO_SPELL where SPELL_NONE like '/FOUR/TWO%'
+
+Plan hash value: 3383582924
+
+---------------------------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers | Reads  |
+---------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                 |      1 |        |     4 (100)|      1 |00:00:01.74 |     128 |    131 |
+|   1 |  SORT AGGREGATE   |                 |      1 |      1 |            |      1 |00:00:01.74 |     128 |    131 |
+|*  2 |   INDEX RANGE SCAN| DEMO_SPELL_NONE |      1 |      1 |     4   (0)|  15625 |00:00:00.01 |     128 |    131 |
+---------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("SPELL_NONE" LIKE '/FOUR/TWO%')
+       filter("SPELL_NONE" LIKE '/FOUR/TWO%')
+
+21 rows selected.
+
+SQL&gt; select /*+ gather_plan_statistics no_result_cache index(DEMO_SPELL) */ count(*) from DEMO_SPELL where SPELL_LOW like '/FOUR/TWO%';
+
+  COUNT(*)
+----------
+     15625
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'allstats last +cost');
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  284699580541x, child number 0
+-------------------------------------
+select /*+ gather_plan_statistics no_result_cache index(DEMO_SPELL) */
+count(*) from DEMO_SPELL where SPELL_LOW like '/FOUR/TWO%'
+
+Plan hash value: 1340321241
+
+--------------------------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name           | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers | Reads  |
+--------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                |      1 |        |     4 (100)|      1 |00:00:01.55 |     129 |    128 |
+|   1 |  SORT AGGREGATE   |                |      1 |      1 |            |      1 |00:00:01.55 |     129 |    128 |
+|*  2 |   INDEX RANGE SCAN| DEMO_SPELL_LOW |      1 |      1 |     4   (0)|  15625 |00:00:00.01 |     129 |    128 |
+--------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("SPELL_LOW" LIKE '/FOUR/TWO%')
+       filter("SPELL_LOW" LIKE '/FOUR/TWO%')
+
+21 rows selected.
+
+SQL&gt; select /*+ gather_plan_statistics no_result_cache index(DEMO_SPELL) */ count(*) from DEMO_SPELL where SPELL_HIGH like '/FOUR/TWO%';
+
+  COUNT(*)
+----------
+     15625
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'allstats last +cost');
+
+PLAN_TABLE_OUTPUT
+------------------------------------------------------------------------------------------------------------------------
+SQL_ID  1cmy31s1ny1a4, child number 0
+-------------------------------------
+select /*+ gather_plan_statistics no_result_cache index(DEMO_SPELL) */
+count(*) from DEMO_SPELL where SPELL_HIGH like '/FOUR/TWO%'
+
+Plan hash value: 3948406928
+
+---------------------------------------------------------------------------------------------------------------------
+| Id  | Operation         | Name            | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers | Reads  |
+---------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                 |      1 |        |     3 (100)|      1 |00:00:00.57 |      65 |     67 |
+|   1 |  SORT AGGREGATE   |                 |      1 |      1 |            |      1 |00:00:00.57 |      65 |     67 |
+|*  2 |   INDEX RANGE SCAN| DEMO_SPELL_HIGH |      1 |      1 |     3   (0)|  15625 |00:00:00.17 |      65 |     67 |
+---------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - access("SPELL_HIGH" LIKE '/FOUR/TWO%')
+       filter("SPELL_HIGH" LIKE '/FOUR/TWO%')
+
+21 rows selected. </pre><p>&nbsp;</p>
+<p>I read 131 buffers to get my 15625 file names from the non-compressed index. Nearly the same, 128 buffers, for the 'low' compressed index. This is expected because this compression is about repeated value in blocks, but all my filenames are unique. They have only some part in common. The 'high' compressed index read 2x less buffers,&nbsp;67 here.&nbsp;</p>
+<h2>Gather statistic</h2>
+<p>Because of the bug in statistics, I gather statistics:</p>
+<pre>
+
+SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO_SPELL');
+PL/SQL procedure successfully completed.</pre><p>&nbsp;</p>
+<p>Now checking the size</p>
+<pre>
+
+SQL&gt; select index_name,compression,blevel,leaf_blocks,clustering_factor,visibility,pct_free from user_indexes where table_name='DEMO_SPELL';
+
+INDEX_NAME           COMPRESSION       BLEVEL LEAF_BLOCKS CLUSTERING_FACTOR VISIBILIT   PCT_FREE
+-------------------- ------------- ---------- ----------- ----------------- --------- ----------
+DEMO_SPELL_NONE      DISABLED               3       91292           1111506 VISIBLE           10
+DEMO_SPELL_LOW       ADVANCED LOW           3       85578           1036872 VISIBLE           10
+DEMO_SPELL_HIGH      ADVANCED HIGH          3       38821            997572 VISIBLE           10</pre><p>&nbsp;</p>
+<p>This looks correct and follows what we have seen in the queries: no significant&nbsp;improvement for 'compress low' here but 2x smaller with 'compress high'.</p>
+<p>Storing full file names is always a problem. If you have some Documentum database, you are probaly familiar with this. It is large, has lot of parts duplicated but cannot benefit from basic compression. It is also badly managed by histograms as they act on a substring only (32 bytes in 11g, 64 bytes in 12c). This is something to think about at design time. A file is a file and a directory is a directory. And we have awesome CONNECT BY or recursive CTE to get the full path from the hierarchy.</p>
+<h2>Substring</h2>
+<p>If we can't change the design, then we can look at some workarounds. Let's say that I know that I'll often query with a known prefix less than 10 characters. I can build an index that will find the rows without having to store the whole file name:</p>
+<pre>
+
+SQL&gt; create index DEMO_SPELL_SUBSTR on DEMO_SPELL(substr(SPELL_NONE,1,10)) compress advanced high;
+Index DEMO_SPELL_SUBSTR created.</pre><p>&nbsp;</p>
+<p>This index is obviously smaller:</p>
+<pre>
+
+SQL&gt; exec dbms_stats.gather_table_stats(user,'DEMO_SPELL');
+PL/SQL procedure successfully completed.
+
+SQL&gt; select index_name,compression,blevel,leaf_blocks,clustering_factor,visibility,pct_free from user_indexes where table_name='DEMO_SPELL';
+
+INDEX_NAME           COMPRESSION       BLEVEL LEAF_BLOCKS CLUSTERING_FACTOR VISIBILIT   PCT_FREE
+-------------------- ------------- ---------- ----------- ----------------- --------- ----------
+DEMO_SPELL_SUBSTR    ADVANCED HIGH          2        2386             88769 VISIBLE           10</pre><p>&nbsp;</p>
+<p>However, I can't query it with the LIKE statement. See&nbsp;<a href="https://blog.dbi-services.com/index-on-truncdate-do-you-still-need-old-index-1/" target="_blank">https://blog.dbi-services.com/index-on-truncdate-do-you-still-need-old-index-1/</a>&nbsp;about it. The optimizer cannot infer a BETWEEN predicate from it and I have to do it myself:</p>
+<pre>
+
+SQL&gt; select /*+ gather_plan_statistics no_result_cache no_parallel index(DEMO_SPELL DEMO_SPELL_SUBSTR) */ count(*)
+&nbsp;    from DEMO_SPELL where <strong>SPELL_NONE between '/FOUR/TWO' and '/FOUR/TWO~'</strong>;
+
+  COUNT(*)
+----------
+     15625</pre><p>&nbsp;</p>
+<p>The execution plan shows the usage of my new index:</p>
+<pre>
+
+SQL&gt; select * from dbms_xplan.display_cursor(format=&gt;'allstats last +cost');
+
+PLAN_TABLE_OUTPUT
+----------------------------------------------------------------------------------------------------------------------------------------------
+SQL_ID  dzrf2c3j00ga1, child number 0
+-------------------------------------
+select /*+ gather_plan_statistics no_result_cache no_parallel
+index(DEMO_SPELL DEMO_SPELL_SUBSTR) */ count(*) from DEMO_SPELL where
+SPELL_NONE between '/FOUR/TWO' and '/FOUR/TWO~'
+
+Plan hash value: 2610913085
+
+---------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name              | Starts | E-Rows | Cost (%CPU)| A-Rows |   A-Time   | Buffers |
+---------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                   |      1 |        |   403 (100)|      1 |00:00:00.01 |     135 |
+|   1 |  SORT AGGREGATE                      |                   |      1 |      1 |            |      1 |00:00:00.01 |     135 |
+|*  2 |   TABLE ACCESS BY INDEX ROWID BATCHED| DEMO_SPELL        |      1 |      1 |   403   (1)|  15625 |00:00:00.01 |     135 |
+|*  3 |    INDEX RANGE SCAN                  | DEMO_SPELL_SUBSTR |      1 |  43945 |     3  (34)|  15625 |00:00:00.01 |       7 |
+---------------------------------------------------------------------------------------------------------------------------------
+
+Predicate Information (identified by operation id):
+---------------------------------------------------
+
+   2 - filter(("SPELL_NONE"&lt;='/FOUR/TWO~' AND "SPELL_NONE"&gt;='/FOUR/TWO'))
+   3 - access("DEMO_SPELL"."SYS_NC00005$"&gt;='/FOUR/TWO' AND "DEMO_SPELL"."SYS_NC00005$"&lt;='/FOUR/TWO~')
+</pre><p>&nbsp;</p>
+<p>The access to the index is cheaper, because it is smaller, but I have to go to the table to get the full name. This is just an example where I query only one column. A real life problem will probably have to read the table anyway. Note however that this solution is optimal only if all filtering is done from the index. With a prefix larger than the substring, the risk is to do unnecessary accesses&nbsp;to the table for rows that will be filtered out later.</p>
+<p>Of course, all this really depends on the shape of data, and performance requirements, so the idea of this post is not to give solutions, but show what can be tested. But always try to challenge the design. Relational databases are build to avoid redundancy. The relationship between files, directories, their names and hierarchy is something that can be modeled in one table with self reference. Compression should not be a solution for redundancy introduced by wrong design.</p>
+<p>&nbsp;</p>
+<hr style="font-style: italic;">
+<p style="font-style: italic;"><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href="https://twitter.com/Franckpachot">@FranckPachot</a>)</strong></p>
+
+</main>
+</body>
+</html>

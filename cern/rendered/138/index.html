@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-LFQ153SCQM"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-LFQ153SCQM');
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-09-oracle-cloud-startstop-automatically-autonomous-databases">
+<title>Oracle Cloud: start/stop automatically the Autonomous Databases</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<nav><a href="../../../index.html">Publication index</a></nav>
+<p class="firstpub">Archived from Databases at CERN, published 2018-09-16.
+<a href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-09-oracle-cloud-startstop-automatically-autonomous-databases">Original article URL</a>.
+The content describes the versions available at the publication date.</p>
+<h1>Oracle Cloud: start/stop automatically the Autonomous Databases</h1>
+<main>
+<p>In the <a href="../137/index.html">previous post</a> I've setup all the environment to be able to easily control the OCI services without bothering with the sign-in headers, and without installing anything. In this post I'll used the oci-curl() function to stop all my Autonomous Database services. In the previous post, I've set the environment variables for the private and public key, and the user, tenant and compartment OCIDs. I'm adding two variables to identify the endpoint I'll use (US-Ashburn-1 here) and the version of the REST API (20160918 here) which are both part of the URL.</p>
+<p>Here are all my environment variables. If you set them to your values, you should be able to use the same commands as mine:</p>
+<pre>
+
+privateKeyPath=~/.oci/oci_api_key.pem
+keyFingerprint="05:56:ee:89:19:e7:16:03:9b:00:c3:91:cf:a6:9d:e9"
+authUserId=ocid1.user.oc1..aaaaaaaaflzrbfegsz2dynqh7nsea2bxm5dzcevjsykxdn45msiso5efhlla
+tenancyId=ocid1.tenancy.oc1..aaaaaaaac6guna6l6lpy2s6cm3kguijf4ivkgy5m4c4cngczztunig6do26q
+compartmentId=ocid1.tenancy.oc1..aaaaaaaac6guna6l6lpy2s6cm3kguijf4ivkgy5m4c4cngczztunig6do26q
+endpoint=database.us-ashburn-1.oraclecloud.com
+apiVersion=20160918
+
+</pre><p>Here is how I use the OCI documentation sample to define the oci-curl() function in my current shell directly from the web documentation:</p>
+<pre>
+
+source &lt;( \
+ curl https://docs.cloud.oracle.com/iaas/Content/Resources/Assets/signing_sample_bash.txt     \
+  | grep -vE "(local tenancyId|local authUserId=|local keyFingerprint|local privateKeyPath=)" \
+  | sed -e '1s/^.*#/#/'
+ )
+
+</pre><h2>List the services</h2>
+<p>I can now list my Autonomous Databases, ADW and ATP, with:</p>
+<pre>
+
+for service in autonomousDatabases autonomousDataWarehouses
+do
+  oci-curl $endpoint get "/$apiVersion/$service?compartmentId=$compartmentId" | jq -r '.[] | [ .dbName , .lifecycleState , .id ]  | @tsv';
+done
+
+</pre><p>I've projected the name, state, and OCID with JQ and used @tsv formatting here to get tabs between the columns for a nice formatting. The result is:</p>
+<pre>
+
+ATP     AVAILABLE       ocid1.autonomousdatabase.oc1.iad.abuwcljtthygmwsbbsr2e3ve5kwrtvyevpbr6sgmrocepqa6wtr2yx73xtoq
+ADWC    AVAILABLE       ocid1.autonomousdwdatabase.oc1.iad.abuwcljrbwuhg2iyzshauzvsjuxuqnd7wcg35xezlmxmtoitqhpw3hfqij3a
+
+</pre><p>You need to remember that <code>/autonomousdwdatabase</code> is for the ADW service and the <code>/autonomousdatabase</code> for ATP. You know that, with Oracle products, the commercial names are often decided after the implementation, and then the API names may not match the common name. But don't worry, all this is documented:</p>
+<ul>
+<li><a href="https://docs.cloud.oracle.com/iaas/api/#/en/database/20160918/AutonomousDataWarehouse/ListAutonomousDataWarehouses" target="_blank">https://docs.cloud.oracle.com/iaas/api/#/en/database/20160918/AutonomousDataWarehouse/ListAutonomousDataWarehouses</a></li>
+<li><a href="https://docs.cloud.oracle.com/iaas/api/#/en/database/20160918/AutonomousDatabase/ListAutonomousDatabases" target="_blank">https://docs.cloud.oracle.com/iaas/api/#/en/database/20160918/AutonomousDatabase/ListAutonomousDatabases</a></li>
+</ul>
+<h2>Stop the services</h2>
+<p>The state "AVAILABLE" means that the service is started (which is the OPEN state for the PDB, as those services are PDBaaS). We can filter on them with JQ <code> select(.lifecycleState=="AVAILABLE")</code> and then call the "stop" API with a POST request:</p>
+<pre>
+
+for service in autonomousDatabases autonomousDataWarehouses
+do
+ for id in $(
+  oci-curl $endpoint get "/$apiVersion/$service?compartmentId=$compartmentId" \
+  | jq -r '.[] | select(.lifecycleState=="AVAILABLE")|.id'
+ ) ; do
+  oci-curl $endpoint post /dev/stdin "/$apiVersion/$service/$id/actions/stop" &lt;&lt;&lt;"{}" | jq -r '.dbName + ": " + .lifecycleState'
+ done
+done
+
+</pre><p>This gets the OCID (<code>.id</code>) for all services that are in the AVAILABLE state and calls the <code>/$id/actions/stop</code> method for each of them. The POST method requires a file and I just pass an empty JSON here, mentioning /dev/stdin and sending "{}" through a here string in bash. The stop query returns the service information and I use JQ to display the name and the status:</p>
+<p>&nbsp;</p>
+<pre>
+
+ATP: STOPPING
+ADWC: STOPPING
+
+</pre><p>After a few seconds, running the command above to list services and status with tabs, I can see that they are in the STOPPED state:</p>
+<pre>
+
+ATP     STOPPED ocid1.autonomousdatabase.oc1.iad.abuwcljtthygmwsbbsr2e3ve5kwrtvyevpbr6sgmrocepqa6wtr2yx73xtoq
+ADWC    STOPPED ocid1.autonomousdwdatabase.oc1.iad.abuwcljrbwuhg2iyzshauzvsjuxuqnd7wcg35xezlmxmtoitqhpw3hfqij3a
+
+</pre><h2>Start the services</h2>
+<p>In order to start the database, the call is simply <code>/$service/$id/actions/start</code> instead of <code>/$service/$id/actions/stop</code></p>
+<pre>
+
+for service in autonomousDatabases autonomousDataWarehouses
+do
+ for id in $(
+  oci-curl $endpoint get "/$apiVersion/$service?compartmentId=$compartmentId" \
+  | jq -r '.[] | select(.lifecycleState=="STOPPED")|.id'
+ ) ; do
+  oci-curl $endpoint post /dev/stdin "/$apiVersion/$service/$id/actions/start" &lt;&lt;&lt;"{}" &lt;&lt;&lt;"{}" | jq -r '.dbName + ": " + .lifecycleState'
+ done
+done
+
+</pre><h2>So what?</h2>
+<p>This oci-curl() function is a very simple way to manage your autonomous database services, without having to install any tool. You just need the private key and a few environment variables. Looking at the script is also a good way to understand how to build the POST/GET request headers as expected by the Oracle Cloud REST API. Of course, for production, the OCI client or OCI SDK will be preferred.</p>
+<p>&nbsp;</p>
+<hr>
+<p><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href="https://twitter.com/Franckpachot">@FranckPachot</a>)</strong></p>
+
+</main>
+</body>
+</html>

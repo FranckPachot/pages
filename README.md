@@ -11,7 +11,7 @@ This repository preserves articles published across several platforms:
 - [Databases at CERN](https://db-blog.web.cern.ch/users/franck-pachot) Drupal JSON:API snapshots, including rendered article content
 - [LinkedIn Articles](https://www.linkedin.com/in/franckpachot/recent-activity/articles/) sanitized JSON snapshots captured from article pages in an authenticated browser; no account or session data is stored
 
-`archive-manifest.json` is the unified, machine-readable inventory. Each entry records its source, stable source ID, title, publication date, canonical URL, local archive path, and tags when available. The original exports remain unchanged.
+`archive-manifest.json` is the unified, machine-readable inventory. Each entry records its source, stable source ID, title, publication date, canonical URL, local archive path, and tags when available. Source article text is preserved; generated reading pages and navigation notices do not replace it.
 
 Version-sensitive follow-up notes live in [reviews](reviews/README.md). They link
 back to the published articles without modifying archived or published content.
@@ -44,6 +44,15 @@ Regenerate its browser catalog after refreshing the archive:
 ```shell
 python util/build_publication_map.py
 ```
+
+The build also renders the CERN JSON snapshots as readable local pages under
+`cern/rendered/`, preserving SQL indentation and execution-plan alignment and caching CERN
+images under `cern/assets/`. The first build needs access to any uncached images.
+Medium exports that reference an archived CERN article gain a full-article link,
+without replacing the original Medium text. When a Medium post and its referenced
+CERN article have the same title, the publication index opens the full CERN
+archive and keeps the Medium export available as an archived copy. Other Medium
+articles retain their own reading destination, even when they cite CERN.
 
 This also rebuilds `rss.xml` with the 50 newest deduplicated publications and `impact.html` from the latest dated observation for each publication under `impact/<source>/`. Platform metrics remain separate: article views are not inferred from impressions, reactions, or public counters.
 

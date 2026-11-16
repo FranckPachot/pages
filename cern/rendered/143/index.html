@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<!-- Google tag (gtag.js) -->
+<script async src="https://www.googletagmanager.com/gtag/js?id=G-LFQ153SCQM"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+
+  gtag('config', 'G-LFQ153SCQM');
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="canonical" href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-09-unindexed-foreign-keys-oracle-and-postgresql">
+<title>Unindexed Foreign Keys in Oracle and PostgreSQL</title>
+<link rel="stylesheet" href="../../../style.css">
+</head>
+<body>
+<nav><a href="../../../index.html">Publication index</a></nav>
+<p class="firstpub">Archived from Databases at CERN, published 2018-09-28.
+<a href="https://db-blog.web.cern.ch/blog/franck-pachot/2018-09-unindexed-foreign-keys-oracle-and-postgresql">Original article URL</a>.
+The content describes the versions available at the publication date.</p>
+<h1>Unindexed Foreign Keys in Oracle and PostgreSQL</h1>
+<main>
+<p>In Oracle we need to have a index on the foreign key column as soon as we&nbsp;have the intention to delete from the parent row, or a locking situation may block all transactions around the child table. PostgreSQL has a similar way to manage isolation, with MVCC, then do you think you also need to index the foreign keys? Here is a test that confirms that postgres does need to not lock the tables even without index on the foreign key.&nbsp;</p>
+<p>I have created the <a href="https://livesql.oracle.com/apex/livesql/file/content_O5AEB2HE08PYEPTGCFLZU9YCV.html" target="_blank">EMP / DEPT</a> tables from the Oracle demo schema, with a foreign key in EMP referencing DEPT, and no index on it. Then I've run the combination of following statements:</p>
+<p>One session inserting a row in EMP for DEPTNO 10 (one that already has childen in EMP), 40 (with no row in EMP) or 50 (not existing in the initial state)</p>
+<pre>
+
+"insert into emp(empno,deptno) values (8001,10);"
+"insert into emp(empno,deptno) values (8001,40);"
+"insert into emp(empno,deptno) values (8001,50);"
+
+</pre><p>Another session running some delete statements on a specific DEPTNO, or all of them:</p>
+<pre>
+
+"delete from dept;"
+"delete from dept where deptno=0;"
+"delete from dept where deptno=40;"
+"delete from dept where deptno=10;"
+
+</pre><p>Or this second session inserts a new DEPTNO 50:</p>
+<pre>
+
+"insert into dept values (50,'x','x');"
+
+</pre><p>Or it updates one DEPT with and without touching the referenced column:</p>
+<pre>
+
+"update dept set deptno=41 where deptno=40;"
+"update dept set loc='x' where deptno=40;"
+
+</pre><p>I've run all combination, and for each, started with one or the other session. The first one waits 10 seconds before doing a rollback, so that we can see 10 seconds of wait if there is a blocking lock. For Oracle, I've queried V$ACTIVE_SESSION_HISTORY at the end, which shows the blocking session and the blocked session with its wait event detailing the lock (enqueue wait event with p1 containing the type and mode, and p2 containing the object if in the case of 'enq: TM').</p>
+<p>For PostgreSQL, I used pg_active_session_history from the pgSentinel extension (<a href="https://github.com/pgsentinel/pgsentinel" target="_blank">https://github.com/pgsentinel/pgsentinel</a> which provides the blocking session as well and the wait event). The name of the wait event mentions the lock type but the lock mode must be queried from pg_locks. However, this ASH approch makes the test very easy: just run all combinations and look at the blocking situations later.</p>
+<h2>Oracle</h2>
+<p>Two combinations resulted in transaction locks (TX): when inserting a child for a department that is being created by a concurrent session. The insert sees the parent row but must wait to know if this row will be commited or not. If commited, the insert of the child is possible. If not, ORA-02291 'parent key not found' is raised. In this situation, the session waits for the another transaction with the wait event 'enq: TX' in mode 4 (Share). In summary, a row lock serializes the transactions in the following situations:</p>
+<pre>
+
+ 1. update dept set deptno=41 where deptno=40;
+ 2. insert into emp(empno,deptno) values (8001,40);
+
+ 1. insert into dept values (50,'x','x');
+ 2. insert into emp(empno,deptno) values (8001,50);
+
+</pre><p>This is the first situation. The second situation is more problematic because the whole child table is locked, and this happens even when the two sessions touch to unrelated rows. Actually, as long as there is any DML on the child table, an intention to delete a row from the parent table, or update the key, is blocked. This occurs even before the rows are read, and then even if the delete does not touch any row (such as my 'delete from dept where deptno=0' here). Oracle has to lock the whole child table in Share more, waiting on 'enq: TM' mode Share, when the foreign key is not indexed, because an insert can go anywhere in the table. The worst happens when this lock takes a long time to be acquired because Oracle locks are enqueues and then any other DML on the child table has to wait behind it.&nbsp;Here is a list of all the combinations. Any delete on DEPT (or update of DEPTNO) is blocked by any insert into EMP.</p>
+<pre>
+
+1. insert into emp(empno,deptno) values (8001,10);
+2. delete from dept;
+
+1. insert into emp(empno,deptno) values (8001,10);
+2. delete from dept where deptno=0;
+
+1. insert into emp(empno,deptno) values (8001,10);
+2. delete from dept where deptno=40;
+
+1. insert into emp(empno,deptno) values (8001,10);
+2. delete from dept where deptno=10;
+
+1. insert into emp(empno,deptno) values (8001,10);
+2. update dept set deptno=41 where deptno=40;
+
+1. insert into emp(empno,deptno) values (8001,40);
+2. delete from dept;
+
+1. insert into emp(empno,deptno) values (8001,40);
+2. delete from dept where deptno=0;
+
+1. insert into emp(empno,deptno) values (8001,40);
+2. delete from dept where deptno=40;
+
+1. delete from dept where deptno=40;
+2. insert into emp(empno,deptno) values (8001,40);
+
+1. insert into emp(empno,deptno) values (8001,40);
+2. update dept set deptno=41 where deptno=40;
+
+</pre><p>The goal of this post is not to detail the Oracle behaviour as it is well known. Here is a recording of some demos and explanations I did a few years ago: <a href="https://www.youtube.com/watch?v=yVbrfwtiHx8">Oracle Midlands #13: All About Table Locks - Franck Pachot</a> and this is still relevant in 18c.</p>
+<p>Let's see if postgres has the same issue with unindexed foreign keys.</p>
+<h2>PostgreSQL</h2>
+<p>The first blocking situation occurs when we insert into the child and another session deletes the referenced row (or updates the key). Here is an example. The first session inserts an employee for DEPTNO 40:</p>
+<pre>
+
+begin transaction;
+BEGIN
+insert into emp(empno,deptno) values (8001,40);
+INSERT 0 1
+select pg_sleep(10);
+
+</pre><p>The second session intends to delete this department:</p>
+<pre>
+
+begin transaction;
+BEGIN
+delete from dept where deptno=40;
+
+</pre><p>Here is the lock situation, during those 10 seconds where the delete (pid 3798) waits to acquire (granted=false) the transaction Share Lock which is held in exclusive mode by the pid 3706:</p>
+<pre>
+
+select pid,locktype,mode,relation,relname,transactionid,page,tuple,granted,fastpath,case when pid!=pg_backend_pid() then query end as query
+from pg_locks left outer join (select oid relation,relname from pg_class) c using(relation) join pg_stat_activity using(pid)
+where application_name='psql' and (relation is null or relname in('dept','emp')) order by pid,2,3,4,5;
+
+ pid  |   locktype    |        mode         | relation | relname | transactionid | page | tuple | granted | fastpath |               query
+------+---------------+---------------------+----------+---------+---------------+------+-------+---------+----------+-----------------------------------
+ 3706 | relation      | RowExclusiveLock    |   214385 | emp     |               |      |       | t       | t        |
+ 3706 | relation      | RowShareLock        |   214377 | dept    |               |      |       | t       | t        |
+ 3706 | transactionid | ExclusiveLock       |          |         |         54728 |      |       | t       | f        |
+ 3706 | virtualxid    | ExclusiveLock       |          |         |               |      |       | t       | t        |
+ 3708 | relation      | RowExclusiveLock    |   214377 | dept    |               |      |       | t       | t        | delete from dept where deptno=40;
+ 3708 | transactionid | ExclusiveLock       |          |         |         54729 |      |       | t       | f        | delete from dept where deptno=40;
+ 3708 | transactionid | ShareLock           |          |         |         54728 |      |       | f       | f        | delete from dept where deptno=40;
+ 3708 | tuple         | AccessExclusiveLock |   214377 | dept    |               |    0 |     4 | t       | f        | delete from dept where deptno=40;
+ 3708 | virtualxid    | ExclusiveLock       |          |         |               |      |       | t       | t        | delete from dept where deptno=40;
+
+</pre><p>This is very similar to the Oracle behaviour. We have a similar situation in the opposite situation. And updating the key is the same as deleting it:</p>
+<pre>
+
+begin transaction;
+BEGIN
+update dept set deptno=41 where deptno=40;
+UPDATE 1
+select pg_sleep(10);
+
+</pre><p>and</p>
+<pre>
+
+begin transaction;
+BEGIN
+insert into emp(empno,deptno) values (8001,40);
+
+</pre><p>The locking situation is again a transaction lock when encountering the same row:</p>
+<pre>
+
+select pid,locktype,mode,relation,relname,transactionid,page,tuple,granted,fastpath,case when pid!=pg_backend_pid() then query end as query
+from pg_locks left outer join (select oid relation,relname from pg_class) c using(relation) join pg_stat_activity using(pid)
+where application_name='psql' and (relation is null or relname in('dept','emp')) order by pid,2,3,4,5;
+
+ pid  |   locktype    |       mode       | relation | relname | transactionid | page | tuple | granted | fastpath |                      query
+------+---------------+------------------+----------+---------+---------------+------+-------+---------+----------+-------------------------------------------------
+ 4033 | relation      | RowExclusiveLock |   214377 | dept    |               |      |       | t       | t        |
+ 4033 | relation      | RowShareLock     |   214377 | dept    |               |      |       | t       | t        |
+ 4033 | relation      | RowShareLock     |   214385 | emp     |               |      |       | t       | t        |
+ 4033 | transactionid | ExclusiveLock    |          |         |         54774 |      |       | t       | f        |
+ 4033 | virtualxid    | ExclusiveLock    |          |         |               |      |       | t       | t        |
+ 4035 | relation      | RowExclusiveLock |   214385 | emp     |               |      |       | t       | t        | insert into emp(empno,deptno) values (8001,40);
+ 4035 | relation      | RowShareLock     |   214377 | dept    |               |      |       | t       | t        | insert into emp(empno,deptno) values (8001,40);
+ 4035 | transactionid | ExclusiveLock    |          |         |         54775 |      |       | t       | f        | insert into emp(empno,deptno) values (8001,40);
+ 4035 | transactionid | ShareLock        |          |         |         54774 |      |       | f       | f        | insert into emp(empno,deptno) values (8001,40);
+ 4035 | tuple         | AccessShareLock  |   214377 | dept    |               |    0 |     4 | t       | f        | insert into emp(empno,deptno) values (8001,40);
+ 4035 | virtualxid    | ExclusiveLock    |          |         |               |      |       | t       | t        | insert into emp(empno,deptno) values (8001,40);
+
+</pre><p>And that's all. There are no other lock situation in Postgres at least since version 9.3. Before version 9.3 this locking occured even when updating a non-key column, but not anymore. The change is documented <a href="https://github.com/postgres/postgres/commit/0ac5ad5134f2769ccbaefec73844f8504c4d6182#diff-79a1a60cd631a1067199e0296de47ec4" target="_blank">here</a>. Only columns that may be referenced (because they belong to a primary key or unique constraint) will request a lock.</p>
+<p>I explained that I used the pgSentinel extension to quickly see the blocker/blocked wait chain as with Oracle ASH. Here an example of 5 samples covering 5 seconds of this blocking situation:</p>
+<pre>
+
+select pid,locktype,mode,relation,relname,transactionid,page,tuple,granted,fastpath,case when pid&lt;&gt;pg_backend_pid() then query end as query
+from pg_locks left outer join (select oid relation,relname from pg_class) c using(relation) join pg_stat_activity using(pid)
+where application_name='psql' and (relation is null or relname in('dept','emp')) order by pid,2,3,4,5;
+
+ pid  | state  | blockers | blockerpid | blocker_state | wait_event_type |  wait_event   | cmdtype |                 top_level_query
+------+--------+----------+------------+---------------+-----------------+---------------+---------+-------------------------------------------------
+ 4033 | active |          |            |               | Timeout         | PgSleep       | SELECT  | select pg_sleep(10);
+ 4035 | active |        1 |       4033 | active        | Lock            | transactionid |         | insert into emp(empno,deptno) values (8001,40);
+ 4033 | active |          |            |               | Timeout         | PgSleep       | SELECT  | select pg_sleep(10);
+ 4035 | active |        1 |       4033 | active        | Lock            | transactionid |         | insert into emp(empno,deptno) values (8001,40);
+ 4033 | active |          |            |               | Timeout         | PgSleep       | SELECT  | select pg_sleep(10);
+ 4035 | active |        1 |       4033 | active        | Lock            | transactionid |         | insert into emp(empno,deptno) values (8001,40);
+ 4033 | active |          |            |               | Timeout         | PgSleep       | SELECT  | select pg_sleep(10);
+ 4035 | active |        1 |       4033 | active        | Lock            | transactionid |         | insert into emp(empno,deptno) values (8001,40);
+ 4033 | active |          |            |               | Timeout         | PgSleep       | SELECT  | select pg_sleep(10);
+ 4035 | active |        1 |       4033 | active        | Lock            | transactionid |         | insert into emp(empno,deptno) values (8001,40);
+
+</pre><p>The big advantage of this extension is that we can estimate both the time (I didn't display it but each sample&nbsp;has a ash_time column), and the number of blocked sessions (there is one row per active session). More info about this in <a href="https://bdrouvot.wordpress.com/2018/09/01/active-session-history-in-postgresql-blocker-and-wait-chain" target="_blank">Bertrand Drouvot's blog</a>.</p>
+<p>&nbsp;</p>
+<h3>So...</h3>
+<p>&nbsp;</p>
+<p>PostgreSQL has evolved to reduce the blocking situation to its minimum, and without the need to index the foreign key. For highly selective navigation from parent to child, you will probably create the index anyway. But for low selectivity (example: a big Orders table which references one out of few countries) you do not need to. Postgres can do this minimal locking because they have shared row locks.</p>
+<p>Oracle has only exclusive row locks (do not be confused by the shared mode of the transaction lock that is acquired after encountering an exclusive row lock). Then, locking the parent row could be very bad in some situation as the child operations can block eachothers (think about an insert into orders blocking all concurrent inserts for orders in the same country). To avoid this situation, Oracle does the opposite: a delete (or update of the key) has to block the inserts into the child. If there is an index on the foreign key, the referenced value can be locked (because each value goes at a specific place in an index - it is a kind of range lock). But without an index starting with the foreign key columns, the whole table must be locked because there is no way to lock only one value in a heap table.</p>
+<p>Note that when comparing, we must understand that Oracle has more features and must deal with much more complex concurrency situations,&nbsp;such as parallel DML and online DDL operations. Standard Edition does not provide those features, but uses the same code for locking, and then the situation is the same. Postgres is introducing more and more features and we will see if the can maintain the same minimal level of locking.</p>
+<p>&nbsp;</p>
+<hr>
+<p><strong>The comments are closed on this post, but do not hesitate to give feedback, comment or questions on Twitter (<a href="https://twitter.com/Franckpachot">@FranckPachot</a>)</strong></p>
+
+</main>
+</body>
+</html>

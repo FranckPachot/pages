@@ -23,6 +23,7 @@ from urllib.parse import quote
 
 from build_impact_page import write_impact_page
 from google_analytics import install_google_tags
+from render_cern_articles import cern_references, reader_path, render_cern_articles, without_cern_notice
 
 
 SITE_URL = "https://franckpachot.github.io/pages/"
@@ -188,6 +189,8 @@ def load_snapshot(root: Path, article: dict[str, Any]) -> tuple[str, str]:
         source == "dbi-services" and path.suffix.casefold() == ".html"
     ):
         document = path.read_text(encoding="utf-8", errors="replace")
+        if source == "medium":
+            document = without_cern_notice(document)
         return html_text(document), html_description(document)
 
     value = json.loads(path.read_text(encoding="utf-8", errors="replace"))
@@ -306,8 +309,21 @@ def infer_versions(signal: str, databases: list[str]) -> list[str]:
     return unique_strings(versions)
 
 
-def publication_urls(root: Path, article: dict[str, Any]) -> tuple[str, str]:
+def publication_urls(
+    root: Path, article: dict[str, Any], cern_articles: list[dict[str, Any]]
+) -> tuple[str, str]:
     archive_url = article["archive_path"]
+    if article["source"] == "cern":
+        rendered_url = reader_path(article)
+        if (root / rendered_url).is_file():
+            return rendered_url, ""
+    if article["source"] == "medium":
+        document = (root / archive_url).read_text(encoding="utf-8")
+        for reference in cern_references(document, cern_articles):
+            if normalize_text(reference["title"]).casefold() == normalize_text(article["title"]).casefold():
+                rendered_url = reader_path(reference)
+                if (root / rendered_url).is_file():
+                    return rendered_url, archive_url
     if article["source"] in {"oracle-scene", "soug"}:
         return archive_url, article["canonical_url"]
     if article["source"] == "dbi-services" and archive_url.endswith(".json"):
@@ -327,6 +343,7 @@ def publication_urls(root: Path, article: dict[str, Any]) -> tuple[str, str]:
 def build_catalog(root: Path) -> dict[str, Any]:
     manifest = json.loads((root / "archive-manifest.json").read_text(encoding="utf-8"))
     ai_descriptions = load_ai_descriptions(root)
+    cern_articles = [article for article in manifest["articles"] if article["source"] == "cern"]
     publications = []
     linkedin_canonicals = {
         article["canonical_url"].rstrip("/")
@@ -361,7 +378,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         date = article["published_at"][:10]
         employment = employment_period(date)
         archive_url = article["archive_path"]
-        read_url, snapshot_url = publication_urls(root, article)
+        read_url, snapshot_url = publication_urls(root, article, cern_articles)
         search_text = normalize_text(
             " ".join([title, summary, " ".join(tags + categories + databases + versions), body[:3500]])
         ).casefold()
@@ -659,7 +676,7 @@ def write_social_preview(root: Path, catalog: dict[str, Any]) -> None:
 def write_sitemap(path: Path, catalog: dict[str, Any], root: Path) -> None:
     local_pages = [
         publication for publication in catalog["publications"]
-        if publication["source_key"] in {"dbi-services", "medium"}
+        if publication["source_key"] in {"dbi-services", "medium", "cern"}
     ]
     minibook_pages = [
         f"{index_path.parent.relative_to(root).as_posix()}/"
@@ -674,7 +691,12 @@ def write_sitemap(path: Path, catalog: dict[str, Any], root: Path) -> None:
     ]
     entries = [f"  <url><loc>{SITE_URL}{page}</loc></url>" for page in static_pages]
     for publication in local_pages:
-        url = SITE_URL + quote(publication["archive_url"], safe="/-._~")
+        local_url = publication["archive_url"]
+        if publication["source_key"] == "cern":
+            local_url = publication["read_url"]
+            if local_url.startswith(("http://", "https://")):
+                continue
+        url = SITE_URL + quote(local_url, safe="/-._~")
         entries.append(f"  <url><loc>{html.escape(url)}</loc><lastmod>{publication['date']}</lastmod></url>")
     sitemap = '<?xml version="1.0" encoding="UTF-8"?>\n<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">\n' + "\n".join(entries) + "\n</urlset>\n"
     path.write_text(sitemap, encoding="utf-8")
@@ -742,6 +764,9 @@ def main() -> None:
     )
     args = parser.parse_args()
     root = args.root.resolve()
+    manifest = json.loads((root / "archive-manifest.json").read_text(encoding="utf-8"))
+    rendered, linked = render_cern_articles(root, manifest["articles"])
+    print(f"Rendered {rendered} CERN articles; linked {linked} Medium exports")
     output = root / "home" / "publications.js"
     catalog = build_catalog(root)
     catalog_version = write_catalog(output, catalog)
