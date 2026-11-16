@@ -49,10 +49,10 @@ The build also renders the CERN JSON snapshots as readable local pages under
 `cern/rendered/`, preserving SQL indentation and execution-plan alignment and caching CERN
 images under `cern/assets/`. The first build needs access to any uncached images.
 Medium exports that reference an archived CERN article gain a full-article link,
-without replacing the original Medium text. When a Medium post and its referenced
-CERN article have the same title, the publication index opens the full CERN
-archive and keeps the Medium export available as an archived copy. Other Medium
-articles retain their own reading destination, even when they cite CERN.
+without replacing the original Medium text. Medium entries in the publication
+index open their original Medium URLs and offer the local Medium export as an
+archived copy. CERN entries open the restored CERN archive; a Medium entry is
+never redirected to CERN, even when the titles match.
 
 This also rebuilds `rss.xml` with the 50 newest deduplicated publications and `impact.html` from the latest dated observation for each publication under `impact/<source>/`. Platform metrics remain separate: article views are not inferred from impressions, reactions, or public counters.
 

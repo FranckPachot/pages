@@ -23,7 +23,7 @@ from urllib.parse import quote
 
 from build_impact_page import write_impact_page
 from google_analytics import install_google_tags
-from render_cern_articles import cern_references, reader_path, render_cern_articles, without_cern_notice
+from render_cern_articles import reader_path, render_cern_articles, without_cern_notice
 
 
 SITE_URL = "https://franckpachot.github.io/pages/"
@@ -309,21 +309,12 @@ def infer_versions(signal: str, databases: list[str]) -> list[str]:
     return unique_strings(versions)
 
 
-def publication_urls(
-    root: Path, article: dict[str, Any], cern_articles: list[dict[str, Any]]
-) -> tuple[str, str]:
+def publication_urls(root: Path, article: dict[str, Any]) -> tuple[str, str]:
     archive_url = article["archive_path"]
     if article["source"] == "cern":
         rendered_url = reader_path(article)
         if (root / rendered_url).is_file():
             return rendered_url, ""
-    if article["source"] == "medium":
-        document = (root / archive_url).read_text(encoding="utf-8")
-        for reference in cern_references(document, cern_articles):
-            if normalize_text(reference["title"]).casefold() == normalize_text(article["title"]).casefold():
-                rendered_url = reader_path(reference)
-                if (root / rendered_url).is_file():
-                    return rendered_url, archive_url
     if article["source"] in {"oracle-scene", "soug"}:
         return archive_url, article["canonical_url"]
     if article["source"] == "dbi-services" and archive_url.endswith(".json"):
@@ -335,7 +326,7 @@ def publication_urls(
             return rendered_url, article["canonical_url"]
         return article["canonical_url"], ""
 
-    read_url = archive_url if article["source"] == "medium" else article["canonical_url"]
+    read_url = article["canonical_url"]
     snapshot_url = archive_url if archive_url.endswith((".html", "/index.html")) and read_url != archive_url else ""
     return read_url, snapshot_url
 
@@ -343,7 +334,6 @@ def publication_urls(
 def build_catalog(root: Path) -> dict[str, Any]:
     manifest = json.loads((root / "archive-manifest.json").read_text(encoding="utf-8"))
     ai_descriptions = load_ai_descriptions(root)
-    cern_articles = [article for article in manifest["articles"] if article["source"] == "cern"]
     publications = []
     linkedin_canonicals = {
         article["canonical_url"].rstrip("/")
@@ -378,7 +368,7 @@ def build_catalog(root: Path) -> dict[str, Any]:
         date = article["published_at"][:10]
         employment = employment_period(date)
         archive_url = article["archive_path"]
-        read_url, snapshot_url = publication_urls(root, article, cern_articles)
+        read_url, snapshot_url = publication_urls(root, article)
         search_text = normalize_text(
             " ".join([title, summary, " ".join(tags + categories + databases + versions), body[:3500]])
         ).casefold()

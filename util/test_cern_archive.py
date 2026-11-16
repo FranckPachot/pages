@@ -79,9 +79,10 @@ def main() -> None:
         catalog = build_catalog(root)
         publications = {item["id"]: item for item in catalog["publications"]}
         assert publications["cern:150"]["read_url"] == "cern/rendered/150/index.html"
-        assert publications["medium:announcement"]["read_url"] == "cern/rendered/150/index.html"
+        assert publications["medium:announcement"]["read_url"] == manifest[1]["canonical_url"]
         assert publications["medium:announcement"]["snapshot_url"] == manifest[1]["archive_path"]
-        assert publications["medium:citation"]["read_url"] == manifest[2]["archive_path"]
+        assert publications["medium:citation"]["read_url"] == manifest[2]["canonical_url"]
+        assert publications["medium:citation"]["snapshot_url"] == manifest[2]["archive_path"]
         sitemap = root / "sitemap.xml"
         write_sitemap(sitemap, catalog, root)
         urls = [
