@@ -13,6 +13,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from archive_articles import list_devto_articles
+
 
 DEVTO_API = "https://dev.to/api"
 USER_AGENT = "FranckPachot-blog-archive/1.0"
@@ -103,7 +105,7 @@ def normalize_devto_public(article: dict[str, Any], collected_at: str) -> dict[s
         "provenance": {
             "measurement_type": "public_counter",
             "provider": "DEV Community public articles API",
-            "endpoint": "/api/articles?username=franckpachot",
+            "endpoint": "/api/articles/latest",
             "notes": "Public reactions and comments only; article views require authenticated analytics.",
         },
     }
@@ -139,36 +141,16 @@ def devto_get(path: str, api_key: str) -> dict[str, Any]:
     return value
 
 
-def devto_get_public(path: str) -> Any:
-    request = urllib.request.Request(
-        f"{DEVTO_API}{path}",
-        headers={"Accept": "application/json", "User-Agent": USER_AGENT},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.load(response)
-
-
 def collect_devto_public(root: Path, username: str) -> Path:
     collected_at = datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
-    publications = []
-    page = 1
-    while True:
-        query = urllib.parse.urlencode(
-            {"username": username, "per_page": 100, "page": page}
-        )
-        batch = devto_get_public(f"/articles?{query}")
-        if not isinstance(batch, list):
-            raise ValueError(f"Unexpected Dev.to article list response on page {page}")
-        if not batch:
-            break
-        publications.extend(
-            normalize_devto_public(article, collected_at) for article in batch
-        )
-        print(f"Dev.to public impact page {page}: {len(batch)} articles")
-        page += 1
+    publications = [
+        normalize_devto_public(article, collected_at)
+        for article in list_devto_articles(username)
+    ]
 
     if not publications:
         raise ValueError(f"No public Dev.to articles found for {username}")
+    print(f"Dev.to public impact: {len(publications)} unique articles")
     snapshot = {
         "schema_version": 1,
         "collected_at": collected_at,

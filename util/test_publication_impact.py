@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
 """Regression checks for publication impact normalization."""
 
+import json
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
 from collect_publication_impact import (
+    collect_devto_public,
     merge_publications,
     normalize_devto_public,
     normalize_devto_totals,
@@ -16,6 +22,7 @@ def main() -> None:
         "published_at": "2026-08-31T13:42:16Z",
         "public_reactions_count": 2,
         "comments_count": 0,
+        "user": {"username": "franckpachot"},
     }
     totals = {
         "comments": {"total": 1},
@@ -46,6 +53,16 @@ def main() -> None:
     assert public["metrics"] == {}
     assert public["public_counters"] == {"reactions": 2, "comments": 0}
     assert public["provenance"]["measurement_type"] == "public_counter"
+    assert public["provenance"]["endpoint"] == "/api/articles/latest"
+
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        with patch("collect_publication_impact.list_devto_articles", return_value=[article]) as discover:
+            output = collect_devto_public(Path(temporary_directory), "franckpachot")
+        discover.assert_called_once_with("franckpachot")
+        snapshot = json.loads(output.read_text(encoding="utf-8"))
+        assert snapshot["publication_count"] == 1
+        assert snapshot["publications"][0]["metrics"] == {}
+        assert snapshot["publications"][0]["public_counters"] == {"reactions": 2, "comments": 0}
 
     older = {**impact, "collected_at": "2026-08-31T15:00:00Z"}
     other = {**impact, "publication_id": "dev.to:123", "source_id": "123"}

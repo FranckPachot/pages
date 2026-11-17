@@ -26,6 +26,11 @@ python util/archive_articles.py
 
 The command discovers current DBI Services, Dev.to, Yugabyte, JAVAPRO, Microsoft Tech Community, and CERN articles; rescans the local Medium export; downloads only snapshots that are not already present; and regenerates the manifest.
 
+DEV discovery and public-impact collection share the chronological
+`/api/articles/latest` listing, verify the requested author, and deduplicate
+article IDs across pages. This avoids counting overlapping feed pages as new
+publications; a repeated page with no new IDs is reported as an error.
+
 LinkedIn blocks anonymous article discovery and its activity feed omits older articles. Its snapshots are therefore captured separately through `util/capture_linkedin.py`, a localhost-only receiver for article metadata and body HTML extracted in an authenticated browser. The regular archive command inventories those local snapshots, including in `--offline` mode.
 
 Use `--refresh-dbi`, `--refresh-devto`, `--refresh-yugabyte`, `--refresh-javapro`, `--refresh-techcommunity`, or `--refresh-cern` to replace existing snapshots from one source. The corresponding `--skip-*` options avoid contacting that source, while `--offline` rebuilds the manifest entirely from local snapshots.

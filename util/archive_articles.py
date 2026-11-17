@@ -261,16 +261,27 @@ def web_get_json(url: str) -> Any:
 
 def list_devto_articles(username: str) -> list[dict[str, Any]]:
     articles = []
+    seen_ids: set[int] = set()
     page = 1
     while True:
-        batch = api_get(f"/articles?username={username}&per_page=100&page={page}")
+        query = urllib.parse.urlencode({"username": username, "per_page": 100, "page": page})
+        batch = api_get(f"/articles/latest?{query}")
         if not isinstance(batch, list):
             raise ValueError(f"Unexpected Dev.to article list response on page {page}")
         if not batch:
             return articles
         if not all(isinstance(article.get("id"), int) and article["id"] > 0 for article in batch):
             raise ValueError(f"Invalid Dev.to article ID on page {page}")
-        articles.extend(batch)
+        if any(article.get("user", {}).get("username") != username for article in batch):
+            raise ValueError(f"Unexpected Dev.to author on page {page}; expected {username}")
+        new_articles = []
+        for article in batch:
+            if article["id"] not in seen_ids:
+                new_articles.append(article)
+                seen_ids.add(article["id"])
+        if not new_articles:
+            raise ValueError(f"Dev.to pagination made no progress on page {page}")
+        articles.extend(new_articles)
         page += 1
 
 
